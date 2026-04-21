@@ -1,4 +1,4 @@
-# Uney ZK Object Fabric — Technical Proposal
+# ZK Object Fabric — Technical Proposal
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
@@ -10,88 +10,345 @@
 
 ## 1. Executive Summary
 
-- **What**: A multi-tenanted, zero-knowledge, S3-compatible object storage
-  fabric with customer-controlled placement, erasure-coded durability,
-  regional hot cache, and explicit bandwidth accounting.
-- **Why**: The market leaves a gap. Wasabi is proprietary and centralized
-  with opaque "fair-use" egress. Storj is open but its 80/29 erasure
-  coding profile (tuned for untrusted peers) is too expensive for
-  controlled DCs. Backblaze B2 and Cloudflare R2 are centralized and do
-  not offer zero-knowledge by default. No existing product combines
-  **ZK by default + customer-controlled placement + cache-aware pricing**.
-- **How**: An S3-compatible API at the edge, a ZK gateway that encrypts
-  client-side (per-object DEKs, encrypted manifests, optional CMK),
-  a placement engine that enforces topology constraints, an
-  erasure-coded durable origin (8+3 or 10+4), a regional hot replica /
-  edge cache layer, and explicit per-tenant bandwidth accounting.
+- **What**: ZK Object Fabric is a multi-tenanted, portable, zero-knowledge
+  object storage fabric. It exposes an S3-compatible API at the edge,
+  encrypts data client-side (or gateway-side for managed mode), stores
+  ciphertext across pluggable storage backends, and serves hot reads
+  from a regional cache.
+- **Why**: The market leaves a gap.
+  - **Wasabi** is proprietary and centralized, has no zero-knowledge
+    mode, and uses an opaque fair-use egress policy. It is the
+    cheapest S3-compatible storage available and the right Phase 1
+    primary backend, but it is not a finished product for ZK-sensitive
+    customers.
+  - **Storj** is open and ZK-friendly, but its 80/29 erasure coding is
+    tuned for untrusted peers and is too expensive to run on controlled
+    DCs. Its AGPLv3 license is incompatible with a proprietary product.
+  - **Backblaze B2** and **Cloudflare R2** are centralized, not ZK, and
+    do not offer customer-controlled placement.
+  - **No existing product** combines *ZK by default + customer-
+    controlled placement + cache-aware pricing + cloud-to-local
+    migration*.
+- **How**: S3-compatible API, client-side encryption (per-object DEKs,
+  encrypted manifests, optional CMK), provider-neutral object
+  manifests, pluggable storage backends (with **Wasabi as the Phase 1
+  primary**), a hot cache layer, explicit per-tenant bandwidth
+  accounting, and a built-in migration engine.
+- **Phase 1 stack**: **AWS control plane + Linode data plane + Wasabi
+  storage backend.** Customer data flows only through Linode; it
+  never transits AWS.
 - **For whom**:
-  - B2C: app developers who want cheap, private, S3-compatible storage
-    behind an SDK and API key.
-  - B2B: enterprises and sovereign customers who need dedicated cells,
-    country/DC/rack-level placement, committed bandwidth, and SLAs.
+  - **B2C**: app developers who want cheap, private, S3-compatible
+    storage behind an SDK and API key.
+  - **B2B**: enterprises and sovereign customers who need dedicated
+    cells, country / DC / rack-level placement, committed bandwidth,
+    and SLAs.
 - **License**: Proprietary. AGPL-licensed bases are ruled out for
-  production. Ceph RGW (LGPL-2.1) and SeaweedFS (Apache-2.0) are the
-  viable bases.
+  production. Permissive / weak-copyleft bases (Ceph RGW LGPL-2.1,
+  SeaweedFS Apache-2.0) are acceptable for Phase 2+ local DC storage.
+- **Key strategic insight**: Use public cloud first to prove the
+  product and the migration layer. Because data flows only through the
+  Linode data plane — never through AWS — bandwidth costs stay
+  predictable. Cost leadership is claimed only after moving to local
+  DC cells in Phase 3.
+
+### 1.1 Tech stack
+
+- **Server-side: Go.** The ZK Gateway, control-plane services
+  (metadata, auth, billing, placement policy evaluation, migration
+  orchestration), and storage provider adapters are written in Go.
+  Go is chosen for operational scalability, developer velocity, and
+  ecosystem maturity (HTTP servers, S3 clients, Kubernetes operators,
+  observability).
+- **Frontend: React.** Tenant console, admin dashboards, self-service
+  onboarding, billing portal, and operator UIs.
+- **Rust, selectively.** Used only where it makes a large, measurable
+  difference: chunking and encryption hot paths, cache eviction loops,
+  erasure-coding workers (Phase 2+), and any node-local agent where
+  memory footprint and per-byte CPU cost matter. Rust is **not** the
+  default server-side language.
 
 ---
 
 ## 2. Market Analysis & Pricing
 
-### 2.1 Competitive pricing landscape
+### 2.1 Competitive landscape
 
-| Provider                  | Public storage price           | Egress signal                           | Strengths                                    | Constraints                                            |
-| ------------------------- | ------------------------------ | --------------------------------------- | -------------------------------------------- | ------------------------------------------------------ |
-| Wasabi Hot Cloud Storage  | ~$6.99 / TB-mo                 | "Free" egress with fair-use policy      | Simple pricing, S3 API, large ecosystem      | Proprietary, centralized, opaque fair-use, no ZK       |
-| Storj Regional            | ~$4.00 / TB-mo storage         | ~$7.00 / TB egress                      | Decentralized, S3-compatible, good SDKs      | AGPLv3 base, 80/29 EC is expensive in controlled DCs   |
-| Storj Global              | ~$4.00 / TB-mo storage         | ~$7.00 / TB egress                      | Geo-distributed by design                    | Same license / EC constraints as Regional              |
-| Storj Archive             | ~$1.00 / TB-mo storage         | Cold retrieval fees                     | Aggressive archive price                     | Retrieval cost & latency, AGPLv3                       |
-| Backblaze B2              | ~$6.00 / TB-mo                 | ~$10.00 / TB egress (Cloudflare free)   | Mature, cheap, good ecosystem                | Centralized, no ZK, no customer-controlled placement   |
-| Cloudflare R2             | ~$15.00 / TB-mo                | $0 egress to internet                   | Free egress, global edge                     | Higher storage price, no ZK, vendor lock-in            |
+| Backend                       | Storage cost              | Egress model                                  | Strategic use                                                              |
+| ----------------------------- | ------------------------- | --------------------------------------------- | -------------------------------------------------------------------------- |
+| Wasabi                        | ~$6.99 / TB-mo            | Free, fair-use ≤ 1× stored                    | **Phase 1 primary storage backend.** Main price benchmark.                 |
+| Akamai / Linode Object Storage| ~$20 / TB-mo              | 1 TB / mo included, overage ~$5 / TB          | Data plane compute, not primary storage                                    |
+| AWS S3 Standard               | ~$23 / TB-mo              | Egress ~$0.09 / GB                            | Control plane only. **Never use for data path.**                           |
+| Cloudflare R2                 | ~$15 / TB-mo              | No egress charge, request fees                | Alternative hot egress layer                                               |
+| Backblaze B2                  | ~$6 / TB-mo               | Free egress up to 3× stored, then ~$0.01 / GB | Alternative storage backend                                                |
+| Storj                         | ~$6–$15 / TB-mo by tier   | 1× free egress included                       | ZK and distributed-design **benchmark only** — not usable as prod base     |
 
-### 2.2 Pricing conclusion
+### 2.2 Phase 1 economics with AWS + Linode + Wasabi
 
-Storage cost and bandwidth cost **must be separated** in Uney's pricing.
-"Unlimited egress" marketing is disallowed; it forces cross-subsidization
-that breaks at PB+ scale.
+Why this stack works:
 
-Viable Uney price targets by tier:
+- **Wasabi at ~$6.99 / TB-mo** is the cheapest S3-compatible storage
+  with included egress. It is the right place to put long-term
+  ciphertext in Phase 1.
+- **Linode** provides data-plane compute with predictable bandwidth.
+  Each Linode instance includes a monthly transfer allowance that
+  absorbs hot-read egress from the cache.
+- **AWS control-plane costs are minimal** — a modest RDS, IAM,
+  CloudWatch, and a small compute footprint — because **no customer
+  data** crosses AWS.
+- **Total Phase 1 COGS per TB** = Wasabi storage per TB-mo + amortized
+  Linode compute / bandwidth per TB served + amortized AWS control-
+  plane cost per tenant. This is significantly cheaper than putting
+  the data path on AWS S3 or Akamai Object Storage.
+- **Fair-use constraint**: Wasabi's included egress assumes monthly
+  egress ≤ active storage volume. The data plane must respect this.
+  The **Linode cache is the mechanism** — hot objects are pinned in
+  Linode NVMe / block storage so repeat reads do not hit Wasabi.
 
-| Tier                  | Target storage price   | Egress model                          |
-| --------------------- | ---------------------- | ------------------------------------- |
-| ZK Archive            | $2.99–$4.99 / TB-mo    | Low / retrieval-priced                |
-| ZK Standard (Basic)   | $4.99–$5.99 / TB-mo    | 1× stored included, then metered      |
-| ZK Hot (Regional)     | $6.99–$9.99 / TB-mo    | 2–5× stored included if cacheable     |
-| ZK Dedicated (PB+)    | Custom                 | Committed bandwidth contracts         |
-| ZK Sovereign          | Premium                | Contractual, country/DC-constrained   |
+### 2.3 Pricing conclusion
 
-**Key insight**: price the two resources separately and expose the cache
-behavior to customers. Hot-tier discounts are honest only when cache hit
-ratios are actually high.
+With Wasabi as the backend, Phase 1 retail pricing can be more
+competitive than previously estimated. The privacy premium over
+direct Wasabi is the value proposition: customers get ZK encryption,
+placement policy, provider neutrality, and migration-readiness on top
+of Wasabi-class storage economics. Storage cost and bandwidth cost
+must still be separated in all pricing; "unlimited egress" is
+disallowed.
+
+### 2.4 Pricing by phase
+
+#### Phase 1 — AWS + Linode + Wasabi
+
+| Product               | Backend                     | Suggested retail          | Positioning                                              |
+| --------------------- | --------------------------- | ------------------------- | -------------------------------------------------------- |
+| ZK Beta               | Wasabi via Linode           | $9.99–$14.99 / TB-mo      | ZK + placement + portability premium over Wasabi direct  |
+| ZK Hot                | Wasabi + Linode cache       | $14.99–$19.99 / TB-mo     | High egress, frequent reads, cache-served                |
+| BYOC Control Plane    | Customer's own cloud        | SaaS fee + usage          | Enterprise, customer pays storage directly               |
+| Migration Layer       | Cloud → local DC            | Project or usage fee      | Builds future local storage demand                       |
+
+#### Phase 2 — Hybrid (local DC primary + Wasabi / cloud DR)
+
+| Product                  | Backend                        | Suggested retail       |
+| ------------------------ | ------------------------------ | ---------------------- |
+| ZK Standard              | Local primary + Wasabi DR      | $6.99–$8.99 / TB-mo    |
+| ZK Standard (Strict)     | Local EC + customer keys       | $7.99–$11.99 / TB-mo   |
+| ZK Hot                   | Local cache + CDN              | $9.99–$19.99 / TB-mo   |
+| Dedicated PB Cell        | Reserved local capacity        | Custom                 |
+
+#### Phase 3 — Local DC
+
+| Product         | Backend                                | Possible retail target |
+| --------------- | -------------------------------------- | ---------------------- |
+| ZK Archive      | Local HDD EC                           | $2.99–$4.99 / TB-mo    |
+| ZK Standard     | Local HDD EC + limited egress          | $4.99–$6.99 / TB-mo    |
+| ZK Hot          | Local EC + NVMe cache + replica        | $7.99–$12.99 / TB-mo   |
+| ZK Sovereign    | Reserved racks or nodes                | Contracted             |
+
+### 2.5 Key insight
+
+Storage cost and bandwidth cost must be separated. Do **not** advertise
+"unlimited egress." Wasabi's fair-use egress policy means **the Linode
+cache layer is critical** — it absorbs repeated reads so Wasabi origin
+egress stays within fair-use bounds. Cache hit ratio is a product
+metric, not an implementation detail.
 
 ---
 
 ## 3. Architecture
 
-### 3.1 Control Plane
+### 3.1 Phase 1 Architecture: AWS + Linode + Wasabi
+
+Phase 1 deliberately separates concerns across three providers so that
+data never transits AWS, Linode is the only path for customer bytes,
+and Wasabi is used purely as a durable-origin S3 endpoint.
+
+#### AWS (Control Plane)
+
+- Postgres / RDS for tenant, bucket, and object metadata (manifest
+  headers, ACLs, versioning, tenant directory, policy store).
+- IAM / auth token issuance (signed tokens consumed by the Linode
+  gateway fleet).
+- Billing counters and usage analytics (ClickHouse or an equivalent
+  analytics store).
+- Monitoring, alerting, operational dashboards (CloudWatch + derived
+  pipelines).
+- Placement policy engine (OPA / Rego or an equivalent evaluator).
+- **No customer data** crosses AWS — only metadata, auth, billing, and
+  control signals.
+
+#### Linode (Data Plane)
+
+- S3-compatible gateway fleet (receives every customer PUT / GET /
+  HEAD / DELETE / LIST request).
+- Hot object cache on NVMe or memory, in front of Wasabi.
+- Encryption / decryption boundary for Managed Encrypted mode.
+- Ciphertext streaming to and from Wasabi.
+- Range GET handling (byte-range reads served from cache when
+  possible).
+- CDN integration point (Akamai or Cloudflare in front of the Linode
+  gateway for globally distributed hot reads).
+- **All customer data** flows through Linode only.
+
+#### Wasabi (Storage Backend)
+
+- Durable encrypted object / chunk storage.
+- ~$6.99 / TB-mo with fair-use included egress.
+- S3-compatible API — the Linode gateway speaks S3 to Wasabi.
+- **90-day minimum storage duration applies.** The data plane must
+  **not** use Wasabi for ephemeral objects. Short-TTL cache objects
+  live on Linode, not Wasabi.
+
+#### Data flow diagram
+
+```mermaid
+flowchart LR
+    Client["Client / SDK"]
+    LinodeGW["Linode: ZK Gateway"]
+    LinodeCache["Linode: Hot Cache"]
+    Wasabi["Wasabi: Storage"]
+    AWS["AWS: Control Plane"]
+
+    Client <-->|"encrypted data"| LinodeGW
+    LinodeGW <-->|"cache lookup"| LinodeCache
+    LinodeGW <-->|"encrypted chunks"| Wasabi
+    LinodeGW ---|"auth, metadata,<br/>billing signals"| AWS
+```
+
+#### Design constraint
+
+Data must **only** flow through the Linode data plane. The Linode-
+hosted gateway handles:
+
+1. Client authentication (validates tokens issued by the AWS control
+   plane).
+2. Encryption (client-side SDK validates, or the gateway encrypts
+   directly in Managed Encrypted mode).
+3. Chunking and manifest creation.
+4. Writing encrypted chunks to Wasabi via the S3 API.
+5. Reading encrypted chunks from Wasabi, or serving them from the
+   Linode cache on hit.
+6. Streaming ciphertext back to the client.
+
+Metadata updates (manifest headers, billing counters, placement
+decisions) are written to the AWS control plane over a dedicated
+control channel. Those payloads contain **no customer data**, only
+opaque object IDs, sizes, hashes, and accounting counters.
+
+#### Wasabi fair-use management
+
+Wasabi's free-egress policy assumes monthly egress ≤ stored data
+volume. The Linode cache layer is essential. Hot objects are pinned
+to Linode so repeated reads do not hit Wasabi origin. Promotion
+policy (see §3.10) ensures frequently-read objects move to Linode
+cache within a few reads.
+
+### 3.2 Critical design decision: customer object ≠ provider object
+
+Provider-neutral manifests are used from day one:
+
+```
+customer object  →  encrypted chunks  →  encrypted manifest  →  backend pieces  →  provider-specific locators
+```
+
+This indirection lets ZK Object Fabric move a bucket from Wasabi to a
+local DC cell without changing the customer-facing bucket name,
+object key, URL, or API. The manifest records which provider currently
+holds each piece, and the migration engine rewrites those locators
+without touching the customer's namespace.
+
+### 3.3 Object manifest format
+
+```json
+{
+  "tenant_id": "tnt_123",
+  "bucket": "prod-assets",
+  "object_key_hash": "blake3:...",
+  "version_id": "v7",
+  "object_size": 10737418240,
+  "chunk_size": 16777216,
+  "encryption": {
+    "mode": "client_side",
+    "algorithm": "xchacha20-poly1305",
+    "key_id": "customer-managed",
+    "manifest_encrypted": true
+  },
+  "placement_policy": {
+    "residency": ["SG"],
+    "allowed_backends": ["wasabi-ap-southeast-1", "local-cell-1"],
+    "min_failure_domains": 2,
+    "hot_cache": true
+  },
+  "pieces": [
+    {
+      "piece_id": "p_001",
+      "hash": "blake3:...",
+      "backend": "wasabi-ap-southeast-1",
+      "locator": "s3://zk-prod-a/pieces/p_001",
+      "state": "active"
+    }
+  ],
+  "migration_state": {
+    "generation": 4,
+    "primary_backend": "local-cell-1",
+    "cloud_copy": "drain_after_30d"
+  }
+}
+```
+
+The manifest itself is encrypted before it is stored in the metadata
+DB. The control plane sees only the manifest ID, size, and placement
+tags required for policy evaluation.
+
+### 3.4 Storage provider adapter
+
+All backends implement the same `StorageProvider` interface:
+
+```go
+type StorageProvider interface {
+    PutPiece(ctx context.Context, pieceID string, r io.Reader, opts PutOptions) (PutResult, error)
+    GetPiece(ctx context.Context, pieceID string, r *ByteRange) (io.ReadCloser, error)
+    HeadPiece(ctx context.Context, pieceID string) (PieceMetadata, error)
+    DeletePiece(ctx context.Context, pieceID string) error
+    ListPieces(ctx context.Context, prefix, cursor string) (ListResult, error)
+    Capabilities() ProviderCapabilities
+    CostModel() ProviderCostModel
+    PlacementLabels() PlacementLabels
+}
+```
+
+Planned implementations:
+
+- `wasabi` — **Phase 1 primary backend.**
+- `aws_s3` — DR / backup only. **Not used in the data plane.**
+- `backblaze_b2` — alternative storage backend.
+- `cloudflare_r2` — alternative hot egress layer.
+- `local_fs_dev` — developer loopback for tests.
+- `ceph_rgw` / `seaweedfs` — Phase 2+ local DC storage.
+
+Adapters report cost models and placement labels back to the policy
+engine so placement decisions can factor in per-provider $/GB, egress
+policy, and regulatory tags.
+
+### 3.5 Control plane (on AWS)
 
 Responsibilities:
 
-- Tenant, bucket, and object metadata (manifests, ACLs, versioning).
-- Placement policies and policy evaluation.
-- Node health, inventory, and failure-domain topology.
-- Repair queues and repair scheduling.
+- Tenant, bucket, object manifest metadata.
+- Placement policy evaluation.
+- Backend inventory and health.
 - Billing counters (storage-seconds, PUTs, GETs, egress bytes).
-- Abuse controls (rate limits, anomaly detection, CDN interaction).
+- Abuse controls (rate limits, anomaly detection).
+- Migration state and orchestration signals.
 
 Technology choices:
 
-- **Metadata store**: FoundationDB, CockroachDB, or Postgres-Citus.
-  Requirements: strong consistency, horizontal scale, transactions over
-  small objects.
+- **Metadata store**: Postgres / RDS for Phase 1. Migrate to
+  CockroachDB or FoundationDB if per-row transaction throughput on a
+  single primary becomes the bottleneck.
 - **Billing / analytics**: ClickHouse for high-cardinality event
-  ingestion and cost/SLA reporting.
-- **Policy engine**: OPA / Rego for placement rules, egress budgets, and
-  tenant guardrails.
+  ingestion and cost / SLA reporting.
+- **Policy engine**: OPA / Rego (or a Go-native evaluator) for
+  placement rules, egress budgets, and tenant guardrails.
 
 Example placement policy (YAML, evaluated by OPA):
 
@@ -100,11 +357,11 @@ tenant: acme-fintech
 bucket: acme-vault
 policy:
   encryption:
-    mode: zk                  # client-side only
+    mode: zk                    # client-side only
     kms: customer-managed
   placement:
     country: ["DE", "AT"]
-    provider: ["uney-owned", "leaseweb"]
+    provider: ["wasabi", "local-cell-1"]
     min_dcs: 2
     min_racks: 6
     node_class: ["hdd-dense"]
@@ -112,7 +369,7 @@ policy:
     carbon_profile: ["low"]
     sovereignty_tag: "eu-only"
   erasure_coding:
-    profile: "10+4"
+    profile: "10+4"              # Phase 2+ only
     stripe_mb: 4
   egress:
     monthly_budget_tb: 50
@@ -120,149 +377,211 @@ policy:
     serve_from: ["l0", "l1"]
 ```
 
-### 3.2 Data Plane
+The control plane handles **no customer data**. It sees only opaque
+object IDs, sizes, hashes, and accounting counters.
 
-Three layers, each with a distinct function and storage format. All layers
-below the ZK Gateway operate on ciphertext.
+### 3.6 Data plane — three layers
 
-| Layer | Name                      | Function                                           | Storage format                                          |
-| ----- | ------------------------- | -------------------------------------------------- | ------------------------------------------------------- |
-| L0    | Edge Cache                | Serve hot reads with lowest latency                | NVMe, encrypted objects or chunks, LRU / LFU eviction   |
-| L1    | Regional Hot Replica      | Serve bulk hot reads, absorb cache misses          | Full encrypted objects, 1–2 replicas in-region          |
-| L2    | Durable Origin            | Durable storage of record                          | Erasure-coded shards across DCs / racks / nodes         |
+| Layer | Function                                | Storage format                                | Phase 1 implementation                                            |
+| ----- | --------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------- |
+| L0    | Serve hot reads close to users          | Full encrypted object or range chunks         | Linode NVMe / memory cache                                        |
+| L1    | Reduce repeated origin reads            | Full encrypted object, 1–2 replicas           | Linode block storage, or a second Wasabi region used as a mirror  |
+| L2    | Long-term durability                    | Provider-native (Wasabi) in Phase 1; EC shards in Phase 2+ | Wasabi S3                                              |
 
-**Why EC saves storage but not read bandwidth.** Erasure coding reduces
-storage overhead from e.g. 3× (replication) to ~1.375× (8+3) or ~1.4×
-(10+4). It does **not** reduce read bandwidth cost: each GET still
-transfers the object bytes to the caller. That is why hot reads must be
-served from L0 / L1 where the object is materialized and not
-reconstructed from shards on every request.
+In Phase 1, Wasabi provides L2 durability natively — Wasabi handles
+its own replication. Erasure coding is **not** needed until Phase 2+
+when using local DC storage. The Linode cache layer (L0 / L1) is the
+mechanism that keeps Wasabi egress within fair-use and that serves
+hot reads with low latency.
 
-### 3.3 Encryption Model
+**Why EC alone does not solve read bandwidth**: erasure coding lowers
+*storage* overhead (for example 1.33× for 6+2 or 1.4× for 10+4) but
+does not lower *read* bandwidth; every GET still transfers the
+object bytes. Hot reads must therefore be served from L0 / L1 where
+the object is materialized, not reconstructed from shards.
 
-- **Per-object DEKs**: every object has a fresh data encryption key.
-- **Encrypted manifests**: object manifests (shard lists, chunk hashes,
-  sizes, offsets) are themselves encrypted so the operator cannot infer
-  object structure from the metadata store.
-- **Customer-managed keys (CMK)**: tenants may bring their own root key
-  and rotate independently. Uney never stores plaintext root keys.
-- **No plaintext keys at rest in the service**: DEKs are wrapped by the
-  tenant's root key (which is client-side or CMK-held).
+### 3.7 Encryption model
 
-> **Warning — deduplication**: global cross-tenant deduplication is
-> incompatible with ZK by default. Convergent encryption re-enables
-> dedup but leaks content identity (equal plaintext → equal ciphertext).
-> Uney's default is **no cross-tenant dedup**. A convergent-encryption
-> bucket type may be offered opt-in for specific workloads (e.g. backup
-> corpora) where the leak is acceptable.
+- **Strict ZK**: client SDK performs encryption. Plaintext keys never
+  cross to the service. Per-object DEKs are wrapped by the tenant's
+  root key (customer-held or CMK).
+- **Managed Encrypted** ("confidential managed storage"): the Linode
+  gateway performs encryption. The gateway can see plaintext in
+  memory during request handling. This mode is *not* zero-knowledge
+  and must not be sold as such.
+- **Public Distribution**: objects are stored encrypted at rest but
+  served unencrypted at the edge for assets / media / downloads. The
+  origin remains encrypted; distribution is explicitly public.
 
-### 3.4 Erasure Coding Model
+Per-object DEKs, encrypted manifests, and CMK support apply to all ZK
+and confidential modes. **No cross-tenant deduplication** is enabled
+by default. Convergent-encryption buckets may be offered as an
+explicit opt-in for specific corpora (backup archives) where the
+content-identity leak is acceptable.
 
-EC profile selection is environment-dependent. Profiles below assume
-Reed–Solomon (k + m) with failure domains spread across DCs / racks.
+### 3.8 Erasure coding model (Phase 2+ only)
 
-| Environment                            | Profile | Storage overhead | Notes                                                     |
-| -------------------------------------- | ------- | ---------------- | --------------------------------------------------------- |
-| Single controlled DC                   | 6 + 2   | 1.33×            | Cheapest; only survives 2 shard losses in one DC          |
-| Two or three controlled DCs            | 8 + 3   | 1.375×           | Good balance for regional deployments                     |
-| Larger multi-region deployments        | 10 + 4  | 1.4×             | Recommended default for ZK Standard / Hot / Archive       |
-| Untrusted peer networks (Storj-style)  | 29 + 51 | 2.76×            | Needed only when nodes are adversarial / churny           |
+| Environment                              | Recommended EC   | Raw overhead  | Use case                                             |
+| ---------------------------------------- | ---------------- | ------------- | ---------------------------------------------------- |
+| Hot local                                | 2 replicas or 4+2 EC | 2.0× or 1.5× | Low latency, high read rate                         |
+| Standard local (single DC)               | 6+2              | 1.33×         | Hot regional objects with fast repair                |
+| Standard local (2–3 DCs)                 | 8+3              | 1.375×        | Good default                                         |
+| Large durable local                      | 10+4             | 1.4×          | PB-scale storage                                     |
+| Archive                                  | 12+4 or 16+4     | 1.33×–1.25×   | Cold data with slower repair                         |
 
-**Recommendation**: start Phase 2 with **10+4** as the default and
-**8+3** for single-region cells. Do not adopt Storj-style 80/29 — it is
-tuned for untrusted peers and wastes capacity in controlled DCs.
+During Phase 1, Wasabi handles durability natively and EC is not
+needed. Do not overbuild EC.
 
-### 3.5 Placement Control
+### 3.9 Placement control
 
-Uney exposes a CRUSH-like topology:
+- **Phase 1**: expose `provider`, `region`, `country`, `storage_class`.
+  Example:
+
+  ```yaml
+  placement:
+    country: SG
+    provider: wasabi
+    region: ap-southeast-1
+    storage_class: standard
+    cache_location: linode-sg
+  ```
+
+- **Phase 2+**: expose DC / rack / node / disk via a CRUSH-like
+  topology (see §6).
+
+Do **not** expose node-level placement in Phase 1. Provider and region
+are the only meaningful knobs while Wasabi owns durability.
+
+### 3.10 Read path & promotion
+
+#### Phase 1 read path
 
 ```
-world
-└── region
-    └── country
-        └── dc
-            └── room
-                └── rack
-                    └── node
-                        └── disk
+GET object
+  → Linode ZK Gateway
+  → Linode hot cache lookup
+  → if miss: read encrypted chunks from Wasabi
+  → stream ciphertext to client
+  → client decrypts (Strict ZK) or gateway decrypts (Managed mode)
+  → if read frequency crosses threshold: promote to Linode cache
 ```
 
-Exposure levels (customer-facing policy knobs):
+#### Phase 2+ read path
 
-- **country** — jurisdictional containment.
-- **region** — latency / failure-domain grouping.
-- **dc** — explicit facility list.
-- **provider** — owned nodes, leased (e.g. Leaseweb, OVH, FDCServers), or cloud.
-- **rack** — failure-domain spread within a DC.
-- **node class** — HDD-dense, SSD-hot, NVMe-cache.
-- **disk class** — CMR enterprise HDD, QLC SSD, etc.
-- **carbon profile** — e.g. low-carbon-grid DCs only.
-- **sovereignty tag** — compliance labels ("eu-only", "us-fedramp", etc).
-
-### 3.6 Read Path & Promotion
-
-Full read path for an S3 GET:
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant GW as Nearest S3 Gateway
-    participant L0 as L0 Edge Cache
-    participant L1 as L1 Regional Hot
-    participant L2 as L2 EC Origin
-    C->>GW: GET /bucket/key
-    GW->>L0: lookup ciphertext
-    alt hit
-        L0-->>GW: ciphertext
-    else miss
-        GW->>L1: lookup
-        alt hit
-            L1-->>GW: ciphertext
-            GW->>L0: async populate
-        else miss
-            GW->>L2: reconstruct from shards
-            L2-->>GW: ciphertext
-            GW->>L1: async promote if policy allows
-            GW->>L0: async populate
-        end
-    end
-    GW-->>C: decrypted bytes (client-side)
+```
+GET object
+  → nearest ZK Gateway
+  → check local cache
+  → check local DC primary
+  → if missing: read from Wasabi (cloud fallback)
+  → verify hash
+  → write local copy
+  → update manifest
+  → serve object
 ```
 
-Promotion rules from L2 → L1 / L1 → L0 are evaluated per object and per
-tenant:
+#### Promotion trigger rules
 
-- `monthly_read_egress(obj) > 0.2 × object_size` — the object is being
-  read more than it is stored.
-- `daily_reads(obj) > N` — configurable per tier.
-- `p95_latency_miss > SLO` — latency-driven promotion.
-- **Customer paid for hot tier** — tenants on ZK Hot default to
-  L1-aggressive promotion; ZK Archive never promotes to L0.
+- `monthly_egress(obj) ≥ 0.2 × object_size`
+- `daily_read_count(obj) > N` (tier-configurable)
+- `p95 latency miss > SLO`
+- Tenant is on the Hot tier (default-aggressive promotion)
 
-### 3.7 Bandwidth Strategy
+**Critical for Phase 1**: promotion to Linode cache keeps Wasabi
+egress within fair-use. If a hot object is read repeatedly, it **must**
+be cached on Linode to avoid excessive Wasabi origin reads.
 
-Bandwidth procurement is a first-class concern. Prefer flat /
-high-commit providers:
+### 3.11 Bandwidth strategy
 
-- Leaseweb
-- FDCServers
-- OVH
+- **Phase 1**: Linode provides the bandwidth. Wasabi fair-use egress
+  is the constraint. A cache-first design on Linode absorbs hot reads.
+- **Phase 3**: flat / high-commit bandwidth providers (Leaseweb,
+  FDCServers, OVH) for local DC cells.
 
-For serving architecture, match the traffic shape to the layer:
+Rules:
 
-| Traffic shape                                   | Wrong approach                                         | Correct approach                                                  |
-| ----------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------- |
-| Hot object reads                                | Reconstruct from EC shards on every GET                | Serve from L0 edge cache; populate on first miss                  |
-| Regional users                                  | Cross-region reads from a single origin                | Place L1 hot replica in-region; pin locality by policy            |
-| Range reads (video, archive chunks)             | Full-object reconstruct per range                      | Chunked storage; range-read from L0 / L1 without reconstruction   |
-| Spiky public downloads (viral file, release)    | Serve directly from origin; pay burst egress           | CDN shielding in front of L0; origin-offload billing              |
-| Cheap frequent egress on cold data              | Let GETs hit EC origin repeatedly                      | Promote to L1 after threshold; charge hot-tier; or decline promo  |
+- Never read from Wasabi repeatedly for hot objects — promote to
+  Linode cache.
+- Cache ciphertext, not plaintext.
+- Use range-aligned encrypted chunks so range GETs can be served from
+  cache without reconstruction.
+- Charge separately for non-cacheable egress (large single-read
+  transfers, public downloads without a CDN).
 
 ---
 
-## 4. Multi-Tenancy Design
+## 4. Migration Design
 
-### 4.1 Per-tenant isolation
+### 4.1 Why migration is a first-class feature
+
+Customers must be able to start on Wasabi via Linode and end up on a
+local DC cell without changing their SDK, bucket name, URL, or object
+key. Customer namespaces are decoupled from backend locators (see
+§3.2), so migration is a manifest-rewrite, not a client-visible event.
+
+### 4.2 Phase 1 → Phase 2 migration
+
+Move objects from **Wasabi → local DC cell** using three mechanisms:
+
+1. **Dual-write for new objects**: once a tenant is flagged for
+   migration, new PUTs go to both the local cell and Wasabi until the
+   local cell is confirmed durable.
+2. **Lazy migration on read**: on a GET, if the object is not yet on
+   the local cell, read from Wasabi, verify the hash, write a local
+   copy, update the manifest, serve the response.
+3. **Background rebalancer**: a worker drains cold objects from
+   Wasabi to the local cell over committed bandwidth, in priority
+   order.
+
+### 4.3 Migration state machine
+
+```
+wasabi_primary
+  ↓
+dual_write
+  ↓
+local_primary_wasabi_backup
+  ↓
+local_primary_wasabi_drain
+  ↓
+local_only
+```
+
+Each state is recorded on the manifest at `migration_state.generation`.
+Readers use the generation to choose where to look first.
+
+### 4.4 Read behaviour during migration
+
+```
+GET object
+  → check local cell
+  → if missing: read from Wasabi
+  → verify hash (BLAKE3)
+  → write local copy (async if tenant SLA allows)
+  → update manifest
+  → serve object
+```
+
+Hot objects self-migrate first via lazy read migration; cold objects
+are handled by the background rebalancer.
+
+### 4.5 Required capabilities
+
+| Capability                      | Why                                                                             |
+| ------------------------------- | ------------------------------------------------------------------------------- |
+| Dual-write                      | Ensures durability during cut-over                                              |
+| Lazy migration on read          | Hot objects move first, on user-paid bandwidth                                  |
+| Background rebalancer           | Drains cold tail without hot-path penalty                                       |
+| Manifest versioning             | Readers can roll back during a bad cut-over                                     |
+| Cryptographic verification      | BLAKE3 hash check on every piece after move                                     |
+| Backend drain state             | Wasabi retains a copy for a configurable grace period before delete             |
+| Placement simulator             | Predicts cost and risk of a migration before it is executed                     |
+
+---
+
+## 5. Multi-Tenancy Design
+
+### 5.1 Per-tenant isolation
 
 - **Encryption keys**: independent per tenant. CMK supported. No shared
   DEKs across tenants.
@@ -273,35 +592,46 @@ For serving architecture, match the traffic shape to the layer:
 - **Abuse controls**: rate limits, anomaly detection, throttling,
   reputation, and optional CDN shielding.
 
-### 4.2 B2C model
+### 5.2 B2C model
 
-- Shared ("pooled") cells.
+- Shared ("pooled") gateways and cache.
 - Self-service API keys and SDKs.
-- SDK handles client-side encryption; plaintext keys never cross to Uney.
+- SDK handles client-side encryption; plaintext keys never cross to
+  the service.
 - Automated onboarding: signup → bucket → API key in minutes.
-- Standard tier defaults (Standard or Hot).
+- Standard tier defaults (ZK Beta or ZK Hot in Phase 1; ZK Standard or
+  ZK Hot in Phase 2+).
 
-### 4.3 B2B model
+### 5.3 B2B model
 
-- Dedicated cells (physical or logical).
+- Dedicated cells (physical or logical) in Phase 2+.
 - Custom SLAs (durability, availability, latency).
 - Sovereign placement (specific countries / DCs / racks).
 - Committed bandwidth contracts.
 - Custom EC profile per cell.
 
-### 4.4 Tenant metadata schema (conceptual)
+### 5.4 BYOC (Bring Your Own Cloud)
+
+- Customer owns the AWS / GCP / Azure account and pays the cloud bills
+  directly.
+- ZK Object Fabric ships the gateway, SDK, migration engine, and
+  control-plane tooling as SaaS.
+- Useful for early enterprise adoption before local DC cells are in
+  place.
+
+### 5.5 Tenant metadata schema (conceptual)
 
 ```yaml
 tenant:
   id: t_01H....
   name: acme-fintech
-  contract_type: b2b_dedicated     # b2c_pooled | b2b_dedicated | sovereign
-  license_tier: standard           # archive | standard | hot | dedicated | sovereign
+  contract_type: b2b_dedicated     # b2c_pooled | b2b_dedicated | sovereign | byoc
+  license_tier: standard           # beta | archive | standard | hot | dedicated | sovereign
   keys:
     root_key_ref: cmk://acme/prod/root
     dek_policy: per_object
   placement_default:
-    policy_ref: p_eu_strict
+    policy_ref: p_country_strict
   budgets:
     egress_tb_month: 50
     requests_per_sec: 5000
@@ -315,126 +645,216 @@ tenant:
 
 ---
 
-## 5. Cell Architecture
+## 6. Cell Architecture (Phase 2+)
 
-### 5.1 Why not one giant cluster
+### 6.1 Why not one giant cluster
 
-- **Blast radius**: a bug, a repair storm, or an abuse event should not
+- **Blast radius**: a bug, a repair storm, or an abuse event must not
   affect every tenant globally.
 - **Repair complexity**: repair traffic scales badly when one cluster
   spans many regions.
-- **Policy scoping**: sovereign tenants need hard boundaries, not "mostly
-  EU" soft placement.
+- **Policy scoping**: sovereign tenants need hard boundaries, not
+  "mostly in-country" soft placement.
 - **Billing and ops**: per-cell accounting simplifies cost allocation
   and capacity forecasting.
 
-### 5.2 Cell sizing
+### 6.2 Cell sizing
 
 A cell is **2–20 PB usable**. Below 2 PB the per-cell overhead
 dominates; above 20 PB repair and failure domains get unwieldy.
 
-### 5.3 Per-cell components
+### 6.3 Per-cell components
 
-- Independent metadata shard (FoundationDB / CRDB region / Postgres-Citus shard).
+- Independent metadata shard (Postgres region / CockroachDB region /
+  FoundationDB cluster).
 - Repair queues scoped to the cell.
 - Failure-domain topology pinned to the cell's DCs / racks / nodes.
 - S3 gateway fleet sized to the cell's request volume.
 - Billing counters rolled up to the global control plane.
-- Placement inventory (which nodes, with which capacity, of which class).
+- Placement inventory (nodes, capacities, classes).
 
-### 5.4 Cross-cell replication
+### 6.4 Cross-cell replication
 
-Cross-cell replication is **policy-driven, not automatic**. Tenants opt
-in when they need multi-region durability or latency. Default is
-single-cell placement.
+Cross-cell replication is **policy-driven, not automatic**. Tenants
+opt in when they need multi-region durability or latency. The default
+is single-cell placement.
 
-### 5.5 Global control plane with regional cells
+### 6.5 Global control plane with regional cells
 
 ```mermaid
 flowchart TD
-    subgraph Global[Global Control Plane]
-      G_POLICY[Policy / OPA]
-      G_BILL[Billing &amp; Analytics]
-      G_IAM[Tenants / IAM]
-      G_INV[Cell Inventory]
+    subgraph Global["Global Control Plane (AWS)"]
+      G_POLICY["Policy / OPA"]
+      G_BILL["Billing &amp; Analytics"]
+      G_IAM["Tenants / IAM"]
+      G_INV["Cell Inventory"]
     end
-    subgraph SG[Cell sg-1 Singapore]
-      SG_MD[Metadata]
-      SG_GW[S3 Gateway Fleet]
-      SG_L0[L0/L1/L2]
+    subgraph Cell1["Cell 1: DC-A"]
+      C1_MD["Metadata"]
+      C1_GW["S3 Gateway Fleet"]
+      C1_L["L0 / L1 / L2"]
     end
-    subgraph VN[Cell vn-1 Vietnam]
-      VN_MD[Metadata]
-      VN_GW[S3 Gateway Fleet]
-      VN_L0[L0/L1/L2]
+    subgraph Cell2["Cell 2: DC-B"]
+      C2_MD["Metadata"]
+      C2_GW["S3 Gateway Fleet"]
+      C2_L["L0 / L1 / L2"]
     end
-    subgraph USW[Cell us-west-1]
-      USW_MD[Metadata]
-      USW_GW[S3 Gateway Fleet]
-      USW_L0[L0/L1/L2]
+    subgraph CloudDR["Cloud DR (Wasabi region)"]
+      DR_L2["L2 ciphertext copy"]
     end
-    subgraph EUC[Cell eu-central-1]
-      EUC_MD[Metadata]
-      EUC_GW[S3 Gateway Fleet]
-      EUC_L0[L0/L1/L2]
-    end
-    Global --> SG
-    Global --> VN
-    Global --> USW
-    Global --> EUC
+
+    Global --> Cell1
+    Global --> Cell2
+    Global --> CloudDR
+    Cell1 <-->|"async DR"| CloudDR
+    Cell2 <-->|"async DR"| CloudDR
 ```
 
 ---
 
-## 6. Open-Source Base Assessment
+## 7. In-Country Migration Path (Generic)
 
-Uney uses a **proprietary license**. That rules out AGPL-licensed bases
-because statically or dynamically linking Uney's proprietary service
-code with AGPL code would force the combined work under AGPL terms.
-Reference / study use is fine; production build on AGPL is not.
+The first in-country target is **[target country]**. Concrete country
+selection is a business decision and is left unspecified in this
+document.
 
-| Base         | License      | Maturity        | EC support              | Fit as Uney base             | Notes                                                                     |
-| ------------ | ------------ | --------------- | ----------------------- | ---------------------------- | ------------------------------------------------------------------------- |
-| Ceph RGW     | LGPL-2.1     | Very mature     | Yes (built-in)          | **Best durable-origin base** | Production-grade at EB scale. Operationally heavy but well understood.    |
-| SeaweedFS    | Apache-2.0   | Mature enough   | Yes                     | **Best fast-build base**     | Fast to iterate on. Good permissive license. Active community.            |
-| Storj        | AGPLv3       | Mature          | Yes (80/29 default)     | Ruled out (license)          | Excellent ZK / EC reference material. Cannot ship as production base.     |
-| MinIO        | AGPLv3       | Mature          | Yes                     | Avoid                        | AGPL + recent maintenance / community concerns. Not a viable base.        |
-| Garage       | AGPL-3.0     | Lightweight     | No (replication only)   | Small sovereign only         | Good for tiny cells, but no EC makes it unfit for PB-scale durability.    |
-| Tahoe-LAFS   | GPL / TGPPL  | Stable, niche   | Yes (erasure in design) | Reference                    | Great ZK architecture reference; not a modern S3 base.                    |
-| RustFS       | Apache-2.0   | Early           | In progress             | Watch                        | Permissive license; not yet production-ready. Revisit later.              |
+### 7.1 Minimum viable local design
 
-> **Explicitly**: AGPL-licensed projects (Storj, MinIO, Garage) cannot be
-> used as Uney's production base because Uney ships under a proprietary
-> license. They are reference / study material only.
+- **Cell 1**: City A DC.
+- **Cell 2**: City B DC.
+- **Cloud DR**: nearest AWS or Wasabi region (async ciphertext copy).
 
-### 6.1 Recommended build paths
+### 7.2 Better design
 
-- **Option A — Fastest**: SeaweedFS (Apache-2.0) + Uney layers
-  (encryption, placement, repair, billing, cache).
-- **Option B — Most production-grade**: Ceph RGW (LGPL-2.1) + Uney
-  layers (ZK gateway, placement abstraction, cache, policy API).
-- **Option C — Research / fork**: Storj — **RULED OUT** as a production
-  base because AGPLv3 conflicts with Uney's proprietary license.
-  Retained as a reference implementation for ZK-style EC and peer
-  coordination.
+- Add **Cell 3**: a second City A DC or a City C DC. This gives three
+  independent failure domains in-country and satisfies stricter
+  sovereign-storage requirements.
 
-### 6.2 Decision criteria
+### 7.3 Explicit durability caveat
 
-| Requirement                               | Pick        |
-| ----------------------------------------- | ----------- |
-| Maximum production maturity at EB scale   | Ceph RGW    |
-| Fastest time to a custom product build    | SeaweedFS   |
-| Permissive licensing (non-negotiable)     | Ceph RGW or SeaweedFS |
-| Strong peer-to-peer EC (reference only)   | Storj       |
+Do **not** claim strong in-country durability with one DC. A single
+local DC plus cloud DR is a **transitional hybrid**, not sovereign
+multi-site storage. Multi-site sovereign durability requires two or
+more in-country cells.
+
+### 7.4 Private-transit option
+
+Where available, **AWS Direct Connect** or equivalent private-transit
+links (MPLS, dedicated fibre) can be used for the control-plane
+channel and for migration traffic between AWS and the local cells.
+Private transit reduces public-internet exposure for control signals
+and speeds up bulk migration. Customer data still flows through the
+Linode data plane, not AWS.
 
 ---
 
-## 7. Cost Architecture
+## 8. Public Cloud Provider Selection
 
-### 7.1 COGS formula
+Phase 1 recommended stack:
+
+| Component               | Choice                                     | Reason                                                               |
+| ----------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
+| Control plane           | AWS (RDS, IAM, CloudWatch)                 | Enterprise trust; no data path needed                                |
+| Data plane / gateway    | Linode compute instances                   | Predictable bandwidth; good compute pricing                          |
+| Storage backend         | Wasabi                                     | ~$6.99 / TB-mo; cheapest S3-compatible; included egress              |
+| Hot cache               | Linode NVMe / block storage                | Absorbs hot reads; keeps Wasabi egress in fair-use                   |
+| CDN (optional)          | Cloudflare or Akamai                       | Additional edge caching for global distribution                      |
+| DR copy                 | AWS S3 Standard-IA or a 2nd Wasabi region  | Not hot serving; cold DR only                                        |
+| Encryption              | Client-side SDK or Linode-hosted gateway   | Required for real ZK                                                 |
+
+Phase 2+ adds local DC cells (Ceph RGW or SeaweedFS on owned
+high-density HDD storage) and migrates tenants off Wasabi on a
+per-bucket basis.
+
+---
+
+## 9. Open-Source Base Assessment
+
+ZK Object Fabric uses a **proprietary license**. Statically or
+dynamically linking proprietary service code with AGPL code would
+force the combined work under AGPL terms. Reference / study use is
+fine; production build on AGPL is not.
+
+### 9.1 Phase 1 base
+
+- **Custom Go gateway + provider adapters.** Wasabi, B2, R2, S3, and a
+  `local_fs_dev` adapter for tests. No Ceph or Storj fork.
+- Rust is reserved for chunking / encryption / EC workers.
+
+### 9.2 Phase 2+ base (local DC storage)
+
+| Base       | License     | Maturity       | EC support              | Fit as a local-DC base            | Notes                                                                     |
+| ---------- | ----------- | -------------- | ----------------------- | --------------------------------- | ------------------------------------------------------------------------- |
+| Ceph RGW   | LGPL-2.1    | Very mature    | Yes (built-in)          | **Best durable-origin base**      | Production-grade at EB scale. Operationally heavy but well understood.    |
+| SeaweedFS  | Apache-2.0  | Mature enough  | Yes                     | **Best fast-build base**          | Fast to iterate on. Permissive license. Active community.                 |
+| Storj      | AGPLv3      | Mature         | Yes (80/29 default)     | Ruled out (license)               | Excellent ZK / EC reference. Cannot ship as a production base.            |
+| MinIO      | AGPLv3      | Mature         | Yes                     | Avoid                             | AGPL + maintenance concerns. Not a viable base.                           |
+| Garage     | AGPL-3.0    | Lightweight    | No (replication only)   | Small sovereign only              | No EC; unfit for PB-scale durability.                                     |
+| Tahoe-LAFS | GPL / TGPPL | Stable, niche  | Yes (erasure in design) | Reference                         | Good ZK architecture reference; not a modern S3 base.                     |
+| RustFS     | Apache-2.0  | Early          | In progress             | Watch                             | Permissive license; not yet production-ready. Revisit later.              |
+
+> **Explicitly**: AGPL-licensed projects (Storj, MinIO, Garage) are
+> ruled out as production bases because ZK Object Fabric ships under a
+> proprietary license.
+
+### 9.3 Recommended build paths
+
+- **Option A — Fastest**: SeaweedFS (Apache-2.0) in Phase 2+ with the
+  ZK Gateway, placement, repair, billing, and cache layers on top.
+- **Option B — Most production-grade**: Ceph RGW (LGPL-2.1) in
+  Phase 2+ with the ZK Gateway, placement abstraction, cache layer,
+  and policy API on top.
+- **Option C — Research / fork**: Storj — **RULED OUT** as a
+  production base. Retained as a reference implementation for ZK-style
+  EC and peer coordination.
+
+---
+
+## 10. What NOT to Do
+
+| Bad move                                                           | Why                                                                                            |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| Route customer data through AWS                                    | AWS egress costs destroy the economics. Data must stay on the Linode path.                     |
+| Promise cheaper-than-Wasabi pricing during Phase 1                 | ZK Object Fabric adds margin on top of Wasabi. Claim cost leadership only in Phase 3.          |
+| Ignore Wasabi's 90-day minimum storage duration                    | Ephemeral objects on Wasabi incur unnecessary minimum-storage charges. Keep short-TTL on Linode cache. |
+| Exceed Wasabi's fair-use egress                                    | Triggers throttling or account review. Cache hit ratio is a first-class product metric.        |
+| Advertise "unlimited egress"                                       | Forces cross-subsidization that breaks at PB+ scale; invites adverse-selection workloads.      |
+| Reconstruct EC shards on every hot GET                             | EC lowers storage overhead, not read bandwidth. Hot reads must come from L0 / L1.              |
+| Enable global cross-tenant deduplication                           | Incompatible with ZK by default. Convergent-encryption buckets are opt-in only.                |
+| Use AGPL bases (Storj, MinIO, Garage) as production bases          | Conflicts with the proprietary license. Permitted only as reference / study material.          |
+| Build Storj-style 80/29 EC in controlled DCs                       | Tuned for untrusted peers. Wastes capacity when nodes are controlled (use 8+3 or 10+4).        |
+| Expose node-level placement in Phase 1                             | Meaningless while Wasabi owns durability. Wait until Phase 2+ for DC / rack / node knobs.      |
+| Build a full decentralized reputation / token / satellite system   | Out of scope. Adds complexity without improving the Phase 1 / 2 value proposition.             |
+| Publish theoretical "eleven nines" durability                      | Cannot be validated in Phase 1. Only publish measured durability from chaos tests.             |
+| Block on a custom distributed filesystem                           | Wasabi is the Phase 1 durable origin; Ceph RGW or SeaweedFS is the Phase 2+ base.              |
+
+---
+
+## 11. Cost Architecture
+
+### 11.1 Phase 1 COGS per usable TB
 
 ```
-cost_per_usable_TB_month =
+cost_per_TB_month_phase1 =
+    wasabi_storage_per_TB_month                                  (~$6.99)
+  + linode_compute_amortized_per_TB_served_per_month
+  + linode_bandwidth_amortized_per_TB_served_per_month
+  + aws_control_plane_amortized_per_tenant_per_month
+  + ops_amortized_per_TB_per_month
+```
+
+Notes:
+
+- Wasabi dominates the storage-at-rest line; cache in Linode NVMe is
+  a small fraction of stored bytes.
+- Linode bandwidth is pooled across instances; hot objects should be
+  served from the included transfer allowance.
+- AWS control-plane cost is roughly fixed per tenant, not per TB.
+
+### 11.2 Phase 3 COGS per usable TB
+
+```
+cost_per_TB_month_phase3 =
     raw_disk_cost_per_TB_month × erasure_overhead
   + server_amortization_per_TB_month
   + rack_per_TB_month
@@ -450,44 +870,43 @@ cost_per_usable_TB_month =
   must be budgeted, not assumed free.
 - Metadata cost scales with object count, not byte count.
 
-### 7.2 Scale economics
+### 11.3 Scale economics
 
-| Scale       | Reality                                            | Implication                                              |
-| ----------- | -------------------------------------------------- | -------------------------------------------------------- |
-| 1 TB        | Pooled / automated infrastructure                  | Must be self-service; no manual support                  |
-| 100 TB      | Ops-sensitive; a few customers move the margin     | Per-tenant monitoring, egress budgets, support tier      |
-| 1 PB        | Dedicated storage nodes become viable              | Start moving large tenants off shared pools              |
-| 10 PB+      | Owned HDD-dense nodes can undercut Wasabi per TB   | Win on price when bandwidth is committed                 |
-| 1 EB+       | Cell architecture is mandatory                     | Multi-cell, cross-cell replication, repair federation    |
-| Multi-EB    | Federation across cells and regions is mandatory   | Hardware procurement and DC strategy are core product    |
+| Scale    | Reality                                            | Implication                                              |
+| -------- | -------------------------------------------------- | -------------------------------------------------------- |
+| 1 TB     | Pooled / automated infrastructure                  | Must be self-service; no manual support                  |
+| 100 TB   | Ops-sensitive; a few customers move the margin     | Per-tenant monitoring, egress budgets, support tier      |
+| 1 PB     | Dedicated local nodes become viable                | Start moving large tenants off Wasabi-backed pools       |
+| 10 PB+   | Owned HDD-dense nodes can undercut Wasabi per TB   | Win on price when bandwidth is committed                 |
+| 1 EB+    | Cell architecture is mandatory                     | Multi-cell, cross-cell replication, repair federation    |
 
 ---
 
-## 8. Competitive Positioning
+## 12. Competitive Positioning
 
-### 8.1 At 1 TB (entry)
+### 12.1 At 1 TB (entry)
 
-- Pooled infrastructure, no manual support.
+- Pooled Linode gateway + Wasabi backend.
 - 1 TB minimum.
 - Strict egress rules.
-- Self-service signup.
+- Self-service signup through a React console.
 - Automated abuse controls.
-- **Entry offer**: $5.99 / TB-mo, 1× egress included, ZK by default.
+- Entry offer: ZK Beta on Wasabi via Linode.
 
-### 8.2 At 100 TB – 10 PB (best zone)
+### 12.2 At 100 TB – 10 PB (best zone)
 
-This is Uney's strongest zone. Win on:
+This is the product's strongest zone. Win on:
 
-- Erasure coding on controlled nodes (8+3 / 10+4, not 80/29).
-- Dedicated nodes or pooled-with-pinning.
+- Erasure coding on controlled nodes (8+3 / 10+4, not 80/29) in
+  Phase 2+.
+- Dedicated cells or pooled-with-pinning.
 - Regional cache layers.
 - Committed bandwidth.
 - Placement control (country / DC / rack).
 
-### 8.3 At multi-million TB
+### 12.3 At multi-million TB
 
-This becomes an **infrastructure company problem**, not a software
-problem. Needs:
+Becomes an **infrastructure company problem**. Needs:
 
 - Multi-cell architecture.
 - Hardware procurement pipeline.
@@ -495,48 +914,57 @@ problem. Needs:
 - Global peering and transit.
 - Automated repair and drive replacement.
 - Abuse, DDoS, and legal response operations.
-- Observability stack (metrics, traces, logs at scale).
+- Observability at scale.
 - Capacity forecasting and supply planning.
 - Region-specific compliance (GDPR, HIPAA, FedRAMP, etc).
 
-### 8.4 Where Uney wins
+### 12.4 Where ZK Object Fabric wins
 
 1. Zero-knowledge by default.
 2. Customer-controlled placement.
-3. Lower storage price for capped-egress workloads.
-4. Better frequent-read economics via cache.
+3. Lower storage price for capped-egress workloads in Phase 3.
+4. Better frequent-read economics via the Linode cache.
 5. Dedicated cells for PB+ / sovereign customers.
-6. Transparent egress pricing (no "fair-use" surprises).
+6. Transparent egress pricing (no fair-use surprises at the product
+   layer — the fair-use constraint is absorbed operationally by the
+   cache).
+7. Built-in cloud-to-local migration path that does not change
+   customer-facing APIs.
 
 ---
 
-## 9. Technical Risks & Mitigations
+## 13. Technical Risks & Mitigations
 
-| Risk                                                      | Mitigation                                                                                             |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Small-object overhead (metadata + EC per-object cost)     | Pack small objects into encrypted containers; index within the container manifest                      |
-| Frequent uncached reads hammering EC origin               | Promote to L1 / L0 once thresholds cross; decline promotion on Archive tier                            |
-| ZK metadata leakage (object names, sizes, access patterns)| Encrypt manifests; minimize object names in logs/metadata; pad sizes where practical                   |
-| Deduplication vs ZK conflict                              | No cross-tenant dedup by default; convergent-encryption buckets offered only as explicit opt-in        |
-| AGPL exposure from chosen base                            | Use Ceph RGW or SeaweedFS only; Uney is proprietary; AGPL bases (Storj, MinIO, Garage) are ruled out   |
-| Repair storms saturating inter-DC bandwidth               | Rate-limit repair workers, prioritize by durability risk, schedule off-peak, cap per-link throughput   |
-| Placement policy bugs (data in wrong country)             | Formalize constraints in OPA; test failure domains in CI; chaos-test placement under node loss         |
-| Abuse traffic (viral files, DDoS, scraping)               | Per-tenant egress budgets, anomaly detection, CDN shielding, reputation-based throttling               |
-| Durability marketing ("eleven nines") that can't be met   | Chaos testing, audit replays, measured durability — do not publish theoretical nines                   |
+| Risk                                                        | Mitigation                                                                                                  |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Wasabi fair-use egress breach                               | Aggressive Linode cache sizing; per-tenant egress budgets; promotion before threshold; alert on ratio drift |
+| Wasabi 90-day minimum storage duration                      | Never land short-TTL objects on Wasabi; cache-only tier for ephemeral writes                                |
+| Data accidentally routed through AWS                        | Enforce in code: control-plane APIs reject object bytes; contract tests on the AWS endpoints                |
+| Small-object overhead (metadata + per-object cost)          | Pack small objects into encrypted containers; index inside the container manifest                           |
+| Frequent uncached reads hammering Wasabi origin             | Promote to L1 / L0 once thresholds cross; decline promotion on Archive tier                                 |
+| ZK metadata leakage (names, sizes, access patterns)         | Encrypt manifests; minimize object names in logs; pad sizes where practical                                 |
+| Deduplication vs ZK conflict                                | No cross-tenant dedup by default; convergent-encryption buckets offered only as explicit opt-in             |
+| AGPL exposure from the chosen base                          | Use SeaweedFS or Ceph RGW only in Phase 2+; AGPL bases remain reference only                                |
+| Repair storms saturating inter-DC bandwidth (Phase 2+)      | Rate-limit repair workers; prioritize by durability risk; schedule off-peak; cap per-link throughput        |
+| Placement policy bugs (data in wrong country)               | Formalize constraints in OPA; test failure domains in CI; chaos-test placement under node loss              |
+| Abuse traffic (viral files, DDoS, scraping)                 | Per-tenant egress budgets, anomaly detection, CDN shielding, reputation-based throttling                    |
+| Durability marketing ("eleven nines") that cannot be met    | Chaos testing, audit replays, measured durability — do not publish theoretical nines                        |
+| Vendor lock-in on Wasabi                                    | Provider-neutral manifests and the migration engine; B2 / R2 / local DC always available as drop-ins        |
 
 ---
 
-## 10. Product Tiers
+## 14. Product Tiers (Consolidated)
 
-| Tier          | Storage Price        | Included Egress    | Backend                         | Target                           |
-| ------------- | -------------------- | ------------------ | ------------------------------- | -------------------------------- |
-| ZK Archive    | $2.99–$4.99 / TB-mo  | Low / none         | 10+4 EC, HDD                    | Backup, compliance               |
-| ZK Standard   | $4.99–$5.99 / TB-mo  | 1× stored          | 8+3 or 10+4 EC                  | Wasabi / B2 replacement          |
-| ZK Hot        | $6.99–$9.99 / TB-mo  | 2–5× if cacheable  | EC + regional replicas          | SaaS assets, frequent reads      |
-| ZK Dedicated  | Custom               | Committed BW       | Dedicated cell                  | PB+ customers                    |
-| ZK Sovereign  | Premium              | Contractual        | Country / DC / rack-constrained | Regulated customers              |
+| Tier          | Phase  | Storage price          | Included egress          | Backend                                        | Target                           |
+| ------------- | ------ | ---------------------- | ------------------------ | ---------------------------------------------- | -------------------------------- |
+| ZK Beta       | 1      | $9.99–$14.99 / TB-mo   | Capped, cache-shaped     | Wasabi via Linode                              | Privacy-premium early adopters   |
+| ZK Hot        | 1–3    | $7.99–$19.99 / TB-mo   | 2–5× if cacheable        | Wasabi + Linode cache → local + CDN            | SaaS assets, frequent reads      |
+| ZK Archive    | 3      | $2.99–$4.99 / TB-mo    | Low / retrieval-priced   | Local HDD EC (10+4)                            | Backup, compliance               |
+| ZK Standard   | 2–3    | $4.99–$8.99 / TB-mo    | 1× stored                | Local EC + Wasabi DR / local HDD EC            | Wasabi / B2 replacement          |
+| ZK Dedicated  | 2–3    | Custom                 | Committed bandwidth      | Dedicated cell                                 | PB+ customers                    |
+| ZK Sovereign  | 3      | Premium                | Contractual              | Country / DC / rack-constrained cell           | Regulated customers              |
 
 All tiers are zero-knowledge by default. All tiers are S3-compatible.
-All tiers expose placement policy; Archive and Standard use sensible
-defaults, Hot and Dedicated expect customer configuration, Sovereign
-requires it.
+All tiers expose placement policy; ZK Archive and ZK Standard use
+sensible defaults, ZK Hot and ZK Dedicated expect customer
+configuration, ZK Sovereign requires it.
