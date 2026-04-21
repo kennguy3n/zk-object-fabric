@@ -82,14 +82,14 @@ func (e EncryptionSpec) validate() error {
 	return nil
 }
 
-func (p PlacementSpec) validate() error {
+func (p *PlacementSpec) validate() error {
 	if len(p.Provider) == 0 {
 		return fmt.Errorf("placement_policy: placement.provider must list at least one provider")
 	}
-	for i, c := range p.Country {
-		c = strings.TrimSpace(c)
-		if len(c) != 2 {
-			return fmt.Errorf("placement_policy: placement.country[%d]=%q is not an ISO-3166 alpha-2 code", i, c)
+	for i := range p.Country {
+		p.Country[i] = strings.TrimSpace(p.Country[i])
+		if len(p.Country[i]) != 2 {
+			return fmt.Errorf("placement_policy: placement.country[%d]=%q is not an ISO-3166 alpha-2 code", i, p.Country[i])
 		}
 	}
 	return nil

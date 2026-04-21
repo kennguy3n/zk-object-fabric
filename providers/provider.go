@@ -54,8 +54,8 @@ type PutResult struct {
 	Locator   string
 }
 
-// ByteRange is a half-open byte range [Start, End]. End == -1 means
-// "to the end of the piece".
+// ByteRange is a closed byte range [Start, End] where both endpoints
+// are inclusive. End == -1 means "to the end of the piece".
 type ByteRange struct {
 	Start int64
 	End   int64
