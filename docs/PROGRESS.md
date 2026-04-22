@@ -3,7 +3,7 @@
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 3 — Beta Cell (in progress)
-- **Last updated**: 2026-04-22 (Phase 3 foundations landed: NVMe-backed `DiskCache` implementing `HotObjectCache` with warm-from-disk + TTL + capacity eviction in `cache/hot_object_cache/disk_cache.go`; production `ClickHouseSink` batch billing metering backend with retry + schema DDL in `billing/clickhouse_sink.go` and `billing/schema.sql`; gateway fleet node health monitor — per-cell quorum, drain, `GET /internal/health`, `GET /internal/ready`, `POST /internal/drain` — in `internal/health/health.go`; `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, `TestSuite_AWSS3` entrypoints added alongside `TestSuite_CephRGW` in `tests/s3_compat/suite_test.go`; gateway wired to use disk cache when `gateway.cache_path` is set, ClickHouse billing when `billing.clickhouse_url` is set, and the health monitor as a background goroutine with SIGTERM drain)
+- **Last updated**: 2026-04-22 (Phase 3 multipart + erasure-coding landed: real S3 multipart upload (`CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` / `AbortMultipartUpload` / `ListMultipartUploads`) in `api/s3compat/multipart_handler.go` backed by `api/s3compat/multipart/store.go`, with multipart-aware GET assembly in `api/s3compat/erasure_coding.go`; clean-room Reed-Solomon encoder in `metadata/erasure_coding/encoder.go` + profile registry in `metadata/erasure_coding/registry.go`; EC write/read paths wired into `api/s3compat/handler.go` via `putErasureCoded` / `getErasureCoded` when `PlacementPolicy.ErasureProfile` is set, with rollback on failure; manifest `Piece` extended with `PartNumber`, `StripeIndex`, `ShardIndex`, `ShardKind`; `Handler.Config` now takes `Multipart` and `ErasureCoding`; `cmd/gateway/main.go` wires the in-memory multipart store and default profile registry; `tests/s3_compat/suite_test.go` covers multipart round-trip, multipart abort, and EC (6+2) round-trip. Phase 3 foundations — `DiskCache`, `ClickHouseSink`, gateway health monitor, and BYOC adapter entrypoints — remain landed from PR 1.)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -321,6 +321,41 @@ Checklist:
       following the `TestSuite_CephRGW` pattern, each gated on
       the provider's `*_ENDPOINT` / `*_BUCKET` env vars so CI
       stays green without credentials.
+- [x] Real S3 multipart upload support. `CreateMultipartUpload`,
+      `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
+      and `ListMultipartUploads` implemented in
+      `api/s3compat/multipart_handler.go`, backed by
+      `api/s3compat/multipart/store.go` (in-memory `Store` with
+      tenant-scoped listing, part-ETag validation, and idempotent
+      abort). Per-part pieces are addressed by a deterministic
+      `{uploadID}-p{partNumber:05d}` piece ID; the `Complete`
+      aggregate ETag follows the S3 `MD5(part_md5s)-N` convention.
+      The GET path in `api/s3compat/erasure_coding.go#getMultipart`
+      concatenates pieces in ascending `PartNumber` order.
+      Handler routing in `api/s3compat/handler.go#dispatch` covers
+      `?uploads`, `?uploadId=...&partNumber=...`, and
+      `?uploadId=...` variants. Coverage in
+      `api/s3compat/multipart/store_test.go` and integration tests
+      `MultipartRoundTrip` + `MultipartAbort` in
+      `tests/s3_compat/suite_test.go`.
+- [x] Erasure coding wired into the write path for local DC
+      backends. `PlacementPolicy.ErasureProfile` diverts PUTs to
+      `api/s3compat/erasure_coding.go#putErasureCoded`, which
+      shards the body into k+m Reed-Solomon pieces per stripe via
+      the clean-room encoder in
+      `metadata/erasure_coding/encoder.go` (codec:
+      `github.com/klauspost/reedsolomon`, MIT). Profiles are
+      registered in `metadata/erasure_coding/registry.go`
+      (`DefaultRegistry` ships 6+2, 8+3, 10+4, 12+4, 16+4 per
+      `StandardProfiles`). Each shard lands as its own piece
+      carrying `StripeIndex`, `ShardIndex`, and `ShardKind`
+      metadata; `getErasureCoded` reconstructs the plaintext and
+      tolerates up to `ParityShards` missing shards per stripe.
+      `cmd/gateway/main.go` wires the default registry into
+      `s3compat.Config.ErasureCoding`. Coverage in
+      `metadata/erasure_coding/encoder_test.go` (pad, round-trip,
+      single + multi-shard loss) and `ErasureRoundTrip` in
+      `tests/s3_compat/suite_test.go`.
 
 ### Avoid early customers with
 

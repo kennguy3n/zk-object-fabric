@@ -21,11 +21,13 @@ import (
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
+	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	pgstore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/postgres"
@@ -94,6 +96,9 @@ func main() {
 
 	healthMon := startHealthMonitor(workerCtx, cfg.Health, cache)
 
+	multipartStore := multipart.NewMemoryStore()
+	erasureRegistry := erasure_coding.DefaultRegistry()
+
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
 		Manifests:      store,
@@ -101,6 +106,8 @@ func main() {
 		Placement:      placement,
 		Auth:           authenticator,
 		Billing:        billingSink,
+		Multipart:      multipartStore,
+		ErasureCoding:  erasureRegistry,
 		Cache:          cache,
 		CachePublisher: signalBus,
 		ReadRepair:     readRepair,
