@@ -1,25 +1,21 @@
-// Package wasabi is a stub of the Phase 1 primary storage backend.
+// Package wasabi implements the Phase 2 primary storage backend.
 //
-// Wasabi is S3-compatible, so the real adapter will wrap the AWS SDK
-// for Go v2 S3 client pointed at a Wasabi endpoint. This file defines
-// the configuration surface, the constructor, and method stubs with
-// TODO markers; real implementation lands in Phase 2 per
-// docs/PROGRESS.md.
+// Wasabi is S3-compatible, so this adapter embeds *s3_generic.Provider
+// and only overrides the fields that differ for Wasabi: provider
+// identity, capability envelope (90-day minimum storage duration),
+// cost model (~$6.99 / TB-month with fair-use egress), and placement
+// labels.
 package wasabi
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/kennguy3n/zk-object-fabric/providers"
+	"github.com/kennguy3n/zk-object-fabric/providers/s3_generic"
 )
 
 // Config is the Wasabi-specific runtime configuration.
-//
-// TODO(phase-2): decide on the final canonical Wasabi endpoint/region
-// naming (e.g. "s3.ap-southeast-1.wasabisys.com" vs per-region host).
 type Config struct {
 	// Endpoint is the Wasabi S3 endpoint URL, e.g.
 	// "https://s3.ap-southeast-1.wasabisys.com".
@@ -37,17 +33,15 @@ type Config struct {
 	SecretKey string
 }
 
-// Provider is the Wasabi StorageProvider implementation.
-//
-// TODO(phase-2): wire in github.com/aws/aws-sdk-go-v2/service/s3 with
-// a custom endpoint resolver pointing at Config.Endpoint.
+// Provider is the Wasabi StorageProvider implementation. It embeds
+// *s3_generic.Provider for the bulk of the S3 API and overrides the
+// Wasabi-specific descriptive methods.
 type Provider struct {
+	*s3_generic.Provider
 	cfg Config
-	// s3 *s3.Client // TODO(phase-2): populate in New
 }
 
-// New returns a Provider configured for Wasabi. The current Phase 1
-// stub validates the config but does not open a network connection.
+// New returns a Provider configured for Wasabi.
 func New(cfg Config) (*Provider, error) {
 	if cfg.Endpoint == "" {
 		return nil, errors.New("wasabi: endpoint is required")
@@ -61,64 +55,56 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.AccessKey == "" || cfg.SecretKey == "" {
 		return nil, errors.New("wasabi: access_key and secret_key are required")
 	}
-	return &Provider{cfg: cfg}, nil
-}
-
-var errNotImplemented = errors.New("wasabi: not implemented in Phase 1 stub")
-
-// PutPiece is a stub.
-//
-// TODO(phase-2): call s3.PutObject against Config.Bucket with a
-// Wasabi-compatible storage class and the ciphertext reader. Honour
-// opts.IfNoneMatch via the If-None-Match header, which Wasabi
-// supports.
-func (p *Provider) PutPiece(_ context.Context, _ string, _ io.Reader, _ providers.PutOptions) (providers.PutResult, error) {
-	return providers.PutResult{}, errNotImplemented
-}
-
-// GetPiece is a stub.
-//
-// TODO(phase-2): call s3.GetObject with an optional Range header
-// derived from byteRange.
-func (p *Provider) GetPiece(_ context.Context, _ string, _ *providers.ByteRange) (io.ReadCloser, error) {
-	return nil, errNotImplemented
-}
-
-// HeadPiece is a stub.
-//
-// TODO(phase-2): call s3.HeadObject and project into PieceMetadata.
-func (p *Provider) HeadPiece(_ context.Context, _ string) (providers.PieceMetadata, error) {
-	return providers.PieceMetadata{}, errNotImplemented
-}
-
-// DeletePiece is a stub.
-//
-// TODO(phase-2): call s3.DeleteObject. Respect Wasabi's 90-day
-// minimum storage duration; emit a billing warning if pieces are
-// deleted before that window.
-func (p *Provider) DeletePiece(_ context.Context, _ string) error {
-	return errNotImplemented
-}
-
-// ListPieces is a stub.
-//
-// TODO(phase-2): call s3.ListObjectsV2 with ContinuationToken=cursor
-// and translate responses to providers.ListResult.
-func (p *Provider) ListPieces(_ context.Context, _, _ string) (providers.ListResult, error) {
-	return providers.ListResult{}, errNotImplemented
-}
-
-// Capabilities reports what Wasabi supports. Values match the
-// S3-compatible subset Wasabi documents.
-func (p *Provider) Capabilities() providers.ProviderCapabilities {
-	return providers.ProviderCapabilities{
-		SupportsRangeReads:     true,
-		SupportsMultipart:      true,
-		SupportsIfNoneMatch:    true,
-		SupportsServerSideCopy: true,
-		MaxObjectSizeBytes:     5 * 1024 * 1024 * 1024 * 1024, // 5 TiB
-		MinStorageDurationDays: 90,
+	base, err := s3_generic.New(s3_generic.Config{
+		Name:      "wasabi",
+		Endpoint:  cfg.Endpoint,
+		Region:    cfg.Region,
+		Bucket:    cfg.Bucket,
+		AccessKey: cfg.AccessKey,
+		SecretKey: cfg.SecretKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("wasabi: %w", err)
 	}
+	return &Provider{Provider: base, cfg: cfg}, nil
+}
+
+// NewWithClient returns a Provider wrapping a caller-supplied S3API.
+// Tests use this to exercise the Wasabi adapter against an in-memory
+// fake without opening a network connection.
+func NewWithClient(cfg Config, client s3_generic.S3API) (*Provider, error) {
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
+	}
+	if cfg.Bucket == "" {
+		return nil, errors.New("wasabi: bucket is required")
+	}
+	if cfg.AccessKey == "" {
+		cfg.AccessKey = "test"
+	}
+	if cfg.SecretKey == "" {
+		cfg.SecretKey = "test"
+	}
+	base, err := s3_generic.NewWithClient(s3_generic.Config{
+		Name:      "wasabi",
+		Endpoint:  cfg.Endpoint,
+		Region:    cfg.Region,
+		Bucket:    cfg.Bucket,
+		AccessKey: cfg.AccessKey,
+		SecretKey: cfg.SecretKey,
+	}, client)
+	if err != nil {
+		return nil, fmt.Errorf("wasabi: %w", err)
+	}
+	return &Provider{Provider: base, cfg: cfg}, nil
+}
+
+// Capabilities reports what Wasabi supports. It widens the generic S3
+// envelope with Wasabi's documented 90-day minimum storage duration.
+func (p *Provider) Capabilities() providers.ProviderCapabilities {
+	caps := p.Provider.Capabilities()
+	caps.MinStorageDurationDays = 90
+	return caps
 }
 
 // CostModel is the public Wasabi pricing snapshot at the time of
@@ -135,8 +121,8 @@ func (p *Provider) CostModel() providers.ProviderCostModel {
 	}
 }
 
-// PlacementLabels reports the provider identity. Region, country, and
-// failure-zone are populated from Config.
+// PlacementLabels reports the provider identity. Region, country,
+// storage class, and failure zone are populated from Config.
 func (p *Provider) PlacementLabels() providers.PlacementLabels {
 	return providers.PlacementLabels{
 		Provider:     "wasabi",
@@ -151,10 +137,10 @@ func (p *Provider) PlacementLabels() providers.PlacementLabels {
 	}
 }
 
-// regionToCountry is a Phase 1 approximation. A real mapping lives in
-// the control-plane's provider inventory.
+// regionToCountry is a Phase 1/2 approximation. A real mapping lives
+// in the control-plane's provider inventory.
 //
-// TODO(phase-2): replace with a lookup against the control-plane
+// TODO(phase-3): replace with a lookup against the control-plane
 // inventory, which records the authoritative region → country mapping.
 func regionToCountry(region string) string {
 	switch {

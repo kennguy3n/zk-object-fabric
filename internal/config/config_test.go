@@ -9,10 +9,10 @@ import (
 
 func TestDuration_UnmarshalJSON_AcceptsString(t *testing.T) {
 	cases := map[string]time.Duration{
-		`"30s"`:    30 * time.Second,
-		`"5m"`:     5 * time.Minute,
-		`"250ms"`:  250 * time.Millisecond,
-		`"1h30m"`:  90 * time.Minute,
+		`"30s"`:   30 * time.Second,
+		`"5m"`:    5 * time.Minute,
+		`"250ms"`: 250 * time.Millisecond,
+		`"1h30m"`: 90 * time.Minute,
 	}
 	for input, want := range cases {
 		t.Run(input, func(t *testing.T) {
