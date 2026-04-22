@@ -132,9 +132,17 @@ func (p *Provider) PutPiece(_ context.Context, pieceID string, r io.Reader, opts
 	}
 	metaBytes, err := json.Marshal(sc)
 	if err != nil {
+		// Sidecar serialisation failed after the data file was already
+		// renamed into place; remove it so the piece is not left half
+		// written (data present, sidecar missing), which would block
+		// future IfNoneMatch retries.
+		_ = os.Remove(dataPath)
 		return providers.PutResult{}, fmt.Errorf("local_fs_dev: marshal sidecar %q: %w", pieceID, err)
 	}
 	if err := os.WriteFile(metaPath, metaBytes, 0o644); err != nil {
+		// Same half-written piece concern as above: clean up the data
+		// file so Put/HeadPiece stay consistent.
+		_ = os.Remove(dataPath)
 		return providers.PutResult{}, fmt.Errorf("local_fs_dev: write sidecar %q: %w", pieceID, err)
 	}
 
