@@ -59,6 +59,8 @@ type Config struct {
 	ControlPlane ControlPlaneConfig `json:"control_plane"`
 	Providers    ProvidersConfig    `json:"providers"`
 	Rebalancer   RebalancerConfig   `json:"rebalancer"`
+	Billing      BillingConfig      `json:"billing"`
+	Health       HealthConfig       `json:"health"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the
@@ -115,17 +117,61 @@ type ControlPlaneConfig struct {
 	BillingURL  string `json:"billing_url"`
 }
 
+// BillingConfig configures the metering sink. When ClickHouseURL is
+// empty the gateway falls back to the development LoggerSink.
+type BillingConfig struct {
+	ClickHouseURL      string   `json:"clickhouse_url"`
+	ClickHouseDatabase string   `json:"clickhouse_database"`
+	ClickHouseTable    string   `json:"clickhouse_table"`
+	ClickHouseUsername string   `json:"clickhouse_username"`
+	ClickHousePassword string   `json:"clickhouse_password"`
+	BatchSize          int      `json:"batch_size"`
+	FlushInterval      Duration `json:"flush_interval"`
+}
+
+// HealthConfig configures the gateway fleet node health monitor.
+// When ListenAddr is empty the monitor still runs as a background
+// quorum watcher but does not expose HTTP endpoints.
+type HealthConfig struct {
+	// NodeID identifies this gateway in peer /health responses.
+	// Defaults to the hostname.
+	NodeID string `json:"node_id"`
+	// CellID is the logical cell this gateway belongs to.
+	CellID string `json:"cell_id"`
+	// ListenAddr is the bind address for the internal health
+	// endpoints (e.g. ":29090"). Optional.
+	ListenAddr string `json:"listen_addr"`
+	// Peers is the cell's peer gateway list.
+	Peers []HealthPeer `json:"peers"`
+	// QuorumThreshold is the minimum number of nodes (including
+	// local) that must be healthy for the cell to be in quorum.
+	// Defaults to a simple majority of (peers + 1).
+	QuorumThreshold int `json:"quorum_threshold"`
+	// PollInterval is the peer poll cadence. Defaults to 2s.
+	PollInterval Duration `json:"poll_interval"`
+	// PollTimeout bounds one peer probe. Defaults to 1s.
+	PollTimeout Duration `json:"poll_timeout"`
+	// DrainTimeout bounds the drain wait. Defaults to 30s.
+	DrainTimeout Duration `json:"drain_timeout"`
+}
+
+// HealthPeer is a single peer gateway in the cell.
+type HealthPeer struct {
+	NodeID   string `json:"node_id"`
+	Endpoint string `json:"endpoint"`
+}
+
 // ProvidersConfig carries per-provider settings. Phase 2 surfaces
 // the full B2C / B2B / BYOC provider matrix described in
 // docs/STORAGE_INFRA.md. Empty sub-configs mean "do not register
 // this provider".
 type ProvidersConfig struct {
-	Wasabi     WasabiConfig     `json:"wasabi"`
-	LocalFSDev LocalFSDevConfig `json:"local_fs_dev"`
-	CephRGW    CephRGWConfig    `json:"ceph_rgw"`
-	BackblazeB2 BackblazeB2Config `json:"backblaze_b2"`
+	Wasabi       WasabiConfig       `json:"wasabi"`
+	LocalFSDev   LocalFSDevConfig   `json:"local_fs_dev"`
+	CephRGW      CephRGWConfig      `json:"ceph_rgw"`
+	BackblazeB2  BackblazeB2Config  `json:"backblaze_b2"`
 	CloudflareR2 CloudflareR2Config `json:"cloudflare_r2"`
-	AWSS3      AWSS3Config      `json:"aws_s3"`
+	AWSS3        AWSS3Config        `json:"aws_s3"`
 }
 
 // WasabiConfig configures the Phase 1 primary storage backend.

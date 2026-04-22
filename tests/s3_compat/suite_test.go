@@ -35,7 +35,10 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/providers"
+	"github.com/kennguy3n/zk-object-fabric/providers/aws_s3"
+	"github.com/kennguy3n/zk-object-fabric/providers/backblaze_b2"
 	"github.com/kennguy3n/zk-object-fabric/providers/ceph_rgw"
+	"github.com/kennguy3n/zk-object-fabric/providers/cloudflare_r2"
 	"github.com/kennguy3n/zk-object-fabric/providers/local_fs_dev"
 )
 
@@ -438,5 +441,124 @@ func TestSuite_CephRGW(t *testing.T) {
 		Manifests: memory.New(),
 		Providers: map[string]providers.StorageProvider{"ceph_rgw": p},
 		Default:   "ceph_rgw",
+	})
+}
+
+// TestSuite_BackblazeB2 runs the full S3 compliance suite against a
+// Backblaze B2 S3-compatible endpoint.
+//
+//	B2_ENDPOINT    — required, e.g. https://s3.us-west-002.backblazeb2.com
+//	B2_REGION      — required, e.g. us-west-002
+//	B2_BUCKET      — required, throwaway bucket; suite writes/deletes in place
+//	B2_ACCESS_KEY  — required
+//	B2_SECRET_KEY  — required
+//
+// The test is skipped when B2_ENDPOINT is unset so CI does not need
+// B2 credentials.
+func TestSuite_BackblazeB2(t *testing.T) {
+	endpoint := os.Getenv("B2_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("B2_ENDPOINT not set")
+	}
+	region := os.Getenv("B2_REGION")
+	bucket := os.Getenv("B2_BUCKET")
+	accessKey := os.Getenv("B2_ACCESS_KEY")
+	secretKey := os.Getenv("B2_SECRET_KEY")
+	if region == "" || bucket == "" || accessKey == "" || secretKey == "" {
+		t.Fatalf("B2_ENDPOINT is set but B2_REGION / B2_BUCKET / B2_ACCESS_KEY / B2_SECRET_KEY are missing")
+	}
+	p, err := backblaze_b2.New(backblaze_b2.Config{
+		Endpoint:  endpoint,
+		Region:    region,
+		Bucket:    bucket,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+	})
+	if err != nil {
+		t.Fatalf("backblaze_b2.New: %v", err)
+	}
+	Run(t, Setup{
+		Manifests: memory.New(),
+		Providers: map[string]providers.StorageProvider{"backblaze_b2": p},
+		Default:   "backblaze_b2",
+	})
+}
+
+// TestSuite_CloudflareR2 runs the full S3 compliance suite against a
+// Cloudflare R2 bucket.
+//
+//	R2_ACCOUNT_ID — required unless R2_ENDPOINT is set
+//	R2_ENDPOINT   — optional, overrides the derived endpoint
+//	R2_BUCKET     — required, throwaway bucket
+//	R2_ACCESS_KEY — required
+//	R2_SECRET_KEY — required
+//
+// The test is skipped when R2_BUCKET is unset.
+func TestSuite_CloudflareR2(t *testing.T) {
+	bucket := os.Getenv("R2_BUCKET")
+	if bucket == "" {
+		t.Skip("R2_BUCKET not set")
+	}
+	accessKey := os.Getenv("R2_ACCESS_KEY")
+	secretKey := os.Getenv("R2_SECRET_KEY")
+	accountID := os.Getenv("R2_ACCOUNT_ID")
+	endpoint := os.Getenv("R2_ENDPOINT")
+	if accessKey == "" || secretKey == "" || (accountID == "" && endpoint == "") {
+		t.Fatalf("R2_BUCKET is set but R2_ACCESS_KEY / R2_SECRET_KEY / R2_ACCOUNT_ID or R2_ENDPOINT are missing")
+	}
+	p, err := cloudflare_r2.New(cloudflare_r2.Config{
+		AccountID: accountID,
+		Endpoint:  endpoint,
+		Bucket:    bucket,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+	})
+	if err != nil {
+		t.Fatalf("cloudflare_r2.New: %v", err)
+	}
+	Run(t, Setup{
+		Manifests: memory.New(),
+		Providers: map[string]providers.StorageProvider{"cloudflare_r2": p},
+		Default:   "cloudflare_r2",
+	})
+}
+
+// TestSuite_AWSS3 runs the full S3 compliance suite against an AWS S3
+// bucket. This entrypoint is the BYOC validation gate: before we
+// hand a tenant a role-based BYOC placement policy we validate that
+// their bucket accepts our full request matrix.
+//
+//	AWS_S3_REGION     — required
+//	AWS_S3_BUCKET     — required, throwaway bucket
+//	AWS_S3_ACCESS_KEY — required
+//	AWS_S3_SECRET_KEY — required
+//	AWS_S3_ENDPOINT   — optional, override for S3-compatible endpoints
+//
+// Tests are skipped when AWS_S3_BUCKET is unset.
+func TestSuite_AWSS3(t *testing.T) {
+	bucket := os.Getenv("AWS_S3_BUCKET")
+	if bucket == "" {
+		t.Skip("AWS_S3_BUCKET not set")
+	}
+	region := os.Getenv("AWS_S3_REGION")
+	accessKey := os.Getenv("AWS_S3_ACCESS_KEY")
+	secretKey := os.Getenv("AWS_S3_SECRET_KEY")
+	if region == "" || accessKey == "" || secretKey == "" {
+		t.Fatalf("AWS_S3_BUCKET is set but AWS_S3_REGION / AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY are missing")
+	}
+	p, err := aws_s3.New(aws_s3.Config{
+		Region:    region,
+		Bucket:    bucket,
+		Endpoint:  os.Getenv("AWS_S3_ENDPOINT"),
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+	})
+	if err != nil {
+		t.Fatalf("aws_s3.New: %v", err)
+	}
+	Run(t, Setup{
+		Manifests: memory.New(),
+		Providers: map[string]providers.StorageProvider{"aws_s3": p},
+		Default:   "aws_s3",
 	})
 }
