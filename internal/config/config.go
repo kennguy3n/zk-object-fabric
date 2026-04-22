@@ -61,6 +61,17 @@ type Config struct {
 	Rebalancer   RebalancerConfig   `json:"rebalancer"`
 	Billing      BillingConfig      `json:"billing"`
 	Health       HealthConfig       `json:"health"`
+	Console      ConsoleConfig      `json:"console"`
+}
+
+// ConsoleConfig configures the tenant-console HTTP surface (api/console).
+// The console runs on its own listener so a saturated S3 data plane
+// cannot starve the management controls. Leave ListenAddr empty to
+// disable the console API entirely.
+type ConsoleConfig struct {
+	ListenAddr   string   `json:"listen_addr"`
+	ReadTimeout  Duration `json:"read_timeout"`
+	WriteTimeout Duration `json:"write_timeout"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the
@@ -296,6 +307,11 @@ func Default() Config {
 			LocalFSDev: LocalFSDevConfig{
 				RootPath: "/var/lib/zk-object-fabric/local_fs_dev",
 			},
+		},
+		Console: ConsoleConfig{
+			ListenAddr:   ":8081",
+			ReadTimeout:  Duration(30 * time.Second),
+			WriteTimeout: Duration(30 * time.Second),
 		},
 	}
 }
