@@ -131,6 +131,49 @@ func TestClickHouseSink_RejectsInvalidConfig(t *testing.T) {
 	if _, err := NewClickHouseSink(ClickHouseConfig{Endpoint: "http://x"}); err == nil {
 		t.Fatalf("missing database: want error, got nil")
 	}
+	if _, err := NewClickHouseSink(ClickHouseConfig{Endpoint: "http://x", Database: "obj", Table: "my_table"}); err == nil {
+		t.Fatalf("table without _events suffix: want error, got nil")
+	}
+	if _, err := NewClickHouseSink(ClickHouseConfig{Endpoint: "http://x", Database: "obj", Table: "bad events"}); err == nil {
+		t.Fatalf("table with space: want error, got nil")
+	}
+	if _, err := NewClickHouseSink(ClickHouseConfig{Endpoint: "http://x", Database: "bad db", Table: "usage_events"}); err == nil {
+		t.Fatalf("database with space: want error, got nil")
+	}
+	if _, err := NewClickHouseSink(ClickHouseConfig{Endpoint: "http://x", Database: "obj", Table: "usage_events;DROP TABLE x--_events"}); err == nil {
+		t.Fatalf("table with punctuation: want error, got nil")
+	}
+}
+
+func TestClickHouseSink_BackticksTableName(t *testing.T) {
+	cap := &captured{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.mu.Lock()
+		defer cap.mu.Unlock()
+		// Capture the URL query so we can inspect the INSERT statement.
+		cap.requests = append(cap.requests, r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	sink, err := NewClickHouseSink(ClickHouseConfig{
+		Endpoint:  srv.URL,
+		Database:  "obj",
+		Table:     "custom_events",
+		BatchSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewClickHouseSink: %v", err)
+	}
+	sink.Emit(UsageEvent{TenantID: "t", Bucket: "b", Dimension: PutRequests, Delta: 1, ObservedAt: time.Unix(1, 0)})
+	if err := sink.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if cap.total() != 1 {
+		t.Fatalf("captured %d requests, want 1", cap.total())
+	}
+	if !strings.Contains(cap.requests[0], "INSERT+INTO+%60custom_events%60") {
+		t.Fatalf("INSERT query missing backtick-quoted table: %s", cap.requests[0])
+	}
 }
 
 func TestSchemaDDL_ContainsTables(t *testing.T) {
@@ -139,5 +182,32 @@ func TestSchemaDDL_ContainsTables(t *testing.T) {
 		if !strings.Contains(ddl, want) {
 			t.Fatalf("schema missing %q", want)
 		}
+	}
+}
+
+func TestSchemaDDL_CustomEventsSuffix(t *testing.T) {
+	// A custom events-table name still yields a properly-named
+	// counters companion (previously "my_tablecounters").
+	ddl := SchemaDDL("obj", "my_events")
+	for _, want := range []string{"obj.my_events", "obj.my_counters"} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("schema missing %q:\n%s", want, ddl)
+		}
+	}
+	if strings.Contains(ddl, "my_eventscounters") || strings.Contains(ddl, "my_tablecounters") {
+		t.Fatalf("schema has malformed counters name:\n%s", ddl)
+	}
+}
+
+func TestSchemaDDL_RejectsBadSuffix(t *testing.T) {
+	// The SchemaDDL helper accepts any string (it's called
+	// out-of-band) so it falls back to a safe error rather than
+	// emitting an invalid DDL.
+	ddl := SchemaDDL("obj", "my_table")
+	if strings.Contains(ddl, "CREATE TABLE") {
+		t.Fatalf("expected fallback, got DDL:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "does not end in") {
+		t.Fatalf("fallback missing explanation:\n%s", ddl)
 	}
 }

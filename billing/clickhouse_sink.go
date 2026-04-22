@@ -101,6 +101,15 @@ func NewClickHouseSink(cfg ClickHouseConfig) (*ClickHouseSink, error) {
 	if cfg.Table == "" {
 		cfg.Table = "usage_events"
 	}
+	if !strings.HasSuffix(cfg.Table, "_events") {
+		return nil, fmt.Errorf("billing: clickhouse table %q must end in \"_events\" (the companion counters table is derived from this suffix)", cfg.Table)
+	}
+	if !validIdent(cfg.Table) {
+		return nil, fmt.Errorf("billing: clickhouse table name %q contains invalid characters", cfg.Table)
+	}
+	if !validIdent(cfg.Database) {
+		return nil, fmt.Errorf("billing: clickhouse database name %q contains invalid characters", cfg.Database)
+	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 500
 	}
@@ -318,9 +327,35 @@ func (s *ClickHouseSink) insertURL() (string, error) {
 	}
 	q := u.Query()
 	q.Set("database", s.cfg.Database)
-	q.Set("query", fmt.Sprintf("INSERT INTO %s FORMAT JSONEachRow", s.cfg.Table))
+	// The table name is validated by NewClickHouseSink to be a
+	// simple [A-Za-z0-9_]+ identifier, but backtick-quote it
+	// anyway so this query survives future loosening of that
+	// check (e.g. to allow a database-qualified `db`.`table`).
+	q.Set("query", fmt.Sprintf("INSERT INTO `%s` FORMAT JSONEachRow", s.cfg.Table))
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// validIdent accepts a conservative subset of SQL identifiers —
+// letters, digits, and underscore. ClickHouse is more permissive
+// (backticks allow arbitrary strings) but restricting the allowed
+// set keeps the INSERT query safe from injection by misconfiguration
+// and makes the SchemaDDL output predictable.
+func validIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // clickHouseRow is the on-the-wire shape ClickHouse ingests. Column
@@ -363,14 +398,28 @@ func (s *ClickHouseSink) logf(format string, args ...any) {
 	s.cfg.Logger.Printf(format, args...)
 }
 
-// SchemaDDL returns the DDL statements that create the usage_events
-// and usage_counters tables. Operators can apply these out-of-band
-// or through their migration tool of choice.
+// SchemaDDL returns the DDL statements that create the events
+// and counters tables. Operators can apply these out-of-band or
+// through their migration tool of choice.
+//
+// The table argument is the events table name; the counters table
+// name is derived by replacing the trailing "_events" suffix with
+// "_counters". The table name must therefore end in "_events";
+// this mirrors the same invariant NewClickHouseSink enforces on
+// its config. An empty table name defaults to "usage_events".
 func SchemaDDL(database, table string) string {
 	if table == "" {
 		table = "usage_events"
 	}
-	counterTable := strings.TrimSuffix(table, "events") + "counters"
+	if !strings.HasSuffix(table, "_events") {
+		// Fall back to appending rather than producing a
+		// nonsensical "my_tablecounters" name. This path is
+		// unreachable through NewClickHouseSink, which rejects
+		// table names that don't end in "_events", but keeps
+		// direct callers of SchemaDDL honest.
+		return fmt.Sprintf("-- billing: table %q does not end in \"_events\"; expected suffix required to derive counters table\n", table)
+	}
+	counterTable := strings.TrimSuffix(table, "_events") + "_counters"
 	return fmt.Sprintf(`-- billing schema for ClickHouseSink.
 CREATE TABLE IF NOT EXISTS %[1]s.%[2]s (
     tenant_id      LowCardinality(String),
