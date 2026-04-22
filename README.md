@@ -330,7 +330,7 @@ cache in front of it.
 
 ## Project status
 
-- **Current phase**: Phase 2 — Prototype (complete).
+- **Current phase**: Phase 3 — Beta Cell (in progress).
 - **Tracker**: [docs/PROGRESS.md](docs/PROGRESS.md).
 - **Technical proposal**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
 

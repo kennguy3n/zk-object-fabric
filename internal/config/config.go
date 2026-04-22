@@ -283,7 +283,14 @@ func Default() Config {
 			ReadTimeout:     Duration(30 * time.Second),
 			WriteTimeout:    Duration(30 * time.Second),
 			MaxRequestBytes: 5 * 1024 * 1024 * 1024, // 5 GiB
-			CachePath:       "/var/lib/zk-object-fabric/cache",
+			// CachePath defaults to empty so developer and test
+			// environments get the in-memory cache without a
+			// DiskCache-fallback warning when the host has no
+			// persistent cache volume. Production gateway nodes
+			// must set this via the config file (gateway.cache_path)
+			// or via an environment-specific override so that NVMe /
+			// block storage is used as the L0 / L1 hot-object cache.
+			CachePath: "",
 		},
 		Providers: ProvidersConfig{
 			LocalFSDev: LocalFSDevConfig{
