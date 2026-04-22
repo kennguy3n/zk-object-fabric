@@ -235,7 +235,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		byteRange = rng
 	}
 
-	body, served, err := h.fetchPiece(r, piece, pieceProvider, byteRange, tenantID, bucket)
+	body, served, err := h.fetchPiece(r, piece, pieceProvider, byteRange, manifest.ObjectSize, tenantID, bucket)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
 		return
@@ -283,6 +283,7 @@ func (h *Handler) fetchPiece(
 	piece metadata.Piece,
 	pieceProvider providers.StorageProvider,
 	byteRange *providers.ByteRange,
+	objectSize int64,
 	tenantID, bucket string,
 ) (io.ReadCloser, bool, error) {
 	if h.cfg.Cache != nil && byteRange == nil {
@@ -318,8 +319,14 @@ func (h *Handler) fetchPiece(
 		// Range reads skip the inline cache warm because the cache
 		// is keyed by piece, not by byte range. Publish a signal so
 		// the promotion worker can decide whether to fetch the
-		// whole piece asynchronously.
-		h.signalPromotion(piece, tenantID, byteRange.End-byteRange.Start+1)
+		// whole piece asynchronously. Open-ended ranges (End == -1)
+		// resolve against the object size so the published
+		// ReadBytes is never negative.
+		end := byteRange.End
+		if end < 0 {
+			end = objectSize - 1
+		}
+		h.signalPromotion(piece, tenantID, end-byteRange.Start+1)
 	}
 	return body, false, nil
 }
