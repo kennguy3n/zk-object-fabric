@@ -162,7 +162,7 @@ func (p *Provider) PutPiece(ctx context.Context, pieceID string, r io.Reader, op
 	}
 	return providers.PutResult{
 		PieceID:   pieceID,
-		ETag:      aws.ToString(out.ETag),
+		ETag:      normalizeETag(aws.ToString(out.ETag)),
 		SizeBytes: size,
 		Backend:   p.cfg.Name,
 		Locator:   fmt.Sprintf("s3://%s/%s", p.cfg.Bucket, pieceID),
@@ -203,7 +203,7 @@ func (p *Provider) HeadPiece(ctx context.Context, pieceID string) (providers.Pie
 	return providers.PieceMetadata{
 		PieceID:      pieceID,
 		SizeBytes:    aws.ToInt64(out.ContentLength),
-		ETag:         aws.ToString(out.ETag),
+		ETag:         normalizeETag(aws.ToString(out.ETag)),
 		ContentType:  aws.ToString(out.ContentType),
 		StorageClass: string(out.StorageClass),
 		Metadata:     out.Metadata,
@@ -246,7 +246,7 @@ func (p *Provider) ListPieces(ctx context.Context, prefix, cursor string) (provi
 		pieces = append(pieces, providers.PieceMetadata{
 			PieceID:      aws.ToString(obj.Key),
 			SizeBytes:    aws.ToInt64(obj.Size),
-			ETag:         strings.Trim(aws.ToString(obj.ETag), `"`),
+			ETag:         normalizeETag(aws.ToString(obj.ETag)),
 			StorageClass: string(obj.StorageClass),
 		})
 	}
@@ -281,6 +281,14 @@ func (p *Provider) PlacementLabels() providers.PlacementLabels {
 		Provider: p.cfg.Name,
 		Region:   p.cfg.Region,
 	}
+}
+
+// normalizeETag strips the surrounding double quotes that S3 wraps
+// ETag values in. Applied consistently in PutPiece, HeadPiece, and
+// ListPieces so callers see the same shape regardless of which call
+// surfaced the ETag.
+func normalizeETag(etag string) string {
+	return strings.Trim(etag, `"`)
 }
 
 // formatRange builds an HTTP Range header from a ByteRange.
