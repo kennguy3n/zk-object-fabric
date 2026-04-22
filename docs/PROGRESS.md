@@ -2,8 +2,8 @@
 
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 2 — Prototype (complete)
-- **Last updated**: 2026-04-22 (Phase 2 hardening pass: lazy read-repair wired into the gateway GET path, optional background rebalancer started as a gateway-managed goroutine driven by `config.migration`, duplicate `StaticFetcher` removed from `cmd/gateway` in favour of `hot_object_cache.StaticFetcher`, Ceph RGW compliance-suite entrypoint stubbed behind `CEPH_RGW_ENDPOINT`, and the node health monitor explicitly deferred to Phase 3)
+- **Status**: Phase 3 — Beta Cell (in progress)
+- **Last updated**: 2026-04-22 (Phase 3 foundations landed: NVMe-backed `DiskCache` implementing `HotObjectCache` with warm-from-disk + TTL + capacity eviction in `cache/hot_object_cache/disk_cache.go`; production `ClickHouseSink` batch billing metering backend with retry + schema DDL in `billing/clickhouse_sink.go` and `billing/schema.sql`; gateway fleet node health monitor — per-cell quorum, drain, `GET /internal/health`, `GET /internal/ready`, `POST /internal/drain` — in `internal/health/health.go`; `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, `TestSuite_AWSS3` entrypoints added alongside `TestSuite_CephRGW` in `tests/s3_compat/suite_test.go`; gateway wired to use disk cache when `gateway.cache_path` is set, ClickHouse billing when `billing.clickhouse_url` is set, and the health monitor as a background goroutine with SIGTERM drain)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -242,7 +242,7 @@ Checklist:
 
 ## Phase 3: Beta Cell (Weeks 10–15)
 
-**Status**: `NOT STARTED`
+**Status**: `IN PROGRESS`
 
 **Goal**: stand up a real beta deployment on the AWS + Linode +
 Wasabi stack with paying / design-partner customers on both B2C and
@@ -251,11 +251,24 @@ B2B paths, plus a first local DC cell for early hybrid customers.
 Checklist:
 
 - [ ] Production AWS control plane (RDS, IAM, CloudWatch,
-      ClickHouse or equivalent).
+      ClickHouse or equivalent). ClickHouse billing sink
+      (`billing/clickhouse_sink.go`, schema in `billing/schema.sql`)
+      is implemented and wired into `cmd/gateway/main.go` under
+      `config.billing.clickhouse_url`; remaining work is the
+      operator-side cluster provisioning and the rest of the
+      control-plane surface (RDS, IAM, CloudWatch).
 - [ ] Production Linode gateway fleet, multi-region.
 - [ ] Production Wasabi buckets (per region) wired as the durable
       origin.
-- [ ] NVMe cache nodes (L0 / L1) on Linode.
+- [x] NVMe cache nodes (L0 / L1) on Linode. `DiskCache`
+      implementing `HotObjectCache` lives in
+      `cache/hot_object_cache/disk_cache.go`, rebuilds its index
+      from disk on restart, supports TTL + capacity eviction + hot
+      pinning, and is wired into `cmd/gateway/main.go` via
+      `config.gateway.cache_path`. Coverage in
+      `cache/hot_object_cache/disk_cache_test.go` (round-trip,
+      restart-persistence, TTL expiry, capacity eviction, orphan
+      cleanup, oversize rejection).
 - [ ] First local DC cell: 6–12 storage nodes, 300 TB – 1 PB raw
       capacity, HDD durable nodes (L2), NVMe cache, gateway fleet.
 - [ ] 25–100 Gbps aggregate public bandwidth across Linode + local
@@ -274,12 +287,40 @@ Checklist:
       `TestSuite_CephRGW` is in place in `tests/s3_compat/suite_test.go`
       and runs the full `Run(t, setup)` suite when
       `CEPH_RGW_ENDPOINT` is set; it skips otherwise so CI stays
-      green without a Ceph cluster.
+      green without a Ceph cluster. Companion entrypoints
+      `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, and
+      `TestSuite_AWSS3` gate BYOC / cloud adapter validation on
+      the same env-var pattern.
 - [ ] Run S3 compliance test suite during a live Wasabi → Ceph RGW
       migration with beta customers.
-- [ ] Gateway fleet node health monitor (deferred from Phase 2):
+- [x] Gateway fleet node health monitor (deferred from Phase 2):
       per-cell quorum, cache-tier drain, graceful gateway
-      replacement.
+      replacement. Implemented in `internal/health/health.go` with
+      `GET /internal/health`, `GET /internal/ready`, `POST
+      /internal/drain` endpoints, `Monitor.Track()` for in-flight
+      gating, `Monitor.Drain()` bounded by `DrainTimeout`, and
+      optional cache eviction on drain. Wired into
+      `cmd/gateway/main.go` as a background goroutine alongside
+      the rebalancer and promotion worker; SIGTERM triggers
+      `Drain()` before `signalBus.Close()`. Coverage in
+      `internal/health/health_test.go` for quorum transitions,
+      drain readiness flip, in-flight gating, and timeout
+      handling.
+- [x] Phase 3 billing metering backend. `ClickHouseSink` in
+      `billing/clickhouse_sink.go` ingests usage events via
+      ClickHouse HTTP `INSERT FORMAT JSONEachRow`, batches by size
+      + interval, retries 5xx with exponential backoff, and
+      drains on `Close()`. Schema in `billing/schema.sql` ships
+      `usage_events` (MergeTree) + `usage_counters`
+      (SummingMergeTree). Coverage in
+      `billing/clickhouse_sink_test.go` for batch-size flush,
+      close flush, 5xx retry, and config validation.
+- [x] BYOC / cloud adapter compliance entrypoints.
+      `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, and
+      `TestSuite_AWSS3` added in `tests/s3_compat/suite_test.go`
+      following the `TestSuite_CephRGW` pattern, each gated on
+      the provider's `*_ENDPOINT` / `*_BUCKET` env vars so CI
+      stays green without credentials.
 
 ### Avoid early customers with
 

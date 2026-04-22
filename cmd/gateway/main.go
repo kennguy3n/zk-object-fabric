@@ -25,6 +25,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
+	"github.com/kennguy3n/zk-object-fabric/internal/health"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	pgstore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/postgres"
@@ -64,9 +65,9 @@ func main() {
 	placement := placement_policy.NewEngine(defaultBackend, registry, nil)
 	tenantStore := buildTenantStore(*tenantsPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
-	billingSink := &billing.LoggerSink{Logger: log.New(os.Stdout, "", log.LstdFlags)}
+	billingSink := buildBillingSink(cfg)
 
-	cache, err := hot_object_cache.NewMemoryCache(hot_object_cache.DefaultEvictionPolicy(1 << 30))
+	cache, err := buildHotObjectCache(cfg)
 	if err != nil {
 		log.Fatalf("gateway: build hot object cache: %v", err)
 	}
@@ -90,6 +91,8 @@ func main() {
 	readRepair.Logger = log.New(os.Stdout, "read_repair ", log.LstdFlags)
 
 	rebalancerDone := startRebalancer(workerCtx, cfg.Rebalancer, store, registry)
+
+	healthMon := startHealthMonitor(workerCtx, cfg.Health, cache)
 
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
@@ -129,6 +132,22 @@ func main() {
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("gateway: http shutdown: %v", err)
+		}
+		if healthMon != nil {
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := healthMon.Drain(drainCtx); err != nil {
+				log.Printf("gateway: health drain: %v", err)
+			}
+			drainCancel()
+		}
+		if closer, ok := billingSink.(interface {
+			Close(context.Context) error
+		}); ok {
+			billingCtx, billingCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := closer.Close(billingCtx); err != nil {
+				log.Printf("gateway: close billing sink: %v", err)
+			}
+			billingCancel()
 		}
 		signalBus.Close()
 		cancelWorker()
@@ -313,6 +332,97 @@ func pickDefaultBackend(registry map[string]providers.StorageProvider) string {
 		}
 	}
 	return ""
+}
+
+// buildHotObjectCache returns a DiskCache when cfg.Gateway.CachePath
+// is set and a writable directory, falling back to an in-memory
+// cache for developer/test flows. The cache capacity is 1 GiB so
+// small dev machines don't fill the disk; operators size it via
+// the eviction policy in Phase 4's config refactor.
+func buildHotObjectCache(cfg config.Config) (hot_object_cache.HotObjectCache, error) {
+	policy := hot_object_cache.DefaultEvictionPolicy(1 << 30)
+	if cfg.Gateway.CachePath == "" {
+		return hot_object_cache.NewMemoryCache(policy)
+	}
+	return hot_object_cache.NewDiskCache(hot_object_cache.DiskCacheConfig{
+		RootPath: cfg.Gateway.CachePath,
+		Policy:   policy,
+	})
+}
+
+// buildBillingSink returns the ClickHouseSink when billing is
+// configured, otherwise the development LoggerSink. The returned
+// value satisfies api/s3compat.BillingSink.
+func buildBillingSink(cfg config.Config) interface {
+	Emit(event billing.UsageEvent)
+} {
+	if cfg.Billing.ClickHouseURL == "" {
+		return &billing.LoggerSink{Logger: log.New(os.Stdout, "", log.LstdFlags)}
+	}
+	sink, err := billing.NewClickHouseSink(billing.ClickHouseConfig{
+		Endpoint:      cfg.Billing.ClickHouseURL,
+		Database:      cfg.Billing.ClickHouseDatabase,
+		Table:         cfg.Billing.ClickHouseTable,
+		Username:      cfg.Billing.ClickHouseUsername,
+		Password:      cfg.Billing.ClickHousePassword,
+		BatchSize:     cfg.Billing.BatchSize,
+		FlushInterval: cfg.Billing.FlushInterval.ToDuration(),
+		Logger:        log.New(os.Stdout, "billing ", log.LstdFlags),
+	})
+	if err != nil {
+		log.Fatalf("gateway: build clickhouse billing sink: %v", err)
+	}
+	return sink
+}
+
+// startHealthMonitor starts the gateway fleet node health monitor
+// and, when a listen address is configured, the internal HTTP
+// endpoints it exposes. The monitor shares ctx with the other
+// background workers so SIGTERM drains all of them together.
+func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_object_cache.HotObjectCache) *health.Monitor {
+	nodeID := hc.NodeID
+	if nodeID == "" {
+		if name, err := os.Hostname(); err == nil {
+			nodeID = name
+		} else {
+			nodeID = "gateway"
+		}
+	}
+	peers := make([]health.Peer, 0, len(hc.Peers))
+	for _, p := range hc.Peers {
+		peers = append(peers, health.Peer{NodeID: p.NodeID, Endpoint: p.Endpoint})
+	}
+	mon, err := health.New(health.Config{
+		NodeID:          nodeID,
+		CellID:          hc.CellID,
+		Peers:           peers,
+		QuorumThreshold: hc.QuorumThreshold,
+		PollInterval:    hc.PollInterval.ToDuration(),
+		PollTimeout:     hc.PollTimeout.ToDuration(),
+		DrainTimeout:    hc.DrainTimeout.ToDuration(),
+		Cache:           cache,
+		Logger:          log.New(os.Stdout, "health ", log.LstdFlags),
+	})
+	if err != nil {
+		log.Fatalf("gateway: build health monitor: %v", err)
+	}
+	go func() { _ = mon.Run(ctx) }()
+	if hc.ListenAddr != "" {
+		srv := &http.Server{Addr: hc.ListenAddr, Handler: mon.ServeMux("")}
+		go func() {
+			log.Printf("gateway: health endpoints on %s", hc.ListenAddr)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("gateway: health listener: %v", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+	}
+	return mon
 }
 
 func buildTenantStore(path string) *auth.MemoryTenantStore {
