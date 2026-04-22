@@ -319,10 +319,11 @@ func (h *Handler) fetchPiece(
 	}
 	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
 	if err != nil {
-		if repaired, repairErr := h.tryReadRepair(r, mkey, manifest, byteRange); repairErr == nil && repaired != nil {
-			return repaired, false, nil
+		repaired, repairErr := h.tryReadRepair(r, mkey, manifest, byteRange)
+		if repairErr != nil || repaired == nil {
+			return nil, false, err
 		}
-		return nil, false, err
+		body = repaired
 	}
 	if h.cfg.Cache != nil && byteRange == nil {
 		h.emit(tenantID, bucket, billing.CacheMisses, 1)
@@ -331,11 +332,13 @@ func (h *Handler) fetchPiece(
 		if rerr != nil {
 			return nil, false, rerr
 		}
-		// Warm the cache inline. The promotion worker handles
-		// signals for pieces that were not cached here (e.g. range
-		// reads) so we do not publish one from this path — doing so
-		// would cause a redundant origin fetch since the piece is
-		// already resident.
+		// Warm the cache inline so a concurrent request doesn't
+		// re-trigger the backend GET (or a redundant read-repair
+		// round-trip during migration). The promotion worker
+		// handles signals for pieces that were not cached here
+		// (e.g. range reads) so we do not publish one from this
+		// path — doing so would cause a redundant origin fetch
+		// since the piece is already resident.
 		_ = h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,

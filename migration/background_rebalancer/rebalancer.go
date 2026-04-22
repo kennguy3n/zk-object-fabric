@@ -223,7 +223,9 @@ func (r *Rebalancer) rebalanceManifest(
 		if err != nil {
 			return copied, bytesCopied, fmt.Errorf("drain piece %s: %w", piece.PieceID, err)
 		}
-		r.throttle(int64(len(body)))
+		if err := r.throttle(ctx, int64(len(body))); err != nil {
+			return copied, bytesCopied, err
+		}
 
 		put, err := primary.PutPiece(ctx, piece.PieceID, bytes.NewReader(body), providers.PutOptions{
 			ContentLength: int64(len(body)),
@@ -322,14 +324,24 @@ func applyPhase(m *metadata.ObjectManifest, next migration.MigrationPhase) {
 
 // throttle pauses the worker to honour BytesPerSecond. It uses a
 // simple token-bucket model: one call per copy reserves `bytes` of
-// budget and sleeps the shortfall.
-func (r *Rebalancer) throttle(bytes int64) {
+// budget and sleeps the shortfall. The sleep respects ctx so a
+// SIGTERM-driven cancel unwinds the rebalancer promptly instead of
+// blocking for up to piece_size / BytesPerSecond seconds.
+func (r *Rebalancer) throttle(ctx context.Context, bytes int64) error {
 	if r.cfg.BytesPerSecond <= 0 {
-		return
+		return nil
 	}
 	d := time.Duration(float64(bytes) / float64(r.cfg.BytesPerSecond) * float64(time.Second))
-	if d > 0 {
-		time.Sleep(d)
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
