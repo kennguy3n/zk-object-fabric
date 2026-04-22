@@ -1,11 +1,14 @@
 import { expect, test } from "@playwright/test";
 
-import { seedAuth } from "./helpers";
+import { requireGateway, seedAuth } from "./helpers";
 
 // buckets.spec.ts exercises the bucket list CRUD flow: the page
 // renders existing buckets, the "Create bucket" action posts to
 // /api/v1/buckets, and the delete action issues a DELETE on the
-// bucket-specific path.
+// bucket-specific path. Requires CONSOLE_E2E=1 and a running
+// gateway; see helpers.ts.
+
+requireGateway();
 
 test.describe("buckets", () => {
   test.beforeEach(async ({ page }) => {

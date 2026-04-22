@@ -1,11 +1,14 @@
 import { expect, test } from "@playwright/test";
 
-import { seedAuth } from "./helpers";
+import { requireGateway, seedAuth } from "./helpers";
 
 // b2b-cells.spec.ts verifies the dedicated-cells page is visible
 // only to tenants on a dedicated contract. The frontend gates the
 // route on tenant.contractType; B2C tenants should see a 404 or
-// redirect.
+// redirect. Requires CONSOLE_E2E=1 and a running gateway; see
+// helpers.ts.
+
+requireGateway();
 
 test.describe("dedicated cells", () => {
   test("hidden for b2c tenants", async ({ page }) => {

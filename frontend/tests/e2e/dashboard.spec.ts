@@ -1,11 +1,14 @@
 import { expect, test } from "@playwright/test";
 
-import { seedAuth } from "./helpers";
+import { requireGateway, seedAuth } from "./helpers";
 
 // dashboard.spec.ts verifies that the dashboard renders the three
 // usage stat cards (storage / requests / egress) and that the SSE
 // stream wired in DashboardPage.tsx opens a connection to
-// /api/v1/usage/stream/{tenantID}.
+// /api/v1/usage/stream/{tenantID}. Requires CONSOLE_E2E=1 and a
+// running gateway; see helpers.ts.
+
+requireGateway();
 
 test.describe("dashboard", () => {
   test.beforeEach(async ({ page }) => {

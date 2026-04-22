@@ -35,6 +35,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -63,6 +64,14 @@ type TenantStore interface {
 	// initial API key pair. Implementations should reject a
 	// tenant ID that is already registered.
 	CreateTenant(t tenant.Tenant) error
+
+	// DeleteTenant removes a tenant record by ID. The signup
+	// handler calls this to roll back an in-flight signup whose
+	// subsequent steps (CreateUser, AddAPIKey, IssueToken) failed
+	// so a racing duplicate-email signup does not leave orphaned
+	// tenant records behind. Implementations should treat a
+	// missing tenantID as a no-op rather than an error.
+	DeleteTenant(tenantID string) error
 }
 
 // UsageQuery is the interface the console uses to summarize per-
@@ -183,9 +192,20 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	tokens := h.cfg.Tokens
 	if tokens == nil {
+		// MemoryTokenStore is process-local and loses every
+		// issued token on restart; it is safe for dev / tests
+		// but NOT for production deploys behind a load
+		// balancer where different replicas must agree on
+		// which tokens are valid. Log loudly so an operator
+		// running the gateway without wiring Tokens in
+		// config.yaml sees the warning at startup.
+		log.Printf("console: Tokens not configured; falling back to in-memory MemoryTokenStore — DO NOT use in production")
 		tokens = NewMemoryTokenStore()
 	}
 	if h.cfg.Auth != nil {
+		if _, ok := h.cfg.Auth.(*MemoryAuthStore); ok {
+			log.Printf("console: Auth is a MemoryAuthStore — DO NOT use in production; wire a persistent AuthStore")
+		}
 		auth := NewAuthHandler(AuthConfig{
 			Tenants:     h.cfg.Tenants,
 			Auth:        h.cfg.Auth,
@@ -200,6 +220,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	if h.cfg.Usage != nil {
 		sse := NewUsageStreamHandler(UsageStreamConfig{
 			Usage:    h.cfg.Usage,
+			Tokens:   tokens,
 			Interval: h.cfg.UsageStreamInterval,
 			Window:   h.cfg.usageStreamWindowEffective(),
 			Now:      h.cfg.Now,

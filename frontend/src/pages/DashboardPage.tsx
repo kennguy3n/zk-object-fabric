@@ -35,7 +35,7 @@ function usageFromStreamEvent(ev: UsageStreamEvent): UsageSnapshot {
 }
 
 export function DashboardPage() {
-  const { tenant } = useAuth();
+  const { tenant, token } = useAuth();
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
@@ -58,7 +58,12 @@ export function DashboardPage() {
   useEffect(() => {
     if (!tenant?.id) return;
     if (typeof EventSource === "undefined") return;
-    const url = `/api/v1/usage/stream/${encodeURIComponent(tenant.id)}`;
+    if (!token) return;
+    // EventSource cannot set an Authorization header, so the SSE
+    // endpoint accepts the bearer token on the query string. The
+    // backend (sse_handler.go) validates the token and rejects
+    // tokens bound to a different tenant than the URL path.
+    const url = `/api/v1/usage/stream/${encodeURIComponent(tenant.id)}?token=${encodeURIComponent(token)}`;
     const es = new EventSource(url, { withCredentials: false });
     setStreaming(true);
     const onUsage = (ev: MessageEvent) => {
@@ -66,6 +71,11 @@ export function DashboardPage() {
         const frame = JSON.parse(ev.data) as UsageStreamEvent;
         setUsage(usageFromStreamEvent(frame));
         setError(null);
+        // EventSource transparently reconnects after transport
+        // errors; the first usage frame delivered after a
+        // reconnect is the signal that the stream is healthy
+        // again, so re-raise the live badge here.
+        setStreaming(true);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
@@ -85,7 +95,7 @@ export function DashboardPage() {
       es.close();
       setStreaming(false);
     };
-  }, [tenant?.id]);
+  }, [tenant?.id, token]);
 
   return (
     <div className="stack">

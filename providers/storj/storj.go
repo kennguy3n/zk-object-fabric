@@ -106,22 +106,18 @@ type Provider struct {
 	project UplinkProject
 }
 
-// New opens a real storj.io/uplink.Project against cfg and wraps it
-// in a Provider. It is the production entry point.
-//
-// TODO(storj-wiring): actually dial storj.io/uplink here. The
-// scaffold returns an error to keep main.go from silently booting
-// with a no-op backend until the dependency is added.
-func New(cfg Config) (*Provider, error) {
-	if err := cfg.validate(); err != nil {
-		return nil, err
-	}
-	return nil, errors.New("storj: uplink dialer not wired; use NewWithUplink")
-}
-
 // NewWithUplink wraps a caller-supplied UplinkProject. Tests use
 // this to exercise the adapter against an in-memory fake; operators
-// use it to inject a pre-dialed *uplink.Project.
+// will use it to inject a pre-dialed *uplink.Project once the
+// storj.io/uplink dependency is added to the module graph (tracked
+// in the Phase 4 roadmap).
+//
+// A plain New(cfg) entry point is intentionally omitted: it would
+// have to either pull in storj.io/uplink (not yet in go.mod) or
+// return an error on every call, neither of which main.go can use.
+// Keeping the only constructor explicit about the uplink dependency
+// makes the missing-wiring failure a compile-time break in
+// cmd/gateway/main.go rather than a silent startup-time error.
 func NewWithUplink(cfg Config, project UplinkProject) (*Provider, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err

@@ -1,4 +1,22 @@
-import type { Page } from "@playwright/test";
+import { test, type Page } from "@playwright/test";
+
+// The e2e suite is a scaffold: every spec is gated on the
+// CONSOLE_E2E=1 environment variable so `npm run test:e2e` does not
+// run against a nonexistent gateway in CI, and `npm run build`
+// never tries to execute it. Operators opt in by starting
+// ./cmd/gateway and the Vite preview (or setting
+// PLAYWRIGHT_BASE_URL) and then running `CONSOLE_E2E=1 npm run
+// test:e2e`. See frontend/tests/e2e/README.md for the full
+// runbook.
+export const e2eEnabled = process.env.CONSOLE_E2E === "1";
+
+// requireGateway skips the current suite when CONSOLE_E2E is not
+// set. Call it from the top level of every spec file so the
+// suite reports as "skipped" rather than "passed" in a
+// no-gateway run, which would otherwise mask genuine regressions.
+export function requireGateway(): void {
+  test.skip(!e2eEnabled, "CONSOLE_E2E=1 required to run console e2e suite");
+}
 
 // seedAuth injects a fake tenant + token into sessionStorage so
 // tests that exercise authenticated routes do not depend on the

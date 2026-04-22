@@ -1,11 +1,14 @@
 import { expect, test } from "@playwright/test";
 
-import { seedAuth } from "./helpers";
+import { requireGateway, seedAuth } from "./helpers";
 
 // placement.spec.ts exercises the placement-policy YAML editor.
 // The editor is a textarea backed by the canonical YAML representation
 // documented in docs/PROPOSAL.md §3.6; round-tripping a known
-// document should not modify its contents.
+// document should not modify its contents. Requires CONSOLE_E2E=1
+// and a running gateway; see helpers.ts.
+
+requireGateway();
 
 const SAMPLE_POLICY = `name: p_country_strict
 version: 1

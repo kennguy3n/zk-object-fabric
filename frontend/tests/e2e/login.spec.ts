@@ -1,14 +1,14 @@
 import { expect, test } from "@playwright/test";
 
+import { requireGateway } from "./helpers";
+
 // login.spec.ts covers the B2C self-service signup / login flow the
 // gateway exposes at /api/v1/auth/{signup,login}. The suite runs
-// against the Vite preview build defined in playwright.config.ts.
-//
-// The tests assume the gateway is reachable at the same origin as
-// the preview build. When running locally without a gateway the
-// preview server falls through to a 404 on /api/v1/auth/* and the
-// network assertions below fail — that is the expected signal that
-// the operator forgot to boot `./cmd/gateway`.
+// against the Vite preview build defined in playwright.config.ts
+// and requires a live gateway on the same origin — see the
+// CONSOLE_E2E gate in helpers.ts.
+
+requireGateway();
 
 test.describe("auth flow", () => {
   test("renders the login page at /login", async ({ page }) => {

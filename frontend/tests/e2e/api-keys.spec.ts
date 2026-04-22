@@ -1,12 +1,15 @@
 import { expect, test } from "@playwright/test";
 
-import { seedAuth } from "./helpers";
+import { requireGateway, seedAuth } from "./helpers";
 
 // api-keys.spec.ts covers the API-key management page. The
 // important invariant is that a freshly created key reveals the
 // secret exactly once, then subsequent reads return only the access
 // key — mirroring the backend contract in
-// api/console/handler.go:createAPIKey.
+// api/console/handler.go:createAPIKey. Requires CONSOLE_E2E=1 and
+// a running gateway; see helpers.ts.
+
+requireGateway();
 
 test.describe("api keys", () => {
   test.beforeEach(async ({ page }) => {

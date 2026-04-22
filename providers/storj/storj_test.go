@@ -136,19 +136,21 @@ func newTestProvider(t *testing.T) (*Provider, *fakeUplink) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	if _, err := New(Config{}); err == nil {
+	fake := newFakeUplink()
+	// NewWithUplink is the only constructor the package exposes.
+	// It runs Config.validate() before touching the uplink project
+	// so every validation failure below surfaces from that call.
+	if _, err := NewWithUplink(Config{}, fake); err == nil {
 		t.Fatal("expected error for empty config")
 	}
-	if _, err := New(Config{AccessGrant: "g"}); err == nil {
+	if _, err := NewWithUplink(Config{AccessGrant: "g"}, fake); err == nil {
 		t.Fatal("expected error for missing bucket")
-	}
-	// New always returns an error today (no uplink wiring) — the
-	// validation path is the interesting one.
-	if _, err := New(Config{AccessGrant: "g", Bucket: "b"}); err == nil {
-		t.Fatal("expected scaffold error from New")
 	}
 	if _, err := NewWithUplink(Config{AccessGrant: "g", Bucket: "b"}, nil); err == nil {
 		t.Fatal("expected error for nil project")
+	}
+	if _, err := NewWithUplink(Config{AccessGrant: "g", Bucket: "b"}, fake); err != nil {
+		t.Fatalf("expected success for valid config with fake uplink: %v", err)
 	}
 }
 

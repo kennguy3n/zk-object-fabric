@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -189,18 +190,31 @@ type signupRequest struct {
 // TenantSummary is the tenant subset returned to the SPA on signup /
 // login. It matches frontend/src/api/types.ts `Tenant`.
 type TenantSummary struct {
-	ID                         string                 `json:"id"`
-	Name                       string                 `json:"name"`
-	ContractType               tenant.ContractType    `json:"contractType"`
-	LicenseTier                tenant.LicenseTier     `json:"licenseTier"`
-	PlacementDefaultPolicyRef  string                 `json:"placementDefaultPolicyRef"`
-	Budgets                    TenantBudgetsSummary   `json:"budgets"`
+	ID                        string               `json:"id"`
+	Name                      string               `json:"name"`
+	ContractType              tenant.ContractType  `json:"contractType"`
+	LicenseTier               tenant.LicenseTier   `json:"licenseTier"`
+	PlacementDefaultPolicyRef string               `json:"placementDefaultPolicyRef"`
+	Budgets                   TenantBudgetsSummary `json:"budgets"`
+	// CreatedAt echoes the time the tenant record was first
+	// minted. The SPA's Tenant.createdAt field is populated from
+	// this value and is informational only — authorization never
+	// depends on it.
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // TenantBudgetsSummary is the budgets slice the frontend dashboard
 // renders. The full tenant.Budgets structure has additional operator
 // knobs that should not leak to the SPA.
 type TenantBudgetsSummary struct {
+	// RequestsPerSec is the steady-state request rate ceiling
+	// the gateway fleet enforces. Mirrors tenant.Budgets.RequestsPerSec.
+	RequestsPerSec int `json:"requestsPerSec"`
+	// BurstRequests is the short-window burst allowance the rate
+	// limiter permits above RequestsPerSec. The B2C default is
+	// 2 × RequestsPerSec; operators override it per tenant.
+	BurstRequests int `json:"burstRequests"`
+	// EgressTBMonth is the soft monthly egress cap in TB.
 	EgressTBMonth float64 `json:"egressTbMonth"`
 }
 
@@ -322,7 +336,10 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 
 	// Short-circuit duplicate emails before we mint a tenant ID so
 	// a retried signup does not litter the tenant store with
-	// orphan records.
+	// orphan records. This is a fast path only — the
+	// authoritative uniqueness check happens inside CreateUser
+	// below, which races-safely rejects duplicates and triggers
+	// the rollback block that follows.
 	if _, _, exists := h.cfg.Auth.LookupUser(req.Email); exists {
 		writeError(w, http.StatusConflict, "email is already registered")
 		return
@@ -338,11 +355,25 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "create tenant: "+err.Error())
 		return
 	}
+	// rollbackTenant removes the tenant record the request just
+	// created. Every failure path between CreateTenant and the
+	// final writeJSON calls this so a losing racer in a concurrent
+	// duplicate-email signup — or a transient CreateUser /
+	// AddAPIKey / IssueToken failure — does not leave an orphaned
+	// tenant record behind. Best-effort: a DeleteTenant error is
+	// logged, not returned, because the original request failure
+	// is the more useful signal for the caller.
+	rollbackTenant := func(reason string) {
+		if derr := h.cfg.Tenants.DeleteTenant(tenantID); derr != nil {
+			log.Printf("console: signup rollback (%s) failed to delete tenant %q: %v", reason, tenantID, derr)
+		}
+	}
 
 	var passwordHash string
 	if req.OAuthToken == "" {
 		hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 		if err != nil {
+			rollbackTenant("hash password")
 			writeError(w, http.StatusInternalServerError, "hash password: "+err.Error())
 			return
 		}
@@ -357,16 +388,22 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 	// provider-issued subject identifier in AuthStore so subsequent
 	// logins can be re-authenticated without a password.
 	if err := h.cfg.Auth.CreateUser(req.Email, passwordHash, tenantID); err != nil {
+		// CreateUser is the authoritative email-uniqueness
+		// check. A concurrent signup that lost the race gets
+		// here and must not leave its tenant record behind.
+		rollbackTenant("create user")
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 
 	accessKey, secretKey, err := h.cfg.GenerateKey()
 	if err != nil {
+		rollbackTenant("generate key")
 		writeError(w, http.StatusInternalServerError, "generate key: "+err.Error())
 		return
 	}
 	if err := h.cfg.Tenants.AddAPIKey(tenantID, accessKey, secretKey); err != nil {
+		rollbackTenant("register key")
 		writeError(w, http.StatusInternalServerError, "register key: "+err.Error())
 		return
 	}
@@ -389,15 +426,17 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 
 	token, err := h.cfg.Tokens.IssueToken(tenantID)
 	if err != nil {
+		rollbackTenant("issue token")
 		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
 		return
 	}
+	createdAt := h.cfg.Now()
 	writeJSON(w, http.StatusCreated, AuthResponse{
-		Tenant:    summarizeTenant(newTenant),
+		Tenant:    summarizeTenantAt(newTenant, createdAt),
 		Token:     token,
 		AccessKey: accessKey,
 		SecretKey: secretKey,
-		CreatedAt: h.cfg.Now(),
+		CreatedAt: createdAt,
 	})
 }
 
@@ -480,6 +519,17 @@ func defaultB2CTenant(id, name string) tenant.Tenant {
 }
 
 func summarizeTenant(t tenant.Tenant) TenantSummary {
+	return summarizeTenantAt(t, time.Time{})
+}
+
+// summarizeTenantAt is the createdAt-aware variant summarizeTenant
+// delegates to. The signup handler passes the just-minted timestamp
+// so the SPA renders a valid ISO date on the tenant card; the login
+// handler uses the zero value because the tenant.Tenant record does
+// not carry a persisted creation timestamp yet (the Phase 4 Postgres
+// schema will populate it via a column default).
+func summarizeTenantAt(t tenant.Tenant, createdAt time.Time) TenantSummary {
+	burst := 2 * t.Budgets.RequestsPerSec
 	return TenantSummary{
 		ID:                        t.ID,
 		Name:                      t.Name,
@@ -487,8 +537,11 @@ func summarizeTenant(t tenant.Tenant) TenantSummary {
 		LicenseTier:               t.LicenseTier,
 		PlacementDefaultPolicyRef: t.PlacementDefault.PolicyRef,
 		Budgets: TenantBudgetsSummary{
-			EgressTBMonth: t.Budgets.EgressTBMonth,
+			RequestsPerSec: t.Budgets.RequestsPerSec,
+			BurstRequests:  burst,
+			EgressTBMonth:  t.Budgets.EgressTBMonth,
 		},
+		CreatedAt: createdAt,
 	}
 }
 

@@ -66,6 +66,13 @@ func (s *fakeTenantStore) CreateTenant(t tenant.Tenant) error {
 	return nil
 }
 
+func (s *fakeTenantStore) DeleteTenant(tenantID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tenants, tenantID)
+	return nil
+}
+
 // fakeUsage is a UsageQuery that returns pre-canned counter maps.
 type fakeUsage struct {
 	result map[string]uint64

@@ -40,6 +40,14 @@ type TenantStore interface {
 	// calls this before minting an initial API key pair via
 	// AddBinding.
 	CreateTenant(t tenant.Tenant) error
+
+	// DeleteTenant removes the tenant record registered under
+	// tenantID. It is used by the tenant-console signup handler
+	// to roll back a half-finished signup so a concurrent
+	// duplicate-email race cannot leave an orphaned tenant
+	// record behind. Implementations should treat a missing
+	// tenantID as a no-op (return nil) rather than an error.
+	DeleteTenant(tenantID string) error
 }
 
 // MemoryTenantStore is the Phase 2 in-memory TenantStore.
@@ -79,6 +87,22 @@ func (s *MemoryTenantStore) CreateTenant(t tenant.Tenant) error {
 		}
 	}
 	s.tenants[t.ID] = t
+	return nil
+}
+
+// DeleteTenant removes the tenant record registered via
+// CreateTenant. It is idempotent: deleting an unknown tenantID is a
+// no-op. Bindings keyed by access key are left alone so the signup
+// rollback path does not accidentally revoke a concurrent login
+// session that reuses the same tenant ID — callers unwind bindings
+// explicitly via a dedicated revoke path when that is desired.
+func (s *MemoryTenantStore) DeleteTenant(tenantID string) error {
+	if tenantID == "" {
+		return fmt.Errorf("auth: tenant.id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tenants, tenantID)
 	return nil
 }
 

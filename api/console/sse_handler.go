@@ -15,6 +15,16 @@ type UsageStreamConfig struct {
 	// Usage is the query surface the handler polls each tick.
 	Usage UsageQuery
 
+	// Tokens authenticates the caller. The browser's EventSource
+	// API cannot set arbitrary headers, so the SPA passes its
+	// bearer token via the ?token= query parameter; the handler
+	// resolves it here and rejects any request whose token is
+	// missing, unknown, or bound to a different tenant than the
+	// URL path. A nil Tokens store makes the endpoint refuse all
+	// requests rather than falling through to an unauthenticated
+	// stream.
+	Tokens TokenStore
+
 	// Interval is the poll cadence between SSE frames. Defaults
 	// to 5 seconds.
 	Interval time.Duration
@@ -88,9 +98,40 @@ func (h *UsageStreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "usage query not configured")
 		return
 	}
+	if h.cfg.Tokens == nil {
+		// Without a TokenStore the endpoint has no way to
+		// authenticate the caller, so refuse rather than leak
+		// per-tenant usage counters to anyone who knows a
+		// tenant ID.
+		writeError(w, http.StatusServiceUnavailable, "usage stream auth not configured")
+		return
+	}
 	tenantID, ok := parseUsageStreamPath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "expected /api/v1/usage/stream/{tenantID}")
+		return
+	}
+	// EventSource cannot send an Authorization header, so the SPA
+	// mints a short-lived bearer token via /auth/login and passes
+	// it on the query string. We accept the Authorization header
+	// too so non-browser clients (curl, Go tests) can use the
+	// same endpoint without special-casing.
+	token := extractUsageStreamToken(r)
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "missing bearer token")
+		return
+	}
+	boundTenant, ok := h.cfg.Tokens.ResolveToken(token)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid bearer token")
+		return
+	}
+	if boundTenant != tenantID {
+		// The caller's token is valid but authenticates a
+		// different tenant. Return 403 so a probing client
+		// cannot distinguish "tenant does not exist" from
+		// "tenant exists but I'm not allowed to stream it".
+		writeError(w, http.StatusForbidden, "token does not authorize this tenant")
 		return
 	}
 	// SSE requires a ResponseWriter that supports Flush so frames
@@ -179,6 +220,20 @@ func (h *UsageStreamHandler) writeErrorFrame(w http.ResponseWriter, flusher http
 	payload, _ := json.Marshal(errorResponse{Error: err.Error()})
 	_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
 	flusher.Flush()
+}
+
+// extractUsageStreamToken returns the bearer token the caller
+// supplied, preferring the Authorization header when present and
+// falling back to the ?token= query parameter EventSource clients
+// use. It returns an empty string when the caller supplied neither.
+func extractUsageStreamToken(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); h != "" {
+		const prefix = "Bearer "
+		if strings.HasPrefix(h, prefix) {
+			return strings.TrimSpace(h[len(prefix):])
+		}
+	}
+	return strings.TrimSpace(r.URL.Query().Get("token"))
 }
 
 // parseUsageStreamPath extracts the tenant ID from
