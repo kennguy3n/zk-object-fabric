@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -151,7 +152,25 @@ func (p *Provider) PutPiece(ctx context.Context, pieceID string, r io.Reader, op
 		in.IfNoneMatch = aws.String("*")
 	}
 
-	out, err := p.client.PutObject(ctx, in)
+	// Swap the default payload-hash middleware for the
+	// UNSIGNED-PAYLOAD variant so PutPiece works with any
+	// io.Reader. Without this the signer attempts to hash the
+	// body up-front and then seek back to the start to replay
+	// it on the wire; non-seekable streams (the
+	// r.Body from a multipart part request, a LimitReader
+	// wrapping the request body, etc.) fail with "failed to
+	// compute payload hash: failed to seek body to start".
+	//
+	// This is the AWS SDK v2 documented escape hatch for
+	// non-AWS S3-compatible endpoints that are happy with
+	// UNSIGNED-PAYLOAD as long as the rest of the SigV4
+	// envelope is valid. Backend integrity is still verified
+	// by ETag comparison on the caller side, so dropping the
+	// content hash here is not a security regression for the
+	// gateway.
+	out, err := p.client.PutObject(ctx, in, s3.WithAPIOptions(
+		v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
+	))
 	if err != nil {
 		return providers.PutResult{}, fmt.Errorf("s3_generic: put %s/%s: %w", p.cfg.Bucket, pieceID, err)
 	}

@@ -3,7 +3,7 @@
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 3 — Beta Cell (in progress)
-- **Last updated**: 2026-04-22 (Phase 3 multipart + erasure-coding landed: real S3 multipart upload (`CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` / `AbortMultipartUpload` / `ListMultipartUploads`) in `api/s3compat/multipart_handler.go` backed by `api/s3compat/multipart/store.go`, with multipart-aware GET assembly in `api/s3compat/erasure_coding.go`; clean-room Reed-Solomon encoder in `metadata/erasure_coding/encoder.go` + profile registry in `metadata/erasure_coding/registry.go`; EC write/read paths wired into `api/s3compat/handler.go` via `putErasureCoded` / `getErasureCoded` when `PlacementPolicy.ErasureProfile` is set, with rollback on failure; manifest `Piece` extended with `PartNumber`, `StripeIndex`, `ShardIndex`, `ShardKind`; `Handler.Config` now takes `Multipart` and `ErasureCoding`; `cmd/gateway/main.go` wires the in-memory multipart store and default profile registry; `tests/s3_compat/suite_test.go` covers multipart round-trip, multipart abort, and EC (6+2) round-trip. Phase 3 foundations — `DiskCache`, `ClickHouseSink`, gateway health monitor, and BYOC adapter entrypoints — remain landed from PR 1.)
+- **Last updated**: 2026-04-22 (Phase 3 Ceph RGW compliance landed: the full `TestSuite_CephRGW` subtest matrix — PUT / GET / HEAD / DELETE, ranged GET (prefix / middle / tail), LIST prefix, idempotent DELETE, missing-key 404, presigned GET, multipart-like overwrite, multipart round-trip, multipart abort, and 6+2 erasure-coded round-trip — all pass against a live Ceph Reef RGW at `http://127.0.0.1:8888` (`zkof-ceph-compliance` bucket). To get the AWS SDK v2 client to talk to a non-AWS S3 endpoint with a non-seekable `io.Reader` piece body, `providers/s3_generic/generic.go#PutPiece` now per-call swaps in `v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` (UNSIGNED-PAYLOAD signing); this keeps the SigV4 envelope intact without forcing the body to be seekable, which `handler.go` and `multipart_handler.go` cannot guarantee for request-sourced streams. Backend integrity is still verified by ETag on the gateway side. Phase 3 foundations (`DiskCache`, `ClickHouseSink`, health monitor, BYOC adapter entrypoints) and Phase 3 multipart + EC remain landed from PRs 1 + 2.)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -282,15 +282,25 @@ Checklist:
       media libraries, sovereign storage).
 - [ ] End-to-end migration dry run: move a beta bucket from Wasabi
       to the first local cell without customer-visible changes.
-- [ ] Run S3 compliance test suite against `ceph_rgw` adapter —
-      100% pass required before production traffic. Entrypoint
-      `TestSuite_CephRGW` is in place in `tests/s3_compat/suite_test.go`
-      and runs the full `Run(t, setup)` suite when
-      `CEPH_RGW_ENDPOINT` is set; it skips otherwise so CI stays
-      green without a Ceph cluster. Companion entrypoints
+- [x] Run S3 compliance test suite against `ceph_rgw` adapter —
+      100% pass required before production traffic. Executed
+      against a live Ceph Reef RGW (quay.io/ceph/demo:latest-reef,
+      `127.0.0.1:8888`, bucket `zkof-ceph-compliance`); the full
+      `Run(t, Setup)` subtest matrix in
+      `tests/s3_compat/suite_test.go` passes (PUT/GET/HEAD/DELETE,
+      range GET prefix/middle/tail, LIST, idempotent DELETE,
+      missing-key 404, presigned GET, multipart-like overwrite,
+      multipart round-trip, multipart abort, and 6+2 erasure-
+      coded round-trip). Adapter fix: `providers/s3_generic/
+      generic.go#PutPiece` now per-call applies
+      `v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` so
+      the AWS SDK v2 signer accepts a non-seekable `io.Reader`
+      body against non-AWS S3-compatible endpoints (Ceph RGW,
+      Backblaze B2, Cloudflare R2). Captured test log:
+      `tests/s3_compat/ceph_compliance.log`. Companion entrypoints
       `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, and
       `TestSuite_AWSS3` gate BYOC / cloud adapter validation on
-      the same env-var pattern.
+      the same env-var pattern and inherit the same PutPiece fix.
 - [ ] Run S3 compliance test suite during a live Wasabi → Ceph RGW
       migration with beta customers.
 - [x] Gateway fleet node health monitor (deferred from Phase 2):
