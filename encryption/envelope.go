@@ -11,17 +11,21 @@ import "fmt"
 // EncryptionMode names the operating mode for an object's encryption.
 type EncryptionMode string
 
+// Mode string values are the canonical ones used across
+// metadata.EncryptionConfig.Mode and placement_policy.EncryptionSpec
+// so envelope / manifest / policy all round-trip through the same
+// vocabulary.
 const (
 	// StrictZK: client SDK encrypts. Plaintext keys never reach the
 	// service. This is the default and the marketed "zero-knowledge"
 	// mode.
-	StrictZK EncryptionMode = "strict_zk"
+	StrictZK EncryptionMode = "client_side"
 
 	// ManagedEncrypted: the Linode gateway encrypts. The gateway can
 	// see plaintext in memory during request handling. Per
 	// PROPOSAL.md §3.7 this must be sold as "confidential managed
 	// storage", not as zero-knowledge.
-	ManagedEncrypted EncryptionMode = "managed_encrypted"
+	ManagedEncrypted EncryptionMode = "managed"
 
 	// PublicDistribution: ciphertext at rest, served as plaintext at
 	// the edge. Useful for public assets, media, and downloads where

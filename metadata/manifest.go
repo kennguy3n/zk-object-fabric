@@ -28,9 +28,11 @@ type ObjectManifest struct {
 
 // EncryptionConfig describes how the object is encrypted.
 //
-// Mode values:
-//   - "client_side": strict zero-knowledge, customer-held DEK
-//   - "managed":     gateway-side encryption (confidential managed storage)
+// Mode values (shared with encryption.EncryptionMode and
+// placement_policy.EncryptionSpec):
+//   - "client_side":         strict zero-knowledge, customer-held DEK
+//   - "managed":             gateway-side encryption (confidential managed storage)
+//   - "public_distribution": ciphertext at rest, plaintext at the edge
 type EncryptionConfig struct {
 	Mode              string `json:"mode"`
 	Algorithm         string `json:"algorithm"`
