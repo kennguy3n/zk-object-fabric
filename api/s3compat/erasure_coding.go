@@ -204,6 +204,12 @@ func (h *Handler) getErasureCoded(
 				ShardIndex:  p.ShardIndex,
 				Kind:        shardKindFromManifest(p.ShardKind),
 			})
+			if losses[p.StripeIndex] > tolerance {
+				writeError(w, http.StatusBadGateway, "DataLoss",
+					fmt.Sprintf("stripe %d exceeded parity tolerance: backend %q not registered", p.StripeIndex, p.Backend),
+					r.URL.Path)
+				return
+			}
 			continue
 		}
 		body, getErr := prov.GetPiece(r.Context(), p.PieceID, nil)
@@ -291,6 +297,13 @@ func shardKindFromManifest(s string) erasure_coding.ShardKind {
 // piece in ascending PartNumber order. Range reads are not yet
 // supported on multipart manifests; S3 SDKs do not rely on ranged
 // reads for multipart downloads, so this is a Phase 4 workstream.
+//
+// All piece backends are verified up front so an unknown backend
+// fails fast with a 502 instead of a silently-truncated body. A
+// GetPiece failure mid-stream can still truncate the response
+// (the headers are already on the wire), but any bytes already
+// written are recorded in the billing sink so the operator has
+// visibility into the partial transfer.
 func (h *Handler) getMultipart(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -309,19 +322,29 @@ func (h *Handler) getMultipart(
 		return pieces[i].PartNumber < pieces[j].PartNumber
 	})
 
+	provs := make([]providers.StorageProvider, len(pieces))
+	for i, p := range pieces {
+		prov, ok := h.cfg.Providers[p.Backend]
+		if !ok {
+			writeError(w, http.StatusBadGateway, "BackendNotRegistered",
+				fmt.Sprintf("part %d references unregistered backend %q", p.PartNumber, p.Backend),
+				r.URL.Path)
+			return
+		}
+		provs[i] = prov
+	}
+
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", manifest.ObjectSize))
 	w.WriteHeader(http.StatusOK)
 
 	var written int64
-	for _, p := range pieces {
-		prov, ok := h.cfg.Providers[p.Backend]
-		if !ok {
-			return
-		}
-		body, err := prov.GetPiece(r.Context(), p.PieceID, nil)
+	for i, p := range pieces {
+		body, err := provs[i].GetPiece(r.Context(), p.PieceID, nil)
 		if err != nil {
-			return
+			// Headers already committed — the best we can do is
+			// stop writing and record the partial transfer.
+			break
 		}
 		n, _ := io.Copy(w, body)
 		_ = body.Close()
