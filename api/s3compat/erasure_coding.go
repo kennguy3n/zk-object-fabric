@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sort"
 
@@ -294,17 +293,18 @@ func shardKindFromManifest(s string) erasure_coding.ShardKind {
 	return erasure_coding.ShardKindData
 }
 
-// getMultipart serves a multipart-assembled object by streaming each
-// piece in ascending PartNumber order. Range reads are not yet
+// getMultipart serves a multipart-assembled object by concatenating
+// each piece in ascending PartNumber order. Range reads are not yet
 // supported on multipart manifests; S3 SDKs do not rely on ranged
 // reads for multipart downloads, so this is a Phase 4 workstream.
 //
-// All piece backends are verified up front so an unknown backend
-// fails fast with a 502 instead of a silently-truncated body. A
-// GetPiece failure mid-stream can still truncate the response
-// (the headers are already on the wire), but any bytes already
-// written are recorded in the billing sink so the operator has
-// visibility into the partial transfer.
+// All piece backends are verified up front, then every piece body is
+// fetched and buffered in memory before the HTTP status line or
+// Content-Length header is committed. This mirrors getErasureCoded:
+// a GetPiece failure surfaces as a clean 502 instead of a
+// silently-truncated response body. The whole-object buffering
+// trade-off matches Phase 3's EC path; streaming multipart GETs
+// are a Phase 4 workstream tracked in docs/PROPOSAL.md §6.
 func (h *Handler) getMultipart(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -314,6 +314,23 @@ func (h *Handler) getMultipart(
 	if r.Header.Get("Range") != "" {
 		writeError(w, http.StatusNotImplemented, "NotImplemented",
 			"range reads on multipart objects are not yet supported", r.URL.Path)
+		return
+	}
+
+	// maxMultipartInMemoryBytes is the hard ceiling on the total
+	// manifest size the pre-fetch path will buffer. Multipart GETs
+	// above this ceiling are rejected up front with 507 so a
+	// pathological request cannot OOM the gateway. Streaming
+	// multipart GETs are a Phase 4 workstream; until that lands
+	// operators should route very large objects through the EC
+	// path or a direct-to-backend presigned URL.
+	const maxMultipartInMemoryBytes int64 = 256 * 1024 * 1024
+
+	if manifest.ObjectSize > maxMultipartInMemoryBytes {
+		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
+			fmt.Sprintf("multipart object of %d bytes exceeds in-memory pre-fetch ceiling of %d bytes",
+				manifest.ObjectSize, maxMultipartInMemoryBytes),
+			r.URL.Path)
 		return
 	}
 
@@ -335,29 +352,56 @@ func (h *Handler) getMultipart(
 		provs[i] = prov
 	}
 
-	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", manifest.ObjectSize))
-	w.WriteHeader(http.StatusOK)
-
-	// Best-effort partial-response handling. The response status
-	// line and Content-Length header are already on the wire, so
-	// we cannot surface a GetPiece failure as a clean 5xx. Instead
-	// we stop writing at the first error, log the offending piece
-	// ID and part number so operators can diagnose the truncation,
-	// and emit billing events for the bytes we actually delivered.
-	// Clients will observe the short read as a truncated body and
-	// the S3 SDK retry logic will take over from there.
-	var written int64
+	// Pre-fetch every piece body into memory so a backend failure
+	// mid-assembly fails cleanly as a 502. Writing the status line
+	// before we hold the full object would force us to truncate on
+	// a late error; the EC path has the same constraint and
+	// resolves it the same way (see getErasureCoded).
+	bodies := make([][]byte, len(pieces))
 	for i, p := range pieces {
 		body, err := provs[i].GetPiece(r.Context(), p.PieceID, nil)
 		if err != nil {
-			log.Printf("s3compat getMultipart: partial transfer for tenant=%q bucket=%q key=%q version=%q part=%d piece=%q bytes_written=%d: %v",
-				tenantID, bucket, manifest.ObjectKey, manifest.VersionID, p.PartNumber, p.PieceID, written, err)
-			break
+			writeError(w, http.StatusBadGateway, "BackendGetFailed",
+				fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, err),
+				r.URL.Path)
+			return
 		}
-		n, _ := io.Copy(w, body)
+		buf, rerr := io.ReadAll(body)
 		_ = body.Close()
-		written += n
+		if rerr != nil {
+			writeError(w, http.StatusBadGateway, "BackendGetFailed",
+				fmt.Sprintf("part %d piece %q: read: %v", p.PartNumber, p.PieceID, rerr),
+				r.URL.Path)
+			return
+		}
+		bodies[i] = buf
+	}
+
+	var total int64
+	for _, b := range bodies {
+		total += int64(len(b))
+	}
+	// Integrity guard: the aggregate of the piece bodies we just
+	// pulled from the backends must match the manifest's recorded
+	// object size. A mismatch points at either manifest corruption
+	// or a backend that served truncated / padded pieces — either
+	// way, the client should see a 502 instead of a correct-looking
+	// 200 with the wrong Content-Length.
+	if manifest.ObjectSize != 0 && total != manifest.ObjectSize {
+		writeError(w, http.StatusBadGateway, "ManifestIntegrityMismatch",
+			fmt.Sprintf("assembled %d bytes but manifest records %d", total, manifest.ObjectSize),
+			r.URL.Path)
+		return
+	}
+
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", total))
+	w.WriteHeader(http.StatusOK)
+
+	var written int64
+	for _, b := range bodies {
+		n, _ := w.Write(b)
+		written += int64(n)
 	}
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)

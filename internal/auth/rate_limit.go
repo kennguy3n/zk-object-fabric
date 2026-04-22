@@ -195,9 +195,19 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 			http.Error(w, "anomaly throttle active", http.StatusTooManyRequests)
 			return
 		}
-		counter := &countingWriter{ResponseWriter: w}
+		// Reuse an upstream countingWriter if an outer middleware
+		// (e.g. AbuseGuard) already wrapped the response. Each
+		// guard's Observe call uses the delta of bytes written
+		// during its own serve window, so re-wrapping would only
+		// add a second pass-through layer without changing the
+		// measured bytes.
+		counter, ok := w.(*countingWriter)
+		if !ok {
+			counter = &countingWriter{ResponseWriter: w}
+		}
+		startBytes := counter.bytes
 		next.ServeHTTP(counter, r)
-		l.Observe(tenantID, counter.bytes)
+		l.Observe(tenantID, counter.bytes-startBytes)
 	})
 }
 

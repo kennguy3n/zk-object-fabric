@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kennguy3n/zk-object-fabric/api/console"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
@@ -32,6 +34,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	pgstore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/postgres"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
+	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 	"github.com/kennguy3n/zk-object-fabric/migration/background_rebalancer"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -120,7 +123,18 @@ func main() {
 			auth.TenantBudgetsLookup(tenantStore),
 			auth.TenantResolverFromAuth(authenticator),
 		)
-		handler = rl.Middleware(mux)
+		rl.AlertSink = billingSink
+		// The abuse guard layers per-tenant egress bandwidth
+		// budgets, 2x-of-baseline anomaly detection, and the
+		// CDN-shielding gate in front of the S3 handler. It
+		// shares the authenticator's tenant view with the rate
+		// limiter so both guards see the same identity.
+		ag := auth.NewAbuseGuard(
+			auth.TenantLookupFromStore(tenantStore),
+			auth.TenantResolverFromAuth(authenticator),
+		)
+		ag.AlertSink = billingSink
+		handler = ag.Middleware(rl.Middleware(mux))
 	}
 
 	srv := &http.Server{
@@ -129,6 +143,13 @@ func main() {
 		ReadTimeout:  cfg.Gateway.ReadTimeout.ToDuration(),
 		WriteTimeout: cfg.Gateway.WriteTimeout.ToDuration(),
 	}
+
+	// Console API: separate HTTP surface for the tenant console
+	// (react frontend in frontend/). It runs on its own listener
+	// so a saturated S3 data plane cannot starve the management
+	// controls operators use to diagnose it. The default address
+	// is :8081 when the operator has not overridden it in config.
+	consoleSrv := startConsoleAPI(cfg, tenantStore, billingSink)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -155,6 +176,13 @@ func main() {
 				log.Printf("gateway: close billing sink: %v", err)
 			}
 			billingCancel()
+		}
+		if consoleSrv != nil {
+			consoleCtx, consoleCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := consoleSrv.Shutdown(consoleCtx); err != nil {
+				log.Printf("gateway: console shutdown: %v", err)
+			}
+			consoleCancel()
 		}
 		signalBus.Close()
 		cancelWorker()
@@ -442,6 +470,94 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 		}()
 	}
 	return mon
+}
+
+func startConsoleAPI(
+	cfg config.Config,
+	tenantStore *auth.MemoryTenantStore,
+	billingSink billing.BillingSink,
+) *http.Server {
+	if cfg.Console.ListenAddr == "" {
+		return nil
+	}
+	// Adapter: LookupTenant returns only the Tenant value so the
+	// secret key stays inside the auth package. AddAPIKey wires
+	// new bindings straight back into the tenant store the
+	// authenticator already consults.
+	tenants := &consoleTenantAdapter{store: tenantStore}
+	// Usage adapter: if the billing sink is a ClickHouse sink it
+	// satisfies console.UsageQuery directly; otherwise we hand
+	// the console a no-op stub that returns an empty map so the
+	// frontend still renders a dashboard shell.
+	var usage console.UsageQuery = noopUsageQuery{}
+	if uq, ok := billingSink.(console.UsageQuery); ok {
+		usage = uq
+	}
+	h := console.New(console.Config{
+		Tenants:    tenants,
+		Usage:      usage,
+		Placements: console.NewMemoryPlacementStore(),
+	})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	srv := &http.Server{
+		Addr:         cfg.Console.ListenAddr,
+		Handler:      mux,
+		ReadTimeout:  cfg.Console.ReadTimeout.ToDuration(),
+		WriteTimeout: cfg.Console.WriteTimeout.ToDuration(),
+	}
+	go func() {
+		log.Printf("gateway: console API on %s", cfg.Console.ListenAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("gateway: console listener: %v", err)
+		}
+	}()
+	return srv
+}
+
+// consoleTenantAdapter bridges *auth.MemoryTenantStore to
+// console.TenantStore. It lives in main so the auth package does
+// not have to know about the console API.
+type consoleTenantAdapter struct {
+	store *auth.MemoryTenantStore
+}
+
+func (c *consoleTenantAdapter) LookupTenant(tenantID string) (tenant.Tenant, bool) {
+	b, ok := c.store.LookupByTenantID(tenantID)
+	if !ok {
+		return tenant.Tenant{}, false
+	}
+	return b.Tenant, true
+}
+
+func (c *consoleTenantAdapter) AddAPIKey(tenantID, accessKey, secretKey string) error {
+	b, ok := c.store.LookupByTenantID(tenantID)
+	if !ok {
+		return fmt.Errorf("gateway: tenant %q not found", tenantID)
+	}
+	// Reject duplicate access keys. MemoryTenantStore.AddBinding
+	// silently replaces on collision, which would let a console
+	// caller overwrite the secret for an access key that already
+	// authenticates a different (or the same) tenant — a silent
+	// credential swap the console API must not enable.
+	if _, exists := c.store.LookupByAccessKey(accessKey); exists {
+		return fmt.Errorf("gateway: access key %q is already bound", accessKey)
+	}
+	return c.store.AddBinding(auth.TenantBinding{
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		Tenant:    b.Tenant,
+	})
+}
+
+// noopUsageQuery is the zero-cost fallback used when no ClickHouse
+// sink is wired. It returns an empty counter map so the frontend
+// renders a dashboard shell even in local development.
+type noopUsageQuery struct{}
+
+func (noopUsageQuery) TenantUsage(ctx context.Context, tenantID string, start, end time.Time) (map[string]uint64, error) {
+	return map[string]uint64{}, nil
 }
 
 func buildTenantStore(path string) *auth.MemoryTenantStore {
