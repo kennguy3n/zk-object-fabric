@@ -3,9 +3,11 @@ package background_rebalancer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -148,6 +150,43 @@ func TestRebalancer_StateMachineFullMigration(t *testing.T) {
 	}
 	if stats.PhasesAdvanced != 0 {
 		t.Fatalf("pass 4: phases advanced %d, want 0 (terminal)", stats.PhasesAdvanced)
+	}
+}
+
+// TestRebalancer_ThrottleHonoursContextCancellation asserts that
+// cancelling ctx while throttle is sleeping unblocks the call
+// promptly instead of waiting the full bytes / BytesPerSecond
+// duration. Prior to the Phase 2 hardening pass the throttle used
+// time.Sleep, so a SIGTERM-driven shutdown would block for up to
+// piece_size / BytesPerSecond seconds.
+func TestRebalancer_ThrottleHonoursContextCancellation(t *testing.T) {
+	// 1 B/s against 100 bytes would block for 100 s under
+	// time.Sleep; the ctx-aware timer+select must unblock within
+	// the cancellation grace window instead. The payload is kept
+	// well below the ~9.2e18 ns int64 cap of time.Duration so the
+	// computed sleep duration does not wrap to a non-positive
+	// value (which would bypass the sleep entirely).
+	reb := New(Config{
+		Manifests:      memory.New(),
+		Providers:      map[string]providers.StorageProvider{},
+		BytesPerSecond: 1,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err := reb.throttle(ctx, 100)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("throttle err = %v, want context.Canceled", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("throttle blocked for %v, want < 1s (cancellation must unblock promptly)", elapsed)
 	}
 }
 

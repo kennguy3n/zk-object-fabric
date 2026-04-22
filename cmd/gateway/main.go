@@ -89,7 +89,7 @@ func main() {
 	readRepair := lazy_read_repair.New(registry, store)
 	readRepair.Logger = log.New(os.Stdout, "read_repair ", log.LstdFlags)
 
-	rebalancerDone := startRebalancer(workerCtx, cfg.Migration, store, registry)
+	rebalancerDone := startRebalancer(workerCtx, cfg.Rebalancer, store, registry)
 
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
@@ -145,22 +145,23 @@ func main() {
 }
 
 // startRebalancer spins up the background_rebalancer on a ticker
-// when the gateway config names one or more migration targets. It
-// returns a channel that closes when the rebalancer goroutine has
-// fully drained, or nil when no rebalancer was started. The
-// rebalancer shares ctx with the promotion worker so a SIGTERM-
-// triggered cancelWorker() also stops the rebalancer.
+// when the gateway config enables it and names one or more
+// migration targets. It returns a channel that closes when the
+// rebalancer goroutine has fully drained, or nil when no
+// rebalancer was started. The rebalancer shares ctx with the
+// promotion worker so a SIGTERM-triggered cancelWorker() also
+// stops the rebalancer.
 func startRebalancer(
 	ctx context.Context,
-	mig config.MigrationConfig,
+	rb config.RebalancerConfig,
 	store manifest_store.ManifestStore,
 	registry map[string]providers.StorageProvider,
 ) <-chan struct{} {
-	if len(mig.Targets) == 0 {
+	if !rb.Enabled || len(rb.Targets) == 0 {
 		return nil
 	}
-	targets := make([]background_rebalancer.TenantTarget, 0, len(mig.Targets))
-	for _, t := range mig.Targets {
+	targets := make([]background_rebalancer.TenantTarget, 0, len(rb.Targets))
+	for _, t := range rb.Targets {
 		targets = append(targets, background_rebalancer.TenantTarget{
 			TenantID:       t.TenantID,
 			Bucket:         t.Bucket,
@@ -168,15 +169,15 @@ func startRebalancer(
 			PrimaryBackend: t.PrimaryBackend,
 		})
 	}
-	interval := mig.Interval.ToDuration()
+	interval := rb.Interval.ToDuration()
 	if interval <= 0 {
 		interval = 5 * time.Minute
 	}
-	rb := background_rebalancer.New(background_rebalancer.Config{
+	reb := background_rebalancer.New(background_rebalancer.Config{
 		Manifests:      store,
 		Providers:      registry,
 		Targets:        targets,
-		BytesPerSecond: mig.BytesPerSecond,
+		BytesPerSecond: rb.BytesPerSecond,
 		Logger:         log.New(os.Stdout, "rebalancer ", log.LstdFlags),
 	})
 	done := make(chan struct{})
@@ -185,7 +186,7 @@ func startRebalancer(
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			stats, err := rb.Run(ctx)
+			stats, err := reb.Run(ctx)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("gateway: rebalancer pass: %v", err)
 			}

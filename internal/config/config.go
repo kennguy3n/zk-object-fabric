@@ -58,7 +58,41 @@ type Config struct {
 	Gateway      GatewayConfig      `json:"gateway"`
 	ControlPlane ControlPlaneConfig `json:"control_plane"`
 	Providers    ProvidersConfig    `json:"providers"`
-	Migration    MigrationConfig    `json:"migration"`
+	Rebalancer   RebalancerConfig   `json:"rebalancer"`
+}
+
+// UnmarshalJSON accepts both the canonical "rebalancer" key and the
+// legacy "migration" key for RebalancerConfig. When both are
+// present "rebalancer" wins. This lets operators migrate their
+// gateway config files at their own pace.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	type alias Config
+	aux := struct {
+		*alias
+		Migration *RebalancerConfig `json:"migration,omitempty"`
+	}{alias: (*alias)(c)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	// Fall back to the legacy key only when the canonical
+	// "rebalancer" block was not supplied.
+	if aux.Migration != nil && !rebalancerPresent(data) {
+		c.Rebalancer = *aux.Migration
+	}
+	return nil
+}
+
+// rebalancerPresent reports whether the raw JSON object has an
+// explicit "rebalancer" key. Used to disambiguate "supplied but
+// zero-valued" from "omitted" when picking between the canonical
+// and legacy config keys.
+func rebalancerPresent(data []byte) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	_, ok := raw["rebalancer"]
+	return ok
 }
 
 // GatewayConfig configures the S3-compatible gateway fleet on Linode.
@@ -150,24 +184,44 @@ type AWSS3Config struct {
 	SecretKey string `json:"secret_key"`
 }
 
-// MigrationConfig configures the optional background rebalancer that
-// sweeps manifests in a migration-in-progress state and copies their
-// pieces from the old backend onto the new primary. See
+// RebalancerConfig configures the optional background rebalancer
+// that sweeps manifests in a migration-in-progress state and copies
+// their pieces from the old backend onto the new primary. See
 // migration/background_rebalancer for the semantics.
 //
-// When Targets is empty the rebalancer does not start. Interval
-// controls the gap between full passes; BytesPerSecond caps the
-// steady-state copy bandwidth.
-type MigrationConfig struct {
-	Targets        []MigrationTarget `json:"targets"`
-	BytesPerSecond int64             `json:"bytes_per_second"`
-	Interval       Duration          `json:"interval"`
+// The rebalancer starts only when Enabled is true and Targets is
+// non-empty. Interval controls the gap between full passes;
+// BytesPerSecond caps the steady-state copy bandwidth.
+//
+// Enabled defaults to true when the key is omitted from the config
+// file so existing deployments that only specified targets keep
+// running the rebalancer after this field was introduced. Setting
+// it explicitly to false disables the worker regardless of Targets.
+type RebalancerConfig struct {
+	Enabled        bool               `json:"enabled"`
+	Interval       Duration           `json:"interval"`
+	BytesPerSecond int64              `json:"bytes_per_second"`
+	Targets        []RebalancerTarget `json:"targets"`
 }
 
-// MigrationTarget names a single (tenant, bucket) pair to rebalance
-// along with the source and destination backend names. The backend
-// names must resolve to entries in the gateway's provider registry.
-type MigrationTarget struct {
+// UnmarshalJSON decodes a RebalancerConfig, defaulting Enabled to
+// true when the "enabled" key is omitted. Explicit "enabled": false
+// still disables the worker.
+func (r *RebalancerConfig) UnmarshalJSON(data []byte) error {
+	type alias RebalancerConfig
+	tmp := alias{Enabled: true}
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	*r = RebalancerConfig(tmp)
+	return nil
+}
+
+// RebalancerTarget names a single (tenant, bucket) pair to
+// rebalance along with the source and destination backend names.
+// The backend names must resolve to entries in the gateway's
+// provider registry.
+type RebalancerTarget struct {
 	TenantID       string `json:"tenant_id"`
 	Bucket         string `json:"bucket"`
 	SourceBackend  string `json:"source_backend"`
