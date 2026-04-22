@@ -321,8 +321,8 @@ func TestDelete_IdempotentOnMissing(t *testing.T) {
 
 func TestList_ReturnsPutItems(t *testing.T) {
 	h, _, _, _ := newTestHandler()
-	for i, name := range []string{"a", "b", "c"} {
-		_ = i
+	names := []string{"a", "nested/path/b", "c"}
+	for _, name := range names {
 		req := httptest.NewRequest(http.MethodPut, "/bucket/"+name, bytes.NewReader([]byte(name)))
 		req.ContentLength = int64(len(name))
 		rec := httptest.NewRecorder()
@@ -354,8 +354,29 @@ func TestList_ReturnsPutItems(t *testing.T) {
 	if r.Name != "bucket" {
 		t.Errorf("LIST name = %q, want %q", r.Name, "bucket")
 	}
-	if len(r.Contents) != 3 {
-		t.Errorf("LIST contents = %d, want 3", len(r.Contents))
+	if len(r.Contents) != len(names) {
+		t.Fatalf("LIST contents = %d, want %d", len(r.Contents), len(names))
+	}
+	listed := map[string]int64{}
+	for _, c := range r.Contents {
+		listed[c.Key] = c.Size
+	}
+	for _, name := range names {
+		size, ok := listed[name]
+		if !ok {
+			t.Errorf("LIST missing key %q; got keys %v", name, listed)
+			continue
+		}
+		if size != int64(len(name)) {
+			t.Errorf("LIST size for %q = %d, want %d", name, size, len(name))
+		}
+		// Round-trip: the listed key must be directly usable for GET.
+		getReq := httptest.NewRequest(http.MethodGet, "/bucket/"+name, nil)
+		getRec := httptest.NewRecorder()
+		h.Get(getRec, getReq)
+		if getRec.Code != http.StatusOK {
+			t.Errorf("GET /bucket/%s after LIST status = %d, want 200", name, getRec.Code)
+		}
 	}
 }
 

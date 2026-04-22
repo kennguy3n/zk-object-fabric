@@ -164,6 +164,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	manifest := &metadata.ObjectManifest{
 		TenantID:        tenantID,
 		Bucket:          bucket,
+		ObjectKey:       key,
 		ObjectKeyHash:   hashObjectKey(key),
 		VersionID:       pieceID,
 		ObjectSize:      putRes.SizeBytes,
@@ -385,7 +386,16 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 
 	resp := response{Name: bucket, IsTruncated: page.NextCursor != "", NextContinuationToken: page.NextCursor}
 	for _, m := range page.Manifests {
-		c := content{Key: m.ObjectKeyHash, Size: m.ObjectSize}
+		// Return the opaque object key (plaintext under managed
+		// encryption, ciphertext under strict ZK) so that a follow-up
+		// GET /{bucket}/{key} resolves back to the same manifest.
+		// Fall back to the hash for manifests written before the
+		// ObjectKey field existed.
+		listedKey := m.ObjectKey
+		if listedKey == "" {
+			listedKey = m.ObjectKeyHash
+		}
+		c := content{Key: listedKey, Size: m.ObjectSize}
 		if len(m.Pieces) > 0 {
 			c.ETag = quote(m.Pieces[0].Hash)
 		}

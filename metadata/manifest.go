@@ -14,8 +14,16 @@ import (
 // ObjectManifest is the provider-neutral description of a single
 // customer object. See docs/PROPOSAL.md §3.3.
 type ObjectManifest struct {
-	TenantID        string           `json:"tenant_id"`
-	Bucket          string           `json:"bucket"`
+	TenantID string `json:"tenant_id"`
+	Bucket   string `json:"bucket"`
+	// ObjectKey is the opaque byte-string that identifies the object
+	// within (tenant, bucket). In managed-encryption mode the gateway
+	// sees plaintext S3 keys so this field carries them verbatim; in
+	// strict zero-knowledge mode the client SDK wraps the key with
+	// tenant-held material before PUT so the field carries ciphertext.
+	// Either way, LIST round-trips it back to clients so subsequent
+	// GET/HEAD/DELETE calls can address the object directly.
+	ObjectKey       string           `json:"object_key"`
 	ObjectKeyHash   string           `json:"object_key_hash"`
 	VersionID       string           `json:"version_id"`
 	ObjectSize      int64            `json:"object_size"`
