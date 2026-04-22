@@ -9,6 +9,7 @@
 package s3compat
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -71,6 +73,15 @@ type Config struct {
 
 	// Billing receives usage events. Optional.
 	Billing BillingSink
+
+	// Cache is the L0/L1 hot object cache consulted on the GET path.
+	// Optional; nil disables caching.
+	Cache hot_object_cache.HotObjectCache
+
+	// CachePublisher, when non-nil, receives PromotionSignals on
+	// every cache miss so the promotion worker can decide what to
+	// warm. A *hot_object_cache.SignalBus satisfies this. Optional.
+	CachePublisher hot_object_cache.SignalPublisher
 
 	// NodeID identifies the gateway node emitting billing events.
 	NodeID string
@@ -224,12 +235,13 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		byteRange = rng
 	}
 
-	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
+	body, served, err := h.fetchPiece(r, piece, pieceProvider, byteRange, tenantID, bucket)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
 		return
 	}
 	defer body.Close()
+	_ = served
 
 	if piece.Hash != "" {
 		w.Header().Set("ETag", quote(piece.Hash))
@@ -253,11 +265,67 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	if n > 0 {
 		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
-		// In Phase 2 every GET that misses the cache is also an
-		// origin-egress event. The cache integration will later
-		// subtract hits from this counter.
-		h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
+		if !served {
+			// A cache miss counts toward origin egress; hits are
+			// served from the gateway's local cache and do not
+			// touch the origin.
+			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
+		}
 	}
+}
+
+// fetchPiece consults the hot object cache (if configured) before
+// hitting the backend. Range requests bypass the cache because the
+// cache is keyed by piece, not by byte range. The second return
+// value reports whether the piece came from the cache.
+func (h *Handler) fetchPiece(
+	r *http.Request,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	byteRange *providers.ByteRange,
+	tenantID, bucket string,
+) (io.ReadCloser, bool, error) {
+	if h.cfg.Cache != nil && byteRange == nil {
+		cached, _, err := h.cfg.Cache.Get(r.Context(), piece.PieceID)
+		if err == nil {
+			h.emit(tenantID, bucket, billing.CacheHits, 1)
+			return cached, true, nil
+		}
+	}
+	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
+	if err != nil {
+		return nil, false, err
+	}
+	if h.cfg.Cache != nil && byteRange == nil {
+		h.emit(tenantID, bucket, billing.CacheMisses, 1)
+		buf, rerr := io.ReadAll(body)
+		_ = body.Close()
+		if rerr != nil {
+			return nil, false, rerr
+		}
+		if putErr := h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
+			SizeBytes: int64(len(buf)),
+			Hash:      piece.Hash,
+		}); putErr == nil {
+			h.signalPromotion(piece, tenantID, int64(len(buf)))
+		}
+		return io.NopCloser(bytes.NewReader(buf)), false, nil
+	}
+	return body, false, nil
+}
+
+func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, n int64) {
+	if h.cfg.CachePublisher == nil {
+		return
+	}
+	h.cfg.CachePublisher.Publish(hot_object_cache.PromotionSignal{
+		PieceID:       piece.PieceID,
+		TenantID:      tenantID,
+		ReadBytes:     n,
+		ReadCount:     1,
+		ObservedAt:    h.cfg.Now(),
+		OriginBackend: piece.Backend,
+	})
 }
 
 // Head handles S3 HEAD object.

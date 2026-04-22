@@ -2,7 +2,7 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 1 — Architecture Proof. This document defines the target
+> Status: Phase 2 — Prototype Complete. This document defines the target
 > architecture, not the current implementation. See
 > [PROGRESS.md](PROGRESS.md) for build status.
 

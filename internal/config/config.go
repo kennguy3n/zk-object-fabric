@@ -80,12 +80,17 @@ type ControlPlaneConfig struct {
 	BillingURL  string `json:"billing_url"`
 }
 
-// ProvidersConfig carries per-provider settings. In Phase 1 only
-// Wasabi and local_fs_dev are populated; other providers are
-// placeholders for later phases.
+// ProvidersConfig carries per-provider settings. Phase 2 surfaces
+// the full B2C / B2B / BYOC provider matrix described in
+// docs/STORAGE_INFRA.md. Empty sub-configs mean "do not register
+// this provider".
 type ProvidersConfig struct {
 	Wasabi     WasabiConfig     `json:"wasabi"`
 	LocalFSDev LocalFSDevConfig `json:"local_fs_dev"`
+	CephRGW    CephRGWConfig    `json:"ceph_rgw"`
+	BackblazeB2 BackblazeB2Config `json:"backblaze_b2"`
+	CloudflareR2 CloudflareR2Config `json:"cloudflare_r2"`
+	AWSS3      AWSS3Config      `json:"aws_s3"`
 }
 
 // WasabiConfig configures the Phase 1 primary storage backend.
@@ -101,6 +106,47 @@ type WasabiConfig struct {
 // tests.
 type LocalFSDevConfig struct {
 	RootPath string `json:"root_path"`
+}
+
+// CephRGWConfig configures the Ceph RADOS Gateway backend used for
+// B2B dedicated cells and sovereign placement. See
+// https://docs.ceph.com/en/latest/radosgw/.
+type CephRGWConfig struct {
+	Endpoint  string `json:"endpoint"`
+	Region    string `json:"region"`
+	Bucket    string `json:"bucket"`
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
+	Cell      string `json:"cell"`
+	Country   string `json:"country"`
+}
+
+// BackblazeB2Config configures the Backblaze B2 S3-compatible
+// backend.
+type BackblazeB2Config struct {
+	Endpoint  string `json:"endpoint"`
+	Region    string `json:"region"`
+	Bucket    string `json:"bucket"`
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
+}
+
+// CloudflareR2Config configures the Cloudflare R2 backend.
+type CloudflareR2Config struct {
+	AccountID string `json:"account_id"`
+	Endpoint  string `json:"endpoint"`
+	Bucket    string `json:"bucket"`
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
+}
+
+// AWSS3Config configures the AWS S3 BYOC / disaster-recovery backend.
+type AWSS3Config struct {
+	Region    string `json:"region"`
+	Bucket    string `json:"bucket"`
+	Endpoint  string `json:"endpoint"`
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
 }
 
 // Default returns a minimal, developer-friendly configuration.

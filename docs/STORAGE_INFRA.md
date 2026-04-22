@@ -69,13 +69,13 @@ It answers two questions:
 
 | Adapter | Package | Phase | Role | Status |
 | --- | --- | --- | --- | --- |
-| `wasabi`        | [`providers/wasabi`](../providers/wasabi)               | 1 | B2C primary (cold origin) | Wired on AWS SDK v2. 90-day minimum-storage guardrails shipped. |
-| `local_fs_dev`  | [`providers/local_fs_dev`](../providers/local_fs_dev)   | 1 | Dev / conformance loopback | Wired. Passes the shared conformance suite. |
+| `wasabi`        | [`providers/wasabi`](../providers/wasabi)               | 1 | B2C primary (cold origin) | Wired on AWS SDK v2; registered as default provider in `cmd/gateway`; exercised by the S3 compliance suite via `s3_generic` fake. 90-day minimum-storage guardrails shipped. |
+| `local_fs_dev`  | [`providers/local_fs_dev`](../providers/local_fs_dev)   | 1 | Dev / conformance loopback | Wired; drives the Phase 2 S3 compliance suite (`tests/s3_compat`), the migration suite, and the benchmark runner. |
 | `s3_generic`    | [`providers/s3_generic`](../providers/s3_generic)       | 1 | Shared S3-compatible base | Wired on AWS SDK v2. ETag normalization (PR #6). |
-| `ceph_rgw`      | [`providers/ceph_rgw`](../providers/ceph_rgw)           | 2 | B2B / sovereign primary | Scaffold. Config, constructor, descriptive methods. |
-| `backblaze_b2`  | [`providers/backblaze_b2`](../providers/backblaze_b2)   | 2 | B2C alternative          | Scaffold. |
-| `cloudflare_r2` | [`providers/cloudflare_r2`](../providers/cloudflare_r2) | 2 | B2C hot-egress backend   | Scaffold. |
-| `aws_s3`        | [`providers/aws_s3`](../providers/aws_s3)               | 2 | BYOC / DR-only           | Scaffold. |
+| `ceph_rgw`      | [`providers/ceph_rgw`](../providers/ceph_rgw)           | 2 | B2B / sovereign primary | Scaffold — Config, constructor, Capabilities, CostModel, PlacementLabels. Passes conformance against a fake S3 backend; Phase 3 wires a real RGW cluster. |
+| `backblaze_b2`  | [`providers/backblaze_b2`](../providers/backblaze_b2)   | 2 | B2C alternative          | Scaffold — Config, constructor, descriptive methods. |
+| `cloudflare_r2` | [`providers/cloudflare_r2`](../providers/cloudflare_r2) | 2 | B2C hot-egress backend   | Scaffold — Config, constructor, descriptive methods. |
+| `aws_s3`        | [`providers/aws_s3`](../providers/aws_s3)               | 2 | BYOC / DR-only           | Scaffold — Config, constructor, descriptive methods. |
 
 `wasabi`, `ceph_rgw`, `backblaze_b2`, `cloudflare_r2`, and `aws_s3`
 all embed `s3_generic.Provider` so the API surface is identical; only
