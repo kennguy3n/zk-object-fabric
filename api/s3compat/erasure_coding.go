@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 
@@ -338,12 +339,20 @@ func (h *Handler) getMultipart(
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", manifest.ObjectSize))
 	w.WriteHeader(http.StatusOK)
 
+	// Best-effort partial-response handling. The response status
+	// line and Content-Length header are already on the wire, so
+	// we cannot surface a GetPiece failure as a clean 5xx. Instead
+	// we stop writing at the first error, log the offending piece
+	// ID and part number so operators can diagnose the truncation,
+	// and emit billing events for the bytes we actually delivered.
+	// Clients will observe the short read as a truncated body and
+	// the S3 SDK retry logic will take over from there.
 	var written int64
 	for i, p := range pieces {
 		body, err := provs[i].GetPiece(r.Context(), p.PieceID, nil)
 		if err != nil {
-			// Headers already committed — the best we can do is
-			// stop writing and record the partial transfer.
+			log.Printf("s3compat getMultipart: partial transfer for tenant=%q bucket=%q key=%q version=%q part=%d piece=%q bytes_written=%d: %v",
+				tenantID, bucket, manifest.ObjectKey, manifest.VersionID, p.PartNumber, p.PieceID, written, err)
 			break
 		}
 		n, _ := io.Copy(w, body)

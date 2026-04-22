@@ -346,15 +346,27 @@ func pickDefaultBackend(registry map[string]providers.StorageProvider) string {
 // cache for developer/test flows. The cache capacity is 1 GiB so
 // small dev machines don't fill the disk; operators size it via
 // the eviction policy in Phase 4's config refactor.
+//
+// Production nodes configure cache_path so the NVMe tier survives
+// gateway restarts. Dev and CI environments leave it unset and get
+// an in-memory cache. When cache_path is set but the disk cache
+// cannot be opened (permission error, missing volume, corrupt
+// warm-up), we log a warning and degrade to the memory cache so a
+// single bad disk doesn't knock the gateway offline.
 func buildHotObjectCache(cfg config.Config) (hot_object_cache.HotObjectCache, error) {
 	policy := hot_object_cache.DefaultEvictionPolicy(1 << 30)
 	if cfg.Gateway.CachePath == "" {
 		return hot_object_cache.NewMemoryCache(policy)
 	}
-	return hot_object_cache.NewDiskCache(hot_object_cache.DiskCacheConfig{
+	disk, err := hot_object_cache.NewDiskCache(hot_object_cache.DiskCacheConfig{
 		RootPath: cfg.Gateway.CachePath,
 		Policy:   policy,
 	})
+	if err != nil {
+		log.Printf("gateway: disk cache at %q unavailable (%v); falling back to in-memory cache", cfg.Gateway.CachePath, err)
+		return hot_object_cache.NewMemoryCache(policy)
+	}
+	return disk, nil
 }
 
 // buildBillingSink returns the ClickHouseSink when billing is
