@@ -3,7 +3,7 @@
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Architecture Proof
-- **Last updated**: 2026-04-21
+- **Last updated**: 2026-04-21 (Phase 1 scaffold landed)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -25,16 +25,22 @@ re-debating core decisions.
 
 Checklist:
 
-- [ ] Ratify the Phase 1 stack: AWS (control plane) + Linode (data
-      plane) + Wasabi (storage backend).
+- [x] Ratify the Phase 1 stack: AWS (control plane) + Linode (data
+      plane) + Wasabi (storage backend). Reflected in the code
+      scaffold's AWS / Linode / Wasabi separation
+      (`cmd/gateway`, `providers/wasabi`, `internal/config`).
 - [ ] Confirm that no customer data flows through AWS (contract test
       on control-plane API surface).
 - [ ] Select the Phase 2+ local-DC base (Ceph RGW vs SeaweedFS —
       AGPL options are ruled out).
-- [ ] Define the provider-neutral object manifest format.
-- [ ] Define the encryption envelope (per-object DEK, encrypted
-      manifest, CMK support).
-- [ ] Define the placement policy DSL (YAML schema).
+- [x] Define the provider-neutral object manifest format (implemented
+      in `metadata/manifest.go` with JSON round-trip coverage in
+      `metadata/manifest_test.go`).
+- [x] Define the encryption envelope (per-object DEK, encrypted
+      manifest, CMK support) — implemented in
+      `encryption/envelope.go`.
+- [x] Define the placement policy DSL (YAML schema) — implemented in
+      `metadata/placement_policy/policy.go`.
 - [ ] Define erasure-coding profiles for Phase 2+ (6+2, 8+3, 10+4).
       Note: Phase 1 uses Wasabi's native durability; EC is not needed
       until Phase 2+.
@@ -45,8 +51,10 @@ Checklist:
       network cost).
 - [ ] Define the multi-tenancy model (tenant isolation, billing,
       abuse controls).
-- [ ] Define the migration engine spec (dual-write, lazy migration on
-      read, background rebalancer, migration state machine).
+- [x] Define the migration engine spec (dual-write, lazy migration on
+      read, background rebalancer, migration state machine) — state
+      machine in `migration/state.go` with transition coverage in
+      `migration/state_test.go`.
 - [ ] Specify the Linode cache design (NVMe / block storage sizing,
       promotion rules, range-aligned chunking).
 - [ ] Specify Wasabi fair-use guardrails (egress budgets, per-tenant
