@@ -58,11 +58,11 @@ const (
 // UsageEvent is a single raw event emitted by the gateway. The billing
 // pipeline aggregates these into Counter rows.
 type UsageEvent struct {
-	TenantID    string
-	Bucket      string
-	Dimension   Dimension
-	Delta       uint64
-	ObservedAt  time.Time
+	TenantID     string
+	Bucket       string
+	Dimension    Dimension
+	Delta        uint64
+	ObservedAt   time.Time
 	SourceNodeID string
 }
 

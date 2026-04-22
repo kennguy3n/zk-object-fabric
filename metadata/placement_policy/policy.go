@@ -15,9 +15,9 @@ import (
 // policy. It is designed to round-trip through YAML (yaml.v3 tags) and
 // JSON.
 type Policy struct {
-	Tenant string       `json:"tenant" yaml:"tenant"`
-	Bucket string       `json:"bucket,omitempty" yaml:"bucket,omitempty"`
-	Spec   PolicySpec   `json:"policy" yaml:"policy"`
+	Tenant string     `json:"tenant" yaml:"tenant"`
+	Bucket string     `json:"bucket,omitempty" yaml:"bucket,omitempty"`
+	Spec   PolicySpec `json:"policy" yaml:"policy"`
 }
 
 // PolicySpec is the body of a policy.

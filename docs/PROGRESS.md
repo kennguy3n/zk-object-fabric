@@ -3,7 +3,7 @@
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Architecture Proof
-- **Last updated**: 2026-04-21 (Phase 1 scaffold landed)
+- **Last updated**: 2026-04-22 (Phase 1 complete; Wasabi adapter wired on AWS SDK v2)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -15,7 +15,7 @@ For the technical design, see [PROPOSAL.md](PROPOSAL.md).
 
 ## Phase 1: Architecture Proof (Weeks 1–3)
 
-**Status**: `IN PROGRESS`
+**Status**: `COMPLETE`
 
 **Goal**: lock the architecture on the **AWS control plane + Linode
 data plane + Wasabi storage backend** stack, ratify the
@@ -29,10 +29,16 @@ Checklist:
       plane) + Wasabi (storage backend). Reflected in the code
       scaffold's AWS / Linode / Wasabi separation
       (`cmd/gateway`, `providers/wasabi`, `internal/config`).
-- [ ] Confirm that no customer data flows through AWS (contract test
-      on control-plane API surface).
-- [ ] Select the Phase 2+ local-DC base (Ceph RGW vs SeaweedFS —
-      AGPL options are ruled out).
+- [x] Confirm that no customer data flows through AWS (contract test
+      on control-plane API surface) — implemented in
+      `tests/control_plane/no_data_test.go`, which reflects over every
+      control-plane type (manifest, tenant, placement policy, billing)
+      and rejects any field that could carry raw object bytes.
+- [x] Select the Phase 2+ local-DC base (Ceph RGW vs SeaweedFS —
+      AGPL options are ruled out). Decision: **Ceph RGW** for maximum
+      production maturity; SeaweedFS remains documented as the
+      "faster custom product build" alternative should priorities
+      shift. See the decision-gate table below.
 - [x] Define the provider-neutral object manifest format (implemented
       in `metadata/manifest.go` with JSON round-trip coverage in
       `metadata/manifest_test.go`).
@@ -41,29 +47,53 @@ Checklist:
       `encryption/envelope.go`.
 - [x] Define the placement policy DSL (YAML schema) — implemented in
       `metadata/placement_policy/policy.go`.
-- [ ] Define erasure-coding profiles for Phase 2+ (6+2, 8+3, 10+4).
-      Note: Phase 1 uses Wasabi's native durability; EC is not needed
-      until Phase 2+.
+- [x] Define erasure-coding profiles for Phase 2+ (6+2, 8+3, 10+4)
+      — implemented in `metadata/erasure_coding/profile.go` with
+      `Profile6Plus2`, `Profile8Plus3`, `Profile10Plus4` constants,
+      a `Validate` method, and a `StorageOverhead` helper.
+      Coverage in `metadata/erasure_coding/profile_test.go`.
+      Phase 1 still uses Wasabi's native durability; EC is not wired
+      into the write path until Phase 2+.
 - [x] Define the S3 compatibility subset (PUT, GET, HEAD, DELETE,
       LIST, multipart, range GET). Full operation matrix specified in
       [PROPOSAL.md §3.2.2](PROPOSAL.md).
 - [x] Define the S3 API as the phase-invariant contract (operation
       matrix, migration behavior, compliance test suite spec) —
       specified in [PROPOSAL.md §3.2](PROPOSAL.md).
-- [ ] Define the benchmark suite (PUT / GET latency percentiles,
+- [x] Define the benchmark suite (PUT / GET latency percentiles,
       cache hit ratio, repair time, Wasabi origin egress ratio,
-      network cost).
-- [ ] Define the multi-tenancy model (tenant isolation, billing,
-      abuse controls).
+      network cost) — declarative harness in `tests/benchmark/suite.go`
+      with PUT/GET p50/p95/p99 targets, cache-hit ratio (>90% Hot),
+      Wasabi origin egress ratio (≤1.0 per tenant), and LIST
+      performance at 10M / 100M / 1B objects. Coverage in
+      `tests/benchmark/suite_test.go`.
+- [x] Define the multi-tenancy model (tenant isolation, billing,
+      abuse controls) — implemented in `metadata/tenant/tenant.go`
+      with the §5.5 schema (`contract_type`, `license_tier`, `keys`,
+      `placement_default`, `budgets`, `abuse`, `billing`), plus
+      `Validate`, JSON, and YAML round-trips in
+      `metadata/tenant/tenant_test.go`.
 - [x] Define the migration engine spec (dual-write, lazy migration on
       read, background rebalancer, migration state machine) — state
       machine in `migration/state.go` with transition coverage in
       `migration/state_test.go`.
-- [ ] Specify the Linode cache design (NVMe / block storage sizing,
-      promotion rules, range-aligned chunking).
-- [ ] Specify Wasabi fair-use guardrails (egress budgets, per-tenant
-      cache hit ratio targets, 90-day minimum storage handling).
-- [ ] Decision gate: Phase 2+ base selection.
+- [x] Specify the Linode cache design (NVMe / block storage sizing,
+      promotion rules, range-aligned chunking) —
+      `cache/hot_object_cache/cache.go` now defines `PromotionPolicy`
+      (monthly egress ratio, daily read count, p95 miss latency) and
+      `EvictionPolicy` (LRU with hot-pin) with L0/L1 defaults plus
+      NVMe/block-storage sizing guidance in the package comment.
+      Coverage in `cache/hot_object_cache/cache_test.go`.
+- [x] Specify Wasabi fair-use guardrails (egress budgets, per-tenant
+      cache hit ratio targets, 90-day minimum storage handling) —
+      implemented in `providers/wasabi/guardrails.go` with
+      `FairUseEgressBudget`, `MinStorageTracker`, `CacheHitRatioTarget`,
+      `AlertThresholds`, and the composite `Guardrails` type. The
+      default budget encodes the ≤1.0 egress/storage ratio from
+      PROPOSAL.md §3.11; coverage in
+      `providers/wasabi/guardrails_test.go`.
+- [x] Decision gate: Phase 2+ base selection — **Ceph RGW** picked as
+      the Phase 2+ local-DC origin. See table below.
 
 ### Phase 1 decision gate: base selection
 
@@ -72,10 +102,18 @@ proprietary license. Garage is ruled out because it does not support
 erasure coding and therefore cannot meet Phase 2+'s EC
 durable-origin requirement.
 
-| Requirement                              | Pick        |
-| ---------------------------------------- | ----------- |
-| Maximum production maturity              | Ceph RGW    |
-| Faster custom product build              | SeaweedFS   |
+**Decision (Phase 1 gate, 2026-04-22): Ceph RGW** is the Phase 2+
+local-DC base. Ceph's production maturity, operational tooling, and
+erasure-coding support outweigh the slower custom-feature roadmap
+relative to SeaweedFS. SeaweedFS is retained as a documented
+fallback: if Phase 2 operational load or feature velocity pushes us
+off Ceph, SeaweedFS becomes the second-choice base without
+reopening the AGPL / EC gates.
+
+| Requirement                              | Pick        | Notes                        |
+| ---------------------------------------- | ----------- | ---------------------------- |
+| Maximum production maturity (selected)   | Ceph RGW    | Phase 2+ local-DC base       |
+| Faster custom product build (fallback)   | SeaweedFS   | Retained as documented backup |
 
 ---
 
