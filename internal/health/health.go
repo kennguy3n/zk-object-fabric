@@ -24,7 +24,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -458,8 +457,3 @@ func QuorumMajority(n int) int {
 	}
 	return (n / 2) + 1
 }
-
-// Ensure the package compiles when no peers are configured — a
-// single-node dev gateway should still be able to use the
-// monitor.
-var _ = fmt.Sprintf
