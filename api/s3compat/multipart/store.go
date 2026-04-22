@@ -35,6 +35,16 @@ var (
 	// ErrPartETagMismatch is returned when the client-supplied ETag
 	// does not match the one recorded at UploadPart time.
 	ErrPartETagMismatch = errors.New("multipart: part etag mismatch")
+
+	// ErrTenantMismatch is returned when Abort / Complete is called
+	// with a tenant that does not own the upload. The upload is
+	// left intact so the legitimate tenant can still finish it.
+	ErrTenantMismatch = errors.New("multipart: tenant mismatch")
+
+	// ErrUploadMismatch is returned when Complete is called with a
+	// (bucket, object key) pair that does not match the upload's
+	// recorded target. The upload is left intact.
+	ErrUploadMismatch = errors.New("multipart: bucket or object key mismatch")
 )
 
 // Part describes a single uploaded part.
@@ -90,12 +100,17 @@ func (u *Upload) SortedParts() []Part {
 //
 // Upload is passed and returned by pointer because it embeds a
 // sync.Mutex that must not be copied.
+//
+// Complete and Abort take the caller's tenant / bucket / object-key
+// claim so the authorization check is atomic with the state-changing
+// delete: a tenant mismatch returns ErrTenantMismatch without
+// removing the upload.
 type Store interface {
 	Create(upload *Upload) error
 	Get(uploadID string) (*Upload, error)
 	PutPart(uploadID string, part Part) error
-	Complete(uploadID string, expected []PartReference) ([]Part, *Upload, error)
-	Abort(uploadID string) (*Upload, []Part, error)
+	Complete(uploadID, tenantID, bucket, objectKey string, expected []PartReference) ([]Part, *Upload, error)
+	Abort(uploadID, tenantID string) (*Upload, []Part, error)
 	// List returns all in-flight uploads for (tenantID, bucket).
 	// Primarily used by the ListMultipartUploads administrative
 	// endpoint; dev / tests also consult it.
@@ -166,16 +181,26 @@ func (s *MemoryStore) PutPart(uploadID string, part Part) error {
 	return nil
 }
 
-// Complete finalises the upload. It validates that every PartReference
-// names a part that was uploaded and that the recorded ETag matches
-// the client's claim. On success the upload is removed from the
-// store and the sorted part list is returned for manifest assembly.
-func (s *MemoryStore) Complete(uploadID string, expected []PartReference) ([]Part, *Upload, error) {
+// Complete finalises the upload. It validates that the caller's
+// tenant / bucket / object-key match the upload's recorded target
+// (authorization check is atomic with the delete) and that every
+// PartReference names a part that was uploaded with the claimed
+// ETag. On success the upload is removed from the store and the
+// sorted part list is returned for manifest assembly.
+func (s *MemoryStore) Complete(uploadID, tenantID, bucket, objectKey string, expected []PartReference) ([]Part, *Upload, error) {
 	s.mu.Lock()
 	u, ok := s.uploads[uploadID]
 	if !ok {
 		s.mu.Unlock()
 		return nil, nil, ErrNotFound
+	}
+	if u.TenantID != tenantID {
+		s.mu.Unlock()
+		return nil, nil, ErrTenantMismatch
+	}
+	if u.Bucket != bucket || u.ObjectKey != objectKey {
+		s.mu.Unlock()
+		return nil, nil, ErrUploadMismatch
 	}
 	delete(s.uploads, uploadID)
 	s.mu.Unlock()
@@ -208,13 +233,19 @@ func (s *MemoryStore) Complete(uploadID string, expected []PartReference) ([]Par
 }
 
 // Abort removes an upload and returns the parts that were uploaded so
-// the caller can delete their backing pieces.
-func (s *MemoryStore) Abort(uploadID string) (*Upload, []Part, error) {
+// the caller can delete their backing pieces. The tenantID must
+// match the upload's recorded tenant; mismatch returns
+// ErrTenantMismatch without removing the upload.
+func (s *MemoryStore) Abort(uploadID, tenantID string) (*Upload, []Part, error) {
 	s.mu.Lock()
 	u, ok := s.uploads[uploadID]
 	if !ok {
 		s.mu.Unlock()
 		return nil, nil, ErrNotFound
+	}
+	if u.TenantID != tenantID {
+		s.mu.Unlock()
+		return nil, nil, ErrTenantMismatch
 	}
 	delete(s.uploads, uploadID)
 	s.mu.Unlock()

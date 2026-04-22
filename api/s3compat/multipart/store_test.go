@@ -26,7 +26,7 @@ func TestMemoryStore_CreatePutComplete(t *testing.T) {
 		t.Fatalf("PutPart 1: %v", err)
 	}
 
-	parts, final, err := store.Complete("u1", []PartReference{
+	parts, final, err := store.Complete("u1", "t1", "b1", "k1", []PartReference{
 		{PartNumber: 1, ETag: "e1"},
 		{PartNumber: 2, ETag: "e2"},
 	})
@@ -48,7 +48,7 @@ func TestMemoryStore_CompleteETagMismatch(t *testing.T) {
 	store := NewMemoryStore()
 	_ = store.Create(&Upload{ID: "u1", TenantID: "t", Bucket: "b", ObjectKey: "k", Backend: "x"})
 	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "p1", ETag: "actual"})
-	_, _, err := store.Complete("u1", []PartReference{{PartNumber: 1, ETag: "wrong"}})
+	_, _, err := store.Complete("u1", "t", "b", "k", []PartReference{{PartNumber: 1, ETag: "wrong"}})
 	if !errors.Is(err, ErrPartETagMismatch) {
 		t.Fatalf("expected ErrPartETagMismatch, got %v", err)
 	}
@@ -62,7 +62,7 @@ func TestMemoryStore_CompleteMissingPart(t *testing.T) {
 	store := NewMemoryStore()
 	_ = store.Create(&Upload{ID: "u1", TenantID: "t", Bucket: "b", ObjectKey: "k", Backend: "x"})
 	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "p1", ETag: "e1"})
-	_, _, err := store.Complete("u1", []PartReference{
+	_, _, err := store.Complete("u1", "t", "b", "k", []PartReference{
 		{PartNumber: 1, ETag: "e1"},
 		{PartNumber: 2, ETag: "e2"},
 	})
@@ -79,7 +79,7 @@ func TestMemoryStore_AbortReturnsParts(t *testing.T) {
 	_ = store.Create(&Upload{ID: "u1", TenantID: "t", Bucket: "b", ObjectKey: "k", Backend: "x"})
 	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "p1"})
 	_ = store.PutPart("u1", Part{PartNumber: 2, PieceID: "p2"})
-	_, parts, err := store.Abort("u1")
+	_, parts, err := store.Abort("u1", "t")
 	if err != nil {
 		t.Fatalf("Abort: %v", err)
 	}

@@ -240,11 +240,15 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 	for i, p := range req.Parts {
 		refs[i] = multipart.PartReference{PartNumber: p.PartNumber, ETag: p.ETag}
 	}
-	parts, upload, err := h.cfg.Multipart.Complete(uploadID, refs)
+	parts, upload, err := h.cfg.Multipart.Complete(uploadID, tenantID, bucket, key, refs)
 	if err != nil {
 		switch {
 		case errors.Is(err, multipart.ErrNotFound):
 			writeError(w, http.StatusNotFound, "NoSuchUpload", "upload "+uploadID+" not found", r.URL.Path)
+		case errors.Is(err, multipart.ErrTenantMismatch):
+			writeError(w, http.StatusForbidden, "AccessDenied", "tenant mismatch", r.URL.Path)
+		case errors.Is(err, multipart.ErrUploadMismatch):
+			writeError(w, http.StatusForbidden, "AccessDenied", "upload does not match bucket/key", r.URL.Path)
 		case errors.Is(err, multipart.ErrPartNotFound):
 			writeError(w, http.StatusBadRequest, "InvalidPart", "one or more parts are missing", r.URL.Path)
 		case errors.Is(err, multipart.ErrPartETagMismatch):
@@ -252,10 +256,6 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		default:
 			writeError(w, http.StatusInternalServerError, "MultipartCompleteFailed", err.Error(), r.URL.Path)
 		}
-		return
-	}
-	if upload.TenantID != tenantID || upload.Bucket != bucket || upload.ObjectKey != key {
-		writeError(w, http.StatusForbidden, "AccessDenied", "upload does not match bucket/key", r.URL.Path)
 		return
 	}
 
@@ -331,20 +331,20 @@ func (h *Handler) AbortMultipartUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uploadID := r.URL.Query().Get("uploadId")
-	upload, parts, err := h.cfg.Multipart.Abort(uploadID)
+	upload, parts, err := h.cfg.Multipart.Abort(uploadID, tenantID)
 	if err != nil {
-		if errors.Is(err, multipart.ErrNotFound) {
+		switch {
+		case errors.Is(err, multipart.ErrNotFound):
 			// S3 Abort is idempotent.
 			w.WriteHeader(http.StatusNoContent)
-			return
+		case errors.Is(err, multipart.ErrTenantMismatch):
+			writeError(w, http.StatusForbidden, "AccessDenied", "tenant mismatch", r.URL.Path)
+		default:
+			writeError(w, http.StatusInternalServerError, "MultipartAbortFailed", err.Error(), r.URL.Path)
 		}
-		writeError(w, http.StatusInternalServerError, "MultipartAbortFailed", err.Error(), r.URL.Path)
 		return
 	}
-	if upload.TenantID != tenantID {
-		writeError(w, http.StatusForbidden, "AccessDenied", "tenant mismatch", r.URL.Path)
-		return
-	}
+	_ = upload
 	for _, p := range parts {
 		if provider, ok := h.cfg.Providers[p.Backend]; ok {
 			_ = provider.DeletePiece(r.Context(), p.PieceID)
