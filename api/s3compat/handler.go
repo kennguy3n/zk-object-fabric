@@ -387,15 +387,17 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 	resp := response{Name: bucket, IsTruncated: page.NextCursor != "", NextContinuationToken: page.NextCursor}
 	for _, m := range page.Manifests {
 		// Return the opaque object key (plaintext under managed
-		// encryption, ciphertext under strict ZK) so that a follow-up
-		// GET /{bucket}/{key} resolves back to the same manifest.
-		// Fall back to the hash for manifests written before the
-		// ObjectKey field existed.
-		listedKey := m.ObjectKey
-		if listedKey == "" {
-			listedKey = m.ObjectKeyHash
+		// encryption, ciphertext under strict ZK) so a follow-up
+		// GET /{bucket}/{key} hashes it back to the stored
+		// ObjectKeyHash. Manifests written before ObjectKey existed
+		// are unreachable via S3 LIST — clients would have to use
+		// ObjectKeyHash directly, which does not round-trip through
+		// the gateway's hashing step; skip them rather than return
+		// a key that produces 404 on GET.
+		if m.ObjectKey == "" {
+			continue
 		}
-		c := content{Key: listedKey, Size: m.ObjectSize}
+		c := content{Key: m.ObjectKey, Size: m.ObjectSize}
 		if len(m.Pieces) > 0 {
 			c.ETag = quote(m.Pieces[0].Hash)
 		}

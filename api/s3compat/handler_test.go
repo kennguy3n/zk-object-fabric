@@ -380,6 +380,65 @@ func TestList_ReturnsPutItems(t *testing.T) {
 	}
 }
 
+func TestList_DedupesOverwrittenVersions(t *testing.T) {
+	// Use an advancing clock so each PUT gets a distinct VersionID
+	// (newPieceID mixes the timestamp) — otherwise the memory store's
+	// ManifestKey collides and masks the duplicate-row bug.
+	store := memory.New()
+	fake := newFakeProvider("test")
+	now := time.Unix(1700000000, 0)
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Now: func() time.Time {
+			t := now
+			now = now.Add(time.Second)
+			return t
+		},
+	})
+
+	for i := 0; i < 3; i++ {
+		body := []byte(fmt.Sprintf("v%d", i))
+		req := httptest.NewRequest(http.MethodPut, "/bucket/key", bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		rec := httptest.NewRecorder()
+		h.Put(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT %d status = %d", i, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/?list-type=2", nil)
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LIST status = %d; body=%s", rec.Code, rec.Body)
+	}
+	type content struct {
+		Key  string `xml:"Key"`
+		Size int64  `xml:"Size"`
+	}
+	type resp struct {
+		XMLName  xml.Name  `xml:"ListBucketResult"`
+		Contents []content `xml:"Contents"`
+	}
+	var r resp
+	if err := xml.Unmarshal(rec.Body.Bytes(), &r); err != nil {
+		t.Fatalf("unmarshal LIST: %v (body=%s)", err, rec.Body)
+	}
+	if len(r.Contents) != 1 {
+		t.Fatalf("LIST after 3 overwrites returned %d entries, want 1 (%+v)", len(r.Contents), r.Contents)
+	}
+	if r.Contents[0].Key != "key" {
+		t.Errorf("LIST key = %q, want %q", r.Contents[0].Key, "key")
+	}
+	if r.Contents[0].Size != 2 {
+		t.Errorf("LIST size = %d, want 2 (latest write)", r.Contents[0].Size)
+	}
+}
+
 func TestParseBucketKey(t *testing.T) {
 	cases := []struct {
 		in, bucket, key string

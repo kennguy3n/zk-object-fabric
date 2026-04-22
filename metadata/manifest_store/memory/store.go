@@ -95,6 +95,11 @@ func (s *Store) Delete(_ context.Context, key manifest_store.ManifestKey) error 
 
 // List iterates manifests under (tenantID, bucket). Cursor is the
 // decimal-encoded insertion sequence of the last returned manifest.
+//
+// Only the latest version of each (tenant, bucket, object_key_hash)
+// triple is returned — older versions created by overwrite PUTs stay
+// addressable by explicit VersionID via Get, but do not appear in
+// LIST, matching S3 ListObjectsV2 semantics.
 func (s *Store) List(_ context.Context, tenantID, bucket, cursor string, limit int) (manifest_store.ListResult, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -115,14 +120,19 @@ func (s *Store) List(_ context.Context, tenantID, bucket, cursor string, limit i
 		manifest *metadata.ObjectManifest
 	}
 	var rows []row
-	for k, m := range s.byKey {
-		if k.TenantID != tenantID || k.Bucket != bucket {
+	for lk, mk := range s.latest {
+		if lk.TenantID != tenantID || lk.Bucket != bucket {
 			continue
 		}
-		if s.seq[k] <= after {
+		seq := s.seq[mk]
+		if seq <= after {
 			continue
 		}
-		rows = append(rows, row{seq: s.seq[k], key: k, manifest: m})
+		m, ok := s.byKey[mk]
+		if !ok {
+			continue
+		}
+		rows = append(rows, row{seq: seq, key: mk, manifest: m})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].seq < rows[j].seq })
 

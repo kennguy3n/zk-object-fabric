@@ -156,9 +156,13 @@ func (s *Store) Delete(ctx context.Context, key manifest_store.ManifestKey) erro
 }
 
 // List paginates manifests under (tenantID, bucket). The cursor is
-// the last (object_key_hash, version_id) pair observed, encoded as
-// "{hash}/{version_id}". Pages are ordered by object_key_hash then
-// version_id so the cursor is a stable keyset.
+// the last object_key_hash observed, encoded verbatim. Pages are
+// ordered by object_key_hash so the cursor is a stable keyset.
+//
+// Only the latest version of each object_key_hash is returned —
+// older versions created by overwrite PUTs remain addressable by
+// explicit VersionID via Get, but do not appear in LIST, matching
+// S3 ListObjectsV2 semantics.
 func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit int) (manifest_store.ListResult, error) {
 	if tenantID == "" || bucket == "" {
 		return manifest_store.ListResult{}, errors.New("postgres: tenant_id and bucket are required")
@@ -166,16 +170,17 @@ func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit
 	if limit <= 0 {
 		limit = 1000
 	}
-	cursorHash, cursorVersion := splitCursor(cursor)
+	cursorHash, _ := splitCursor(cursor)
 
 	q := fmt.Sprintf(`
-		SELECT object_key_hash, version_id, body FROM %s
+		SELECT DISTINCT ON (object_key_hash) object_key_hash, version_id, body
+		FROM %s
 		WHERE tenant_id = $1 AND bucket = $2
-		  AND (object_key_hash, version_id) > ($3, $4)
-		ORDER BY object_key_hash, version_id
-		LIMIT $5
+		  AND object_key_hash > $3
+		ORDER BY object_key_hash, updated_at DESC
+		LIMIT $4
 	`, s.table)
-	rows, err := s.db.QueryContext(ctx, q, tenantID, bucket, cursorHash, cursorVersion, limit+1)
+	rows, err := s.db.QueryContext(ctx, q, tenantID, bucket, cursorHash, limit+1)
 	if err != nil {
 		return manifest_store.ListResult{}, fmt.Errorf("postgres: list manifests: %w", err)
 	}
