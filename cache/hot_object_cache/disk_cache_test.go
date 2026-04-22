@@ -225,6 +225,83 @@ func TestDiskCache_CleansOrphansOnWarm(t *testing.T) {
 	}
 }
 
+func TestDiskCache_BodyDeletionCompensatesHitCounter(t *testing.T) {
+	// If the body file is deleted out from under the cache, Get()
+	// returns ErrCacheMiss and must not inflate the hit ratio.
+	dir := t.TempDir()
+	c, err := NewDiskCache(DiskCacheConfig{RootPath: dir, Policy: DefaultEvictionPolicy(1 << 20)})
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+	ctx := context.Background()
+	if err := c.Put(ctx, "corrupt", bytes.NewReader([]byte("body")), PutOptions{}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	// Delete the body file but leave the sidecar so the in-memory
+	// index still thinks the piece is present.
+	bodyPath := filepath.Join(dir, "co", "corrupt.bin")
+	if err := os.Remove(bodyPath); err != nil {
+		t.Fatalf("remove body: %v", err)
+	}
+	if _, _, err := c.Get(ctx, "corrupt"); !errors.Is(err, ErrCacheMiss) {
+		t.Fatalf("Get after body delete: err = %v, want ErrCacheMiss", err)
+	}
+	stats := c.Stats()
+	if stats.Hits != 0 {
+		t.Fatalf("Hits = %d, want 0 after body-delete miss", stats.Hits)
+	}
+	if stats.Misses != 1 {
+		t.Fatalf("Misses = %d, want 1 after body-delete miss", stats.Misses)
+	}
+}
+
+func TestDiskCache_WarmHydratesInStoredAtOrder(t *testing.T) {
+	// Restart the cache and confirm the LRU is populated
+	// newest-first — i.e. the oldest piece is the first to be
+	// evicted. Without the explicit sort, post-restart eviction
+	// order was whatever os.ReadDir yielded.
+	dir := t.TempDir()
+	clock := &fakeClock{now: time.Unix(1_000_000, 0)}
+	first, err := NewDiskCache(DiskCacheConfig{
+		RootPath: dir,
+		Policy:   EvictionPolicy{Kind: EvictionLRU, MaxBytes: 9},
+		Clock:    clock.Now,
+	})
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+	// Put three 3-byte pieces, advancing the clock between each so
+	// StoredAt is strictly ordered old → middle → new.
+	ctx := context.Background()
+	for _, id := range []string{"old", "mid", "new"} {
+		if err := first.Put(ctx, id, bytes.NewReader([]byte("abc")), PutOptions{}); err != nil {
+			t.Fatalf("Put %s: %v", id, err)
+		}
+		clock.advance(time.Minute)
+	}
+
+	// Re-open with MaxBytes=6 — warming must evict the oldest
+	// piece (StoredAt=earliest), not an arbitrary one.
+	second, err := NewDiskCache(DiskCacheConfig{
+		RootPath: dir,
+		Policy:   EvictionPolicy{Kind: EvictionLRU, MaxBytes: 6},
+		Clock:    clock.Now,
+	})
+	if err != nil {
+		t.Fatalf("re-open NewDiskCache: %v", err)
+	}
+	if _, _, err := second.Get(ctx, "old"); !errors.Is(err, ErrCacheMiss) {
+		t.Fatalf("post-warm: oldest piece not evicted; err = %v", err)
+	}
+	for _, id := range []string{"mid", "new"} {
+		rc, _, err := second.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("post-warm Get %s: %v", id, err)
+		}
+		_ = rc.Close()
+	}
+}
+
 type fakeClock struct{ now time.Time }
 
 func (f *fakeClock) Now() time.Time          { return f.now }

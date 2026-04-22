@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -155,11 +156,18 @@ func (c *DiskCache) Get(_ context.Context, pieceID string) (io.ReadCloser, Cache
 	if err != nil {
 		// On-disk file disappeared under us (corruption, manual
 		// delete). Treat as a miss and drop the index entry so the
-		// next PUT repopulates cleanly.
+		// next PUT repopulates cleanly. The optimistic hit
+		// recorded above is compensated so Stats() reports the
+		// true hit ratio that the Wasabi fair-use guardrails and
+		// the PROGRESS.md hot-tier targets rely on.
 		c.mu.Lock()
 		if el2, ok := c.index[pieceID]; ok {
 			c.removeLocked(el2)
 		}
+		if c.stats.Hits > 0 {
+			c.stats.Hits--
+		}
+		c.stats.Misses++
 		c.mu.Unlock()
 		return nil, CachedPieceMetadata{}, ErrCacheMiss
 	}
@@ -281,7 +289,13 @@ func (c *DiskCache) warm() error {
 	}
 	// Hydrate in StoredAt order so the LRU reflects the order the
 	// pieces were originally written. Newest-first matches how
-	// MemoryCache's PushFront ordering works.
+	// MemoryCache's PushFront ordering works. Without the sort the
+	// list order is whatever os.ReadDir yielded, which is
+	// implementation-defined and makes post-restart eviction
+	// non-deterministic (documented contract violation).
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].storedAt.Before(entries[j].storedAt)
+	})
 	now := c.clock()
 	for _, e := range entries {
 		if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
