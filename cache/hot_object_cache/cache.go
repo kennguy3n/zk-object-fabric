@@ -84,12 +84,16 @@ type Stats struct {
 // promotion threshold. The cache consumes these signals to decide
 // what to pull from the Wasabi origin into the Linode cache.
 type PromotionSignal struct {
-	PieceID       string
-	TenantID      string
-	ReadBytes     int64
-	ReadCount     uint64
-	ObservedAt    time.Time
-	OriginBackend string
+	PieceID string
+	// PieceSizeBytes is the full piece size. Policies evaluate
+	// Min/MaxPieceSizeBytes against this, not ReadBytes, so range
+	// reads of small byte windows on large pieces still match.
+	PieceSizeBytes int64
+	TenantID       string
+	ReadBytes      int64
+	ReadCount      uint64
+	ObservedAt     time.Time
+	OriginBackend  string
 }
 
 // CacheTier names a cache layer. The data plane uses three tiers in
