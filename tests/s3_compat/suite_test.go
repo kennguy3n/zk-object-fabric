@@ -28,10 +28,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -44,10 +47,16 @@ import (
 
 // fixedPlacement resolves every object to a single fixed backend so
 // the suite can stress each adapter in isolation.
-type fixedPlacement struct{ backend string }
+type fixedPlacement struct {
+	backend        string
+	erasureProfile string
+}
 
 func (f fixedPlacement) ResolveBackend(string, string, string) (string, metadata.PlacementPolicy, error) {
-	return f.backend, metadata.PlacementPolicy{AllowedBackends: []string{f.backend}}, nil
+	return f.backend, metadata.PlacementPolicy{
+		AllowedBackends: []string{f.backend},
+		ErasureProfile:  f.erasureProfile,
+	}, nil
 }
 
 // Setup is the harness the suite uses to spin up one gateway
@@ -71,10 +80,12 @@ func newServer(t *testing.T, setup Setup) *server {
 	t.Helper()
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
-		Manifests: setup.Manifests,
-		Providers: setup.Providers,
-		Placement: fixedPlacement{backend: setup.Default},
-		Now:       time.Now,
+		Manifests:     setup.Manifests,
+		Providers:     setup.Providers,
+		Placement:     fixedPlacement{backend: setup.Default},
+		Multipart:     multipart.NewMemoryStore(),
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           time.Now,
 	}).Register(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -106,6 +117,9 @@ func Run(t *testing.T, setup Setup) {
 	t.Run("MissingKeyReturns404", func(t *testing.T) { testMissingKey(t, setup) })
 	t.Run("PresignedGet", func(t *testing.T) { testPresignedGet(t, setup) })
 	t.Run("MultipartLikeOverwrite", func(t *testing.T) { testMultipartLikeOverwrite(t, setup) })
+	t.Run("MultipartRoundTrip", func(t *testing.T) { testMultipartRoundTrip(t, setup) })
+	t.Run("MultipartAbort", func(t *testing.T) { testMultipartAbort(t, setup) })
+	t.Run("ErasureRoundTrip", func(t *testing.T) { testErasureRoundTrip(t, setup) })
 }
 
 func testPutGetHeadDelete(t *testing.T, setup Setup) {
@@ -357,6 +371,187 @@ func testMultipartLikeOverwrite(t *testing.T, setup Setup) {
 	}
 	if !bytes.Equal(data, second) {
 		t.Fatalf("overwrite GET body mismatch: got %d bytes, want %d", len(data), len(second))
+	}
+}
+
+// testMultipartRoundTrip walks the full CreateMultipartUpload /
+// UploadPart / CompleteMultipartUpload path through the AWS SDK and
+// asserts the assembled object reads back byte-identically.
+func testMultipartRoundTrip(t *testing.T, setup Setup) {
+	s := newServer(t, setup)
+	key := "multipart/round-trip.bin"
+
+	part1 := bytes.Repeat([]byte("A"), 5*1024*1024) // S3 requires >=5 MiB for non-final parts
+	part2 := bytes.Repeat([]byte("B"), 512*1024)
+	full := append(append([]byte{}, part1...), part2...)
+
+	create, err := s.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if aws.ToString(create.UploadId) == "" {
+		t.Fatal("CreateMultipartUpload returned empty UploadId")
+	}
+
+	upload1, err := s.client.UploadPart(context.Background(), &s3.UploadPartInput{
+		Bucket:     aws.String(s.bucket),
+		Key:        aws.String(key),
+		PartNumber: aws.Int32(1),
+		UploadId:   create.UploadId,
+		Body:       bytes.NewReader(part1),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 1: %v", err)
+	}
+	upload2, err := s.client.UploadPart(context.Background(), &s3.UploadPartInput{
+		Bucket:     aws.String(s.bucket),
+		Key:        aws.String(key),
+		PartNumber: aws.Int32(2),
+		UploadId:   create.UploadId,
+		Body:       bytes.NewReader(part2),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 2: %v", err)
+	}
+
+	// The SDK expects Complete to list parts in ascending order.
+	complete, err := s.client.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(key),
+		UploadId: create.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{
+				{PartNumber: aws.Int32(1), ETag: upload1.ETag},
+				{PartNumber: aws.Int32(2), ETag: upload2.ETag},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload: %v", err)
+	}
+	if aws.ToString(complete.ETag) == "" {
+		t.Fatal("CompleteMultipartUpload returned empty ETag")
+	}
+	if !strings.Contains(aws.ToString(complete.ETag), "-2") {
+		t.Fatalf("CompleteMultipartUpload ETag %q missing -N suffix", aws.ToString(complete.ETag))
+	}
+
+	got, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("GetObject after multipart: %v", err)
+	}
+	defer got.Body.Close()
+	data, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("read multipart object: %v", err)
+	}
+	if !bytes.Equal(data, full) {
+		t.Fatalf("multipart body mismatch: got %d bytes, want %d", len(data), len(full))
+	}
+}
+
+// testMultipartAbort verifies that AbortMultipartUpload removes the
+// session without persisting a manifest, and that completing the
+// same upload afterwards fails with NoSuchUpload.
+func testMultipartAbort(t *testing.T, setup Setup) {
+	s := newServer(t, setup)
+	key := "multipart/abort.bin"
+	create, err := s.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if _, err := s.client.UploadPart(context.Background(), &s3.UploadPartInput{
+		Bucket:     aws.String(s.bucket),
+		Key:        aws.String(key),
+		PartNumber: aws.Int32(1),
+		UploadId:   create.UploadId,
+		Body:       bytes.NewReader(bytes.Repeat([]byte("x"), 1024)),
+	}); err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	if _, err := s.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.bucket),
+		Key:      aws.String(key),
+		UploadId: create.UploadId,
+	}); err != nil {
+		t.Fatalf("AbortMultipartUpload: %v", err)
+	}
+	// The manifest must not exist.
+	if _, err := s.client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}); err == nil {
+		t.Fatal("HeadObject after abort: want error, got nil")
+	}
+}
+
+// testErasureRoundTrip drives a PUT/GET through the EC write path and
+// asserts the reconstructed plaintext matches the input. The EC
+// profile used by this test is 6+2, which tolerates up to two missing
+// shards per stripe; a full round-trip with every shard present is
+// the happy-path contract.
+func testErasureRoundTrip(t *testing.T, setup Setup) {
+	t.Helper()
+	mux := http.NewServeMux()
+	s3compat.New(s3compat.Config{
+		Manifests:     setup.Manifests,
+		Providers:     setup.Providers,
+		Placement:     fixedPlacement{backend: setup.Default, erasureProfile: "6+2"},
+		Multipart:     multipart.NewMemoryStore(),
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           time.Now,
+	}).Register(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	cfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithRegion("us-east-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatalf("load sdk config: %v", err)
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(ts.URL)
+		o.UsePathStyle = true
+	})
+
+	key := "ec/hello.bin"
+	// Make the body big enough to span multiple stripes with the
+	// 6+2 profile so the test exercises stripe ordering.
+	body := bytes.Repeat([]byte("The quick brown fox jumps over the lazy dog. "), 2048)
+	if _, err := client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String("compat-bucket"),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(body),
+	}); err != nil {
+		t.Fatalf("PutObject EC: %v", err)
+	}
+
+	got, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String("compat-bucket"),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("GetObject EC: %v", err)
+	}
+	defer got.Body.Close()
+	data, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("read EC body: %v", err)
+	}
+	if !bytes.Equal(data, body) {
+		t.Fatalf("EC body mismatch: got %d bytes, want %d", len(data), len(body))
 	}
 }
 

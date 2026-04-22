@@ -49,13 +49,60 @@ type EncryptionConfig struct {
 }
 
 // Piece is a single backend-stored chunk of ciphertext.
+//
+// Most objects are single-piece (PartNumber = 0, ShardIndex = 0).
+// Multi-piece manifests arise in two places:
+//
+//   - S3 multipart uploads: PartNumber 1..N identifies the part the
+//     piece came from. The manifest lists pieces in ascending
+//     PartNumber order and the GET path concatenates them.
+//
+//   - Erasure coding: StripeIndex 0..S-1 and ShardIndex 0..k+m-1
+//     identify the (stripe, shard) position of the piece. ShardKind
+//     names the role (ShardKindData or ShardKindParity). The GET
+//     path fetches at least k data shards per stripe and decodes;
+//     missing shards can be reconstructed from any k surviving
+//     shards per stripe.
+//
+// Multipart and erasure coding never combine in the same manifest:
+// the gateway applies EC to a multipart upload at the per-part
+// level or the whole-object level, not both.
 type Piece struct {
 	PieceID string `json:"piece_id"`
 	Hash    string `json:"hash"`
 	Backend string `json:"backend"`
 	Locator string `json:"locator"`
 	State   string `json:"state"`
+
+	// PartNumber is the 1-based S3 multipart index. Zero means the
+	// piece was not uploaded via multipart.
+	PartNumber int `json:"part_number,omitempty"`
+
+	// SizeBytes is the on-wire size of this specific piece. For
+	// multipart the handler needs per-part sizes to emit correct
+	// Content-Range responses; for EC manifests it records the
+	// shard size.
+	SizeBytes int64 `json:"size_bytes,omitempty"`
+
+	// StripeIndex is the 0-based stripe index within an
+	// erasure-coded object. Zero when the manifest is not EC.
+	StripeIndex int `json:"stripe_index,omitempty"`
+
+	// ShardIndex is the 0-based shard index within a stripe
+	// (0 .. DataShards+ParityShards-1). Zero when the manifest
+	// is not EC.
+	ShardIndex int `json:"shard_index,omitempty"`
+
+	// ShardKind is "data" or "parity" for EC pieces and empty for
+	// non-EC pieces.
+	ShardKind string `json:"shard_kind,omitempty"`
 }
+
+// Shard kinds for EC pieces.
+const (
+	ShardKindData   = "data"
+	ShardKindParity = "parity"
+)
 
 // MigrationState captures where the manifest sits in the cloud→local
 // migration lifecycle. See docs/PROPOSAL.md §4.3.
@@ -74,6 +121,12 @@ type PlacementPolicy struct {
 	AllowedBackends   []string `json:"allowed_backends"`
 	MinFailureDomains int      `json:"min_failure_domains"`
 	HotCache          bool     `json:"hot_cache"`
+
+	// ErasureProfile, when non-empty, names a profile registered in
+	// metadata/erasure_coding that the gateway uses to shard
+	// objects on this tenant/bucket. Empty means single-piece
+	// writes (the provider's own durability takes over).
+	ErasureProfile string `json:"erasure_profile,omitempty"`
 }
 
 // Validate performs minimal structural checks on a manifest. It is not

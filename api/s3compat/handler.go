@@ -21,9 +21,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -75,6 +77,20 @@ type Config struct {
 	// Billing receives usage events. Optional.
 	Billing BillingSink
 
+	// Multipart is the server-side multipart-upload session store.
+	// Required for CreateMultipartUpload / UploadPart /
+	// CompleteMultipartUpload / AbortMultipartUpload. A nil store
+	// causes those endpoints to return 501 NotImplemented.
+	Multipart multipart.Store
+
+	// ErasureCoding is the registry of erasure-coding profiles the
+	// handler can use when a placement policy names an
+	// ErasureProfile. A nil registry disables EC: writes that ask
+	// for it surface an InvalidPlacement error so the misconfig is
+	// caught at PUT time rather than silently demoted to a
+	// single-piece write.
+	ErasureCoding *erasure_coding.Registry
+
 	// Cache is the L0/L1 hot object cache consulted on the GET path.
 	// Optional; nil disables caching.
 	Cache hot_object_cache.HotObjectCache
@@ -122,13 +138,32 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodPut:
+		if q.Get("uploadId") != "" && q.Get("partNumber") != "" {
+			h.UploadPart(w, r)
+			return
+		}
 		h.Put(w, r)
+	case http.MethodPost:
+		if q.Has("uploads") {
+			h.CreateMultipartUpload(w, r)
+			return
+		}
+		if q.Get("uploadId") != "" {
+			h.CompleteMultipartUpload(w, r)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported POST operation", r.URL.Path)
 	case http.MethodGet:
-		// LIST is a bucket-level GET (no key, or ?list-type=2).
 		bucket, key := parseBucketKey(r.URL.Path)
-		if key == "" || r.URL.Query().Has("list-type") {
+		if key == "" && q.Has("uploads") {
+			h.ListMultipartUploads(w, r, bucket)
+			return
+		}
+		// LIST is a bucket-level GET (no key, or ?list-type=2).
+		if key == "" || q.Has("list-type") {
 			h.listBucket(w, r, bucket)
 			return
 		}
@@ -136,6 +171,10 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	case http.MethodHead:
 		h.Head(w, r)
 	case http.MethodDelete:
+		if q.Get("uploadId") != "" {
+			h.AbortMultipartUpload(w, r)
+			return
+		}
 		h.Delete(w, r)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "method not allowed", r.URL.Path)
@@ -145,6 +184,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 // Put handles S3 PUT object. It reads the request body, writes it to
 // the storage backend chosen by the placement engine, constructs an
 // ObjectManifest, and persists it to the manifest store.
+//
+// When the resolved PlacementPolicy names a registered ErasureProfile
+// the handler diverts to putErasureCoded, which shards the object
+// into k + m pieces per stripe. Otherwise a single piece is written
+// and the provider's native durability carries the object.
 func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
@@ -169,6 +213,11 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	provider, ok := h.cfg.Providers[backendName]
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "BackendNotRegistered", "backend "+backendName+" is not in the provider registry", r.URL.Path)
+		return
+	}
+
+	if policy.ErasureProfile != "" {
+		h.putErasureCoded(w, r, tenantID, bucket, key, backendName, provider, policy)
 		return
 	}
 
@@ -232,6 +281,16 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	manifest, pieceProvider, piece, tenantID, bucket, err := h.resolve(r)
 	if err != nil {
 		writeResolveError(w, r, err)
+		return
+	}
+
+	if isErasureCodedManifest(manifest) {
+		h.getErasureCoded(w, r, manifest, tenantID, bucket)
+		return
+	}
+
+	if isMultipartManifest(manifest) {
+		h.getMultipart(w, r, manifest, tenantID, bucket)
 		return
 	}
 
