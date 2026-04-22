@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/providers"
+	"github.com/kennguy3n/zk-object-fabric/providers/ceph_rgw"
 	"github.com/kennguy3n/zk-object-fabric/providers/local_fs_dev"
 )
 
@@ -387,5 +389,54 @@ func TestSuite_LocalFSDev(t *testing.T) {
 		Manifests: memory.New(),
 		Providers: map[string]providers.StorageProvider{"local_fs_dev": p},
 		Default:   "local_fs_dev",
+	})
+}
+
+// TestSuite_CephRGW runs the full S3 compliance suite against a live
+// Ceph RADOS Gateway deployment. It is the Phase 3 gate required
+// before production traffic can be cut over to a local-DC Ceph cell
+// (see docs/PROGRESS.md Phase 3 checklist).
+//
+// The test is gated behind environment variables so CI does not need
+// a Ceph cluster to run the unit test battery:
+//
+//	CEPH_RGW_ENDPOINT   — required, full RGW base URL
+//	CEPH_RGW_BUCKET     — required, pre-created bucket
+//	CEPH_RGW_ACCESS_KEY — required
+//	CEPH_RGW_SECRET_KEY — required
+//	CEPH_RGW_REGION     — optional, defaults to the provider default
+//	CEPH_RGW_CELL       — optional, operator-assigned cell label
+//	CEPH_RGW_COUNTRY    — optional, ISO-3166 alpha-2 code
+//
+// When CEPH_RGW_ENDPOINT is unset the test is skipped. Operators
+// running this locally should point it at a throwaway bucket — the
+// suite writes and deletes test objects in place.
+func TestSuite_CephRGW(t *testing.T) {
+	endpoint := os.Getenv("CEPH_RGW_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("CEPH_RGW_ENDPOINT not set")
+	}
+	bucket := os.Getenv("CEPH_RGW_BUCKET")
+	accessKey := os.Getenv("CEPH_RGW_ACCESS_KEY")
+	secretKey := os.Getenv("CEPH_RGW_SECRET_KEY")
+	if bucket == "" || accessKey == "" || secretKey == "" {
+		t.Fatalf("CEPH_RGW_ENDPOINT is set but CEPH_RGW_BUCKET / CEPH_RGW_ACCESS_KEY / CEPH_RGW_SECRET_KEY are missing")
+	}
+	p, err := ceph_rgw.New(ceph_rgw.Config{
+		Endpoint:  endpoint,
+		Region:    os.Getenv("CEPH_RGW_REGION"),
+		Bucket:    bucket,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		Cell:      os.Getenv("CEPH_RGW_CELL"),
+		Country:   os.Getenv("CEPH_RGW_COUNTRY"),
+	})
+	if err != nil {
+		t.Fatalf("ceph_rgw.New: %v", err)
+	}
+	Run(t, Setup{
+		Manifests: memory.New(),
+		Providers: map[string]providers.StorageProvider{"ceph_rgw": p},
+		Default:   "ceph_rgw",
 	})
 }
