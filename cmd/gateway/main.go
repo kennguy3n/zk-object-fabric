@@ -34,8 +34,8 @@ func main() {
 	srv := &http.Server{
 		Addr:         cfg.Gateway.ListenAddr,
 		Handler:      mux,
-		ReadTimeout:  cfg.Gateway.ReadTimeout,
-		WriteTimeout: cfg.Gateway.WriteTimeout,
+		ReadTimeout:  cfg.Gateway.ReadTimeout.ToDuration(),
+		WriteTimeout: cfg.Gateway.WriteTimeout.ToDuration(),
 	}
 
 	log.Printf("gateway: listening on %s (env=%s)", cfg.Gateway.ListenAddr, cfg.Env)

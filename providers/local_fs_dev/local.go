@@ -39,7 +39,32 @@ func New(root string) (*Provider, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("local_fs_dev: create root %q: %w", root, err)
 	}
-	return &Provider{root: root}, nil
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("local_fs_dev: resolve root %q: %w", root, err)
+	}
+	return &Provider{root: abs}, nil
+}
+
+// validatePieceID rejects piece IDs that would escape the provider
+// root via path traversal. It also rejects separators, empty IDs, and
+// relative components. The gateway must only submit opaque,
+// filesystem-safe IDs (typically BLAKE3 digests) so this is a
+// defence-in-depth check.
+func validatePieceID(pieceID string) error {
+	if pieceID == "" {
+		return errors.New("local_fs_dev: pieceID is required")
+	}
+	if strings.ContainsAny(pieceID, `/\`) {
+		return fmt.Errorf("local_fs_dev: pieceID %q must not contain path separators", pieceID)
+	}
+	if pieceID == "." || pieceID == ".." || strings.HasPrefix(pieceID, ".") {
+		return fmt.Errorf("local_fs_dev: pieceID %q must not be a relative path component", pieceID)
+	}
+	if strings.ContainsRune(pieceID, 0) {
+		return fmt.Errorf("local_fs_dev: pieceID %q must not contain NUL bytes", pieceID)
+	}
+	return nil
 }
 
 // sidecar holds the metadata persisted next to each piece.
@@ -63,8 +88,8 @@ func (p *Provider) metaPath(pieceID string) string {
 // PutPiece writes r to disk at {root}/{pieceID}.bin and records a
 // sidecar JSON next to it.
 func (p *Provider) PutPiece(_ context.Context, pieceID string, r io.Reader, opts providers.PutOptions) (providers.PutResult, error) {
-	if pieceID == "" {
-		return providers.PutResult{}, errors.New("local_fs_dev: pieceID is required")
+	if err := validatePieceID(pieceID); err != nil {
+		return providers.PutResult{}, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -124,6 +149,9 @@ func (p *Provider) PutPiece(_ context.Context, pieceID string, r io.Reader, opts
 
 // GetPiece returns a ReadCloser for the piece, honouring byteRange.
 func (p *Provider) GetPiece(_ context.Context, pieceID string, byteRange *providers.ByteRange) (io.ReadCloser, error) {
+	if err := validatePieceID(pieceID); err != nil {
+		return nil, err
+	}
 	f, err := os.Open(p.piecePath(pieceID))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -169,6 +197,9 @@ func (l *limitedReadCloser) Read(p []byte) (int, error) { return l.Reader.Read(p
 
 // HeadPiece returns the sidecar metadata for a piece.
 func (p *Provider) HeadPiece(_ context.Context, pieceID string) (providers.PieceMetadata, error) {
+	if err := validatePieceID(pieceID); err != nil {
+		return providers.PieceMetadata{}, err
+	}
 	sc, err := p.readSidecar(pieceID)
 	if err != nil {
 		return providers.PieceMetadata{}, err
@@ -188,6 +219,9 @@ func (p *Provider) HeadPiece(_ context.Context, pieceID string) (providers.Piece
 // first Delete of a non-existent piece returns an error so callers can
 // distinguish delete-of-missing from delete-of-existing.
 func (p *Provider) DeletePiece(_ context.Context, pieceID string) error {
+	if err := validatePieceID(pieceID); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

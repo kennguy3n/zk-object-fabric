@@ -7,24 +7,69 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
+// Duration is a time.Duration that (un)marshals through JSON using
+// the human-readable syntax accepted by time.ParseDuration
+// (e.g. "30s", "5m", "250ms"). Bare JSON numbers are rejected to
+// avoid the silent nanosecond trap of time.Duration's default
+// encoding.
+type Duration time.Duration
+
+// String reports the wrapped duration in Go's canonical form.
+func (d Duration) String() string { return time.Duration(d).String() }
+
+// ToDuration returns the value as a time.Duration.
+func (d Duration) ToDuration() time.Duration { return time.Duration(d) }
+
+// MarshalJSON emits the duration as a quoted string like "30s".
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+// UnmarshalJSON accepts quoted duration strings like "30s" and
+// rejects bare numbers. Rejecting numbers is intentional:
+// time.Duration is int64 nanoseconds, so "read_timeout": 30 would
+// silently be 30ns.
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || data[0] != '"' {
+		if _, err := strconv.ParseFloat(string(data), 64); err == nil {
+			return fmt.Errorf("config: duration must be a quoted string like \"30s\"; got bare number %s", string(data))
+		}
+		return fmt.Errorf("config: duration must be a quoted string like \"30s\"; got %s", string(data))
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("config: duration decode: %w", err)
+	}
+	parsed, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("config: parse duration %q: %w", s, err)
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
 // Config is the top-level runtime configuration.
 type Config struct {
-	Env         string            `json:"env"`
-	Gateway     GatewayConfig     `json:"gateway"`
+	Env          string             `json:"env"`
+	Gateway      GatewayConfig      `json:"gateway"`
 	ControlPlane ControlPlaneConfig `json:"control_plane"`
-	Providers   ProvidersConfig   `json:"providers"`
+	Providers    ProvidersConfig    `json:"providers"`
 }
 
 // GatewayConfig configures the S3-compatible gateway fleet on Linode.
+//
+// ReadTimeout and WriteTimeout use the local Duration type so that
+// human-authored JSON can specify "30s" instead of nanoseconds.
 type GatewayConfig struct {
-	ListenAddr      string        `json:"listen_addr"`
-	ReadTimeout     time.Duration `json:"read_timeout"`
-	WriteTimeout    time.Duration `json:"write_timeout"`
-	MaxRequestBytes int64         `json:"max_request_bytes"`
-	CachePath       string        `json:"cache_path"`
+	ListenAddr      string   `json:"listen_addr"`
+	ReadTimeout     Duration `json:"read_timeout"`
+	WriteTimeout    Duration `json:"write_timeout"`
+	MaxRequestBytes int64    `json:"max_request_bytes"`
+	CachePath       string   `json:"cache_path"`
 }
 
 // ControlPlaneConfig configures the AWS-hosted control plane surface
@@ -64,8 +109,8 @@ func Default() Config {
 		Env: "development",
 		Gateway: GatewayConfig{
 			ListenAddr:      ":8080",
-			ReadTimeout:     30 * time.Second,
-			WriteTimeout:    30 * time.Second,
+			ReadTimeout:     Duration(30 * time.Second),
+			WriteTimeout:    Duration(30 * time.Second),
 			MaxRequestBytes: 5 * 1024 * 1024 * 1024, // 5 GiB
 			CachePath:       "/var/lib/zk-object-fabric/cache",
 		},

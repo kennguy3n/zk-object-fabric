@@ -197,6 +197,37 @@ func TestStorageProvider_MissingPieceErrors(t *testing.T) {
 	}
 }
 
+func TestStorageProvider_RejectsUnsafePieceIDs(t *testing.T) {
+	ctx := context.Background()
+	p := newProvider(t)
+
+	unsafe := []string{
+		"../escape",
+		"..",
+		".",
+		".hidden",
+		"nested/id",
+		`back\slash`,
+		"",
+	}
+	for _, id := range unsafe {
+		t.Run("put/"+id, func(t *testing.T) {
+			if _, err := p.PutPiece(ctx, id, bytes.NewReader([]byte("x")), providers.PutOptions{}); err == nil {
+				t.Fatalf("PutPiece(%q): want error, got nil", id)
+			}
+			if _, err := p.GetPiece(ctx, id, nil); err == nil {
+				t.Fatalf("GetPiece(%q): want error, got nil", id)
+			}
+			if _, err := p.HeadPiece(ctx, id); err == nil {
+				t.Fatalf("HeadPiece(%q): want error, got nil", id)
+			}
+			if err := p.DeletePiece(ctx, id); err == nil {
+				t.Fatalf("DeletePiece(%q): want error, got nil", id)
+			}
+		})
+	}
+}
+
 func TestStorageProvider_DescriptiveMethods(t *testing.T) {
 	p := newProvider(t)
 	caps := p.Capabilities()
