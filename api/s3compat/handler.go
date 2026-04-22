@@ -303,12 +303,15 @@ func (h *Handler) fetchPiece(
 		if rerr != nil {
 			return nil, false, rerr
 		}
-		if putErr := h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
+		// Warm the cache inline. The promotion worker handles
+		// signals for pieces that were not cached here (e.g. range
+		// reads) so we do not publish one from this path — doing so
+		// would cause a redundant origin fetch since the piece is
+		// already resident.
+		_ = h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,
-		}); putErr == nil {
-			h.signalPromotion(piece, tenantID, int64(len(buf)))
-		}
+		})
 		return io.NopCloser(bytes.NewReader(buf)), false, nil
 	}
 	return body, false, nil

@@ -60,16 +60,16 @@ func (e *Engine) SetPolicy(tenantID string, p *Policy) {
 // gateway records on the manifest.
 func (e *Engine) ResolveBackend(tenantID, bucket, objectKey string) (string, metadata.PlacementPolicy, error) {
 	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	policy, ok := e.Policies[tenantID]
-	providerMap := e.Providers
 	def := e.Default
-	e.mu.RUnlock()
 
 	if !ok || policy == nil {
 		if def == "" {
 			return "", metadata.PlacementPolicy{}, fmt.Errorf("placement: no policy for tenant %q and no default backend", tenantID)
 		}
-		if _, ok := providerMap[def]; !ok {
+		if _, ok := e.Providers[def]; !ok {
 			return "", metadata.PlacementPolicy{}, fmt.Errorf("placement: default backend %q is not registered", def)
 		}
 		return def, metadata.PlacementPolicy{
@@ -78,12 +78,12 @@ func (e *Engine) ResolveBackend(tenantID, bucket, objectKey string) (string, met
 		}, nil
 	}
 
-	eligible := filterProviders(providerMap, policy.Spec.Placement)
+	eligible := filterProviders(e.Providers, policy.Spec.Placement)
 	if len(eligible) == 0 {
 		return "", metadata.PlacementPolicy{}, fmt.Errorf("placement: no registered backend satisfies tenant %q policy", tenantID)
 	}
 	sort.Slice(eligible, func(i, j int) bool {
-		return storageRank(providerMap[eligible[i]]) < storageRank(providerMap[eligible[j]])
+		return storageRank(e.Providers[eligible[i]]) < storageRank(e.Providers[eligible[j]])
 	})
 	chosen := eligible[0]
 
