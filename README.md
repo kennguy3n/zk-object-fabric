@@ -16,6 +16,11 @@ The fabric is designed to **start on public cloud** and migrate to
 **owned infrastructure** without changing customer-facing APIs. The same
 SDK, bucket name, object key, and URL work across every phase.
 
+The S3 API is the phase-invariant contract. The same `aws s3 cp`,
+`boto3`, or `@aws-sdk/client-s3` command works in Phase 1 (Wasabi),
+Phase 2 (Ceph RGW), and Phase 3 (owned DC) without any client-side
+changes. Backend migrations are invisible to the API consumer.
+
 It serves two audiences:
 
 - **B2C / self-service** app developers who need cheap, zero-knowledge,
@@ -26,6 +31,10 @@ It serves two audiences:
 
 ## Key differentiators
 
+- **S3 API as the stable contract** — the S3-compatible API surface is
+  frozen across all phases. Backend storage, encryption, caching, and
+  erasure coding evolve underneath; the API never changes. Validated
+  by a compliance test suite that runs against every backend adapter.
 - **Zero-knowledge by default** — client-side encryption, per-object
   DEKs, encrypted manifests. The service operator cannot read customer
   data.
@@ -99,14 +108,17 @@ Why this works:
 - **Phase 1 — Public Cloud Origin**: AWS control plane + Linode data
   plane + Wasabi storage. Prove the ZK storage layer, S3 API, client
   SDK, placement policy, billing, hot cache, migration engine, and
-  operational telemetry.
-- **Phase 2 — Hybrid Local Primary**: add local DC cells for new
-  writes. Linode + Wasabi continue as backup and overflow. Dual-write,
-  lazy migration on read, background rebalancer.
+  operational telemetry. *S3 API served by Linode gateway → Wasabi
+  backend.*
+- **Phase 2 — Hybrid Local Primary**: add local DC cells (Ceph RGW)
+  for new writes. Linode + Wasabi continue as backup and overflow.
+  Dual-write, lazy migration on read, background rebalancer. *Same S3
+  API, now served by gateway → Ceph RGW backend. Zero client changes.*
 - **Phase 3 — In-Country Storage Cells**: local erasure-coded HDD
   origin, NVMe cache, DC / rack / node placement. Cloud only for DR,
   migration, and burst. This is where ZK Object Fabric achieves cost
-  leadership.
+  leadership. *Same S3 API, now served by gateway → owned DC backend.
+  Zero client changes.*
 
 ## Architecture (full system view)
 
@@ -227,6 +239,11 @@ key mode.
 ```
 zk-object-fabric/
   api/s3_compat/
+    handler/          # S3 API request handlers (PUT, GET, HEAD, DELETE, LIST, multipart)
+    presigned/        # Presigned URL generation and validation
+    auth/             # S3 signature v4 verification
+    errors/           # S3-compatible error responses (XML)
+    middleware/       # Rate limiting, tenant resolution, request logging
   encryption/
     client_sdk/
     envelope_keys/
@@ -255,6 +272,13 @@ zk-object-fabric/
     request_metering/
   tests/
     s3_compat/
+      crud/           # PUT, GET, HEAD, DELETE, CopyObject
+      listing/        # ListObjectsV2, ListBuckets
+      multipart/      # Full multipart lifecycle
+      range/          # Range GET, conditional headers
+      presigned/      # Presigned URL generation and consumption
+      migration/      # S3 operations during active backend migration
+      cross_adapter/  # Same test suite run against each StorageProvider adapter
     chaos/
     migration/
     cost_model/
@@ -281,6 +305,10 @@ interface StorageProvider {
 
 The Go implementation uses the equivalent interface; the TypeScript
 signature above is the canonical reference for documentation.
+
+Every adapter must pass the S3 compliance test suite
+(`tests/s3_compat/`). This guarantees that swapping `wasabi` for
+`ceph_rgw` or `local_dc` does not change S3 API behavior.
 
 ## What NOT to build first
 

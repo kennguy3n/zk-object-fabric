@@ -239,10 +239,159 @@ opaque object IDs, sizes, hashes, and accounting counters.
 Wasabi's free-egress policy assumes monthly egress ≤ stored data
 volume. The Linode cache layer is essential. Hot objects are pinned
 to Linode so repeated reads do not hit Wasabi origin. Promotion
-policy (see §3.10) ensures frequently-read objects move to Linode
+policy (see §3.11) ensures frequently-read objects move to Linode
 cache within a few reads.
 
-### 3.2 Critical design decision: customer object ≠ provider object
+### 3.2 S3 API Contract
+
+The S3-compatible API is the **architectural invariant** of ZK Object
+Fabric. It is the outermost layer of the system and the only surface
+customers interact with. Everything below it — encryption, manifests,
+cache, storage provider adapters, backends — can evolve, be replaced,
+or be migrated between phases, but the S3 API must not change.
+
+#### 3.2.1 Principle: S3 API is the phase-invariant contract
+
+- The ZK Gateway exposes an S3-compatible API endpoint. This is the
+  **only** interface customers interact with.
+- The S3 API surface is **frozen across phases**. A client application
+  that works against Phase 1 (Wasabi) MUST work identically against
+  Phase 2+ (Ceph RGW) and Phase 3 (owned DC) without any code changes,
+  SDK updates, endpoint changes, or credential rotation (beyond normal
+  key rotation).
+- The same bucket name, object key, URL path, and API semantics work
+  in every phase. Backend migrations are invisible to the S3 API
+  consumer.
+- This is enforced by the `StorageProvider` adapter abstraction
+  (§3.5) and the provider-neutral manifests (§3.3). The S3 API layer
+  translates S3 operations into internal operations; the internal
+  operations are dispatched to whichever backend currently holds the
+  data.
+
+We refer to this property as the S3 API being **phase-invariant** —
+a constant across the variable of phase, backend, or deployment
+model.
+
+#### 3.2.2 Supported S3 operations (compatibility subset)
+
+The following table defines the exact S3 operations supported. The
+subset is deliberately tight: it covers the target use cases
+(business files, chat uploads, file sharing, backup archives, media
+distribution) and nothing else. It is better to support fewer
+operations perfectly than many operations partially.
+
+| Category     | Operation                                | Phase 1   | Phase 2+ | Phase 3 | Notes                                                                   |
+| ------------ | ---------------------------------------- | --------- | -------- | ------- | ----------------------------------------------------------------------- |
+| Object CRUD  | `PutObject`                              | Yes       | Yes      | Yes     | Gateway encrypts/chunks, writes to active backend                       |
+| Object CRUD  | `GetObject`                              | Yes       | Yes      | Yes     | Gateway reads from cache or origin, decrypts if managed mode            |
+| Object CRUD  | `HeadObject`                             | Yes       | Yes      | Yes     | Metadata from manifest; no origin read                                  |
+| Object CRUD  | `DeleteObject`                           | Yes       | Yes      | Yes     | Manifest tombstone + async backend delete                               |
+| Object CRUD  | `CopyObject`                             | Yes       | Yes      | Yes     | Server-side copy within same tenant                                     |
+| Listing      | `ListObjectsV2`                          | Yes       | Yes      | Yes     | Served from metadata store, not backend                                 |
+| Listing      | `ListBuckets`                            | Yes       | Yes      | Yes     | From tenant metadata                                                    |
+| Multipart    | `CreateMultipartUpload`                  | Yes       | Yes      | Yes     | Gateway manages parts; assembles manifest on complete                   |
+| Multipart    | `UploadPart`                             | Yes       | Yes      | Yes     | Each part encrypted/chunked independently                               |
+| Multipart    | `CompleteMultipartUpload`                | Yes       | Yes      | Yes     | Assembles final manifest from part manifests                            |
+| Multipart    | `AbortMultipartUpload`                   | Yes       | Yes      | Yes     | Cleans up part manifests and backend pieces                             |
+| Range reads  | `GetObject` with `Range` header          | Yes       | Yes      | Yes     | Range-aligned encrypted chunks enable partial reads                     |
+| Presigned    | Presigned GET/PUT URLs                   | Yes       | Yes      | Yes     | Gateway generates presigned URLs; URL format is phase-independent       |
+| Bucket ops   | `CreateBucket`                           | Yes       | Yes      | Yes     | Creates namespace in metadata + backend bucket/prefix                   |
+| Bucket ops   | `DeleteBucket`                           | Yes       | Yes      | Yes     | Requires empty bucket                                                   |
+| Bucket ops   | `HeadBucket`                             | Yes       | Yes      | Yes     |                                                                         |
+| Conditional  | `If-None-Match`, `If-Modified-Since`     | Yes       | Yes      | Yes     | Evaluated against manifest metadata                                     |
+| Versioning   | `GetObject?versionId=`                   | Phase 1+  | Yes      | Yes     | Object versioning via manifest versions                                 |
+
+**Operations explicitly NOT supported** (to avoid scope creep):
+
+- S3 Select (SQL queries on objects)
+- S3 Object Lambda
+- S3 Batch Operations
+- S3 Storage Lens
+- S3 Inventory
+- Bucket policies (replaced by ZK placement policies — see §3.10)
+- Cross-region replication (replaced by the ZK migration engine — see §4)
+- S3 Transfer Acceleration (replaced by the ZK cache layer — see §3.7)
+- Object Lock / WORM (deferred to Phase 3)
+
+#### 3.2.3 S3 API behavior across backend transitions
+
+Each S3 operation must behave consistently during a backend migration
+(for example, Wasabi → Ceph RGW). The client sees no difference at
+any point.
+
+- **During dual-write**: `PutObject` writes to both backends.
+  `GetObject` reads from the primary (new backend) first, falls back
+  to the old backend. The client sees no difference.
+- **During lazy migration**: `GetObject` for an object still on the
+  old backend triggers a transparent migration. The response is
+  served normally; the migration happens in the background. Latency
+  may be slightly higher for the first read of a not-yet-migrated
+  object (origin read from old backend + write to new backend), but
+  subsequent reads are served from the new backend or cache.
+- **After migration**: all operations go to the new backend. The old
+  backend copy is drained after the grace period. The client never
+  knew a migration happened.
+- **Presigned URLs**: presigned URLs generated before a migration
+  remain valid because they point to the ZK Gateway endpoint, not to
+  the backend directly. The gateway resolves the current backend from
+  the manifest at request time.
+
+#### 3.2.4 S3 API compliance test suite
+
+The `tests/s3_compat/` directory contains an S3 compliance test suite
+that:
+
+- Runs the full supported operation set against every
+  `StorageProvider` adapter (`wasabi`, `ceph_rgw`, `local_fs_dev`,
+  etc.).
+- Validates that the API behavior is **identical** regardless of
+  which backend is active.
+- Includes migration-in-progress tests: runs the suite while a
+  backend migration is in progress and verifies zero behavioral
+  differences.
+- Uses the AWS SDK (Go and JS) as the test client to ensure
+  real-world SDK compatibility.
+- Runs in CI on every commit and before every phase transition.
+
+The compliance test suite is the enforcement mechanism. Without it,
+"S3 compatible" is a marketing claim; with it, it is an engineering
+guarantee.
+
+#### 3.2.5 S3 API as the stable surface
+
+```mermaid
+flowchart TD
+    subgraph Stable["Stable Contract (never changes)"]
+        S3["S3-Compatible API<br/>(PUT, GET, HEAD, DELETE, LIST,<br/>Multipart, Range, Presigned)"]
+    end
+    subgraph Internal["Internal (changes per phase)"]
+        GW["ZK Gateway"]
+        ENC["Encryption Layer"]
+        MAN["Manifest Store"]
+        CACHE["Cache (L0/L1)"]
+        ADAPT["StorageProvider Adapter"]
+    end
+    subgraph Backends["Backends (swappable)"]
+        W["Wasabi (Phase 1)"]
+        CEPH["Ceph RGW (Phase 2+)"]
+        OWN["Owned DC (Phase 3)"]
+    end
+
+    S3 --> GW
+    GW --> ENC
+    GW --> MAN
+    GW --> CACHE
+    GW --> ADAPT
+    ADAPT --> W
+    ADAPT --> CEPH
+    ADAPT --> OWN
+```
+
+The S3 API sits at the top. Everything below it is internal and may
+change per phase. Everything above it is the customer's application,
+which does not change across phases.
+
+### 3.3 Critical design decision: customer object ≠ provider object
 
 Provider-neutral manifests are used from day one:
 
@@ -256,7 +405,12 @@ object key, URL, or API. The manifest records which provider currently
 holds each piece, and the migration engine rewrites those locators
 without touching the customer's namespace.
 
-### 3.3 Object manifest format
+This indirection is what makes the S3 API phase-invariant. The
+customer interacts with the S3 API using bucket names and object
+keys; the manifest maps those to backend-specific locators that
+change during migration without affecting the S3 surface.
+
+### 3.4 Object manifest format
 
 ```json
 {
@@ -299,7 +453,7 @@ The manifest itself is encrypted before it is stored in the metadata
 DB. The control plane sees only the manifest ID, size, and placement
 tags required for policy evaluation.
 
-### 3.4 Storage provider adapter
+### 3.5 Storage provider adapter
 
 All backends implement the same `StorageProvider` interface:
 
@@ -329,7 +483,12 @@ Adapters report cost models and placement labels back to the policy
 engine so placement decisions can factor in per-provider $/GB, egress
 policy, and regulatory tags.
 
-### 3.5 Control plane (on AWS)
+Every adapter MUST pass the S3 compliance test suite
+(`tests/s3_compat/`, §3.2.4). A new adapter is not considered
+production-ready until it passes 100% of the compliance tests. This
+ensures that swapping backends does not change S3 API behavior.
+
+### 3.6 Control plane (on AWS)
 
 Responsibilities:
 
@@ -380,7 +539,7 @@ policy:
 The control plane handles **no customer data**. It sees only opaque
 object IDs, sizes, hashes, and accounting counters.
 
-### 3.6 Data plane — three layers
+### 3.7 Data plane — three layers
 
 | Layer | Function                                | Storage format                                | Phase 1 implementation                                            |
 | ----- | --------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------- |
@@ -400,7 +559,13 @@ does not lower *read* bandwidth; every GET still transfers the
 object bytes. Hot reads must therefore be served from L0 / L1 where
 the object is materialized, not reconstructed from shards.
 
-### 3.7 Encryption model
+All three layers (L0, L1, L2) are invisible to the S3 API consumer.
+The client issues a `GetObject`; the gateway decides whether to serve
+from L0 cache, L1 replica, or L2 origin. The response format,
+headers, and semantics are identical regardless of which layer served
+the data.
+
+### 3.8 Encryption model
 
 - **Strict ZK**: client SDK performs encryption. Plaintext keys never
   cross to the service. Per-object DEKs are wrapped by the tenant's
@@ -419,7 +584,14 @@ by default. Convergent-encryption buckets may be offered as an
 explicit opt-in for specific corpora (backup archives) where the
 content-identity leak is acceptable.
 
-### 3.8 Erasure coding model (Phase 2+ only)
+Encryption is transparent to the S3 API. In Strict ZK mode, the SDK
+encrypts before calling `PutObject` and decrypts after `GetObject` —
+the S3 API carries ciphertext. In Managed Encrypted mode, the
+gateway encrypts/decrypts transparently — the S3 API carries
+plaintext. In both cases, the S3 API semantics (status codes,
+headers, ETags) are identical.
+
+### 3.9 Erasure coding model (Phase 2+ only)
 
 | Environment                              | Recommended EC   | Raw overhead  | Use case                                             |
 | ---------------------------------------- | ---------------- | ------------- | ---------------------------------------------------- |
@@ -432,7 +604,7 @@ content-identity leak is acceptable.
 During Phase 1, Wasabi handles durability natively and EC is not
 needed. Do not overbuild EC.
 
-### 3.9 Placement control
+### 3.10 Placement control
 
 - **Phase 1**: expose `provider`, `region`, `country`, `storage_class`.
   Example:
@@ -452,7 +624,7 @@ needed. Do not overbuild EC.
 Do **not** expose node-level placement in Phase 1. Provider and region
 are the only meaningful knobs while Wasabi owns durability.
 
-### 3.10 Read path & promotion
+### 3.11 Read path & promotion
 
 #### Phase 1 read path
 
@@ -491,7 +663,7 @@ GET object
 egress within fair-use. If a hot object is read repeatedly, it **must**
 be cached on Linode to avoid excessive Wasabi origin reads.
 
-### 3.11 Bandwidth strategy
+### 3.12 Bandwidth strategy
 
 - **Phase 1**: Linode provides the bandwidth. Wasabi fair-use egress
   is the constraint. A cache-first design on Linode absorbs hot reads.
@@ -517,7 +689,12 @@ Rules:
 Customers must be able to start on Wasabi via Linode and end up on a
 local DC cell without changing their SDK, bucket name, URL, or object
 key. Customer namespaces are decoupled from backend locators (see
-§3.2), so migration is a manifest-rewrite, not a client-visible event.
+§3.3), so migration is a manifest-rewrite, not a client-visible event.
+
+The S3 API is the contract. Migration is invisible to the S3 API
+consumer. The same `aws s3 cp`, `boto3`, or `@aws-sdk/client-s3`
+command works before, during, and after a migration. No endpoint
+change, no credential rotation, no SDK update, no bucket rename.
 
 ### 4.2 Phase 1 → Phase 2 migration
 
@@ -669,7 +846,9 @@ dominates; above 20 PB repair and failure domains get unwieldy.
   FoundationDB cluster).
 - Repair queues scoped to the cell.
 - Failure-domain topology pinned to the cell's DCs / racks / nodes.
-- S3 gateway fleet sized to the cell's request volume.
+- S3 gateway fleet sized to the cell's request volume. Every cell's
+  gateway fleet exposes the same S3 API (§3.2); a client routed to
+  Cell 1 or Cell 2 sees identical S3 behavior.
 - Billing counters rolled up to the global control plane.
 - Placement inventory (nodes, capacities, classes).
 
@@ -950,6 +1129,7 @@ Becomes an **infrastructure company problem**. Needs:
 | Abuse traffic (viral files, DDoS, scraping)                 | Per-tenant egress budgets, anomaly detection, CDN shielding, reputation-based throttling                    |
 | Durability marketing ("eleven nines") that cannot be met    | Chaos testing, audit replays, measured durability — do not publish theoretical nines                        |
 | Vendor lock-in on Wasabi                                    | Provider-neutral manifests and the migration engine; B2 / R2 / local DC always available as drop-ins        |
+| S3 API regression during backend migration                  | S3 compliance test suite (§3.2.4) runs against every adapter and during migration; CI gate blocks deployment if any test fails |
 
 ---
 

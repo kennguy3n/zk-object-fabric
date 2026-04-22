@@ -44,8 +44,12 @@ Checklist:
 - [ ] Define erasure-coding profiles for Phase 2+ (6+2, 8+3, 10+4).
       Note: Phase 1 uses Wasabi's native durability; EC is not needed
       until Phase 2+.
-- [ ] Define the S3 compatibility subset (PUT, GET, HEAD, DELETE,
-      LIST, multipart, range GET).
+- [x] Define the S3 compatibility subset (PUT, GET, HEAD, DELETE,
+      LIST, multipart, range GET). Full operation matrix specified in
+      [PROPOSAL.md §3.2.2](PROPOSAL.md).
+- [x] Define the S3 API as the phase-invariant contract (operation
+      matrix, migration behavior, compliance test suite spec) —
+      specified in [PROPOSAL.md §3.2](PROPOSAL.md).
 - [ ] Define the benchmark suite (PUT / GET latency percentiles,
       cache hit ratio, repair time, Wasabi origin egress ratio,
       network cost).
@@ -103,6 +107,10 @@ Checklist:
 - [ ] Migration engine: dual-write, lazy migration on read,
       background rebalancer (exercised against a `local_fs_dev`
       target).
+- [ ] Implement S3 compliance test suite (`tests/s3_compat/`) and
+      run against `wasabi` and `local_fs_dev` adapters.
+- [ ] Validate S3 API behavior during a simulated Wasabi →
+      `local_fs_dev` migration (zero behavioral differences).
 - [ ] Benchmark execution (PUT / GET p50 / p95 / p99, cache hit
       ratio, Wasabi origin egress ratio vs stored bytes,
       small-object overhead, LIST performance at 10M / 100M / 1B
@@ -139,6 +147,10 @@ Checklist:
       media libraries, sovereign storage).
 - [ ] End-to-end migration dry run: move a beta bucket from Wasabi
       to the first local cell without customer-visible changes.
+- [ ] Run S3 compliance test suite against `ceph_rgw` adapter —
+      100% pass required before production traffic.
+- [ ] Run S3 compliance test suite during a live Wasabi → Ceph RGW
+      migration with beta customers.
 
 ### Avoid early customers with
 
