@@ -3,7 +3,7 @@
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 3 — Beta Cell (in progress)
-- **Last updated**: 2026-04-22 (Phase 3 PR #11 + #12 review-finding fixes landed: (1) `cache/hot_object_cache/disk_cache.go#Get` now captures the index `*list.Element` before the first unlock and, in the corruption-recovery branch, only evicts the entry when the index still points at the same element — a concurrent `Put()` that replaced the entry between the unlock and re-lock is no longer erased by the recovering Get. Regression coverage in `cache/hot_object_cache/disk_cache_test.go#TestDiskCache_ConcurrentPutDuringCorruptGet`. (2) `api/s3compat/erasure_coding.go#getMultipart` now logs the tenant / bucket / key / part / piece ID and the bytes already delivered when a mid-stream `GetPiece` failure truncates the response, with a code comment documenting that this is best-effort because the HTTP headers are already committed. Billing emissions for `GetRequests` and `EgressBytes` on the `written` counter were already in place and are preserved. (3) `cmd/gateway/main.go#buildHotObjectCache` now degrades gracefully: if `cfg.Gateway.CachePath` is set but `NewDiskCache` fails (bad volume, permission error, corrupt warm-up) the gateway logs a warning and falls back to `NewMemoryCache` instead of exiting, so a single bad NVMe disk does not take the node offline. Earlier 2026-04-22 entry: Phase 3 Ceph RGW compliance landed: the full `TestSuite_CephRGW` subtest matrix — PUT / GET / HEAD / DELETE, ranged GET (prefix / middle / tail), LIST prefix, idempotent DELETE, missing-key 404, presigned GET, multipart-like overwrite, multipart round-trip, multipart abort, and 6+2 erasure-coded round-trip — all pass against a live Ceph Reef RGW at `http://127.0.0.1:8888` (`zkof-ceph-compliance` bucket). To get the AWS SDK v2 client to talk to a non-AWS S3 endpoint with a non-seekable `io.Reader` piece body, `providers/s3_generic/generic.go#PutPiece` now per-call swaps in `v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` (UNSIGNED-PAYLOAD signing); this keeps the SigV4 envelope intact without forcing the body to be seekable, which `handler.go` and `multipart_handler.go` cannot guarantee for request-sourced streams. Backend integrity is still verified by ETag on the gateway side. Phase 3 foundations (`DiskCache`, `ClickHouseSink`, health monitor, BYOC adapter entrypoints) and Phase 3 multipart + EC remain landed from PRs 1 + 2.)
+- **Last updated**: 2026-04-22 (Phase 3 abuse-throttling + BYOC adapters + tenant console landed: (1) `internal/auth/rate_limit.go` now enforces the per-tenant `budgets.egress_tb_month` ceiling alongside the existing RPS limiter, and layers a sliding-window anomaly detector (EWMA baseline, configurable alert multiplier, optional throttle-on-anomaly) that emits `AbuseBudgetExhausted` and `AbuseAnomalyAlert` events via the billing sink. Coverage in `internal/auth/rate_limit_test.go` across budget-exhaustion, baseline-convergence, anomaly-alert, and throttle-cooldown scenarios. (2) BYOC cloud provider adapters fleshed out: `providers/aws_s3/s3.go`, `providers/backblaze_b2/b2.go`, and `providers/cloudflare_r2/r2.go` now carry production-ready Config validation, `NewWithClient` test seams, and provider-accurate `CostModel` + `PlacementLabels` values. All three embed `*s3_generic.Provider` so PUT/GET/HEAD/DELETE/LIST are inherited from the shared SigV4 + AWS SDK v2 implementation; Cloudflare R2 derives its account-scoped endpoint from `AccountID` and defaults to path-style addressing. Per-adapter unit tests in `providers/{aws_s3,backblaze_b2,cloudflare_r2}/*_test.go`. (3) Tenant console scaffolded under `frontend/` (Vite + React + TypeScript). Ships login / signup, dashboard (storage / request / egress stats from `/api/v1/usage`), bucket management, API-key management (access key + one-time secret reveal on create), placement-policy YAML editor with a structured summary, and a dedicated-cells page gated on `contract_type ∈ {b2b_dedicated, sovereign}`. Talks to the gateway's `/api/v1/` management API exclusively (separate from the S3-compat routes). (4) Docs: `internal/config/config.go` now defaults `CachePath` to `""` so developer and test environments get the in-memory cache without the DiskCache-fallback warning; operators set `config.gateway.cache_path` (or `ZKOF_GATEWAY_CACHE_PATH`) to enable NVMe-backed caching in production. Status banners in `README.md` and `docs/PROPOSAL.md` now correctly report Phase 3. Earlier 2026-04-22 entry: Phase 3 PR #11 + #12 review-finding fixes landed: (1) `cache/hot_object_cache/disk_cache.go#Get` now captures the index `*list.Element` before the first unlock and, in the corruption-recovery branch, only evicts the entry when the index still points at the same element — a concurrent `Put()` that replaced the entry between the unlock and re-lock is no longer erased by the recovering Get. Regression coverage in `cache/hot_object_cache/disk_cache_test.go#TestDiskCache_ConcurrentPutDuringCorruptGet`. (2) `api/s3compat/erasure_coding.go#getMultipart` now logs the tenant / bucket / key / part / piece ID and the bytes already delivered when a mid-stream `GetPiece` failure truncates the response, with a code comment documenting that this is best-effort because the HTTP headers are already committed. Billing emissions for `GetRequests` and `EgressBytes` on the `written` counter were already in place and are preserved. (3) `cmd/gateway/main.go#buildHotObjectCache` now degrades gracefully: if `cfg.Gateway.CachePath` is set but `NewDiskCache` fails (bad volume, permission error, corrupt warm-up) the gateway logs a warning and falls back to `NewMemoryCache` instead of exiting, so a single bad NVMe disk does not take the node offline. Earlier 2026-04-22 entry: Phase 3 Ceph RGW compliance landed: the full `TestSuite_CephRGW` subtest matrix — PUT / GET / HEAD / DELETE, ranged GET (prefix / middle / tail), LIST prefix, idempotent DELETE, missing-key 404, presigned GET, multipart-like overwrite, multipart round-trip, multipart abort, and 6+2 erasure-coded round-trip — all pass against a live Ceph Reef RGW at `http://127.0.0.1:8888` (`zkof-ceph-compliance` bucket). To get the AWS SDK v2 client to talk to a non-AWS S3 endpoint with a non-seekable `io.Reader` piece body, `providers/s3_generic/generic.go#PutPiece` now per-call swaps in `v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` (UNSIGNED-PAYLOAD signing); this keeps the SigV4 envelope intact without forcing the body to be seekable, which `handler.go` and `multipart_handler.go` cannot guarantee for request-sourced streams. Backend integrity is still verified by ETag on the gateway side. Phase 3 foundations (`DiskCache`, `ClickHouseSink`, health monitor, BYOC adapter entrypoints) and Phase 3 multipart + EC remain landed from PRs 1 + 2.)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -273,11 +273,38 @@ Checklist:
       capacity, HDD durable nodes (L2), NVMe cache, gateway fleet.
 - [ ] 25–100 Gbps aggregate public bandwidth across Linode + local
       DC.
-- [ ] Abuse throttling and per-tenant bandwidth budgets.
-- [ ] Tenant console (React) for onboarding, billing, placement
-      policy, and key management.
-- [ ] B2C self-service onboarding flow.
-- [ ] B2B dedicated cell provisioning.
+- [x] Abuse throttling and per-tenant bandwidth budgets.
+      `internal/auth/rate_limit.go` layers three enforcement bands on
+      every request: the existing per-tenant token-bucket RPS limit
+      (`budgets.requests_per_sec` + `burst_requests`), a monthly
+      egress ceiling sourced from `budgets.egress_tb_month`, and a
+      sliding-window anomaly detector with a configurable EWMA
+      baseline and alert multiplier. Budget exhaustion returns HTTP
+      429 and emits an `AbuseBudgetExhausted` billing event;
+      anomalies emit `AbuseAnomalyAlert` and, when
+      `ThrottleOnAnomaly` is set, throttle for a cooldown window.
+      Coverage in `internal/auth/rate_limit_test.go`.
+- [~] Tenant console (React) for onboarding, billing, placement
+      policy, and key management. Vite + React + TypeScript
+      scaffold landed under `frontend/` with login / signup,
+      dashboard (storage / requests / egress), bucket management,
+      API-key management (access key + one-time secret reveal on
+      create), placement-policy YAML editor with a structured
+      summary, and a dedicated-cells page gated on
+      `contract_type ∈ {b2b_dedicated, sovereign}`. Talks only to
+      `/api/v1/...` (separate from the S3-compat routes).
+      Remaining: real auth backend integration, SSE on
+      `/api/v1/usage/stream`, and Playwright e2e tests.
+- [~] B2C self-service onboarding flow. Frontend signup form +
+      `POST /api/v1/auth/signup` client wired in `frontend/`; the
+      gateway-side handler is still deferred to the control-plane
+      workstream (billing integration, email verification, CAPTCHA).
+- [~] B2B dedicated cell provisioning. Console surface shipped
+      (`frontend/src/pages/B2BPage.tsx`) that lists dedicated cells
+      from `/api/v1/dedicated-cells` for tenants whose
+      `contract_type` is `b2b_dedicated` or `sovereign`. The
+      operator-side provisioning workflow (hardware allocation,
+      cell bring-up) is still part of the Phase 3 ops backlog.
 - [ ] Beta customer onboarding (backup, SaaS assets, AI datasets,
       media libraries, sovereign storage).
 - [ ] End-to-end migration dry run: move a beta bucket from Wasabi
