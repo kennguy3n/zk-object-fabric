@@ -551,6 +551,13 @@ func (c *consoleTenantAdapter) AddAPIKey(tenantID, accessKey, secretKey string) 
 	})
 }
 
+// CreateTenant forwards to the backing MemoryTenantStore so the
+// console signup handler can register a new tenant record before
+// minting its initial API key pair.
+func (c *consoleTenantAdapter) CreateTenant(t tenant.Tenant) error {
+	return c.store.CreateTenant(t)
+}
+
 // noopUsageQuery is the zero-cost fallback used when no ClickHouse
 // sink is wired. It returns an empty counter map so the frontend
 // renders a dashboard shell even in local development.
