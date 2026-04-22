@@ -4,9 +4,21 @@ import (
 	"context"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
+
+// DefaultPromotionWindow is the rolling aggregation window the
+// PromotionWorker uses when evaluating DailyReadCountThreshold. It
+// matches the "daily" intent of the policy while keeping the counter
+// simple (fixed-width bucket that resets after the window elapses).
+const DefaultPromotionWindow = 24 * time.Hour
+
+// promotionPruneThreshold is the size at which the read counter
+// sweeps expired entries opportunistically. Kept small so tests that
+// exercise many pieces don't retain them forever.
+const promotionPruneThreshold = 1024
 
 // PromotionFetcher resolves a PromotionSignal to the ciphertext
 // bytes it should copy into the cache. Phase 2 wires this to the
@@ -25,8 +37,68 @@ type PromotionWorker struct {
 	Policies []PromotionPolicy
 	Fetcher  PromotionFetcher
 
+	// Window overrides the per-piece read-count aggregation window.
+	// Zero uses DefaultPromotionWindow. DailyReadCountThreshold in
+	// the policy is evaluated against the count observed within
+	// this window.
+	Window time.Duration
+
 	// Logger is optional. Nil disables internal logging.
 	Logger *log.Logger
+
+	counterOnce sync.Once
+	counter     *readCounter
+}
+
+// readCounter is a per-piece sliding-window read counter. A piece's
+// bucket resets when the current observation lands outside its
+// window relative to the bucket's start. Expired buckets are pruned
+// opportunistically once the map exceeds promotionPruneThreshold.
+type readCounter struct {
+	mu      sync.Mutex
+	window  time.Duration
+	entries map[string]*readCounterEntry
+}
+
+type readCounterEntry struct {
+	count       uint64
+	windowStart time.Time
+}
+
+func newReadCounter(window time.Duration) *readCounter {
+	return &readCounter{window: window, entries: make(map[string]*readCounterEntry)}
+}
+
+// observe records `delta` reads for pieceID at `now` and returns the
+// total read count currently attributed to the active window.
+func (c *readCounter) observe(pieceID string, delta uint64, now time.Time) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[pieceID]
+	if !ok || now.Sub(e.windowStart) >= c.window {
+		e = &readCounterEntry{windowStart: now}
+		c.entries[pieceID] = e
+	}
+	e.count += delta
+	if len(c.entries) > promotionPruneThreshold {
+		for k, v := range c.entries {
+			if now.Sub(v.windowStart) >= c.window {
+				delete(c.entries, k)
+			}
+		}
+	}
+	return e.count
+}
+
+func (w *PromotionWorker) readCounter() *readCounter {
+	w.counterOnce.Do(func() {
+		window := w.Window
+		if window <= 0 {
+			window = DefaultPromotionWindow
+		}
+		w.counter = newReadCounter(window)
+	})
+	return w.counter
 }
 
 // Run drains signals until ctx is cancelled or the channel is closed.
@@ -46,7 +118,17 @@ func (w *PromotionWorker) Run(ctx context.Context, signals <-chan PromotionSigna
 }
 
 func (w *PromotionWorker) handle(ctx context.Context, sig PromotionSignal) {
-	pol, ok := w.match(sig)
+	observedAt := sig.ObservedAt
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	delta := sig.ReadCount
+	if delta == 0 {
+		delta = 1
+	}
+	windowCount := w.readCounter().observe(sig.PieceID, delta, observedAt)
+
+	pol, ok := w.match(sig, windowCount)
 	if !ok {
 		return
 	}
@@ -66,24 +148,27 @@ func (w *PromotionWorker) handle(ctx context.Context, sig PromotionSignal) {
 	defer body.Close()
 
 	if err := w.Cache.Put(ctx, sig.PieceID, body, PutOptions{
-		SizeBytes: sig.ReadBytes,
+		SizeBytes: sig.PieceSizeBytes,
 		PinHot:    pol.PinHotByDefault,
 	}); err != nil {
 		w.logf("promotion: cache put %s: %v", sig.PieceID, err)
 	}
 }
 
-// match picks the first policy whose thresholds sig crosses. A
-// missing policy means no promotion.
-func (w *PromotionWorker) match(sig PromotionSignal) (PromotionPolicy, bool) {
+// match picks the first policy whose thresholds sig crosses. Piece
+// size comes from sig.PieceSizeBytes (the full piece, not the range
+// read) and the read-count threshold is evaluated against
+// windowCount — the aggregated read count for this piece inside the
+// worker's rolling window. A missing policy means no promotion.
+func (w *PromotionWorker) match(sig PromotionSignal, windowCount uint64) (PromotionPolicy, bool) {
 	for _, p := range w.Policies {
-		if p.MinPieceSizeBytes > 0 && sig.ReadBytes < p.MinPieceSizeBytes {
+		if p.MinPieceSizeBytes > 0 && sig.PieceSizeBytes < p.MinPieceSizeBytes {
 			continue
 		}
-		if p.MaxPieceSizeBytes > 0 && sig.ReadBytes > p.MaxPieceSizeBytes {
+		if p.MaxPieceSizeBytes > 0 && sig.PieceSizeBytes > p.MaxPieceSizeBytes {
 			continue
 		}
-		if p.DailyReadCountThreshold > 0 && sig.ReadCount < p.DailyReadCountThreshold {
+		if p.DailyReadCountThreshold > 0 && windowCount < p.DailyReadCountThreshold {
 			continue
 		}
 		return p, true

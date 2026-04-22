@@ -326,22 +326,23 @@ func (h *Handler) fetchPiece(
 		if end < 0 {
 			end = objectSize - 1
 		}
-		h.signalPromotion(piece, tenantID, end-byteRange.Start+1)
+		h.signalPromotion(piece, tenantID, end-byteRange.Start+1, objectSize)
 	}
 	return body, false, nil
 }
 
-func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, n int64) {
+func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, readBytes, pieceSize int64) {
 	if h.cfg.CachePublisher == nil {
 		return
 	}
 	h.cfg.CachePublisher.Publish(hot_object_cache.PromotionSignal{
-		PieceID:       piece.PieceID,
-		TenantID:      tenantID,
-		ReadBytes:     n,
-		ReadCount:     1,
-		ObservedAt:    h.cfg.Now(),
-		OriginBackend: piece.Backend,
+		PieceID:        piece.PieceID,
+		PieceSizeBytes: pieceSize,
+		TenantID:       tenantID,
+		ReadBytes:      readBytes,
+		ReadCount:      1,
+		ObservedAt:     h.cfg.Now(),
+		OriginBackend:  piece.Backend,
 	})
 }
 
