@@ -1,11 +1,13 @@
-// Package aws_s3 is the StorageProvider adapter for Amazon S3. In
-// the ZK fabric, AWS S3 is a BYOC / disaster-recovery target — not a
-// B2C primary — because its egress pricing undermines the fair-use
-// story.
+// Package aws_s3 is the StorageProvider adapter for Amazon S3.
 //
-// The adapter is currently a scaffold. It embeds s3_generic.Provider
-// and overrides descriptive methods; live conformance is gated
-// behind an env var so CI does not need AWS credentials.
+// In the ZK fabric, AWS S3 is a BYOC / disaster-recovery target — not
+// a B2C primary — because its egress pricing undermines the fair-use
+// story. The adapter embeds *s3_generic.Provider so PutPiece,
+// GetPiece, HeadPiece, DeletePiece, and ListPieces are all delegated
+// to the shared SigV4 + AWS SDK v2 implementation. This file only
+// carries the AWS-specific identity, capabilities, cost model, and
+// placement labels, plus a NewWithClient seam so unit tests can
+// exercise the adapter without opening a network connection.
 //
 // Reference: https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html
 package aws_s3
@@ -31,8 +33,14 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 	// Endpoint overrides the default AWS S3 endpoint. Leave empty
-	// to use the region's default endpoint.
+	// to use the region's default endpoint. Most S3-compatible
+	// appliances (MinIO, SeaweedFS) can be driven through this
+	// adapter by setting Endpoint.
 	Endpoint string
+	// UsePathStyle forces path-style addressing. Default is
+	// virtual-hosted-style, which matches AWS S3's current
+	// recommendation.
+	UsePathStyle bool
 }
 
 // Provider implements providers.StorageProvider on top of Amazon S3.
@@ -43,27 +51,57 @@ type Provider struct {
 
 // New builds a Provider.
 func New(cfg Config) (*Provider, error) {
-	if cfg.Region == "" {
-		return nil, errors.New("aws_s3: Region is required")
-	}
-	if cfg.Bucket == "" {
-		return nil, errors.New("aws_s3: Bucket is required")
-	}
-	if cfg.AccessKey == "" || cfg.SecretKey == "" {
-		return nil, errors.New("aws_s3: AccessKey and SecretKey are required")
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	base, err := s3_generic.New(s3_generic.Config{
-		Name:      "aws_s3",
-		Endpoint:  cfg.Endpoint,
-		Region:    cfg.Region,
-		Bucket:    cfg.Bucket,
-		AccessKey: cfg.AccessKey,
-		SecretKey: cfg.SecretKey,
+		Name:         "aws_s3",
+		Endpoint:     cfg.Endpoint,
+		Region:       cfg.Region,
+		Bucket:       cfg.Bucket,
+		AccessKey:    cfg.AccessKey,
+		SecretKey:    cfg.SecretKey,
+		UsePathStyle: cfg.UsePathStyle,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("aws_s3: build s3_generic base: %w", err)
 	}
 	return &Provider{Provider: base, cfg: cfg}, nil
+}
+
+// NewWithClient returns a Provider wired to a caller-supplied S3API.
+// Unit tests use this to assert the AWS adapter delegates correctly
+// without opening a network connection.
+func NewWithClient(cfg Config, client s3_generic.S3API) (*Provider, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	base, err := s3_generic.NewWithClient(s3_generic.Config{
+		Name:         "aws_s3",
+		Endpoint:     cfg.Endpoint,
+		Region:       cfg.Region,
+		Bucket:       cfg.Bucket,
+		AccessKey:    cfg.AccessKey,
+		SecretKey:    cfg.SecretKey,
+		UsePathStyle: cfg.UsePathStyle,
+	}, client)
+	if err != nil {
+		return nil, fmt.Errorf("aws_s3: build s3_generic base: %w", err)
+	}
+	return &Provider{Provider: base, cfg: cfg}, nil
+}
+
+func (c Config) validate() error {
+	if c.Region == "" {
+		return errors.New("aws_s3: Region is required")
+	}
+	if c.Bucket == "" {
+		return errors.New("aws_s3: Bucket is required")
+	}
+	if c.AccessKey == "" || c.SecretKey == "" {
+		return errors.New("aws_s3: AccessKey and SecretKey are required")
+	}
+	return nil
 }
 
 // Capabilities reports what S3 supports. S3 Standard has no minimum
@@ -74,7 +112,7 @@ func (p *Provider) Capabilities() providers.ProviderCapabilities {
 }
 
 // CostModel is the public AWS S3 Standard pricing snapshot. Egress
-// is expensive ($0.09/GB after the 100 GB/month free tier for most
+// is expensive (~$0.09/GB after the 100 GB/month free tier for most
 // regions) which is why AWS S3 is reserved for BYOC / DR in the
 // fabric.
 func (p *Provider) CostModel() providers.ProviderCostModel {

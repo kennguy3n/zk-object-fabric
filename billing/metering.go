@@ -53,6 +53,19 @@ const (
 
 	// CacheMisses counts hot-cache misses.
 	CacheMisses Dimension = "cache_misses"
+
+	// AbuseAnomalyAlert is emitted by the gateway's rate limiter
+	// when a tenant's recent request or egress rate exceeds the
+	// configured multiple of its historical baseline. The Delta
+	// field on these events carries the ratio (current / baseline)
+	// rounded to the nearest integer so downstream consumers can
+	// threshold on severity.
+	AbuseAnomalyAlert Dimension = "abuse_anomaly_alert"
+
+	// AbuseBudgetExhausted is emitted when a tenant's monthly
+	// egress budget (Budgets.EgressTBMonth) is exhausted and the
+	// rate limiter starts rejecting requests with HTTP 429.
+	AbuseBudgetExhausted Dimension = "abuse_budget_exhausted"
 )
 
 // UsageEvent is a single raw event emitted by the gateway. The billing

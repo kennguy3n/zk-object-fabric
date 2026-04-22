@@ -2,8 +2,8 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 2 — Prototype Complete. This document defines the target
-> architecture, not the current implementation. See
+> Status: Phase 3 — Beta Cell (in progress). This document defines the
+> target architecture, not the current implementation. See
 > [PROGRESS.md](PROGRESS.md) for build status.
 
 ---
