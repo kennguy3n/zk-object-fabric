@@ -8,8 +8,11 @@
 package wasabi
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/providers"
 	"github.com/kennguy3n/zk-object-fabric/providers/s3_generic"
@@ -39,6 +42,16 @@ type Config struct {
 type Provider struct {
 	*s3_generic.Provider
 	cfg Config
+	// AgeLookup, when set, reports how long pieceID has existed on
+	// Wasabi. DeletePiece consults it to emit a warning if the piece
+	// is being removed before the 90-day minimum storage window
+	// expires (and therefore still incurs billable storage). Leave
+	// nil in deployments where the age is tracked separately by the
+	// billing pipeline (MinStorageTracker in guardrails.go).
+	AgeLookup func(ctx context.Context, pieceID string) (time.Duration, bool)
+	// Logger receives the 90-day warning. Defaults to slog.Default()
+	// when nil.
+	Logger *slog.Logger
 }
 
 // New returns a Provider configured for Wasabi.
@@ -159,6 +172,36 @@ func regionToCountry(region string) string {
 
 func startsWith(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// DeletePiece removes a piece from Wasabi and, if AgeLookup is set
+// and reports an age less than Wasabi's 90-day minimum storage
+// duration, emits a warning so operators know billing will continue
+// for the residual window. The delete is still issued regardless of
+// age: the contract with the caller is that they asked for a delete,
+// not that the piece must be free-and-clear to remove.
+func (p *Provider) DeletePiece(ctx context.Context, pieceID string) error {
+	minDuration := WasabiMinStorageDays * 24 * time.Hour
+	if p.AgeLookup != nil {
+		if age, ok := p.AgeLookup(ctx, pieceID); ok && age < minDuration {
+			p.logger().Warn(
+				"wasabi: deleting piece before 90-day minimum storage duration; billing continues for the residual window",
+				slog.String("piece_id", pieceID),
+				slog.String("bucket", p.cfg.Bucket),
+				slog.String("region", p.cfg.Region),
+				slog.Duration("age", age),
+				slog.Duration("residual", minDuration-age),
+			)
+		}
+	}
+	return p.Provider.DeletePiece(ctx, pieceID)
+}
+
+func (p *Provider) logger() *slog.Logger {
+	if p.Logger != nil {
+		return p.Logger
+	}
+	return slog.Default()
 }
 
 // String returns a human-readable description for logs.

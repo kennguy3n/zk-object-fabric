@@ -8,9 +8,15 @@ package manifest_store
 
 import (
 	"context"
+	"errors"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 )
+
+// ErrNotFound is returned by Get and Delete when the requested
+// manifest does not exist. Callers should use errors.Is(err,
+// ErrNotFound) rather than comparing with ==.
+var ErrNotFound = errors.New("manifest_store: manifest not found")
 
 // ManifestKey identifies a single manifest.
 type ManifestKey struct {

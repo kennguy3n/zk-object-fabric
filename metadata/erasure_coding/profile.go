@@ -70,15 +70,39 @@ var (
 		ParityShards: 4,
 		StripeSize:   4 * 1024 * 1024, // 4 MiB
 	}
+
+	// Profile12Plus4 is a wide profile for large cells where
+	// per-stripe overhead matters more than single-node recovery
+	// latency. Storage overhead is 1.333x with tolerance for 4
+	// shard losses per stripe.
+	Profile12Plus4 = ErasureCodingProfile{
+		Name:         "12+4",
+		DataShards:   12,
+		ParityShards: 4,
+		StripeSize:   4 * 1024 * 1024, // 4 MiB
+	}
+
+	// Profile16Plus4 is the widest default profile. It minimises
+	// raw-overhead multiplier (1.25x) at the cost of more IO fan-out
+	// per stripe. Intended for cold / archival B2B cells where
+	// storage COGS dominates.
+	Profile16Plus4 = ErasureCodingProfile{
+		Name:         "16+4",
+		DataShards:   16,
+		ParityShards: 4,
+		StripeSize:   4 * 1024 * 1024, // 4 MiB
+	}
 )
 
-// StandardProfiles returns the three Phase 2+ profiles in declaration
+// StandardProfiles returns the Phase 2+ profiles in declaration
 // order. The slice is freshly allocated so callers may mutate it.
 func StandardProfiles() []ErasureCodingProfile {
 	return []ErasureCodingProfile{
 		Profile6Plus2,
 		Profile8Plus3,
 		Profile10Plus4,
+		Profile12Plus4,
+		Profile16Plus4,
 	}
 }
 
