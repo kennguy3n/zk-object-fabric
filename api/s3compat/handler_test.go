@@ -223,6 +223,82 @@ func TestGet_RangeRequest(t *testing.T) {
 	}
 }
 
+func TestGet_OpenEndedRange(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=5-")
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("GET status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "5" {
+		t.Errorf("open-ended range Content-Length = %q, want %q", got, "5")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 5-9/10" {
+		t.Errorf("open-ended range Content-Range = %q, want %q", got, "bytes 5-9/10")
+	}
+	if rec.Body.String() != "56789" {
+		t.Errorf("open-ended range body = %q, want %q", rec.Body.String(), "56789")
+	}
+}
+
+func TestHashObjectKey_DistinguishesSlashVariants(t *testing.T) {
+	a := hashObjectKey("a//b")
+	b := hashObjectKey("a/b")
+	if a == b {
+		t.Errorf("hashObjectKey collapses a//b and a/b to the same hash (%q)", a)
+	}
+	trailing := hashObjectKey("a/b/")
+	if trailing == b {
+		t.Errorf("hashObjectKey collapses a/b/ and a/b to the same hash (%q)", b)
+	}
+}
+
+func TestDelete_ManifestFirstOrdering(t *testing.T) {
+	// When piece delete fails, manifest is still gone: GET must 404.
+	store := memory.New()
+	bill := &recordingBilling{}
+	broken := &fakeProvider{pieces: map[string][]byte{}, etag: "e", backend: "test"}
+	// Hook DeletePiece to fail after manifest is already removed.
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": &brokenDeleteProvider{fakeProvider: broken}},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   bill,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/bucket/key", bytes.NewReader([]byte("abc")))
+	req.ContentLength = 3
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodDelete, "/bucket/key", nil)
+	rec := httptest.NewRecorder()
+	h.Delete(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d, want 204 even when piece cleanup fails", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET after DELETE status = %d, want 404 (manifest must be gone)", rec.Code)
+	}
+}
+
+type brokenDeleteProvider struct{ *fakeProvider }
+
+func (b *brokenDeleteProvider) DeletePiece(context.Context, string) error {
+	return errors.New("simulated backend failure")
+}
+
 func TestGet_NotFound(t *testing.T) {
 	h, _, _, _ := newTestHandler()
 	req := httptest.NewRequest(http.MethodGet, "/bucket/missing", nil)

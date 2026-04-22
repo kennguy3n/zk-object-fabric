@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -237,8 +236,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	status := http.StatusOK
 	if byteRange != nil {
+		end := byteRange.End
+		if end < 0 {
+			end = manifest.ObjectSize - 1
+		}
 		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
-		w.Header().Set("Content-Length", strconv.FormatInt(byteRange.End-byteRange.Start+1, 10))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
 		status = http.StatusPartialContent
 	} else {
 		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
@@ -309,20 +312,22 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ManifestGetFailed", err.Error(), r.URL.Path)
 		return
 	}
+	// Delete the manifest first so a mid-delete failure leaves orphan
+	// backend pieces (recoverable by GC) rather than a zombie manifest
+	// pointing at pieces that no longer exist.
+	mkey.VersionID = manifest.VersionID
+	if err := h.cfg.Manifests.Delete(r.Context(), mkey); err != nil && !errors.Is(err, manifest_store.ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, "ManifestDeleteFailed", err.Error(), r.URL.Path)
+		return
+	}
 	for _, piece := range manifest.Pieces {
 		provider, ok := h.cfg.Providers[piece.Backend]
 		if !ok {
 			continue
 		}
-		if derr := provider.DeletePiece(r.Context(), piece.PieceID); derr != nil {
-			writeError(w, http.StatusBadGateway, "BackendDeleteFailed", derr.Error(), r.URL.Path)
-			return
-		}
-	}
-	mkey.VersionID = manifest.VersionID
-	if err := h.cfg.Manifests.Delete(r.Context(), mkey); err != nil && !errors.Is(err, manifest_store.ErrNotFound) {
-		writeError(w, http.StatusInternalServerError, "ManifestDeleteFailed", err.Error(), r.URL.Path)
-		return
+		// Best-effort: the manifest is already gone so the object is
+		// user-invisible. Any surviving pieces are orphans for GC.
+		_ = provider.DeletePiece(r.Context(), piece.PieceID)
 	}
 
 	h.emit(tenantID, bucket, billing.DeleteRequests, 1)
@@ -468,9 +473,12 @@ func parseBucketKey(p string) (bucket, key string) {
 
 // hashObjectKey returns the SHA-256 hex digest of the plaintext key.
 // The manifest stores only the hash (docs/PROPOSAL.md §3.3) so the
-// control plane never sees the plaintext key.
+// control plane never sees the plaintext key. S3 keys are opaque
+// byte strings, so the hash is computed over the raw key without
+// any path normalization — distinct keys (e.g. "a//b" vs "a/b")
+// must hash to distinct values.
 func hashObjectKey(key string) string {
-	sum := sha256.Sum256([]byte(path.Clean("/" + key)))
+	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
 }
 
