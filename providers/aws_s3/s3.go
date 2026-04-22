@@ -108,28 +108,51 @@ func (p *Provider) String() string {
 
 // regionToCountry maps a subset of AWS region codes to ISO-3166
 // alpha-2 country codes. Unknown regions return "XX".
+//
+// Each region is matched exactly rather than by prefix: AWS numbers
+// sibling regions in different jurisdictions (e.g. eu-west-1 Dublin
+// vs eu-west-2 London vs eu-west-3 Paris) so a prefix match would
+// route sovereign workloads to the wrong country.
 func regionToCountry(region string) string {
-	switch {
-	case startsWith(region, "ap-southeast-1"):
+	switch region {
+	case "ap-southeast-1":
 		return "SG"
-	case startsWith(region, "ap-southeast-2"):
+	case "ap-southeast-2":
 		return "AU"
-	case startsWith(region, "ap-northeast-1"):
+	case "ap-southeast-3":
+		return "ID"
+	case "ap-northeast-1":
 		return "JP"
-	case startsWith(region, "ap-south-1"):
+	case "ap-northeast-2":
+		return "KR"
+	case "ap-northeast-3":
+		return "JP"
+	case "ap-south-1":
 		return "IN"
-	case startsWith(region, "eu-west-"):
+	case "eu-west-1":
 		return "IE"
-	case startsWith(region, "eu-central-"):
+	case "eu-west-2":
+		return "GB"
+	case "eu-west-3":
+		return "FR"
+	case "eu-central-1":
 		return "DE"
-	case startsWith(region, "us-east-"), startsWith(region, "us-west-"):
+	case "eu-central-2":
+		return "CH"
+	case "eu-north-1":
+		return "SE"
+	case "eu-south-1":
+		return "IT"
+	case "eu-south-2":
+		return "ES"
+	case "us-east-1", "us-east-2", "us-west-1", "us-west-2":
 		return "US"
+	case "ca-central-1":
+		return "CA"
+	case "sa-east-1":
+		return "BR"
 	}
 	return "XX"
-}
-
-func startsWith(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 var _ providers.StorageProvider = (*Provider)(nil)

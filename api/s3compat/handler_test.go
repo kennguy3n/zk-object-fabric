@@ -398,4 +398,10 @@ func TestParseHTTPRange(t *testing.T) {
 	if _, err := parseHTTPRange("bytes=10-5", 1000); err == nil {
 		t.Error("parseHTTPRange(inverted) should error")
 	}
+	if _, err := parseHTTPRange("bytes=1000-", 1000); err == nil {
+		t.Error("parseHTTPRange(start==size) should error")
+	}
+	if _, err := parseHTTPRange("bytes=2000-", 1000); err == nil {
+		t.Error("parseHTTPRange(start>size) should error")
+	}
 }

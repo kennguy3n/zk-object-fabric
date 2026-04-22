@@ -525,7 +525,7 @@ func parseHTTPRange(h string, size int64) (*providers.ByteRange, error) {
 			end = size - 1
 		}
 	}
-	if start < 0 || (end >= 0 && start > end) {
+	if start < 0 || start >= size || (end >= 0 && start > end) {
 		return nil, fmt.Errorf("invalid range [%d,%d]", start, end)
 	}
 	return &providers.ByteRange{Start: start, End: end}, nil
