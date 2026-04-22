@@ -302,6 +302,86 @@ func TestDiskCache_WarmHydratesInStoredAtOrder(t *testing.T) {
 	}
 }
 
+// TestDiskCache_ConcurrentPutDuringCorruptGet asserts that a
+// concurrent Put() racing with a Get() whose body file has been
+// removed does not erase the new entry. Before the el-identity
+// check in Get()'s recovery path, the Get() goroutine would
+// re-acquire the lock after Put() had replaced the index entry
+// and unconditionally removeLocked() the replacement — deleting
+// a piece that a live request just wrote.
+//
+// The interleaving we need is: Get observes the stale entry and
+// unlocks → Put runs end-to-end (replaces index, rewrites body)
+// → Get's os.Open fails (the old body is gone) → Get re-locks
+// and must NOT remove the fresh entry. The testHookGetAfterUnlock
+// is the deterministic seam we use to sequence those steps.
+func TestDiskCache_ConcurrentPutDuringCorruptGet(t *testing.T) {
+	dir := t.TempDir()
+	c, err := NewDiskCache(DiskCacheConfig{RootPath: dir, Policy: DefaultEvictionPolicy(1 << 20)})
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+	ctx := context.Background()
+
+	// Seed the cache with a stale entry, then delete the body
+	// file out from under it so the next Get() will hit the
+	// corruption recovery path.
+	if err := c.Put(ctx, "race", bytes.NewReader([]byte("stale")), PutOptions{}); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "ra", "race.bin")); err != nil {
+		t.Fatalf("remove body: %v", err)
+	}
+
+	// When Get releases its first lock, perform the concurrent
+	// Put from this hook. Put acquires the mutex, swaps the
+	// index entry, writes a fresh body file at the same path,
+	// and returns. By the time Get reaches os.Open, the index
+	// points at the fresh entry but the path now references the
+	// fresh body — so os.Open would actually succeed.
+	//
+	// That is a problem for exercising the specific bug (we
+	// need os.Open to fail so the recovery branch runs), so we
+	// also delete the fresh body after the Put completes. The
+	// index still points at the fresh entry; the fix must keep
+	// it there even though the body is missing again.
+	putDone := make(chan error, 1)
+	hook := func() {
+		err := c.Put(ctx, "race", bytes.NewReader([]byte("fresh-body")), PutOptions{})
+		if err == nil {
+			// Remove the fresh body so Get's os.Open fails and
+			// the corruption-recovery branch runs.
+			_ = os.Remove(filepath.Join(dir, "ra", "race.bin"))
+		}
+		putDone <- err
+	}
+	testHookGetAfterUnlock = hook
+	t.Cleanup(func() { testHookGetAfterUnlock = nil })
+
+	_, _, getErr := c.Get(ctx, "race")
+	if !errors.Is(getErr, ErrCacheMiss) {
+		t.Fatalf("Get err = %v, want ErrCacheMiss", getErr)
+	}
+	if err := <-putDone; err != nil {
+		t.Fatalf("concurrent Put: %v", err)
+	}
+
+	// The fresh entry inserted by the racing Put must still be
+	// in the index. Without the el-identity check the Get's
+	// recovery branch would have called removeLocked on it and
+	// the next lookup would miss with ErrCacheMiss.
+	c.mu.Lock()
+	_, present := c.index["race"]
+	entries := c.stats.Entries
+	c.mu.Unlock()
+	if !present {
+		t.Fatalf("fresh entry erased by racing Get's recovery path")
+	}
+	if entries != 1 {
+		t.Fatalf("Entries = %d, want 1", entries)
+	}
+}
+
 type fakeClock struct{ now time.Time }
 
 func (f *fakeClock) Now() time.Time          { return f.now }

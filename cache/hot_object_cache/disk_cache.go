@@ -114,6 +114,12 @@ func NewDiskCache(cfg DiskCacheConfig) (*DiskCache, error) {
 	return c, nil
 }
 
+// testHookGetAfterUnlock is invoked (when non-nil) by Get between
+// the first c.mu.Unlock() and the subsequent os.Open. Tests set it
+// to deterministically interleave a concurrent Put with the Get
+// corruption-recovery path; production leaves it nil.
+var testHookGetAfterUnlock func()
+
 // Get returns a reader for the cached piece, or ErrCacheMiss.
 func (c *DiskCache) Get(_ context.Context, pieceID string) (io.ReadCloser, CachedPieceMetadata, error) {
 	c.mu.Lock()
@@ -152,6 +158,10 @@ func (c *DiskCache) Get(_ context.Context, pieceID string) (io.ReadCloser, Cache
 	}
 	c.mu.Unlock()
 
+	if testHookGetAfterUnlock != nil {
+		testHookGetAfterUnlock()
+	}
+
 	f, err := os.Open(bodyPath)
 	if err != nil {
 		// On-disk file disappeared under us (corruption, manual
@@ -160,8 +170,14 @@ func (c *DiskCache) Get(_ context.Context, pieceID string) (io.ReadCloser, Cache
 		// recorded above is compensated so Stats() reports the
 		// true hit ratio that the Wasabi fair-use guardrails and
 		// the PROGRESS.md hot-tier targets rely on.
+		//
+		// Between the first c.mu.Unlock() above and this re-lock
+		// a concurrent Put() may have replaced the corrupt entry
+		// with a fresh one. Only evict the index entry when it is
+		// still the element we originally observed; otherwise the
+		// new body belongs to the new entry and must survive.
 		c.mu.Lock()
-		if el2, ok := c.index[pieceID]; ok {
+		if el2, ok := c.index[pieceID]; ok && el2 == el {
 			c.removeLocked(el2)
 		}
 		if c.stats.Hits > 0 {
