@@ -32,6 +32,15 @@ type AuthStore interface {
 	// email. Callers compare the hash against the user-supplied
 	// password via bcrypt.CompareHashAndPassword.
 	LookupUser(email string) (passwordHash, tenantID string, ok bool)
+
+	// DeleteUser removes the email → (hash, tenant ID) row. It is
+	// used by the signup handler to roll back a half-finished
+	// signup: when a step after CreateUser fails, leaving the user
+	// row behind would permanently lock the email out (re-signup
+	// hits LookupUser and 409s, login hits the deleted tenant and
+	// 500s). Implementations should treat a missing email as a
+	// no-op (return nil) rather than an error.
+	DeleteUser(email string) error
 }
 
 // TokenStore maps opaque bearer tokens to tenant IDs. It is used by
@@ -89,6 +98,17 @@ func (s *MemoryAuthStore) LookupUser(email string) (string, string, bool) {
 		return "", "", false
 	}
 	return row.PasswordHash, row.TenantID, true
+}
+
+// DeleteUser implements AuthStore.
+func (s *MemoryAuthStore) DeleteUser(email string) error {
+	if email == "" {
+		return errors.New("console: email is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.users, strings.ToLower(email))
+	return nil
 }
 
 // MemoryTokenStore is a process-local TokenStore.
@@ -368,6 +388,21 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 			log.Printf("console: signup rollback (%s) failed to delete tenant %q: %v", reason, tenantID, derr)
 		}
 	}
+	// rollbackUserAndTenant is called from failure paths that run
+	// AFTER CreateUser has already committed the email row. Without
+	// clearing the user row first, the rolled-back tenant record
+	// leaves the email permanently locked out: re-signup hits the
+	// LookupUser fast path (409) and a login attempt finds the
+	// user but not the tenant (500). The user row must be deleted
+	// before the tenant row so a concurrent LookupTenant that
+	// races this rollback still sees a consistent (no user, no
+	// tenant) state rather than (user → missing tenant).
+	rollbackUserAndTenant := func(reason string) {
+		if derr := h.cfg.Auth.DeleteUser(req.Email); derr != nil {
+			log.Printf("console: signup rollback (%s) failed to delete user %q: %v", reason, req.Email, derr)
+		}
+		rollbackTenant(reason)
+	}
 
 	var passwordHash string
 	if req.OAuthToken == "" {
@@ -398,12 +433,12 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 
 	accessKey, secretKey, err := h.cfg.GenerateKey()
 	if err != nil {
-		rollbackTenant("generate key")
+		rollbackUserAndTenant("generate key")
 		writeError(w, http.StatusInternalServerError, "generate key: "+err.Error())
 		return
 	}
 	if err := h.cfg.Tenants.AddAPIKey(tenantID, accessKey, secretKey); err != nil {
-		rollbackTenant("register key")
+		rollbackUserAndTenant("register key")
 		writeError(w, http.StatusInternalServerError, "register key: "+err.Error())
 		return
 	}
@@ -426,7 +461,7 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 
 	token, err := h.cfg.Tokens.IssueToken(tenantID)
 	if err != nil {
-		rollbackTenant("issue token")
+		rollbackUserAndTenant("issue token")
 		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
 		return
 	}
