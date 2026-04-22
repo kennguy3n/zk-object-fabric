@@ -1,0 +1,34 @@
+=== RUN   TestSuite_CephRGW
+=== RUN   TestSuite_CephRGW/PutGetHeadDelete
+SDK 2026/04/22 14:30:48 WARN Response has no supported checksum. Not validating response payload.
+=== RUN   TestSuite_CephRGW/RangeGet
+=== RUN   TestSuite_CephRGW/RangeGet/prefix
+=== RUN   TestSuite_CephRGW/RangeGet/middle
+=== RUN   TestSuite_CephRGW/RangeGet/tail
+=== RUN   TestSuite_CephRGW/ListObjects
+=== RUN   TestSuite_CephRGW/DeleteIsIdempotent
+=== RUN   TestSuite_CephRGW/MissingKeyReturns404
+=== RUN   TestSuite_CephRGW/PresignedGet
+=== RUN   TestSuite_CephRGW/MultipartLikeOverwrite
+SDK 2026/04/22 14:30:48 WARN Response has no supported checksum. Not validating response payload.
+=== RUN   TestSuite_CephRGW/MultipartRoundTrip
+SDK 2026/04/22 14:30:48 WARN Response has no supported checksum. Not validating response payload.
+=== RUN   TestSuite_CephRGW/MultipartAbort
+=== RUN   TestSuite_CephRGW/ErasureRoundTrip
+SDK 2026/04/22 14:30:48 WARN Response has no supported checksum. Not validating response payload.
+--- PASS: TestSuite_CephRGW (0.61s)
+    --- PASS: TestSuite_CephRGW/PutGetHeadDelete (0.06s)
+    --- PASS: TestSuite_CephRGW/RangeGet (0.14s)
+        --- PASS: TestSuite_CephRGW/RangeGet/prefix (0.05s)
+        --- PASS: TestSuite_CephRGW/RangeGet/middle (0.04s)
+        --- PASS: TestSuite_CephRGW/RangeGet/tail (0.04s)
+    --- PASS: TestSuite_CephRGW/ListObjects (0.03s)
+    --- PASS: TestSuite_CephRGW/DeleteIsIdempotent (0.00s)
+    --- PASS: TestSuite_CephRGW/MissingKeyReturns404 (0.00s)
+    --- PASS: TestSuite_CephRGW/PresignedGet (0.05s)
+    --- PASS: TestSuite_CephRGW/MultipartLikeOverwrite (0.06s)
+    --- PASS: TestSuite_CephRGW/MultipartRoundTrip (0.13s)
+    --- PASS: TestSuite_CephRGW/MultipartAbort (0.02s)
+    --- PASS: TestSuite_CephRGW/ErasureRoundTrip (0.12s)
+PASS
+ok  	github.com/kennguy3n/zk-object-fabric/tests/s3_compat	0.614s
