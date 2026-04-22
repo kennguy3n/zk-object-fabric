@@ -9,11 +9,16 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/billing"
@@ -65,6 +70,20 @@ func main() {
 	}
 	signalBus := hot_object_cache.NewSignalBus(1024)
 
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	defer cancelWorker()
+	worker := &hot_object_cache.PromotionWorker{
+		Cache:    cache,
+		Policies: hot_object_cache.DefaultPromotionPolicies(),
+		Fetcher:  StaticFetcher{Provider: registry[defaultBackend]},
+		Logger:   log.New(os.Stdout, "promotion ", log.LstdFlags),
+	}
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		worker.Run(workerCtx, signalBus.Channel())
+	}()
+
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
 		Manifests:      store,
@@ -93,10 +112,38 @@ func main() {
 		WriteTimeout: cfg.Gateway.WriteTimeout.ToDuration(),
 	}
 
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-shutdownCh
+		log.Printf("gateway: shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("gateway: http shutdown: %v", err)
+		}
+		signalBus.Close()
+		cancelWorker()
+	}()
+
 	log.Printf("gateway: listening on %s (env=%s default_backend=%s)", cfg.Gateway.ListenAddr, cfg.Env, defaultBackend)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("gateway: listen: %v", err)
 	}
+	<-workerDone
+}
+
+// StaticFetcher is a thin adapter that lets a single gateway-wide
+// StorageProvider satisfy hot_object_cache.PromotionFetcher. Richer
+// fetchers (per-manifest primary/secondary resolution) are a Phase 3
+// concern.
+type StaticFetcher struct {
+	Provider providers.StorageProvider
+}
+
+// Fetch returns the statically configured provider.
+func (s StaticFetcher) Fetch(_ context.Context, _ hot_object_cache.PromotionSignal) (providers.StorageProvider, error) {
+	return s.Provider, nil
 }
 
 func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {

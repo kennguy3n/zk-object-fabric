@@ -314,6 +314,13 @@ func (h *Handler) fetchPiece(
 		})
 		return io.NopCloser(bytes.NewReader(buf)), false, nil
 	}
+	if byteRange != nil {
+		// Range reads skip the inline cache warm because the cache
+		// is keyed by piece, not by byte range. Publish a signal so
+		// the promotion worker can decide whether to fetch the
+		// whole piece asynchronously.
+		h.signalPromotion(piece, tenantID, byteRange.End-byteRange.Start+1)
+	}
 	return body, false, nil
 }
 
