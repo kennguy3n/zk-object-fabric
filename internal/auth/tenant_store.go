@@ -91,11 +91,17 @@ func (s *MemoryTenantStore) CreateTenant(t tenant.Tenant) error {
 }
 
 // DeleteTenant removes the tenant record registered via
-// CreateTenant. It is idempotent: deleting an unknown tenantID is a
-// no-op. Bindings keyed by access key are left alone so the signup
-// rollback path does not accidentally revoke a concurrent login
-// session that reuses the same tenant ID — callers unwind bindings
-// explicitly via a dedicated revoke path when that is desired.
+// CreateTenant and every TenantBinding (access-key row) that
+// references tenantID. It is idempotent: deleting an unknown
+// tenantID is a no-op.
+//
+// Scanning byAccess is necessary because the signup rollback path
+// runs after AddAPIKey has already registered an initial binding;
+// without this the orphaned access key would remain valid for S3
+// authentication even though the tenant record is gone. Tenant IDs
+// are minted by a CSPRNG (defaultTenantIDGenerator), so there is
+// no risk of revoking a concurrent login session that reuses the
+// same ID — the ID collision probability is cryptographic noise.
 func (s *MemoryTenantStore) DeleteTenant(tenantID string) error {
 	if tenantID == "" {
 		return fmt.Errorf("auth: tenant.id is required")
@@ -103,6 +109,11 @@ func (s *MemoryTenantStore) DeleteTenant(tenantID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.tenants, tenantID)
+	for accessKey, b := range s.byAccess {
+		if b.Tenant.ID == tenantID {
+			delete(s.byAccess, accessKey)
+		}
+	}
 	return nil
 }
 
