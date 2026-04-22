@@ -35,6 +35,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -57,6 +58,20 @@ type TenantStore interface {
 	// AddAPIKey associates (accessKey, secretKey) with tenantID.
 	// Implementations should reject duplicate accessKey values.
 	AddAPIKey(tenantID, accessKey, secretKey string) error
+
+	// CreateTenant registers a new tenant record. The B2C
+	// self-service signup handler calls this before minting an
+	// initial API key pair. Implementations should reject a
+	// tenant ID that is already registered.
+	CreateTenant(t tenant.Tenant) error
+
+	// DeleteTenant removes a tenant record by ID. The signup
+	// handler calls this to roll back an in-flight signup whose
+	// subsequent steps (CreateUser, AddAPIKey, IssueToken) failed
+	// so a racing duplicate-email signup does not leave orphaned
+	// tenant records behind. Implementations should treat a
+	// missing tenantID as a no-op rather than an error.
+	DeleteTenant(tenantID string) error
 }
 
 // UsageQuery is the interface the console uses to summarize per-
@@ -100,12 +115,41 @@ type Config struct {
 	Usage      UsageQuery
 	Placements PlacementStore
 
+	// Auth is the email → (password hash, tenant ID) store the
+	// B2C signup / login handler reads and writes. When nil the
+	// auth endpoints return 503 so the control plane can ship
+	// without self-service onboarding until it is wired in.
+	Auth AuthStore
+
+	// Tokens mints and resolves the opaque bearer tokens the SPA
+	// presents on subsequent requests. When nil, Register provides
+	// an in-memory default (NewMemoryTokenStore) so dev / test
+	// deployments do not need to set it explicitly.
+	Tokens TokenStore
+
+	// AuthHooks are the optional production integrations the
+	// signup flow needs (CAPTCHA, verification email). All hooks
+	// are no-ops by default.
+	AuthHooks AuthHooks
+
+	// UsageStreamInterval is the SSE usage-stream poll cadence
+	// (see sse_handler.go). Defaults to 5 seconds.
+	UsageStreamInterval time.Duration
+
+	// UsageStreamWindow is the lookback window each SSE frame
+	// reports over. Defaults to DefaultUsageWindow when zero.
+	UsageStreamWindow time.Duration
+
 	// Now returns the current time. Defaults to time.Now.
 	Now Clock
 
 	// GenerateKey mints access/secret pairs. Defaults to 20-byte
 	// hex access keys and 40-byte hex secret keys.
 	GenerateKey KeyGenerator
+
+	// NewTenantID mints fresh tenant identifiers for signup.
+	// Defaults to a 16-byte hex identifier prefixed with "t-".
+	NewTenantID func() (string, error)
 
 	// DefaultUsageWindow is the lookback window used when a GET
 	// /usage request does not specify start/end query parameters.
@@ -140,8 +184,58 @@ func New(cfg Config) *Handler {
 //	/api/tenants/{id}/usage
 //	/api/tenants/{id}/keys
 //	/api/tenants/{id}/placement
+//	/api/v1/auth/signup
+//	/api/v1/auth/login
+//	/api/v1/usage/stream/{id}
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tenants/", h.dispatch)
+
+	tokens := h.cfg.Tokens
+	if tokens == nil {
+		// MemoryTokenStore is process-local and loses every
+		// issued token on restart; it is safe for dev / tests
+		// but NOT for production deploys behind a load
+		// balancer where different replicas must agree on
+		// which tokens are valid. Log loudly so an operator
+		// running the gateway without wiring Tokens in
+		// config.yaml sees the warning at startup.
+		log.Printf("console: Tokens not configured; falling back to in-memory MemoryTokenStore — DO NOT use in production")
+		tokens = NewMemoryTokenStore()
+	}
+	if h.cfg.Auth != nil {
+		if _, ok := h.cfg.Auth.(*MemoryAuthStore); ok {
+			log.Printf("console: Auth is a MemoryAuthStore — DO NOT use in production; wire a persistent AuthStore")
+		}
+		auth := NewAuthHandler(AuthConfig{
+			Tenants:     h.cfg.Tenants,
+			Auth:        h.cfg.Auth,
+			Tokens:      tokens,
+			GenerateKey: h.cfg.GenerateKey,
+			NewTenantID: h.cfg.NewTenantID,
+			Hooks:       h.cfg.AuthHooks,
+			Now:         h.cfg.Now,
+		})
+		auth.Register(mux)
+	}
+	if h.cfg.Usage != nil {
+		sse := NewUsageStreamHandler(UsageStreamConfig{
+			Usage:    h.cfg.Usage,
+			Tokens:   tokens,
+			Interval: h.cfg.UsageStreamInterval,
+			Window:   h.cfg.usageStreamWindowEffective(),
+			Now:      h.cfg.Now,
+		})
+		sse.Register(mux)
+	}
+}
+
+// usageStreamWindowEffective returns UsageStreamWindow, falling back
+// to DefaultUsageWindow when the operator did not set one explicitly.
+func (c Config) usageStreamWindowEffective() time.Duration {
+	if c.UsageStreamWindow > 0 {
+		return c.UsageStreamWindow
+	}
+	return c.DefaultUsageWindow
 }
 
 // ServeHTTP lets callers attach the handler to any http.Handler

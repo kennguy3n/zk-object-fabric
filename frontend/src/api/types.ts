@@ -10,7 +10,17 @@ export type ContractType =
   | "b2b_dedicated"
   | "sovereign";
 
-export type LicenseTier = "community" | "standard" | "enterprise";
+// LicenseTier mirrors metadata/tenant.LicenseTier on the backend.
+// The backend is the source of truth — adding a value here without
+// adding it to the Go LicenseTier.Valid() switch would let the SPA
+// render a tier the gateway immediately rejects.
+export type LicenseTier =
+  | "beta"
+  | "archive"
+  | "standard"
+  | "hot"
+  | "dedicated"
+  | "sovereign";
 
 export interface Tenant {
   id: string;
@@ -19,7 +29,11 @@ export interface Tenant {
   licenseTier: LicenseTier;
   budgets: TenantBudgets;
   placementDefaultPolicyRef: string;
-  createdAt: string;
+  // The backend populates createdAt on signup but older tenant
+  // records minted before the field existed omit it, and the
+  // login endpoint does not echo it back yet. Keep it optional so
+  // neither case renders "Invalid Date" on the tenant card.
+  createdAt?: string;
 }
 
 export interface TenantBudgets {

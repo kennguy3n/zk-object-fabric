@@ -56,6 +56,23 @@ func (s *fakeTenantStore) AddAPIKey(tenantID, accessKey, secretKey string) error
 	return nil
 }
 
+func (s *fakeTenantStore) CreateTenant(t tenant.Tenant) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tenants[t.ID]; ok {
+		return fmt.Errorf("tenant %q already exists", t.ID)
+	}
+	s.tenants[t.ID] = t
+	return nil
+}
+
+func (s *fakeTenantStore) DeleteTenant(tenantID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tenants, tenantID)
+	return nil
+}
+
 // fakeUsage is a UsageQuery that returns pre-canned counter maps.
 type fakeUsage struct {
 	result map[string]uint64
