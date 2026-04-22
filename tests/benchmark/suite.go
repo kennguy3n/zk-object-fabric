@@ -129,6 +129,18 @@ const (
 	// MetricMigrationThroughput is the net ciphertext throughput of
 	// the Wasabi → local cell migration engine in bytes/sec.
 	MetricMigrationThroughput Metric = "migration_throughput_bytes_per_sec"
+
+	// MetricRepairTimeSeconds is the wall-clock time, in seconds, to
+	// recover a single failed storage node for a Phase 2+ local-DC
+	// cell. Measured as the interval from node-loss detection to
+	// restored durability targets.
+	MetricRepairTimeSeconds Metric = "repair_time_seconds"
+
+	// MetricNetworkCostUSDPerTB is the aggregate network cost in US
+	// dollars per terabyte of ciphertext served (includes Wasabi
+	// origin egress, Linode transit, and local-DC peering). Per
+	// docs/PROGRESS.md "Key Metrics to Track".
+	MetricNetworkCostUSDPerTB Metric = "network_cost_usd_per_tb"
 )
 
 // Target values drawn from docs/PROPOSAL.md §3.11 and
@@ -164,6 +176,34 @@ type Result struct {
 	Value    float64
 	Duration time.Duration
 	Labels   map[string]string
+}
+
+// Runner executes a Suite against a single StorageProvider and
+// returns per-scenario Results. Phase 1 ships the interface only;
+// Phase 2 supplies a concrete driver that generates load, measures
+// latency, aggregates counters, and emits Results for downstream
+// Target evaluation.
+//
+// The interface is intentionally provider-shaped rather than
+// gateway-shaped so a benchmark can be pointed at any
+// providers.StorageProvider (wasabi, local_fs_dev, ceph_rgw, etc.)
+// without standing up the full S3 handler stack.
+type Runner interface {
+	// Run executes scenario and returns one Result per Target.
+	Run(scenario Scenario) ([]Result, error)
+}
+
+// EvaluateTarget checks a measured value against a Target and
+// reports a human-readable failure message (empty string means pass).
+// Zero Max or Min means "no bound on that side".
+func EvaluateTarget(t Target, value float64) string {
+	if t.Max != 0 && value > t.Max {
+		return fmt.Sprintf("%s = %v %s exceeds max %v", t.Metric, value, t.Unit, t.Max)
+	}
+	if t.Min != 0 && value < t.Min {
+		return fmt.Sprintf("%s = %v %s below min %v", t.Metric, value, t.Unit, t.Min)
+	}
+	return ""
 }
 
 // Validate performs structural checks on the suite definition.

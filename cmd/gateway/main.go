@@ -29,7 +29,12 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	s3compat.New().Register(mux)
+	// Phase 2 wiring (ManifestStore, provider registry, placement
+	// engine, billing sink) is plumbed in by the cell bootstrap
+	// layer that hosts this binary. Until that lands, mount a bare
+	// handler so the gateway serves ServiceUnavailable rather than
+	// a 404 for every request.
+	s3compat.New(s3compat.Config{}).Register(mux)
 
 	srv := &http.Server{
 		Addr:         cfg.Gateway.ListenAddr,

@@ -2,8 +2,8 @@
 
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 1 — Architecture Proof
-- **Last updated**: 2026-04-22 (Phase 1 complete; Wasabi adapter wired on AWS SDK v2)
+- **Status**: Phase 2 — Prototype (in progress)
+- **Last updated**: 2026-04-22 (Phase 1 complete; Phase 2 prototype scaffold in progress — S3 handler, Postgres manifest store, multi-backend adapters)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -119,7 +119,7 @@ reopening the AGPL / EC gates.
 
 ## Phase 2: Prototype (Weeks 4–9)
 
-**Status**: `NOT STARTED`
+**Status**: `IN PROGRESS`
 
 **Goal**: a single-cell prototype that can PUT, GET, HEAD, DELETE,
 LIST, and range-read encrypted objects end-to-end, backed by Wasabi
@@ -128,11 +128,22 @@ dry-run cut-over to a local DC cell.
 
 Checklist:
 
-- [ ] S3-compatible gateway on Linode (Go).
+- [~] S3-compatible gateway on Linode (Go) — request routing in
+      `api/s3compat/handler.go` now parses bucket/key from the URL
+      and dispatches to manifest store + storage provider registry;
+      auth, multipart, and streaming PUT land next.
 - [ ] Client-side encryption SDK.
-- [ ] Encrypted manifest storage in the AWS control plane.
-- [ ] Storage provider adapter framework (`wasabi`, `local_fs_dev`,
-      stubs for `backblaze_b2`, `cloudflare_r2`, `aws_s3`).
+- [~] Encrypted manifest storage in the AWS control plane —
+      Postgres-backed `ManifestStore` implementation in
+      `metadata/manifest_store/postgres/store.go` (opaque JSONB
+      bodies, index on `(tenant_id, bucket, object_key_hash,
+      version_id)`), gated behind the `postgres` build tag until a
+      live Postgres is wired into CI.
+- [~] Storage provider adapter framework (`wasabi`, `local_fs_dev`,
+      stubs for `backblaze_b2`, `cloudflare_r2`, `aws_s3`) — `wasabi`
+      wired on AWS SDK v2; `ceph_rgw`, `backblaze_b2`,
+      `cloudflare_r2`, and `aws_s3` adapters scaffolded with Config,
+      constructor, Capabilities, CostModel, and PlacementLabels.
 - [ ] Placement engine (provider + region + country + storage_class).
 - [ ] Wasabi durable origin wired up as the primary backend.
 - [ ] Linode hot cache (L0 / L1) with promotion rules.
@@ -152,7 +163,9 @@ Checklist:
 - [ ] Benchmark execution (PUT / GET p50 / p95 / p99, cache hit
       ratio, Wasabi origin egress ratio vs stored bytes,
       small-object overhead, LIST performance at 10M / 100M / 1B
-      objects).
+      objects) — scenarios and stub `Runner` declared in
+      `tests/benchmark/suite.go`; live driver implementation
+      tracked as its own gate.
 
 ---
 

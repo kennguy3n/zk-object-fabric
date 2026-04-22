@@ -14,6 +14,8 @@ func TestStandardProfiles_Shapes(t *testing.T) {
 		{Profile6Plus2, 6, 2},
 		{Profile8Plus3, 8, 3},
 		{Profile10Plus4, 10, 4},
+		{Profile12Plus4, 12, 4},
+		{Profile16Plus4, 16, 4},
 	}
 	for _, tc := range cases {
 		t.Run(tc.profile.Name, func(t *testing.T) {
@@ -39,8 +41,10 @@ func TestStandardProfiles_Overhead(t *testing.T) {
 		want    float64
 	}{
 		{Profile6Plus2, 8.0 / 6.0},
-		{Profile8Plus3, 11.0 / 8.0},   // 1.375
-		{Profile10Plus4, 14.0 / 10.0}, // 1.4
+		{Profile8Plus3, 11.0 / 8.0},    // 1.375
+		{Profile10Plus4, 14.0 / 10.0},  // 1.4
+		{Profile12Plus4, 16.0 / 12.0},  // 1.333
+		{Profile16Plus4, 20.0 / 16.0},  // 1.25
 	}
 	for _, tc := range cases {
 		t.Run(tc.profile.Name, func(t *testing.T) {
@@ -54,11 +58,14 @@ func TestStandardProfiles_Overhead(t *testing.T) {
 
 func TestStandardProfiles_Slice(t *testing.T) {
 	profiles := StandardProfiles()
-	if len(profiles) != 3 {
-		t.Fatalf("StandardProfiles length = %d, want 3", len(profiles))
+	wantNames := []string{"6+2", "8+3", "10+4", "12+4", "16+4"}
+	if len(profiles) != len(wantNames) {
+		t.Fatalf("StandardProfiles length = %d, want %d", len(profiles), len(wantNames))
 	}
-	if profiles[0].Name != "6+2" || profiles[1].Name != "8+3" || profiles[2].Name != "10+4" {
-		t.Fatalf("StandardProfiles order/names mismatch: %v", profiles)
+	for i, want := range wantNames {
+		if profiles[i].Name != want {
+			t.Fatalf("StandardProfiles[%d].Name = %q, want %q", i, profiles[i].Name, want)
+		}
 	}
 	// Mutating the returned slice must not affect later callers.
 	profiles[0].Name = "mutated"
