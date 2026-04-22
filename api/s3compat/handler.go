@@ -25,6 +25,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
@@ -82,6 +83,15 @@ type Config struct {
 	// every cache miss so the promotion worker can decide what to
 	// warm. A *hot_object_cache.SignalBus satisfies this. Optional.
 	CachePublisher hot_object_cache.SignalPublisher
+
+	// ReadRepair, when non-nil, is consulted on the GET path when
+	// the primary backend cannot serve a piece and the manifest's
+	// MigrationState indicates a migration is in progress
+	// (Generation > 1). It fetches the piece from the secondary
+	// backend, copies it to the new primary, and returns the bytes
+	// for the handler to serve. Optional; nil disables the
+	// read-repair fallback and backend GET errors surface as 502.
+	ReadRepair *lazy_read_repair.ReadRepair
 
 	// NodeID identifies the gateway node emitting billing events.
 	NodeID string
@@ -235,7 +245,13 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		byteRange = rng
 	}
 
-	body, served, err := h.fetchPiece(r, piece, pieceProvider, byteRange, manifest.ObjectSize, tenantID, bucket)
+	mkey := manifest_store.ManifestKey{
+		TenantID:      tenantID,
+		Bucket:        bucket,
+		ObjectKeyHash: manifest.ObjectKeyHash,
+		VersionID:     manifest.VersionID,
+	}
+	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
 		return
@@ -278,14 +294,22 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // hitting the backend. Range requests bypass the cache because the
 // cache is keyed by piece, not by byte range. The second return
 // value reports whether the piece came from the cache.
+//
+// When the primary backend fails and the manifest sits in a
+// migration-in-progress state (Generation > 1), fetchPiece falls
+// back to the configured ReadRepair to fetch the piece from the
+// secondary backend, copy it to the new primary, and serve the
+// repaired body to the caller.
 func (h *Handler) fetchPiece(
 	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
 	piece metadata.Piece,
 	pieceProvider providers.StorageProvider,
 	byteRange *providers.ByteRange,
-	objectSize int64,
 	tenantID, bucket string,
 ) (io.ReadCloser, bool, error) {
+	objectSize := manifest.ObjectSize
 	if h.cfg.Cache != nil && byteRange == nil {
 		cached, _, err := h.cfg.Cache.Get(r.Context(), piece.PieceID)
 		if err == nil {
@@ -295,7 +319,11 @@ func (h *Handler) fetchPiece(
 	}
 	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
 	if err != nil {
-		return nil, false, err
+		repaired, repairErr := h.tryReadRepair(r, mkey, manifest, byteRange)
+		if repairErr != nil || repaired == nil {
+			return nil, false, err
+		}
+		body = repaired
 	}
 	if h.cfg.Cache != nil && byteRange == nil {
 		h.emit(tenantID, bucket, billing.CacheMisses, 1)
@@ -304,11 +332,13 @@ func (h *Handler) fetchPiece(
 		if rerr != nil {
 			return nil, false, rerr
 		}
-		// Warm the cache inline. The promotion worker handles
-		// signals for pieces that were not cached here (e.g. range
-		// reads) so we do not publish one from this path — doing so
-		// would cause a redundant origin fetch since the piece is
-		// already resident.
+		// Warm the cache inline so a concurrent request doesn't
+		// re-trigger the backend GET (or a redundant read-repair
+		// round-trip during migration). The promotion worker
+		// handles signals for pieces that were not cached here
+		// (e.g. range reads) so we do not publish one from this
+		// path — doing so would cause a redundant origin fetch
+		// since the piece is already resident.
 		_ = h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,
@@ -329,6 +359,47 @@ func (h *Handler) fetchPiece(
 		h.signalPromotion(piece, tenantID, end-byteRange.Start+1, objectSize)
 	}
 	return body, false, nil
+}
+
+// tryReadRepair invokes the configured ReadRepair when the primary
+// backend fails to serve a piece and the manifest sits in a
+// migration-in-progress state (Generation > 1). It returns the
+// repaired piece body (wrapped in an io.ReadCloser, sliced to
+// byteRange when one was requested) or (nil, nil) when repair is
+// not applicable. A non-nil error indicates the repair attempt
+// itself failed; callers should fall through to the original
+// backend error in that case.
+func (h *Handler) tryReadRepair(
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	byteRange *providers.ByteRange,
+) (io.ReadCloser, error) {
+	if h.cfg.ReadRepair == nil {
+		return nil, nil
+	}
+	if manifest.MigrationState.Generation <= 1 {
+		return nil, nil
+	}
+	if len(manifest.Pieces) == 0 {
+		return nil, nil
+	}
+	res, err := h.cfg.ReadRepair.Repair(r.Context(), mkey, manifest, 0)
+	if err != nil {
+		return nil, err
+	}
+	data := res.Body
+	if byteRange != nil {
+		end := byteRange.End
+		if end < 0 || end >= int64(len(data)) {
+			end = int64(len(data)) - 1
+		}
+		if byteRange.Start < 0 || byteRange.Start > end+1 {
+			return nil, fmt.Errorf("s3compat: repaired body slice out of range")
+		}
+		data = data[byteRange.Start : end+1]
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, readBytes, pieceSize int64) {

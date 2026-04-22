@@ -58,6 +58,7 @@ type Config struct {
 	Gateway      GatewayConfig      `json:"gateway"`
 	ControlPlane ControlPlaneConfig `json:"control_plane"`
 	Providers    ProvidersConfig    `json:"providers"`
+	Migration    MigrationConfig    `json:"migration"`
 }
 
 // GatewayConfig configures the S3-compatible gateway fleet on Linode.
@@ -147,6 +148,30 @@ type AWSS3Config struct {
 	Endpoint  string `json:"endpoint"`
 	AccessKey string `json:"access_key"`
 	SecretKey string `json:"secret_key"`
+}
+
+// MigrationConfig configures the optional background rebalancer that
+// sweeps manifests in a migration-in-progress state and copies their
+// pieces from the old backend onto the new primary. See
+// migration/background_rebalancer for the semantics.
+//
+// When Targets is empty the rebalancer does not start. Interval
+// controls the gap between full passes; BytesPerSecond caps the
+// steady-state copy bandwidth.
+type MigrationConfig struct {
+	Targets        []MigrationTarget `json:"targets"`
+	BytesPerSecond int64             `json:"bytes_per_second"`
+	Interval       Duration          `json:"interval"`
+}
+
+// MigrationTarget names a single (tenant, bucket) pair to rebalance
+// along with the source and destination backend names. The backend
+// names must resolve to entries in the gateway's provider registry.
+type MigrationTarget struct {
+	TenantID       string `json:"tenant_id"`
+	Bucket         string `json:"bucket"`
+	SourceBackend  string `json:"source_backend"`
+	PrimaryBackend string `json:"primary_backend"`
 }
 
 // Default returns a minimal, developer-friendly configuration.

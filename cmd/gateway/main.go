@@ -29,6 +29,8 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	pgstore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/postgres"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
+	"github.com/kennguy3n/zk-object-fabric/migration/background_rebalancer"
+	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 	"github.com/kennguy3n/zk-object-fabric/providers/aws_s3"
 	"github.com/kennguy3n/zk-object-fabric/providers/backblaze_b2"
@@ -75,7 +77,7 @@ func main() {
 	worker := &hot_object_cache.PromotionWorker{
 		Cache:    cache,
 		Policies: hot_object_cache.DefaultPromotionPolicies(),
-		Fetcher:  StaticFetcher{Provider: registry[defaultBackend]},
+		Fetcher:  hot_object_cache.StaticFetcher{Provider: registry[defaultBackend]},
 		Logger:   log.New(os.Stdout, "promotion ", log.LstdFlags),
 	}
 	workerDone := make(chan struct{})
@@ -83,6 +85,11 @@ func main() {
 		defer close(workerDone)
 		worker.Run(workerCtx, signalBus.Channel())
 	}()
+
+	readRepair := lazy_read_repair.New(registry, store)
+	readRepair.Logger = log.New(os.Stdout, "read_repair ", log.LstdFlags)
+
+	rebalancerDone := startRebalancer(workerCtx, cfg.Migration, store, registry)
 
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
@@ -93,6 +100,7 @@ func main() {
 		Billing:        billingSink,
 		Cache:          cache,
 		CachePublisher: signalBus,
+		ReadRepair:     readRepair,
 		NodeID:         cfg.Env,
 	}).Register(mux)
 
@@ -131,19 +139,68 @@ func main() {
 		log.Fatalf("gateway: listen: %v", err)
 	}
 	<-workerDone
+	if rebalancerDone != nil {
+		<-rebalancerDone
+	}
 }
 
-// StaticFetcher is a thin adapter that lets a single gateway-wide
-// StorageProvider satisfy hot_object_cache.PromotionFetcher. Richer
-// fetchers (per-manifest primary/secondary resolution) are a Phase 3
-// concern.
-type StaticFetcher struct {
-	Provider providers.StorageProvider
-}
-
-// Fetch returns the statically configured provider.
-func (s StaticFetcher) Fetch(_ context.Context, _ hot_object_cache.PromotionSignal) (providers.StorageProvider, error) {
-	return s.Provider, nil
+// startRebalancer spins up the background_rebalancer on a ticker
+// when the gateway config names one or more migration targets. It
+// returns a channel that closes when the rebalancer goroutine has
+// fully drained, or nil when no rebalancer was started. The
+// rebalancer shares ctx with the promotion worker so a SIGTERM-
+// triggered cancelWorker() also stops the rebalancer.
+func startRebalancer(
+	ctx context.Context,
+	mig config.MigrationConfig,
+	store manifest_store.ManifestStore,
+	registry map[string]providers.StorageProvider,
+) <-chan struct{} {
+	if len(mig.Targets) == 0 {
+		return nil
+	}
+	targets := make([]background_rebalancer.TenantTarget, 0, len(mig.Targets))
+	for _, t := range mig.Targets {
+		targets = append(targets, background_rebalancer.TenantTarget{
+			TenantID:       t.TenantID,
+			Bucket:         t.Bucket,
+			SourceBackend:  t.SourceBackend,
+			PrimaryBackend: t.PrimaryBackend,
+		})
+	}
+	interval := mig.Interval.ToDuration()
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	rb := background_rebalancer.New(background_rebalancer.Config{
+		Manifests:      store,
+		Providers:      registry,
+		Targets:        targets,
+		BytesPerSecond: mig.BytesPerSecond,
+		Logger:         log.New(os.Stdout, "rebalancer ", log.LstdFlags),
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			stats, err := rb.Run(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("gateway: rebalancer pass: %v", err)
+			}
+			if stats.PiecesCopied > 0 || stats.PhasesAdvanced > 0 {
+				log.Printf("gateway: rebalancer scanned=%d copied=%d bytes=%d advanced=%d errors=%d",
+					stats.ManifestsScanned, stats.PiecesCopied, stats.BytesCopied, stats.PhasesAdvanced, stats.Errors)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return done
 }
 
 func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {

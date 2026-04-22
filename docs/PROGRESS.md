@@ -3,7 +3,7 @@
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 2 — Prototype (complete)
-- **Last updated**: 2026-04-22 (Phase 2 complete; gateway wired end-to-end with encryption SDK, placement engine, hot-object cache, multi-tenant auth + rate limiting, dual-write / lazy-repair / background-rebalancer migration engine, S3 compliance + migration test suites, and benchmark runner)
+- **Last updated**: 2026-04-22 (Phase 2 hardening pass: lazy read-repair wired into the gateway GET path, optional background rebalancer started as a gateway-managed goroutine driven by `config.migration`, duplicate `StaticFetcher` removed from `cmd/gateway` in favour of `hot_object_cache.StaticFetcher`, Ceph RGW compliance-suite entrypoint stubbed behind `CEPH_RGW_ENDPOINT`, and the node health monitor explicitly deferred to Phase 3)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -167,9 +167,12 @@ Checklist:
       promotion worker in `promotion_worker.go` consumes signals off
       the handler's non-blocking `SignalBus` and populates the cache
       against the configured `PromotionPolicy`.
-- [~] Node health monitor for the Linode gateway fleet — deferred to
-      Phase 3; Phase 2 relies on the existing liveness endpoint plus
-      external process supervision.
+- [~] Node health monitor for the Linode gateway fleet — **deferred
+      to Phase 3**. Phase 2 relies on the existing liveness endpoint
+      plus external process supervision; a purpose-built health
+      monitor (per-cell quorum, cache-tier drain, graceful gateway
+      replacement) is tracked as a Phase 3 deliverable alongside the
+      production Linode fleet stand-up.
 - [x] Basic billing counters (per-tenant storage-seconds, PUTs,
       GETs, egress bytes) — `billing/logger_sink.go` is a
       structured-log `BillingSink` wired into `s3compat.Config`; the
@@ -201,6 +204,16 @@ Checklist:
       `wasabi_primary → dual_write → local_primary_wasabi_backup →
       local_primary_wasabi_drain → local_only` state machine with
       bandwidth limits. Coverage in each package's `_test.go`.
+      **Lazy read-repair is now wired into the gateway GET path**
+      via `s3compat.Config.ReadRepair` — when the primary backend
+      fails to serve a piece for a manifest whose `MigrationState`
+      names a distinct new primary (Generation > 1), the handler
+      falls back to `lazy_read_repair.ReadRepair.Repair()` and
+      serves the repaired body. **The background rebalancer is now
+      started as an optional background worker** by
+      `cmd/gateway/main.go` when `config.migration.targets` is
+      non-empty; the goroutine shares the promotion worker's
+      shutdown context so SIGTERM drains both cleanly.
 - [x] Implement S3 compliance test suite (`tests/s3_compat/`) and
       run against `wasabi` and `local_fs_dev` adapters — AWS SDK v2
       test client in `tests/s3_compat/suite_test.go` exercises PUT,
@@ -257,9 +270,16 @@ Checklist:
 - [ ] End-to-end migration dry run: move a beta bucket from Wasabi
       to the first local cell without customer-visible changes.
 - [ ] Run S3 compliance test suite against `ceph_rgw` adapter —
-      100% pass required before production traffic.
+      100% pass required before production traffic. Entrypoint
+      `TestSuite_CephRGW` is in place in `tests/s3_compat/suite_test.go`
+      and runs the full `Run(t, setup)` suite when
+      `CEPH_RGW_ENDPOINT` is set; it skips otherwise so CI stays
+      green without a Ceph cluster.
 - [ ] Run S3 compliance test suite during a live Wasabi → Ceph RGW
       migration with beta customers.
+- [ ] Gateway fleet node health monitor (deferred from Phase 2):
+      per-cell quorum, cache-tier drain, graceful gateway
+      replacement.
 
 ### Avoid early customers with
 
