@@ -308,8 +308,15 @@ func Default() Config {
 				RootPath: "/var/lib/zk-object-fabric/local_fs_dev",
 			},
 		},
+		// Console API is opt-in: ListenAddr defaults to "" so that
+		// a deployment which upgrades without an explicit console
+		// block in its config does not start serving the
+		// unauthenticated console API (see api/console/). Operators
+		// who want the console explicitly set config.console.listen_addr
+		// (":8081" is the conventional port) alongside an admin
+		// authenticator at the reverse-proxy layer.
 		Console: ConsoleConfig{
-			ListenAddr:   ":8081",
+			ListenAddr:   "",
 			ReadTimeout:  Duration(30 * time.Second),
 			WriteTimeout: Duration(30 * time.Second),
 		},

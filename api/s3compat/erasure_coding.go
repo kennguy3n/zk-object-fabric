@@ -317,6 +317,23 @@ func (h *Handler) getMultipart(
 		return
 	}
 
+	// maxMultipartInMemoryBytes is the hard ceiling on the total
+	// manifest size the pre-fetch path will buffer. Multipart GETs
+	// above this ceiling are rejected up front with 507 so a
+	// pathological request cannot OOM the gateway. Streaming
+	// multipart GETs are a Phase 4 workstream; until that lands
+	// operators should route very large objects through the EC
+	// path or a direct-to-backend presigned URL.
+	const maxMultipartInMemoryBytes int64 = 256 * 1024 * 1024
+
+	if manifest.ObjectSize > maxMultipartInMemoryBytes {
+		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
+			fmt.Sprintf("multipart object of %d bytes exceeds in-memory pre-fetch ceiling of %d bytes",
+				manifest.ObjectSize, maxMultipartInMemoryBytes),
+			r.URL.Path)
+		return
+	}
+
 	pieces := make([]metadata.Piece, len(manifest.Pieces))
 	copy(pieces, manifest.Pieces)
 	sort.Slice(pieces, func(i, j int) bool {
@@ -363,6 +380,18 @@ func (h *Handler) getMultipart(
 	var total int64
 	for _, b := range bodies {
 		total += int64(len(b))
+	}
+	// Integrity guard: the aggregate of the piece bodies we just
+	// pulled from the backends must match the manifest's recorded
+	// object size. A mismatch points at either manifest corruption
+	// or a backend that served truncated / padded pieces — either
+	// way, the client should see a 502 instead of a correct-looking
+	// 200 with the wrong Content-Length.
+	if manifest.ObjectSize != 0 && total != manifest.ObjectSize {
+		writeError(w, http.StatusBadGateway, "ManifestIntegrityMismatch",
+			fmt.Sprintf("assembled %d bytes but manifest records %d", total, manifest.ObjectSize),
+			r.URL.Path)
+		return
 	}
 
 	w.Header().Set("x-amz-version-id", manifest.VersionID)

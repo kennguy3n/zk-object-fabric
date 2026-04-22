@@ -536,6 +536,14 @@ func (c *consoleTenantAdapter) AddAPIKey(tenantID, accessKey, secretKey string) 
 	if !ok {
 		return fmt.Errorf("gateway: tenant %q not found", tenantID)
 	}
+	// Reject duplicate access keys. MemoryTenantStore.AddBinding
+	// silently replaces on collision, which would let a console
+	// caller overwrite the secret for an access key that already
+	// authenticates a different (or the same) tenant — a silent
+	// credential swap the console API must not enable.
+	if _, exists := c.store.LookupByAccessKey(accessKey); exists {
+		return fmt.Errorf("gateway: access key %q is already bound", accessKey)
+	}
 	return c.store.AddBinding(auth.TenantBinding{
 		AccessKey: accessKey,
 		SecretKey: secretKey,

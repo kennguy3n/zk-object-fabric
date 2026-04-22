@@ -312,14 +312,28 @@ func (h *Handler) getPlacement(w http.ResponseWriter, r *http.Request, tenantID 
 	writeJSON(w, http.StatusOK, pol)
 }
 
+// maxPlacementPolicyBytes caps the request body size the console
+// will decode on PUT /api/tenants/{id}/placement. Placement policies
+// are small structured documents (backends, routing rules, retention
+// windows); 64 KiB is three orders of magnitude above a realistic
+// policy and keeps a pathological or hostile client from exhausting
+// gateway memory by streaming a large JSON payload at the console.
+const maxPlacementPolicyBytes int64 = 64 * 1024
+
 // putPlacement handles PUT /api/tenants/{id}/placement.
 func (h *Handler) putPlacement(w http.ResponseWriter, r *http.Request, tenantID string) {
 	if h.cfg.Placements == nil {
 		writeError(w, http.StatusServiceUnavailable, "placement store not configured")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxPlacementPolicyBytes)
 	var pol placement_policy.Policy
 	if err := json.NewDecoder(r.Body).Decode(&pol); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("placement policy exceeds %d bytes", maxPlacementPolicyBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "decode policy: "+err.Error())
 		return
 	}

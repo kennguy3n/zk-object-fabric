@@ -58,16 +58,23 @@ type TenantLookup func(tenantID string) (tenant.Tenant, bool)
 const CDNShieldingEnabled = "enabled"
 
 // DefaultCDNHeaders is the header set the guard accepts as proof
-// that a request traversed a CDN. The list covers the Phase 3
-// partner CDNs (Cloudflare, CloudFront, Fastly) plus the generic
-// X-Forwarded-For hop that almost every reverse proxy attaches.
-// Operators can override with AbuseGuard.CDNHeaders.
+// that a request traversed a CDN. The list is limited to headers
+// that CDN edges synthesize from their own signed state — Cloudflare
+// (Cf-Connecting-Ip / Cf-Ray), AWS CloudFront (X-Amz-Cf-Id), and
+// Fastly (Fastly-Client-Ip) — so a direct client cannot trivially
+// forge them to bypass the shielding gate.
+//
+// X-Forwarded-For is deliberately excluded: any HTTP client can
+// attach the header, so accepting it as CDN proof would make the
+// gate bypassable. Operators fronted by a reverse proxy that adds
+// X-Forwarded-For should override CDNHeaders with the specific
+// header their edge attaches (typically a signed or shared-secret
+// header) rather than the generic hop indicator.
 var DefaultCDNHeaders = []string{
 	"Cf-Connecting-Ip",
 	"Cf-Ray",
 	"X-Amz-Cf-Id",
 	"Fastly-Client-Ip",
-	"X-Forwarded-For",
 }
 
 // AbuseGuard is the edge abuse guard. Construct with NewAbuseGuard
@@ -185,6 +192,18 @@ func (g *AbuseGuard) Middleware(next http.Handler) http.Handler {
 			http.Error(w, "cdn shielding required", http.StatusForbidden)
 			return
 		}
+		// The budget check is deliberately soft: we reject further
+		// traffic only once the running monthly counter already
+		// meets or exceeds tenant.Budgets.EgressTBMonth. The
+		// current request itself is allowed through and its bytes
+		// are added to the counter after Observe below, so a
+		// single oversized request can overshoot the budget on
+		// the window it crosses the threshold. Enforcing a hard
+		// pre-request cap would require buffering the backend
+		// response body and making a double-HEAD call to size it
+		// — an explicit non-goal for Phase 3. The billing pipeline
+		// backfills the exhaustion event when it lands, and every
+		// subsequent request is rejected with 429.
 		if !g.allowBudget(tenantID, t) {
 			w.Header().Set("Retry-After", "3600")
 			http.Error(w, "monthly egress budget exhausted", http.StatusTooManyRequests)
@@ -195,9 +214,19 @@ func (g *AbuseGuard) Middleware(next http.Handler) http.Handler {
 			http.Error(w, "abuse anomaly throttle active", http.StatusTooManyRequests)
 			return
 		}
-		counter := &countingWriter{ResponseWriter: w}
+		// Reuse an upstream countingWriter if the rate limiter (or
+		// any other outer middleware) already wrapped the response.
+		// Each guard still calls Observe independently so the
+		// per-tenant budget and anomaly counters stay accurate,
+		// but we avoid layering N counting writers on every byte
+		// write down the chain.
+		counter, ok := w.(*countingWriter)
+		if !ok {
+			counter = &countingWriter{ResponseWriter: w}
+		}
+		startBytes := counter.bytes
 		next.ServeHTTP(counter, r)
-		g.Observe(tenantID, t, counter.bytes)
+		g.Observe(tenantID, t, counter.bytes-startBytes)
 	})
 }
 
