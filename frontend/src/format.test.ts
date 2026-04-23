@@ -22,7 +22,29 @@ describe("formatBytes", () => {
 });
 
 describe("summarizeYaml", () => {
-  it("extracts allowed countries, replication, and cache", () => {
+  it("extracts country, provider-count (as replication), and cache_location from JSON policies", () => {
+    // Mirrors what backendToFrontendPolicy emits into the textarea
+    // (frontend/src/api/client.ts): canonical JSON matching
+    // placement_policy.Policy.
+    const json = JSON.stringify({
+      tenant: "acme",
+      bucket: "",
+      policy: {
+        encryption: { mode: "managed" },
+        placement: {
+          provider: ["wasabi", "r2", "b2"],
+          country: ["DE", "NL"],
+          cache_location: "cloudflare-r2",
+        },
+      },
+    });
+    const summary = summarizeYaml(json);
+    expect(summary.countries).toEqual(["DE", "NL"]);
+    expect(summary.replication).toBe(3);
+    expect(summary.cache).toBe("cloudflare-r2");
+  });
+
+  it("falls back to YAML regex extraction when the buffer is hand-edited YAML", () => {
     const yaml = `
 placement:
   allowed_countries: ['DE', 'NL']

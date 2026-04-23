@@ -138,13 +138,63 @@ interface PolicySummary {
   cache: string | null;
 }
 
-// summarizeYaml is a regex-based extractor for the three headline
-// knobs. We deliberately avoid a full YAML parser in the scaffold;
-// the gateway is the source of truth and will reject invalid YAML on
-// save. Replace with `js-yaml` once the schema stabilizes.
+// summarizeYaml extracts the three headline knobs from the editor
+// buffer. The label is historical: `backendToFrontendPolicy` in
+// frontend/src/api/client.ts#196 round-trips placement policies as
+// canonical JSON (the gateway accepts both YAML and JSON; Phase 1
+// picks JSON for lossless textarea round-trips), so the buffer is
+// JSON in practice and the shape mirrors placement_policy.Policy in
+// metadata/placement_policy/policy.go:
+//
+//   { tenant, bucket, policy: { encryption, placement: {
+//       provider, region, country, storage_class, cache_location
+//   } } }
+//
+// Replication factor is not a Phase 1 knob — Policy.PlacementSpec
+// has no `replication_factor` field — so the summary reports the
+// count of providers as a proxy (matches the product copy "N copies
+// across providers"). If a power user pastes raw YAML back into the
+// textarea we fall back to the legacy regex extractor so the summary
+// panel degrades gracefully instead of silently blanking.
 export function summarizeYaml(yaml: string): PolicySummary {
+  try {
+    const parsed = JSON.parse(yaml) as {
+      policy?: {
+        placement?: {
+          country?: unknown;
+          provider?: unknown;
+          cache_location?: unknown;
+        };
+      };
+    };
+    const placement = parsed.policy?.placement ?? {};
+    const countries = Array.isArray(placement.country)
+      ? placement.country.filter((c): c is string => typeof c === "string")
+      : [];
+    const providers = Array.isArray(placement.provider)
+      ? placement.provider.filter((p): p is string => typeof p === "string")
+      : [];
+    const cache =
+      typeof placement.cache_location === "string" && placement.cache_location !== ""
+        ? placement.cache_location
+        : null;
+    return {
+      countries,
+      replication: providers.length > 0 ? providers.length : null,
+      cache,
+    };
+  } catch {
+    return summarizeYamlLegacy(yaml);
+  }
+}
+
+// summarizeYamlLegacy is the pre-JSON regex extractor, preserved so
+// the summary panel still renders something useful when an operator
+// hand-edits the textarea into YAML while the schema is still in
+// flux. Once js-yaml lands this can be deleted.
+function summarizeYamlLegacy(yaml: string): PolicySummary {
   const countries: string[] = [];
-  const countryLine = yaml.match(/allowed_countries:\s*\[([^\]]*)\]/);
+  const countryLine = yaml.match(/(?:allowed_countries|country):\s*\[([^\]]*)\]/);
   if (countryLine) {
     for (const raw of countryLine[1].split(",")) {
       const v = raw.trim().replace(/^['"]|['"]$/g, "");
@@ -152,7 +202,7 @@ export function summarizeYaml(yaml: string): PolicySummary {
     }
   }
   const repl = yaml.match(/replication_factor:\s*(\d+)/);
-  const cache = yaml.match(/cache:\s*([\w-]+)/);
+  const cache = yaml.match(/cache(?:_location)?:\s*([\w-]+)/);
   return {
     countries,
     replication: repl ? Number(repl[1]) : null,
