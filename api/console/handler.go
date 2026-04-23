@@ -509,10 +509,10 @@ func (h *Handler) getUsage(w http.ResponseWriter, r *http.Request, tenantID stri
 // and never again; the frontend surfaces a one-time reveal so the
 // operator can copy it before it disappears.
 type CreateKeyResponse struct {
-	TenantID  string    `json:"tenant_id"`
-	AccessKey string    `json:"access_key"`
-	SecretKey string    `json:"secret_key"`
-	CreatedAt time.Time `json:"created_at"`
+	TenantID  string    `json:"tenantId"`
+	AccessKey string    `json:"accessKey"`
+	SecretKey string    `json:"secretKey"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // listKeys handles GET /api/tenants/{id}/keys.

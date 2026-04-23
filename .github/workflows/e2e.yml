@@ -81,9 +81,13 @@ jobs:
 
       - name: Run Playwright e2e
         working-directory: frontend
+        # Intentionally leave PLAYWRIGHT_BASE_URL unset. playwright.config.ts
+        # only registers its `webServer` (which runs `npm run build && npm
+        # run preview`) when PLAYWRIGHT_BASE_URL is unset; setting it in CI
+        # skips the preview server and every `page.goto()` hits a dead port
+        # with NS_ERROR_CONNECTION_REFUSED.
         env:
           CONSOLE_E2E: "1"
-          PLAYWRIGHT_BASE_URL: "http://127.0.0.1:4173"
           PLAYWRIGHT_GATEWAY_URL: "http://127.0.0.1:8080"
           PLAYWRIGHT_CONSOLE_URL: "http://127.0.0.1:8081"
         run: npm run test:e2e
