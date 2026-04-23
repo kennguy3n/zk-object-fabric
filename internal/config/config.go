@@ -68,10 +68,18 @@ type Config struct {
 // The console runs on its own listener so a saturated S3 data plane
 // cannot starve the management controls. Leave ListenAddr empty to
 // disable the console API entirely.
+//
+// AdminToken is a shared secret the gateway checks on every
+// non-auth console request via `Authorization: Bearer <token>`.
+// When empty the console API is served without authentication,
+// which is only safe in development or when an upstream reverse
+// proxy enforces authentication out-of-band. Production deploys
+// should always set this alongside ListenAddr.
 type ConsoleConfig struct {
 	ListenAddr   string   `json:"listen_addr"`
 	ReadTimeout  Duration `json:"read_timeout"`
 	WriteTimeout Duration `json:"write_timeout"`
+	AdminToken   string   `json:"admin_token"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the
@@ -183,6 +191,7 @@ type ProvidersConfig struct {
 	BackblazeB2  BackblazeB2Config  `json:"backblaze_b2"`
 	CloudflareR2 CloudflareR2Config `json:"cloudflare_r2"`
 	AWSS3        AWSS3Config        `json:"aws_s3"`
+	Storj        StorjConfig        `json:"storj"`
 }
 
 // WasabiConfig configures the Phase 1 primary storage backend.
@@ -239,6 +248,18 @@ type AWSS3Config struct {
 	Endpoint  string `json:"endpoint"`
 	AccessKey string `json:"access_key"`
 	SecretKey string `json:"secret_key"`
+}
+
+// StorjConfig configures the Storj decentralized-storage BYOC
+// backend. The gateway parses AccessGrant into an *uplink.Access
+// and opens an *uplink.Project at startup; Bucket is the target
+// bucket within the access grant's project. SatelliteAddress is
+// optional: when empty the satellite embedded in the access grant
+// is used, which is the supported path for production deploys.
+type StorjConfig struct {
+	AccessGrant      string `json:"access_grant"`
+	Bucket           string `json:"bucket"`
+	SatelliteAddress string `json:"satellite_address"`
 }
 
 // RebalancerConfig configures the optional background rebalancer

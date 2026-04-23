@@ -2,17 +2,18 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Vite config for the tenant console. The console talks to the
-// gateway's /api/v1/ management API (separate from the
-// S3-compatible routes on /bucket/key). In dev the gateway is
-// proxied through Vite so the SPA can make same-origin requests and
-// avoid CORS preflight noise.
+// Vite config for the tenant console. The console talks to two
+// separate surfaces on the gateway — tenant / usage / placement
+// routes under /api/ and auth routes under /api/v1/auth/ — both of
+// which live on port 8080 alongside the S3-compatible data plane.
+// The dev proxy therefore forwards every /api request so SPA calls
+// are same-origin and avoid CORS preflight noise.
 export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
     proxy: {
-      "/api/v1": {
+      "/api": {
         target: "http://localhost:8080",
         changeOrigin: true,
       },

@@ -6,6 +6,11 @@ import { defineConfig, devices } from "@playwright/test";
 // the gateway's in-memory console stores (see
 // cmd/gateway/main.go:consoleTenantAdapter).
 //
+// The Vite dev/preview server proxies /api/* to the gateway's
+// console API — see frontend/vite.config.ts. Operators running
+// this locally should start `./cmd/gateway` on :8080 (or whatever
+// GATEWAY_URL points at) before `CONSOLE_E2E=1 npm run test:e2e`.
+//
 // PLAYWRIGHT_BASE_URL overrides the default so the same suite can
 // run against a staging deploy in CI without editing the specs.
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:4173";

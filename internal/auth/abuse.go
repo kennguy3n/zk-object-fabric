@@ -471,7 +471,7 @@ func tenantEgressBudgetBytes(t tenant.Tenant) int64 {
 // TenantLookupFromStore adapts a *MemoryTenantStore to TenantLookup.
 // Used by the gateway's main() to hand the abuse guard the same
 // tenant view the authenticator sees.
-func TenantLookupFromStore(store *MemoryTenantStore) TenantLookup {
+func TenantLookupFromStore(store TenantStore) TenantLookup {
 	return func(tenantID string) (tenant.Tenant, bool) {
 		b, ok := store.LookupByTenantID(tenantID)
 		if !ok {

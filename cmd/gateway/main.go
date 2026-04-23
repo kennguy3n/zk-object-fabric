@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"flag"
@@ -43,6 +44,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/providers/ceph_rgw"
 	"github.com/kennguy3n/zk-object-fabric/providers/cloudflare_r2"
 	"github.com/kennguy3n/zk-object-fabric/providers/local_fs_dev"
+	"github.com/kennguy3n/zk-object-fabric/providers/storj"
 	"github.com/kennguy3n/zk-object-fabric/providers/wasabi"
 )
 
@@ -61,16 +63,36 @@ func main() {
 	}
 
 	store := buildManifestStore(cfg)
-	registry := buildProviderRegistry(cfg)
+	registry := buildProviderRegistry(context.Background(), cfg)
 	defaultBackend := pickDefaultBackend(registry)
 	if defaultBackend == "" {
 		log.Fatalf("gateway: no storage providers registered; configure at least one in config.providers")
 	}
 
 	placement := placement_policy.NewEngine(defaultBackend, registry, nil)
-	tenantStore := buildTenantStore(*tenantsPath)
+	tenantStore := buildTenantStore(cfg, *tenantsPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	billingSink := buildBillingSink(cfg)
+	// authStore is the B2C signup / login backing store. Created
+	// here (rather than inside startConsoleAPI) so the S3 handler's
+	// VerifiedCheck hook and the console's auth routes share the
+	// same in-memory view of (tenant → verified) state. A Postgres
+	// implementation drops in behind the same interface.
+	authStore := console.NewMemoryAuthStore()
+	// authHooks is built once and shared between the console API
+	// and the S3 handler's email-verification gate. When
+	// SendVerificationEmail is nil (no SES / transactional email
+	// configured), no one can ever complete verification, so the
+	// S3 gate must stay OFF — otherwise every B2C signup tenant
+	// would be permanently blocked from uploading. Scaffold /
+	// HMAC-only deployments therefore run without the gate.
+	authHooks := buildAuthHooks(cfg)
+	var verifiedCheck func(tenantID string) (verified, tracked bool)
+	if authHooks.SendVerificationEmail != nil {
+		verifiedCheck = authStore.IsVerified
+	} else {
+		log.Printf("gateway: email verification hook not configured; S3 VerifiedCheck gate disabled")
+	}
 
 	cache, err := buildHotObjectCache(cfg)
 	if err != nil {
@@ -108,6 +130,7 @@ func main() {
 		Providers:      registry,
 		Placement:      placement,
 		Auth:           authenticator,
+		VerifiedCheck:  verifiedCheck,
 		Billing:        billingSink,
 		Multipart:      multipartStore,
 		ErasureCoding:  erasureRegistry,
@@ -149,7 +172,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, tenantStore, billingSink)
+	consoleSrv := startConsoleAPI(cfg, tenantStore, authStore, authHooks, billingSink)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -277,7 +300,7 @@ func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {
 	return store
 }
 
-func buildProviderRegistry(cfg config.Config) map[string]providers.StorageProvider {
+func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]providers.StorageProvider {
 	registry := map[string]providers.StorageProvider{}
 
 	if cfg.Providers.LocalFSDev.RootPath != "" {
@@ -354,6 +377,25 @@ func buildProviderRegistry(cfg config.Config) map[string]providers.StorageProvid
 		}
 		registry["aws_s3"] = a
 	}
+	if cfg.Providers.Storj.AccessGrant != "" {
+		project, err := storj.OpenUplinkProject(ctx, storj.Config{
+			AccessGrant:      cfg.Providers.Storj.AccessGrant,
+			Bucket:           cfg.Providers.Storj.Bucket,
+			SatelliteAddress: cfg.Providers.Storj.SatelliteAddress,
+		})
+		if err != nil {
+			log.Fatalf("gateway: open storj uplink: %v", err)
+		}
+		s, err := storj.NewWithUplink(storj.Config{
+			AccessGrant:      cfg.Providers.Storj.AccessGrant,
+			Bucket:           cfg.Providers.Storj.Bucket,
+			SatelliteAddress: cfg.Providers.Storj.SatelliteAddress,
+		}, project)
+		if err != nil {
+			log.Fatalf("gateway: build storj: %v", err)
+		}
+		registry["storj"] = s
+	}
 	return registry
 }
 
@@ -361,7 +403,7 @@ func buildProviderRegistry(cfg config.Config) map[string]providers.StorageProvid
 // preference order so the gateway boots with a usable placement
 // default even without explicit tenant policies.
 func pickDefaultBackend(registry map[string]providers.StorageProvider) string {
-	for _, name := range []string{"wasabi", "ceph_rgw", "backblaze_b2", "cloudflare_r2", "aws_s3", "local_fs_dev"} {
+	for _, name := range []string{"wasabi", "ceph_rgw", "backblaze_b2", "cloudflare_r2", "aws_s3", "storj", "local_fs_dev"} {
 		if _, ok := registry[name]; ok {
 			return name
 		}
@@ -474,7 +516,9 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 
 func startConsoleAPI(
 	cfg config.Config,
-	tenantStore *auth.MemoryTenantStore,
+	tenantStore auth.TenantStore,
+	authStore *console.MemoryAuthStore,
+	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
 ) *http.Server {
 	if cfg.Console.ListenAddr == "" {
@@ -493,10 +537,17 @@ func startConsoleAPI(
 	if uq, ok := billingSink.(console.UsageQuery); ok {
 		usage = uq
 	}
+	placements := buildPlacementStore(cfg)
+	tokens := console.NewMemoryTokenStore()
+
 	h := console.New(console.Config{
 		Tenants:    tenants,
 		Usage:      usage,
-		Placements: console.NewMemoryPlacementStore(),
+		Placements: placements,
+		Auth:       authStore,
+		Tokens:     tokens,
+		AuthHooks:  authHooks,
+		AdminAuth:  buildAdminAuth(cfg),
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -516,11 +567,73 @@ func startConsoleAPI(
 	return srv
 }
 
-// consoleTenantAdapter bridges *auth.MemoryTenantStore to
+// buildAdminAuth returns a bearer-token verifier when cfg.Console
+// AdminToken is set, or nil when it is not (dev mode). The token is
+// a shared secret; the check is a constant-time comparison so a
+// malformed header can't leak timing information about the stored
+// value.
+func buildAdminAuth(cfg config.Config) func(r *http.Request) bool {
+	token := cfg.Console.AdminToken
+	if token == "" {
+		log.Printf("gateway: console admin_token not set; console API is unauthenticated (dev only)")
+		return nil
+	}
+	expected := []byte("Bearer " + token)
+	return func(r *http.Request) bool {
+		got := []byte(r.Header.Get("Authorization"))
+		return len(got) == len(expected) && subtle.ConstantTimeCompare(got, expected) == 1
+	}
+}
+
+// buildAuthHooks wires the hCaptcha / SES hooks when their
+// configuration secrets are available via the environment. Phase 3
+// hooks fall back to no-ops so dev / test deploys still work without
+// a hCaptcha site secret or an AWS SES account.
+func buildAuthHooks(cfg config.Config) console.AuthHooks {
+	hooks := console.AuthHooks{}
+	if secret := os.Getenv("HCAPTCHA_SECRET"); secret != "" {
+		hooks.VerifyCAPTCHA = console.NewHCaptchaVerifier(secret, "")
+	}
+	if from := os.Getenv("SES_FROM_ADDRESS"); from != "" {
+		if sender, err := console.NewSESEmailSender(console.SESEmailConfig{
+			FromAddress:   from,
+			Region:        os.Getenv("AWS_REGION"),
+			VerifyBaseURL: os.Getenv("CONSOLE_VERIFY_BASE_URL"),
+		}); err == nil {
+			hooks.SendVerificationEmail = sender
+		} else {
+			log.Printf("gateway: build SES verification email sender: %v", err)
+		}
+	}
+	return hooks
+}
+
+// buildPlacementStore returns the Postgres-backed PlacementStore when
+// cfg.ControlPlane.MetadataDSN is set, or an in-memory store for dev.
+// The Postgres store reuses the same DSN as the manifest store; the
+// schema migration lives in api/console/schema.sql.
+func buildPlacementStore(cfg config.Config) console.PlacementStore {
+	if cfg.ControlPlane.MetadataDSN == "" {
+		return console.NewMemoryPlacementStore()
+	}
+	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
+	if err != nil {
+		log.Printf("gateway: open postgres for placement store: %v; falling back to in-memory", err)
+		return console.NewMemoryPlacementStore()
+	}
+	store, err := console.NewPostgresPlacementStore(db)
+	if err != nil {
+		log.Printf("gateway: build postgres placement store: %v; falling back to in-memory", err)
+		return console.NewMemoryPlacementStore()
+	}
+	return store
+}
+
+// consoleTenantAdapter bridges auth.TenantStore to
 // console.TenantStore. It lives in main so the auth package does
 // not have to know about the console API.
 type consoleTenantAdapter struct {
-	store *auth.MemoryTenantStore
+	store auth.TenantStore
 }
 
 func (c *consoleTenantAdapter) LookupTenant(tenantID string) (tenant.Tenant, bool) {
@@ -574,7 +687,27 @@ func (noopUsageQuery) TenantUsage(ctx context.Context, tenantID string, start, e
 	return map[string]uint64{}, nil
 }
 
-func buildTenantStore(path string) *auth.MemoryTenantStore {
+// buildTenantStore returns the Postgres-backed tenant store when
+// cfg.ControlPlane.MetadataDSN is set, or the in-memory store for
+// dev. The in-memory store additionally loads bindings from a JSON
+// file when path is supplied; the Postgres path ignores the JSON
+// file because production deploys load bindings via the console API
+// signup flow.
+func buildTenantStore(cfg config.Config, path string) auth.TenantStore {
+	if cfg.ControlPlane.MetadataDSN != "" {
+		db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
+		if err != nil {
+			log.Fatalf("gateway: open postgres for tenant store: %v", err)
+		}
+		store, err := auth.NewPostgresTenantStore(db)
+		if err != nil {
+			log.Fatalf("gateway: build postgres tenant store: %v", err)
+		}
+		if path != "" {
+			log.Printf("gateway: --tenants flag ignored when control_plane.metadata_dsn is set")
+		}
+		return store
+	}
 	store := auth.NewMemoryTenantStore()
 	if path == "" {
 		return store

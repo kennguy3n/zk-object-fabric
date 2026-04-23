@@ -43,6 +43,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/providers/ceph_rgw"
 	"github.com/kennguy3n/zk-object-fabric/providers/cloudflare_r2"
 	"github.com/kennguy3n/zk-object-fabric/providers/local_fs_dev"
+	"github.com/kennguy3n/zk-object-fabric/providers/storj"
 )
 
 // fixedPlacement resolves every object to a single fixed backend so
@@ -755,5 +756,52 @@ func TestSuite_AWSS3(t *testing.T) {
 		Manifests: memory.New(),
 		Providers: map[string]providers.StorageProvider{"aws_s3": p},
 		Default:   "aws_s3",
+	})
+}
+
+// TestSuite_Storj runs the full S3 compliance suite against a Storj
+// decentralized-storage bucket via the uplink adapter. It mirrors
+// the TestSuite_CephRGW pattern: the test is skipped when
+// STORJ_ACCESS_GRANT is unset so CI does not need Storj credentials.
+//
+//	STORJ_ACCESS_GRANT     — required, full access grant string
+//	STORJ_BUCKET           — required, throwaway bucket; suite
+//	                         writes/deletes in place
+//	STORJ_SATELLITE_ADDRESS — optional; ignored because the
+//	                         satellite address is embedded in the
+//	                         access grant
+//
+// Operators running this locally should point STORJ_BUCKET at a
+// throwaway bucket; the suite writes and deletes test objects in
+// place.
+func TestSuite_Storj(t *testing.T) {
+	accessGrant := os.Getenv("STORJ_ACCESS_GRANT")
+	if accessGrant == "" {
+		t.Skip("STORJ_ACCESS_GRANT not set")
+	}
+	bucket := os.Getenv("STORJ_BUCKET")
+	if bucket == "" {
+		t.Fatalf("STORJ_ACCESS_GRANT is set but STORJ_BUCKET is missing")
+	}
+	project, err := storj.OpenUplinkProject(context.Background(), storj.Config{
+		AccessGrant:      accessGrant,
+		Bucket:           bucket,
+		SatelliteAddress: os.Getenv("STORJ_SATELLITE_ADDRESS"),
+	})
+	if err != nil {
+		t.Fatalf("storj.OpenUplinkProject: %v", err)
+	}
+	p, err := storj.NewWithUplink(storj.Config{
+		AccessGrant:      accessGrant,
+		Bucket:           bucket,
+		SatelliteAddress: os.Getenv("STORJ_SATELLITE_ADDRESS"),
+	}, project)
+	if err != nil {
+		t.Fatalf("storj.NewWithUplink: %v", err)
+	}
+	Run(t, Setup{
+		Manifests: memory.New(),
+		Providers: map[string]providers.StorageProvider{"storj": p},
+		Default:   "storj",
 	})
 }
