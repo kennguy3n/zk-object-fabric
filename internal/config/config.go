@@ -80,6 +80,21 @@ type ConsoleConfig struct {
 	ReadTimeout  Duration `json:"read_timeout"`
 	WriteTimeout Duration `json:"write_timeout"`
 	AdminToken   string   `json:"admin_token"`
+
+	// CaptchaProvider names the CAPTCHA backend wired onto the B2C
+	// signup flow. Supported values: "hcaptcha" (default when empty
+	// and CaptchaSecret is set), "recaptcha" (reserved; not wired
+	// yet), or "" (disabled). When disabled the signup handler
+	// accepts requests without a CAPTCHA token; operators running
+	// public signup MUST configure this.
+	CaptchaProvider string `json:"captcha_provider"`
+
+	// CaptchaSecret is the site secret the configured provider
+	// validates tokens against. For hCaptcha this is the secret
+	// from the hCaptcha dashboard (NEVER the site key). When
+	// empty the signup handler falls back to the environment
+	// variable HCAPTCHA_SECRET for backwards compatibility.
+	CaptchaSecret string `json:"captcha_secret"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the

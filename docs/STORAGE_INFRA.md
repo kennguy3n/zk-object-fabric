@@ -53,10 +53,14 @@ It answers two questions:
 ### BYOC — customer-owned backend, ZK Object Fabric as SaaS
 
 - **Primary**: Customer's own S3-compatible service. The fabric ships
-  `aws_s3`, `cloudflare_r2`, and `backblaze_b2` adapters today; any
-  S3-compatible backend can be plugged in by reusing
+  `aws_s3`, `cloudflare_r2`, `backblaze_b2`, and `storj` adapters
+  today; any S3-compatible backend can be plugged in by reusing
   `providers/s3_generic` (Ceph RGW, MinIO, GCS via the Google S3
-  adapter, Azure Blob via the S3 compatibility shim).
+  adapter, Azure Blob via the S3 compatibility shim). The `storj`
+  adapter is special-cased: it does not embed `s3_generic.Provider`
+  and instead drives Storj through `storj.io/uplink`, so BYOC
+  tenants pointed at a Storj satellite share the ZK semantics of
+  the rest of the fabric without a second S3 hop.
 - **Control plane**: Hosted by the fabric. No customer data flows
   through AWS (see the contract test at
   [tests/control_plane/no_data_test.go](../tests/control_plane/no_data_test.go)).
@@ -76,10 +80,15 @@ It answers two questions:
 | `backblaze_b2`  | [`providers/backblaze_b2`](../providers/backblaze_b2)   | 2 | B2C alternative          | Scaffold — Config, constructor, descriptive methods. |
 | `cloudflare_r2` | [`providers/cloudflare_r2`](../providers/cloudflare_r2) | 2 | B2C hot-egress backend   | Scaffold — Config, constructor, descriptive methods. |
 | `aws_s3`        | [`providers/aws_s3`](../providers/aws_s3)               | 2 | BYOC / DR-only           | Scaffold — Config, constructor, descriptive methods. |
+| `storj`         | [`providers/storj`](../providers/storj)                 | 2 | BYOC / ZK reference      | Wired end-to-end via `storj.io/uplink v1.14.0`; `uplink_bridge.go` adapts `*uplink.Project` to the `UplinkProject` interface; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.Storj.AccessGrant` is set; `TestSuite_Storj` in `tests/s3_compat/suite_test.go` gated on `STORJ_ACCESS_GRANT` + `STORJ_BUCKET`; nightly CI in `.github/workflows/storj-compliance.yml`. |
 
 `wasabi`, `ceph_rgw`, `backblaze_b2`, `cloudflare_r2`, and `aws_s3`
 all embed `s3_generic.Provider` so the API surface is identical; only
-Capabilities, CostModel, and PlacementLabels differ.
+Capabilities, CostModel, and PlacementLabels differ. `storj` is the
+deliberate exception — it does not embed `s3_generic.Provider` and
+instead adapts `*uplink.Project` through `providers/storj/uplink_bridge.go`
+so the fabric's ZK envelope composes cleanly with Storj's native
+reed-solomon segment distribution.
 
 ## Reference implementations we draw on
 

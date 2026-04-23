@@ -156,6 +156,54 @@ func (s *PostgresTenantStore) AddBinding(b TenantBinding) error {
 	return nil
 }
 
+// ListBindingsByTenantID returns every binding whose tenant_id
+// matches the argument. Returns an empty (non-nil) slice when no
+// rows match. See tenant_bindings schema in schema.sql.
+func (s *PostgresTenantStore) ListBindingsByTenantID(tenantID string) []TenantBinding {
+	if tenantID == "" {
+		return []TenantBinding{}
+	}
+	const q = `
+		SELECT access_key, secret_key, tenant_json
+		  FROM tenant_bindings
+		 WHERE tenant_id = $1`
+	rows, err := s.db.Query(q, tenantID)
+	if err != nil {
+		return []TenantBinding{}
+	}
+	defer rows.Close()
+	out := make([]TenantBinding, 0)
+	for rows.Next() {
+		var (
+			accessKey  string
+			secretKey  string
+			tenantJSON []byte
+		)
+		if err := rows.Scan(&accessKey, &secretKey, &tenantJSON); err != nil {
+			return out
+		}
+		var t tenant.Tenant
+		if err := json.Unmarshal(tenantJSON, &t); err != nil {
+			continue
+		}
+		out = append(out, TenantBinding{AccessKey: accessKey, SecretKey: secretKey, Tenant: t})
+	}
+	return out
+}
+
+// RemoveBinding deletes the tenant_bindings row identified by
+// accessKey. It is idempotent: a missing row is not an error.
+func (s *PostgresTenantStore) RemoveBinding(accessKey string) error {
+	if accessKey == "" {
+		return errors.New("auth: access_key is required")
+	}
+	const q = `DELETE FROM tenant_bindings WHERE access_key = $1`
+	if _, err := s.db.Exec(q, accessKey); err != nil {
+		return fmt.Errorf("auth: delete binding %q: %w", accessKey, err)
+	}
+	return nil
+}
+
 // Size returns the number of (access_key) bindings in the store.
 // Mirrors MemoryTenantStore.Size so the gateway's main.go can use
 // the same branch to decide whether to enable the rate limiter.

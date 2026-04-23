@@ -1,0 +1,36 @@
+name: storj-compliance
+
+# Runs the provider-adapter compliance suite against a real Storj
+# satellite. Gated on STORJ_ACCESS_GRANT + STORJ_BUCKET secrets so
+# forks and PRs from contributors without Storj credentials do not
+# fail; the TestSuite_Storj helper skips when the env is unset.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 03:17 UTC. Odd minute to dodge top-of-hour load on
+    # the Storj satellite.
+    - cron: "17 3 * * *"
+
+jobs:
+  storj:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Run Storj adapter compliance suite
+        env:
+          STORJ_ACCESS_GRANT: ${{ secrets.STORJ_ACCESS_GRANT }}
+          STORJ_BUCKET: ${{ secrets.STORJ_BUCKET }}
+        run: |
+          if [ -z "$STORJ_ACCESS_GRANT" ] || [ -z "$STORJ_BUCKET" ]; then
+            echo "STORJ_ACCESS_GRANT or STORJ_BUCKET secret unset; skipping."
+            exit 0
+          fi
+          go test -v -run TestSuite_Storj ./tests/s3_compat/ -timeout 10m

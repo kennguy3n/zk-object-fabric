@@ -8,22 +8,37 @@ import type {
 } from "./types";
 
 // ApiClient is the thin wrapper the SPA uses to reach the gateway's
-// management API. Auth endpoints live under /api/v1/auth/ because
-// the backend handler registers them under that versioned prefix
-// (see api/console/auth_handler.go), while tenant-scoped routes
-// (tenants, usage, keys, placement) live under /api/ to match the
-// mux registered in api/console/handler.go:Handler.Register. Feature
-// code never pokes fetch directly so swapping the transport (msw
-// for tests, a batching client, etc.) is a one-file change.
+// management API. Auth endpoints live under `${rootBaseUrl}/v1/auth`
+// (e.g. `/api/v1/auth`); tenant-scoped routes live under
+// `${rootBaseUrl}/tenants/${tenantID}/...` to match the mux
+// registered in api/console/handler.go. The SPA seeds the tenant
+// scope via setTenantScope() immediately after login / signup so
+// subsequent calls resolve to the correct tenant; before login only
+// the auth endpoints are callable.
 export class ApiClient {
+  private tenantBaseUrl: string | undefined;
+
   constructor(
-    private readonly baseUrl: string,
+    private readonly rootBaseUrl: string,
     private token?: string,
-    private readonly authBaseUrl: string = `${baseUrl}/v1/auth`,
+    private readonly authBaseUrl: string = `${rootBaseUrl}/v1/auth`,
   ) {}
 
   setToken(token: string | undefined) {
     this.token = token;
+  }
+
+  // setTenantScope wires the tenant ID into the path prefix used by
+  // every tenant-scoped call on this client. Call it with the
+  // tenant ID returned from login/signup. Pass `undefined` to clear
+  // the scope on logout so the SPA never accidentally sends stale
+  // tenant-scoped requests on behalf of a signed-out user.
+  setTenantScope(tenantId: string | undefined) {
+    if (!tenantId) {
+      this.tenantBaseUrl = undefined;
+      return;
+    }
+    this.tenantBaseUrl = `${this.rootBaseUrl}/tenants/${encodeURIComponent(tenantId)}`;
   }
 
   // --- auth -----------------------------------------------------
@@ -41,6 +56,7 @@ export class ApiClient {
     email: string;
     password: string;
     tenantName: string;
+    captchaToken?: string;
   }): Promise<{ tenant: Tenant; token: string }> {
     return this.requestAt("POST", `${this.authBaseUrl}/signup`, input);
   }
@@ -110,7 +126,13 @@ export class ApiClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    return this.requestAt(method, `${this.baseUrl}${path}`, body);
+    if (!this.tenantBaseUrl) {
+      throw new ApiError(
+        0,
+        "tenant scope is not set; call setTenantScope() after login/signup before issuing tenant-scoped calls",
+      );
+    }
+    return this.requestAt(method, `${this.tenantBaseUrl}${path}`, body);
   }
 
   private async requestAt<T>(method: string, url: string, body?: unknown): Promise<T> {

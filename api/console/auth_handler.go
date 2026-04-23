@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 )
 
@@ -320,6 +321,12 @@ type AuthConfig struct {
 
 	// Hooks are optional production integrations (CAPTCHA, email).
 	Hooks AuthHooks
+
+	// BillingSink receives a billing.TenantCreated event after a
+	// successful signup. A nil sink silently drops the event.
+	BillingSink interface {
+		Emit(event billing.UsageEvent)
+	}
 
 	// Now returns the current time. Defaults to time.Now.
 	Now Clock
@@ -674,6 +681,19 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	createdAt := h.cfg.Now()
+	// Emit a TenantCreated billing event once the signup has
+	// fully committed so the downstream ClickHouse pipeline /
+	// invoice generator starts tracking the tenant from its
+	// creation instant. A nil BillingSink silently drops the
+	// event; production wires cmd/gateway/main.go's sink.
+	if h.cfg.BillingSink != nil {
+		h.cfg.BillingSink.Emit(billing.UsageEvent{
+			TenantID:   tenantID,
+			Dimension:  billing.TenantCreated,
+			Delta:      1,
+			ObservedAt: createdAt,
+		})
+	}
 	writeJSON(w, http.StatusCreated, AuthResponse{
 		Tenant:    summarizeTenantAt(newTenant, createdAt),
 		Token:     token,

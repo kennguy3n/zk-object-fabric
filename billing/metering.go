@@ -66,6 +66,12 @@ const (
 	// egress budget (Budgets.EgressTBMonth) is exhausted and the
 	// rate limiter starts rejecting requests with HTTP 429.
 	AbuseBudgetExhausted Dimension = "abuse_budget_exhausted"
+
+	// TenantCreated is emitted once per tenant, at signup time, so
+	// downstream billing systems (ClickHouse, invoice generation)
+	// start tracking the tenant from its creation instant rather
+	// than waiting for the first S3 request. Delta is always 1.
+	TenantCreated Dimension = "tenant_created"
 )
 
 // UsageEvent is a single raw event emitted by the gateway. The billing

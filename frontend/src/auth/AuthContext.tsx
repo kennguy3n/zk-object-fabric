@@ -15,7 +15,12 @@ interface AuthState {
 
 interface AuthContextValue extends AuthState {
   signIn(email: string, password: string): Promise<void>;
-  signUp(input: { email: string; password: string; tenantName: string }): Promise<void>;
+  signUp(input: {
+    email: string;
+    password: string;
+    tenantName: string;
+    captchaToken?: string;
+  }): Promise<void>;
   signOut(): void;
 }
 
@@ -38,6 +43,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     api.setToken(state.token ?? undefined);
+    api.setTenantScope(state.tenant?.id);
     if (state.token && state.tenant) {
       sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } else {
@@ -51,7 +57,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const signUp = useCallback(
-    async (input: { email: string; password: string; tenantName: string }) => {
+    async (input: {
+      email: string;
+      password: string;
+      tenantName: string;
+      captchaToken?: string;
+    }) => {
       const { tenant, token } = await api.signup(input);
       setState({ tenant, token });
     },
