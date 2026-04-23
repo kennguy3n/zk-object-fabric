@@ -2,14 +2,20 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Vite config for the tenant console. The console talks to two
-// separate surfaces on the gateway — tenant / usage / placement
-// routes under /api/ and auth routes under /api/v1/auth/ — both of
-// which live on port 8080 alongside the S3-compatible data plane.
-// The dev proxy therefore forwards every /api request so SPA calls
-// are same-origin and avoid CORS preflight noise.
-// Canonical gateway dev port — see docs/FRONTEND_PLAN.md §6.
-const GATEWAY_TARGET = "http://localhost:8080";
+// Vite config for the tenant console. The console API and its
+// /api/v1/auth/* routes live on a DEDICATED HTTP server bound to
+// cfg.Console.ListenAddr (see cmd/gateway/main.go#startConsoleAPI),
+// which is NOT the same listener as the S3 data plane on :8080. The
+// canonical console port is 8081; proxy every /api request there so
+// the SPA's same-origin fetch hits the console mux instead of the
+// S3 mux (which 404s on /api/*).
+//
+// VITE_CONSOLE_URL overrides the default for environments where the
+// console is reachable on a different host/port (e.g. staging).
+const CONSOLE_TARGET =
+  (typeof import.meta !== "undefined" &&
+    (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_CONSOLE_URL) ||
+  "http://localhost:8081";
 
 export default defineConfig({
   plugins: [react()],
@@ -17,7 +23,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: GATEWAY_TARGET,
+        target: CONSOLE_TARGET,
         changeOrigin: true,
       },
     },
@@ -33,7 +39,7 @@ export default defineConfig({
     port: 4173,
     proxy: {
       "/api": {
-        target: GATEWAY_TARGET,
+        target: CONSOLE_TARGET,
         changeOrigin: true,
       },
     },
