@@ -84,25 +84,25 @@ export class ApiClient {
   // --- api keys -------------------------------------------------
 
   async listApiKeys(): Promise<ApiKey[]> {
-    return this.get("/api-keys");
+    return this.get("/keys");
   }
 
   async createApiKey(): Promise<ApiKey> {
-    return this.post("/api-keys", {});
+    return this.post("/keys", {});
   }
 
-  async revokeApiKey(id: string): Promise<void> {
-    await this.request("DELETE", `/api-keys/${encodeURIComponent(id)}`);
+  async revokeApiKey(accessKey: string): Promise<void> {
+    await this.request("DELETE", `/keys/${encodeURIComponent(accessKey)}`);
   }
 
   // --- placement policies --------------------------------------
 
   async listPlacementPolicies(): Promise<PlacementPolicy[]> {
-    return this.get("/placement-policies");
+    return this.get("/placement");
   }
 
   async savePlacementPolicy(policy: Omit<PlacementPolicy, "updatedAt">): Promise<PlacementPolicy> {
-    return this.put(`/placement-policies/${encodeURIComponent(policy.id)}`, policy);
+    return this.put("/placement", policy);
   }
 
   // --- dedicated cells (b2b_dedicated / sovereign only) --------
