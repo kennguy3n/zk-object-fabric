@@ -190,6 +190,37 @@ func (s *MemoryTenantStore) Size() int {
 	return len(s.byAccess)
 }
 
+// ListBindingsByTenantID returns every binding whose Tenant.ID
+// matches tenantID. The tenant console uses this to render the API
+// keys list; the slice is freshly allocated so callers may safely
+// retain it. Returns an empty (non-nil) slice when no bindings are
+// registered for the tenant.
+func (s *MemoryTenantStore) ListBindingsByTenantID(tenantID string) []TenantBinding {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]TenantBinding, 0)
+	for _, b := range s.byAccess {
+		if b.Tenant.ID == tenantID {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// RemoveBinding deletes the binding identified by accessKey. It is
+// idempotent: a missing access key is not an error. The tenant
+// console's revoke-key handler calls this so a compromised access
+// key stops authenticating S3 requests immediately.
+func (s *MemoryTenantStore) RemoveBinding(accessKey string) error {
+	if accessKey == "" {
+		return fmt.Errorf("auth: access_key is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byAccess, accessKey)
+	return nil
+}
+
 // LoadBindingsFromJSON reads a JSON file containing a list of
 // TenantBindings and registers them in the store.
 func (s *MemoryTenantStore) LoadBindingsFromJSON(path string) error {

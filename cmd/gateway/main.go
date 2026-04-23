@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -541,13 +542,16 @@ func startConsoleAPI(
 	tokens := console.NewMemoryTokenStore()
 
 	h := console.New(console.Config{
-		Tenants:    tenants,
-		Usage:      usage,
-		Placements: placements,
-		Auth:       authStore,
-		Tokens:     tokens,
-		AuthHooks:  authHooks,
-		AdminAuth:  buildAdminAuth(cfg),
+		Tenants:     tenants,
+		Usage:       usage,
+		Placements:  placements,
+		Auth:        authStore,
+		Tokens:      tokens,
+		AuthHooks:   authHooks,
+		AdminAuth:   buildAdminAuth(cfg),
+		BillingSink: billingSink,
+		Buckets:     console.NewMemoryBucketStore(),
+		Cells:       console.NewMemoryDedicatedCellStore(),
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -591,8 +595,26 @@ func buildAdminAuth(cfg config.Config) func(r *http.Request) bool {
 // a hCaptcha site secret or an AWS SES account.
 func buildAuthHooks(cfg config.Config) console.AuthHooks {
 	hooks := console.AuthHooks{}
-	if secret := os.Getenv("HCAPTCHA_SECRET"); secret != "" {
-		hooks.VerifyCAPTCHA = console.NewHCaptchaVerifier(secret, "")
+	// Config-driven CAPTCHA wiring takes precedence over the env
+	// fallback so operators can flip the provider without
+	// redeploying the gateway. Only hcaptcha is wired today;
+	// "recaptcha" is reserved for a future provider and currently
+	// logs a warning and falls through to env so an unset config
+	// does not silently disable CAPTCHA.
+	captchaSecret := cfg.Console.CaptchaSecret
+	captchaProvider := strings.ToLower(strings.TrimSpace(cfg.Console.CaptchaProvider))
+	if captchaSecret == "" {
+		captchaSecret = os.Getenv("HCAPTCHA_SECRET")
+	}
+	switch captchaProvider {
+	case "", "hcaptcha":
+		if captchaSecret != "" {
+			hooks.VerifyCAPTCHA = console.NewHCaptchaVerifier(captchaSecret, "")
+		}
+	case "recaptcha":
+		log.Printf("gateway: console captcha_provider=recaptcha is not wired yet; signup CAPTCHA disabled")
+	default:
+		log.Printf("gateway: unknown console captcha_provider %q; signup CAPTCHA disabled", captchaProvider)
 	}
 	if from := os.Getenv("SES_FROM_ADDRESS"); from != "" {
 		if sender, err := console.NewSESEmailSender(console.SESEmailConfig{
@@ -676,6 +698,57 @@ func (c *consoleTenantAdapter) CreateTenant(t tenant.Tenant) error {
 // when a downstream step (CreateUser, AddAPIKey, IssueToken) fails.
 func (c *consoleTenantAdapter) DeleteTenant(tenantID string) error {
 	return c.store.DeleteTenant(tenantID)
+}
+
+// bindingLister is satisfied by both MemoryTenantStore and
+// PostgresTenantStore. It is type-asserted dynamically so mock
+// stores used in tests remain usable without implementing the
+// key-management surface.
+type bindingLister interface {
+	ListBindingsByTenantID(tenantID string) []auth.TenantBinding
+	RemoveBinding(accessKey string) error
+}
+
+// ListAPIKeys implements console.APIKeyLister. It returns the
+// tenant's access-key bindings (without the secret key) so the
+// console UI can render a keys table without ever exposing the
+// secret back to the browser.
+func (c *consoleTenantAdapter) ListAPIKeys(tenantID string) ([]console.APIKeyDescriptor, error) {
+	bl, ok := c.store.(bindingLister)
+	if !ok {
+		return nil, fmt.Errorf("gateway: tenant store does not expose binding listing")
+	}
+	bindings := bl.ListBindingsByTenantID(tenantID)
+	out := make([]console.APIKeyDescriptor, 0, len(bindings))
+	for _, b := range bindings {
+		out = append(out, console.APIKeyDescriptor{
+			AccessKey: b.AccessKey,
+			// The binding does not persist its own CreatedAt
+			// so fall back to the zero value; the SPA renders
+			// "unknown" when the timestamp is zero. A later
+			// schema migration can populate this from the
+			// tenant_bindings row.
+		})
+	}
+	return out, nil
+}
+
+// DeleteAPIKey implements console.APIKeyLister by removing the
+// binding so the access key stops authenticating S3 requests on
+// the next request (the auth store is the authoritative hot path).
+func (c *consoleTenantAdapter) DeleteAPIKey(tenantID, accessKey string) error {
+	bl, ok := c.store.(bindingLister)
+	if !ok {
+		return fmt.Errorf("gateway: tenant store does not expose binding removal")
+	}
+	b, ok := c.store.LookupByAccessKey(accessKey)
+	if !ok {
+		return nil // idempotent
+	}
+	if b.Tenant.ID != tenantID {
+		return fmt.Errorf("gateway: access key %q is not bound to tenant %q", accessKey, tenantID)
+	}
+	return bl.RemoveBinding(accessKey)
 }
 
 // noopUsageQuery is the zero-cost fallback used when no ClickHouse

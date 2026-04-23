@@ -8,22 +8,37 @@ import type {
 } from "./types";
 
 // ApiClient is the thin wrapper the SPA uses to reach the gateway's
-// management API. Auth endpoints live under /api/v1/auth/ because
-// the backend handler registers them under that versioned prefix
-// (see api/console/auth_handler.go), while tenant-scoped routes
-// (tenants, usage, keys, placement) live under /api/ to match the
-// mux registered in api/console/handler.go:Handler.Register. Feature
-// code never pokes fetch directly so swapping the transport (msw
-// for tests, a batching client, etc.) is a one-file change.
+// management API. Auth endpoints live under `${rootBaseUrl}/v1/auth`
+// (e.g. `/api/v1/auth`); tenant-scoped routes live under
+// `${rootBaseUrl}/tenants/${tenantID}/...` to match the mux
+// registered in api/console/handler.go. The SPA seeds the tenant
+// scope via setTenantScope() immediately after login / signup so
+// subsequent calls resolve to the correct tenant; before login only
+// the auth endpoints are callable.
 export class ApiClient {
+  private tenantBaseUrl: string | undefined;
+
   constructor(
-    private readonly baseUrl: string,
+    private readonly rootBaseUrl: string,
     private token?: string,
-    private readonly authBaseUrl: string = `${baseUrl}/v1/auth`,
+    private readonly authBaseUrl: string = `${rootBaseUrl}/v1/auth`,
   ) {}
 
   setToken(token: string | undefined) {
     this.token = token;
+  }
+
+  // setTenantScope wires the tenant ID into the path prefix used by
+  // every tenant-scoped call on this client. Call it with the
+  // tenant ID returned from login/signup. Pass `undefined` to clear
+  // the scope on logout so the SPA never accidentally sends stale
+  // tenant-scoped requests on behalf of a signed-out user.
+  setTenantScope(tenantId: string | undefined) {
+    if (!tenantId) {
+      this.tenantBaseUrl = undefined;
+      return;
+    }
+    this.tenantBaseUrl = `${this.rootBaseUrl}/tenants/${encodeURIComponent(tenantId)}`;
   }
 
   // --- auth -----------------------------------------------------
@@ -41,14 +56,24 @@ export class ApiClient {
     email: string;
     password: string;
     tenantName: string;
+    captchaToken?: string;
   }): Promise<{ tenant: Tenant; token: string }> {
     return this.requestAt("POST", `${this.authBaseUrl}/signup`, input);
   }
 
   // --- usage & dashboard ---------------------------------------
+  //
+  // Backend returns placement_policy-style UsageResponse ({tenant_id,
+  // start, end, counters: map[billing.Dimension]uint64}). The SPA
+  // renders UsageSnapshot (camelCase, pre-aggregated stat cards) so
+  // the client projects counter dimensions onto the snapshot shape.
+  // Keep this projection identical to usageFromStreamEvent in
+  // DashboardPage.tsx so the REST bootstrap and the SSE live frames
+  // populate the same fields.
 
   async currentUsage(): Promise<UsageSnapshot> {
-    return this.get("/usage");
+    const raw = await this.get<BackendUsageResponse>("/usage");
+    return backendToUsageSnapshot(raw);
   }
 
   // --- buckets --------------------------------------------------
@@ -68,25 +93,37 @@ export class ApiClient {
   // --- api keys -------------------------------------------------
 
   async listApiKeys(): Promise<ApiKey[]> {
-    return this.get("/api-keys");
+    return this.get("/keys");
   }
 
   async createApiKey(): Promise<ApiKey> {
-    return this.post("/api-keys", {});
+    return this.post("/keys", {});
   }
 
-  async revokeApiKey(id: string): Promise<void> {
-    await this.request("DELETE", `/api-keys/${encodeURIComponent(id)}`);
+  async revokeApiKey(accessKey: string): Promise<void> {
+    await this.request("DELETE", `/keys/${encodeURIComponent(accessKey)}`);
   }
 
   // --- placement policies --------------------------------------
+  //
+  // The backend stores a single Policy per tenant and returns it as
+  // placement_policy.Policy ({tenant, bucket, policy: {...}}). The
+  // SPA's editor models policies as an editable list keyed by id, so
+  // the client adapts the wire shape into a one-element array on
+  // read and translates the editor's yaml field back into the
+  // backend's JSON Policy on write. The "yaml" editor is JSON under
+  // the hood in Phase 1; the same canonical form is what the gateway
+  // accepts, so a round-trip through the textarea is lossless.
 
   async listPlacementPolicies(): Promise<PlacementPolicy[]> {
-    return this.get("/placement-policies");
+    const raw = await this.get<BackendPlacementPolicy>("/placement");
+    return [backendToFrontendPolicy(raw)];
   }
 
   async savePlacementPolicy(policy: Omit<PlacementPolicy, "updatedAt">): Promise<PlacementPolicy> {
-    return this.put(`/placement-policies/${encodeURIComponent(policy.id)}`, policy);
+    const body = frontendToBackendPolicy(policy);
+    const raw = await this.put<BackendPlacementPolicy>("/placement", body);
+    return backendToFrontendPolicy(raw);
   }
 
   // --- dedicated cells (b2b_dedicated / sovereign only) --------
@@ -110,7 +147,13 @@ export class ApiClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    return this.requestAt(method, `${this.baseUrl}${path}`, body);
+    if (!this.tenantBaseUrl) {
+      throw new ApiError(
+        0,
+        "tenant scope is not set; call setTenantScope() after login/signup before issuing tenant-scoped calls",
+      );
+    }
+    return this.requestAt(method, `${this.tenantBaseUrl}${path}`, body);
   }
 
   private async requestAt<T>(method: string, url: string, body?: unknown): Promise<T> {
@@ -138,6 +181,69 @@ export class ApiError extends Error {
     super(`API error ${status}: ${message}`);
     this.name = "ApiError";
   }
+}
+
+// BackendPlacementPolicy mirrors placement_policy.Policy on the
+// gateway side (metadata/placement_policy/policy.go). Phase 1 does not
+// emit an updated_at timestamp, so the frontend synthesizes one at
+// read time for display purposes only.
+interface BackendPlacementPolicy {
+  tenant: string;
+  bucket?: string;
+  policy: Record<string, unknown>;
+}
+
+function backendToFrontendPolicy(raw: BackendPlacementPolicy): PlacementPolicy {
+  // id is stable per (tenant, bucket) so the editor's keyed list
+  // does not lose selection across saves. name is surfaced to the
+  // sidebar as a label; default buckets render as "default".
+  const bucket = raw.bucket ?? "";
+  return {
+    id: bucket ? `${raw.tenant}/${bucket}` : raw.tenant,
+    name: bucket || "default",
+    yaml: JSON.stringify({ tenant: raw.tenant, bucket, policy: raw.policy ?? {} }, null, 2),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+// BackendUsageResponse mirrors api/console/handler.go UsageResponse.
+// Counter keys are billing.Dimension strings; values are cumulative
+// counters over [start, end]. Keep the projection below aligned with
+// usageFromStreamEvent in DashboardPage.tsx so the REST bootstrap and
+// the SSE live frames render identically.
+interface BackendUsageResponse {
+  tenant_id: string;
+  start: string;
+  end: string;
+  counters: Record<string, number>;
+}
+
+function backendToUsageSnapshot(raw: BackendUsageResponse): UsageSnapshot {
+  const c = raw.counters ?? {};
+  return {
+    tenantId: raw.tenant_id,
+    storageBytes: c["storage_bytes_seconds"] ?? 0,
+    requestsLast30Days:
+      (c["put_requests"] ?? 0) +
+      (c["get_requests"] ?? 0) +
+      (c["list_requests"] ?? 0) +
+      (c["delete_requests"] ?? 0),
+    egressBytesThisMonth: c["egress_bytes"] ?? 0,
+    monthStart: raw.start,
+  };
+}
+
+function frontendToBackendPolicy(p: Omit<PlacementPolicy, "updatedAt">): BackendPlacementPolicy {
+  // The editor stores the canonical JSON Policy document in the
+  // yaml field; we parse it back into the wire shape the gateway
+  // expects. Invalid JSON surfaces as a client-side error via the
+  // thrown SyntaxError before any network round-trip is wasted.
+  const parsed = JSON.parse(p.yaml) as Partial<BackendPlacementPolicy>;
+  return {
+    tenant: parsed.tenant ?? p.id.split("/")[0] ?? "",
+    bucket: parsed.bucket ?? "",
+    policy: (parsed.policy ?? {}) as Record<string, unknown>,
+  };
 }
 
 // Shared default client. Tenant-scoped routes (tenants, usage,

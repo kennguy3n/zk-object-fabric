@@ -12,7 +12,12 @@ requireGateway();
 test.describe("signup flow", () => {
   test("renders the signup page at /signup", async ({ page }) => {
     await page.goto("/signup");
-    await expect(page.getByRole("heading", { name: /sign up|create|signup/i })).toBeVisible();
+    // AuthShell wraps the page heading as "Tenant console · Create
+    // a tenant" (h1, LoginPage.tsx#AuthShell); match the trailing
+    // fragment so the assertion stays stable across shell copy.
+    await expect(
+      page.getByRole("heading", { name: /create a tenant|create tenant|sign up|signup/i }),
+    ).toBeVisible();
     await expect(page.getByLabel(/email/i)).toBeVisible();
     await expect(page.getByLabel(/password/i)).toBeVisible();
   });
@@ -22,16 +27,21 @@ test.describe("signup flow", () => {
     // Unique email per run so the gateway's in-memory MemoryAuthStore
     // does not collide with a previously registered tenant.
     const email = `e2e+${Date.now()}@example.com`;
+    // Organization / tenant name is required by SignupPage.tsx; the
+    // backend rejects empty tenantName with 400. Fill it first so the
+    // POST actually fires when the submit button is clicked.
+    await page.getByLabel(/organization|tenant|workspace/i).fill(`e2e-${Date.now()}`);
     await page.getByLabel(/email/i).fill(email);
     await page.getByLabel(/password/i).fill("correct-horse-battery-staple");
-    const tenantField = page.getByLabel(/tenant|workspace|organization/i);
-    if (await tenantField.count()) {
-      await tenantField.fill(`e2e-${Date.now()}`);
-    }
     const resp = page.waitForResponse(
       (r) => r.url().includes("/api/v1/auth/signup") && r.request().method() === "POST",
+      { timeout: 15_000 },
     );
-    await page.getByRole("button", { name: /sign up|create account|signup/i }).click();
+    // Submit button renders "Create tenant" (SignupPage.tsx); match
+    // that exact copy so the click lands on the form's primary CTA.
+    await page
+      .getByRole("button", { name: /create tenant|create a tenant|sign up|signup/i })
+      .click();
     const response = await resp;
     // 200/201 is the success path; 400/409 indicates a validation or
     // collision error which we still accept so the test does not

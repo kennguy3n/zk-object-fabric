@@ -80,9 +80,9 @@ export function AuthShell({
       <div className="panel" style={{ width: "100%", maxWidth: 400 }}>
         <div style={{ marginBottom: 16 }}>
           <div style={{ fontWeight: 700, fontSize: 18 }}>ZK Object Fabric</div>
-          <div className="muted" style={{ fontSize: 13 }}>
+          <h1 style={{ margin: 0, fontSize: 13, fontWeight: 400 }} className="muted">
             Tenant console · {title}
-          </div>
+          </h1>
         </div>
         {children}
       </div>

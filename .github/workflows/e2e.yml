@@ -1,0 +1,116 @@
+name: e2e
+
+# Runs the Playwright console end-to-end suite against a locally
+# built gateway. The gateway is launched with the local_fs_dev
+# backend so the tests do not need cloud credentials. CONSOLE_E2E=1
+# unlocks the gate at frontend/tests/e2e/helpers.ts.
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - "api/console/**"
+      - "cmd/gateway/**"
+      - "internal/**"
+      - ".github/workflows/e2e.yml"
+  push:
+    branches:
+      - main
+
+jobs:
+  console-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build gateway
+        run: |
+          go build -o /tmp/zk-gateway ./cmd/gateway
+
+      - name: Write gateway config
+        run: |
+          mkdir -p /tmp/zkfs
+          cat > /tmp/zk-gateway.json <<'JSON'
+          {
+            "env": "ci",
+            "gateway": { "listen_addr": "127.0.0.1:8080" },
+            "console": { "listen_addr": "127.0.0.1:8081" },
+            "providers": {
+              "local_fs_dev": { "root_path": "/tmp/zkfs" }
+            }
+          }
+          JSON
+
+      - name: Start gateway
+        run: |
+          /tmp/zk-gateway -config /tmp/zk-gateway.json > /tmp/gateway.log 2>&1 &
+          echo $! > /tmp/gateway.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8081/ >/dev/null 2>&1 \
+              || curl -sf http://127.0.0.1:8080/ >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          ss -ltn | grep -E ':(8080|8081)\b' || (cat /tmp/gateway.log; exit 1)
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        # playwright.config.ts enables both chromium and firefox projects;
+        # installing only chromium (`--with-deps chromium`) makes the firefox
+        # project fail with "Executable doesn't exist at .../firefox". Install
+        # everything declared in the config so the suite runs against every
+        # browser the project gates on.
+        run: npx playwright install --with-deps
+
+      - name: Run Playwright e2e
+        working-directory: frontend
+        # Intentionally leave PLAYWRIGHT_BASE_URL unset. playwright.config.ts
+        # only registers its `webServer` (which runs `npm run build && npm
+        # run preview`) when PLAYWRIGHT_BASE_URL is unset; setting it in CI
+        # skips the preview server and every `page.goto()` hits a dead port
+        # with NS_ERROR_CONNECTION_REFUSED.
+        env:
+          CONSOLE_E2E: "1"
+          PLAYWRIGHT_GATEWAY_URL: "http://127.0.0.1:8080"
+          PLAYWRIGHT_CONSOLE_URL: "http://127.0.0.1:8081"
+        run: npm run test:e2e
+
+      - name: Stop gateway
+        if: always()
+        run: |
+          if [ -f /tmp/gateway.pid ]; then
+            kill "$(cat /tmp/gateway.pid)" || true
+          fi
+
+      - name: Upload gateway log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-log
+          path: /tmp/gateway.log
+          if-no-files-found: ignore
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report
+          if-no-files-found: ignore

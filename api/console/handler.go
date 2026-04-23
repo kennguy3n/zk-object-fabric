@@ -40,6 +40,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 )
@@ -72,6 +73,65 @@ type TenantStore interface {
 	// tenant records behind. Implementations should treat a
 	// missing tenantID as a no-op rather than an error.
 	DeleteTenant(tenantID string) error
+}
+
+// APIKeyDescriptor is the non-secret view of an access key returned
+// by GET /api/tenants/{id}/keys. SecretKey is deliberately absent —
+// secrets are shown exactly once, at creation time.
+type APIKeyDescriptor struct {
+	AccessKey string    `json:"accessKey"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// APIKeyLister is an optional extension of TenantStore that lets
+// the console enumerate and revoke access keys for a tenant. When
+// the backing store does not implement it, GET and DELETE on the
+// keys subresource return 501 Not Implemented so the frontend can
+// gracefully hide the list affordance.
+type APIKeyLister interface {
+	ListAPIKeys(tenantID string) ([]APIKeyDescriptor, error)
+	DeleteAPIKey(tenantID, accessKey string) error
+}
+
+// BucketDescriptor mirrors the shape frontend/src/api/types.ts
+// `Bucket` consumes. BytesStored / ObjectCount are Phase 3
+// placeholders populated from the manifest store when available;
+// in-memory stores report zero.
+type BucketDescriptor struct {
+	Name               string    `json:"name"`
+	CreatedAt          time.Time `json:"createdAt"`
+	PlacementPolicyRef string    `json:"placementPolicyRef"`
+	ObjectCount        int64     `json:"objectCount"`
+	BytesStored        int64     `json:"bytesStored"`
+}
+
+// BucketStore persists the tenant → bucket catalog the SPA reads
+// to render BucketsPage. The S3 data plane does not (yet) auto-
+// populate this store; the console writes into it as operators
+// create buckets via POST /api/tenants/{id}/buckets.
+type BucketStore interface {
+	ListBuckets(ctx context.Context, tenantID string) ([]BucketDescriptor, error)
+	CreateBucket(ctx context.Context, tenantID, name, placementPolicyRef string) (BucketDescriptor, error)
+	DeleteBucket(ctx context.Context, tenantID, name string) error
+}
+
+// DedicatedCellDescriptor mirrors frontend/src/api/types.ts
+// `DedicatedCell` for B2B tenants. An empty slice is a valid
+// response for B2C tenants, which never see a dedicated cell.
+type DedicatedCellDescriptor struct {
+	ID                string  `json:"id"`
+	Region            string  `json:"region"`
+	Country           string  `json:"country"`
+	Status            string  `json:"status"` // provisioning|active|decommissioning
+	CapacityPetabytes float64 `json:"capacityPetabytes"`
+	Utilization       float64 `json:"utilization"` // 0..1
+}
+
+// DedicatedCellStore lists the dedicated cells bound to a B2B
+// tenant. Sovereign / b2b_dedicated contracts get one or more
+// rows; b2b_shared / b2c_pooled get none.
+type DedicatedCellStore interface {
+	ListDedicatedCells(ctx context.Context, tenantID string) ([]DedicatedCellDescriptor, error)
 }
 
 // UsageQuery is the interface the console uses to summarize per-
@@ -114,6 +174,18 @@ type Config struct {
 	Tenants    TenantStore
 	Usage      UsageQuery
 	Placements PlacementStore
+	Buckets    BucketStore
+	Cells      DedicatedCellStore
+
+	// BillingSink receives a billing event with the
+	// TenantCreated dimension after a successful signup so the
+	// ClickHouse pipeline starts tracking the tenant from signup
+	// time. A nil sink silently drops the event — acceptable for
+	// tests but discouraged in production where gap-free metering
+	// is load-bearing for invoice generation.
+	BillingSink interface {
+		Emit(event billing.UsageEvent)
+	}
 
 	// AdminAuth is the per-request admin-authorization check. The
 	// tenant / usage / keys / placement routes all consult it
@@ -198,6 +270,8 @@ func New(cfg Config) *Handler {
 //	/api/tenants/{id}/usage
 //	/api/tenants/{id}/keys
 //	/api/tenants/{id}/placement
+//	/api/tenants/{id}/buckets
+//	/api/tenants/{id}/dedicated-cells
 //	/api/v1/auth/signup
 //	/api/v1/auth/login
 //	/api/v1/usage/stream/{id}
@@ -227,6 +301,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 			GenerateKey: h.cfg.GenerateKey,
 			NewTenantID: h.cfg.NewTenantID,
 			Hooks:       h.cfg.AuthHooks,
+			BillingSink: h.cfg.BillingSink,
 			Now:         h.cfg.Now,
 		})
 		auth.Register(mux)
@@ -264,31 +339,60 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "admin authorization required")
 		return
 	}
-	tenantID, suffix, ok := parsePath(r.URL.Path)
+	tenantID, suffix, sub, ok := parsePath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid path, expected /api/tenants/{id}[/subresource]")
 		return
 	}
 	switch suffix {
 	case "":
+		if sub != "" {
+			writeError(w, http.StatusNotFound, "unknown subresource "+sub)
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		h.getTenant(w, r, tenantID)
 	case "usage":
+		if sub != "" {
+			writeError(w, http.StatusNotFound, "unknown subresource usage/"+sub)
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		h.getUsage(w, r, tenantID)
 	case "keys":
-		if r.Method != http.MethodPost {
+		switch r.Method {
+		case http.MethodPost:
+			if sub != "" {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			h.createKey(w, r, tenantID)
+		case http.MethodGet:
+			if sub != "" {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			h.listKeys(w, r, tenantID)
+		case http.MethodDelete:
+			if sub == "" {
+				writeError(w, http.StatusBadRequest, "access key required")
+				return
+			}
+			h.deleteKey(w, r, tenantID, sub)
+		default:
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	case "placement":
+		if sub != "" {
+			writeError(w, http.StatusNotFound, "unknown subresource placement/"+sub)
 			return
 		}
-		h.createKey(w, r, tenantID)
-	case "placement":
 		switch r.Method {
 		case http.MethodGet:
 			h.getPlacement(w, r, tenantID)
@@ -297,6 +401,39 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
+	case "buckets":
+		switch r.Method {
+		case http.MethodGet:
+			if sub != "" {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			h.listBuckets(w, r, tenantID)
+		case http.MethodPost:
+			if sub != "" {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			h.createBucket(w, r, tenantID)
+		case http.MethodDelete:
+			if sub == "" {
+				writeError(w, http.StatusBadRequest, "bucket name required")
+				return
+			}
+			h.deleteBucket(w, r, tenantID, sub)
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	case "dedicated-cells":
+		if sub != "" {
+			writeError(w, http.StatusNotFound, "unknown subresource dedicated-cells/"+sub)
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.listDedicatedCells(w, r, tenantID)
 	default:
 		writeError(w, http.StatusNotFound, "unknown subresource "+suffix)
 	}
@@ -372,10 +509,166 @@ func (h *Handler) getUsage(w http.ResponseWriter, r *http.Request, tenantID stri
 // and never again; the frontend surfaces a one-time reveal so the
 // operator can copy it before it disappears.
 type CreateKeyResponse struct {
-	TenantID  string    `json:"tenant_id"`
-	AccessKey string    `json:"access_key"`
-	SecretKey string    `json:"secret_key"`
-	CreatedAt time.Time `json:"created_at"`
+	TenantID  string    `json:"tenantId"`
+	AccessKey string    `json:"accessKey"`
+	SecretKey string    `json:"secretKey"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// listKeys handles GET /api/tenants/{id}/keys.
+func (h *Handler) listKeys(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if h.cfg.Tenants == nil {
+		writeError(w, http.StatusServiceUnavailable, "tenant store not configured")
+		return
+	}
+	if _, ok := h.cfg.Tenants.LookupTenant(tenantID); !ok {
+		writeError(w, http.StatusNotFound, "tenant not found")
+		return
+	}
+	lister, ok := h.cfg.Tenants.(APIKeyLister)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "tenant store does not support listing keys")
+		return
+	}
+	keys, err := lister.ListAPIKeys(tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list keys: "+err.Error())
+		return
+	}
+	if keys == nil {
+		keys = []APIKeyDescriptor{}
+	}
+	writeJSON(w, http.StatusOK, keys)
+}
+
+// deleteKey handles DELETE /api/tenants/{id}/keys/{accessKey}.
+func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request, tenantID, accessKey string) {
+	if h.cfg.Tenants == nil {
+		writeError(w, http.StatusServiceUnavailable, "tenant store not configured")
+		return
+	}
+	if _, ok := h.cfg.Tenants.LookupTenant(tenantID); !ok {
+		writeError(w, http.StatusNotFound, "tenant not found")
+		return
+	}
+	lister, ok := h.cfg.Tenants.(APIKeyLister)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "tenant store does not support revoking keys")
+		return
+	}
+	if err := lister.DeleteAPIKey(tenantID, accessKey); err != nil {
+		writeError(w, http.StatusInternalServerError, "delete key: "+err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listBuckets handles GET /api/tenants/{id}/buckets.
+func (h *Handler) listBuckets(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
+	if h.cfg.Buckets == nil {
+		writeJSON(w, http.StatusOK, []BucketDescriptor{})
+		return
+	}
+	buckets, err := h.cfg.Buckets.ListBuckets(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list buckets: "+err.Error())
+		return
+	}
+	if buckets == nil {
+		buckets = []BucketDescriptor{}
+	}
+	writeJSON(w, http.StatusOK, buckets)
+}
+
+// createBucketRequest is the POST body of
+// /api/tenants/{id}/buckets.
+type createBucketRequest struct {
+	Name               string `json:"name"`
+	PlacementPolicyRef string `json:"placementPolicyRef"`
+}
+
+const maxBucketPayloadBytes int64 = 8 * 1024
+
+// createBucket handles POST /api/tenants/{id}/buckets.
+func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
+	if h.cfg.Buckets == nil {
+		writeError(w, http.StatusServiceUnavailable, "bucket store not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBucketPayloadBytes)
+	var req createBucketRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("bucket payload exceeds %d bytes", maxBucketPayloadBytes))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "decode bucket: "+err.Error())
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "bucket name is required")
+		return
+	}
+	// parsePath splits DELETE /api/tenants/{id}/buckets/{name} on "/"
+	// and Go's net/http decodes %2F to "/" before ServeHTTP sees the
+	// path, so a name containing "/" would be creatable but never
+	// deletable through the console. Reject the separator (and
+	// backslash, for symmetry on Windows-style inputs) up front so
+	// the lifecycle stays round-trippable.
+	if strings.ContainsAny(req.Name, "/\\") {
+		writeError(w, http.StatusBadRequest, "bucket name must not contain '/' or '\\'")
+		return
+	}
+	bucket, err := h.cfg.Buckets.CreateBucket(r.Context(), tenantID, req.Name, req.PlacementPolicyRef)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "create bucket: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, bucket)
+}
+
+// deleteBucket handles DELETE /api/tenants/{id}/buckets/{name}.
+func (h *Handler) deleteBucket(w http.ResponseWriter, r *http.Request, tenantID, name string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
+	if h.cfg.Buckets == nil {
+		writeError(w, http.StatusServiceUnavailable, "bucket store not configured")
+		return
+	}
+	if err := h.cfg.Buckets.DeleteBucket(r.Context(), tenantID, name); err != nil {
+		writeError(w, http.StatusInternalServerError, "delete bucket: "+err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listDedicatedCells handles GET /api/tenants/{id}/dedicated-cells.
+func (h *Handler) listDedicatedCells(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
+	if h.cfg.Cells == nil {
+		writeJSON(w, http.StatusOK, []DedicatedCellDescriptor{})
+		return
+	}
+	cells, err := h.cfg.Cells.ListDedicatedCells(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list dedicated cells: "+err.Error())
+		return
+	}
+	if cells == nil {
+		cells = []DedicatedCellDescriptor{}
+	}
+	writeJSON(w, http.StatusOK, cells)
 }
 
 // createKey handles POST /api/tenants/{id}/keys.
@@ -464,32 +757,56 @@ func (h *Handler) putPlacement(w http.ResponseWriter, r *http.Request, tenantID 
 	writeJSON(w, http.StatusOK, pol)
 }
 
-// parsePath splits /api/tenants/{id}[/suffix] into (id, suffix, ok).
-// The trailing suffix is returned as a single string so callers can
-// switch on it; multi-segment suffixes are not supported.
-func parsePath(p string) (tenantID, suffix string, ok bool) {
+// ensureTenantExists is the shared 404 guard for tenant-scoped
+// handlers. Every /api/tenants/{id}/... route bottoms out in a store
+// that would otherwise silently accept data for a tenant the gateway
+// never minted — orphaning buckets, keys, or placement rows. Centralise
+// the lookup so callers only have to branch on a single bool and all
+// routes stay consistent with createKey/listKeys/deleteKey which
+// already enforce this.
+func (h *Handler) ensureTenantExists(w http.ResponseWriter, tenantID string) bool {
+	if h.cfg.Tenants == nil {
+		writeError(w, http.StatusServiceUnavailable, "tenant store not configured")
+		return false
+	}
+	if _, ok := h.cfg.Tenants.LookupTenant(tenantID); !ok {
+		writeError(w, http.StatusNotFound, "tenant not found")
+		return false
+	}
+	return true
+}
+
+// parsePath splits /api/tenants/{id}[/suffix[/sub]] into
+// (id, suffix, sub, ok). `sub` is the single segment after suffix
+// (e.g. access key for keys/{accessKey}, bucket name for
+// buckets/{name}); trailing segments beyond sub are rejected so a
+// confused client does not walk into a partially-matched route.
+func parsePath(p string) (tenantID, suffix, sub string, ok bool) {
 	const prefix = "/api/tenants/"
 	if !strings.HasPrefix(p, prefix) {
-		return "", "", false
+		return "", "", "", false
 	}
 	rest := strings.TrimPrefix(p, prefix)
 	rest = strings.TrimSuffix(rest, "/")
 	if rest == "" {
-		return "", "", false
+		return "", "", "", false
 	}
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return rest, "", true
+	parts := strings.Split(rest, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", "", "", false
 	}
-	tenantID = rest[:slash]
-	suffix = rest[slash+1:]
-	if tenantID == "" {
-		return "", "", false
+	tenantID = parts[0]
+	if len(parts) == 1 {
+		return tenantID, "", "", true
 	}
-	if strings.Contains(suffix, "/") {
-		return "", "", false
+	suffix = parts[1]
+	if len(parts) == 2 {
+		return tenantID, suffix, "", true
 	}
-	return tenantID, suffix, true
+	if len(parts) == 3 {
+		return tenantID, suffix, parts[2], true
+	}
+	return "", "", "", false
 }
 
 // defaultKeyGenerator mints a 20-byte hex access key and a 40-byte

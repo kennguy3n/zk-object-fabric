@@ -3,10 +3,10 @@ import { expect, test } from "@playwright/test";
 import { requireGateway, seedAuth } from "./helpers";
 
 // buckets.spec.ts exercises the bucket list CRUD flow: the page
-// renders existing buckets, the "Create bucket" action posts to
-// /api/v1/buckets, and the delete action issues a DELETE on the
-// bucket-specific path. Requires CONSOLE_E2E=1 and a running
-// gateway; see helpers.ts.
+// renders existing buckets and the "Create bucket" action POSTs to
+// the tenant-scoped endpoint. Requires CONSOLE_E2E=1 and a running
+// gateway; see helpers.ts. Tenant-scoped routes live under
+// /api/tenants/{id}/... — see api/console/handler.go#Handler.Register.
 
 requireGateway();
 
@@ -18,24 +18,21 @@ test.describe("buckets", () => {
   test("lists buckets and exposes a create control", async ({ page }) => {
     await page.goto("/buckets");
     await expect(page.getByRole("heading", { name: /buckets/i })).toBeVisible();
-    await expect(page.getByRole("button", { name: /create|new bucket/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /create bucket/i })).toBeVisible();
   });
 
-  test("submits POST /api/v1/buckets on create", async ({ page }) => {
+  test("submits POST to tenant-scoped buckets endpoint on create", async ({ page }) => {
     await page.goto("/buckets");
-    const create = page.getByRole("button", { name: /create|new bucket/i }).first();
+    // Attach the waiter before filling + clicking so the POST is
+    // never missed. The form is inline — both inputs are required
+    // by native HTML validation, so we fill them before submitting.
     const req = page.waitForRequest(
-      (r) => r.url().endsWith("/api/v1/buckets") && r.method() === "POST",
+      (r) => /\/api\/tenants\/[^/]+\/buckets$/.test(r.url()) && r.method() === "POST",
+      { timeout: 10_000 },
     );
-    await create.click();
-    const name = page.getByLabel(/name/i).first();
-    if (await name.count()) {
-      await name.fill("e2e-bucket");
-      await page.getByRole("button", { name: /create|save/i }).click();
-    }
-    await req.catch(() => {
-      // Some implementations post on form submit without a modal;
-      // both flows eventually hit /api/v1/buckets.
-    });
+    await page.getByLabel(/bucket name/i).fill("e2e-bucket");
+    await page.getByLabel(/placement policy/i).fill("b2c_pooled_default");
+    await page.getByRole("button", { name: /create bucket/i }).click();
+    await req;
   });
 });

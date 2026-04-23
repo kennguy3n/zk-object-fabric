@@ -15,7 +15,12 @@ interface AuthState {
 
 interface AuthContextValue extends AuthState {
   signIn(email: string, password: string): Promise<void>;
-  signUp(input: { email: string; password: string; tenantName: string }): Promise<void>;
+  signUp(input: {
+    email: string;
+    password: string;
+    tenantName: string;
+    captchaToken?: string;
+  }): Promise<void>;
   signOut(): void;
 }
 
@@ -33,11 +38,29 @@ function readPersisted(): AuthState {
   }
 }
 
+// applyToClient configures the shared ApiClient with the current
+// token + tenant scope. React's commit phase runs child effects
+// before parent effects, so configuring the client purely inside
+// the AuthProvider's useEffect loses the race with mounting
+// dashboard pages that issue tenant-scoped calls in their own
+// mount effects. We therefore apply it synchronously: at module
+// load (from persisted sessionStorage), inside signIn/signUp
+// right after the server replies, and on signOut.
+function applyToClient(state: AuthState) {
+  api.setToken(state.token ?? undefined);
+  api.setTenantScope(state.tenant?.id);
+}
+
+// Seed the shared ApiClient before React renders so the very first
+// component-mount effect already sees a scoped client if the user
+// has a persisted session. Executed at module load because the
+// ApiClient itself is a module-level singleton.
+applyToClient(readPersisted());
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>(() => readPersisted());
 
   useEffect(() => {
-    api.setToken(state.token ?? undefined);
     if (state.token && state.tenant) {
       sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } else {
@@ -47,18 +70,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signIn = useCallback(async (email: string, password: string) => {
     const { tenant, token } = await api.login(email, password);
+    applyToClient({ tenant, token });
     setState({ tenant, token });
   }, []);
 
   const signUp = useCallback(
-    async (input: { email: string; password: string; tenantName: string }) => {
+    async (input: {
+      email: string;
+      password: string;
+      tenantName: string;
+      captchaToken?: string;
+    }) => {
       const { tenant, token } = await api.signup(input);
+      applyToClient({ tenant, token });
       setState({ tenant, token });
     },
     [],
   );
 
   const signOut = useCallback(() => {
+    applyToClient({ tenant: null, token: null });
     setState({ tenant: null, token: null });
   }, []);
 
