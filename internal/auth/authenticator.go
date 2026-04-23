@@ -8,17 +8,20 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// HMACAuthenticator verifies AWS Signature V4 (SigV4) headers on
-// incoming requests and returns the tenant bound to the signing
-// access key. The implementation follows the SigV4 spec closely
-// enough to interoperate with standard S3 SDKs while deliberately
-// omitting the parts that have no security value for Phase 2
-// (chunked SignatureV4, pre-signed URLs beyond the minimum, and the
-// optional x-amz-date fallback); those become live gates in Phase 3.
+// HMACAuthenticator verifies AWS Signature V4 (SigV4) on incoming
+// requests and returns the tenant bound to the signing access key.
+// It accepts both header-signed requests (Authorization: AWS4-...)
+// and query-string presigned URLs (X-Amz-Signature=...). The
+// implementation follows the SigV4 spec closely enough to
+// interoperate with standard S3 SDKs while deliberately omitting the
+// parts that have no security value for Phase 2 (chunked SignatureV4
+// and the optional x-amz-date fallback); those become live gates in
+// Phase 3.
 type HMACAuthenticator struct {
 	Store         TenantStore
 	Region        string
@@ -39,12 +42,16 @@ func NewHMACAuthenticator(store TenantStore) *HMACAuthenticator {
 	}
 }
 
-// Authenticate implements s3compat.Authenticator. It parses the
-// Authorization header, re-derives the expected signature using the
+// Authenticate implements s3compat.Authenticator. It parses either
+// the Authorization header or the X-Amz-Signature query parameter
+// (presigned URL), re-derives the expected signature using the
 // stored secret key, and compares the two in constant time.
 func (a *HMACAuthenticator) Authenticate(r *http.Request) (string, error) {
 	if a == nil || a.Store == nil {
 		return "", errors.New("auth: authenticator not configured")
+	}
+	if r.URL != nil && r.URL.Query().Get("X-Amz-Signature") != "" {
+		return a.authenticatePresigned(r)
 	}
 	authz := r.Header.Get("Authorization")
 	if authz == "" {
@@ -87,6 +94,129 @@ func (a *HMACAuthenticator) Authenticate(r *http.Request) (string, error) {
 		return "", errors.New("auth: signature mismatch")
 	}
 	return binding.Tenant.ID, nil
+}
+
+// authenticatePresigned verifies a SigV4 presigned URL. The signing
+// parameters live in the query string (X-Amz-Algorithm,
+// X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders,
+// X-Amz-Signature) instead of the Authorization header; the payload
+// hash is fixed to "UNSIGNED-PAYLOAD"; and the canonical query must
+// exclude X-Amz-Signature itself.
+func (a *HMACAuthenticator) authenticatePresigned(r *http.Request) (string, error) {
+	q := r.URL.Query()
+	if alg := q.Get("X-Amz-Algorithm"); alg != "AWS4-HMAC-SHA256" {
+		return "", fmt.Errorf("auth: unsupported presigned algorithm %q", alg)
+	}
+	cred := q.Get("X-Amz-Credential")
+	if cred == "" {
+		return "", errors.New("auth: missing X-Amz-Credential")
+	}
+	segs := strings.Split(cred, "/")
+	if len(segs) != 5 || segs[4] != "aws4_request" {
+		return "", fmt.Errorf("auth: malformed X-Amz-Credential %q", cred)
+	}
+	signedHeadersQ := q.Get("X-Amz-SignedHeaders")
+	if signedHeadersQ == "" {
+		return "", errors.New("auth: missing X-Amz-SignedHeaders")
+	}
+	signedHeaders := strings.Split(signedHeadersQ, ";")
+	sort.Strings(signedHeaders)
+	signature := q.Get("X-Amz-Signature")
+	dateStr := q.Get("X-Amz-Date")
+	if dateStr == "" {
+		return "", errors.New("auth: missing X-Amz-Date")
+	}
+	reqTime, err := time.Parse("20060102T150405Z", dateStr)
+	if err != nil {
+		return "", fmt.Errorf("auth: invalid X-Amz-Date: %w", err)
+	}
+	expiresStr := q.Get("X-Amz-Expires")
+	if expiresStr == "" {
+		return "", errors.New("auth: missing X-Amz-Expires")
+	}
+	expiresSec, err := strconv.ParseInt(expiresStr, 10, 64)
+	if err != nil || expiresSec <= 0 || expiresSec > 604800 {
+		return "", fmt.Errorf("auth: invalid X-Amz-Expires %q", expiresStr)
+	}
+
+	p := parsedAuthHeader{
+		AccessKey:     segs[0],
+		Date:          segs[1],
+		Region:        segs[2],
+		Service:       segs[3],
+		SignedHeaders: signedHeaders,
+		Signature:     signature,
+	}
+	binding, ok := a.Store.LookupByAccessKey(p.AccessKey)
+	if !ok {
+		return "", errors.New("auth: unknown access key")
+	}
+
+	clock := a.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+	skew := a.MaxClockSkew
+	if skew <= 0 {
+		skew = 15 * time.Minute
+	}
+	now := clock()
+	if now.Before(reqTime.Add(-skew)) {
+		return "", errors.New("auth: presigned request dated in the future")
+	}
+	if now.After(reqTime.Add(time.Duration(expiresSec)*time.Second + skew)) {
+		return "", errors.New("auth: presigned URL has expired")
+	}
+
+	// signRequest reads the timestamp from the x-amz-date header and
+	// derives the canonical query from r.URL.RawQuery. Build a
+	// minimal clone that strips X-Amz-Signature from the query and
+	// exposes the signing timestamp via the header, so the header
+	// and presigned paths share signRequest.
+	clonedURL := *r.URL
+	clonedURL.RawQuery = stripQueryParam(r.URL.RawQuery, "X-Amz-Signature")
+	signingReq := &http.Request{
+		Method: r.Method,
+		Host:   r.Host,
+		URL:    &clonedURL,
+		Header: r.Header.Clone(),
+	}
+	if signingReq.Header == nil {
+		signingReq.Header = http.Header{}
+	}
+	signingReq.Header.Set("x-amz-date", dateStr)
+	// Presigned URLs always sign with UNSIGNED-PAYLOAD. Force the
+	// sentinel so a client-supplied x-amz-content-sha256 header
+	// cannot change the canonical request.
+	signingReq.Header.Del("x-amz-content-sha256")
+
+	expected, err := signRequest(signingReq, p, binding.SecretKey)
+	if err != nil {
+		return "", err
+	}
+	if !hmac.Equal([]byte(expected), []byte(signature)) {
+		return "", errors.New("auth: signature mismatch")
+	}
+	return binding.Tenant.ID, nil
+}
+
+// stripQueryParam removes every occurrence of the given parameter
+// (matched case-sensitively against the URL-encoded name) from a raw
+// query string, preserving the order of the remaining segments.
+func stripQueryParam(raw, name string) string {
+	if raw == "" {
+		return ""
+	}
+	prefix := name + "="
+	parts := strings.Split(raw, "&")
+	out := parts[:0]
+	for _, seg := range parts {
+		if strings.HasPrefix(seg, prefix) || seg == name {
+			continue
+		}
+		out = append(out, seg)
+	}
+	return strings.Join(out, "&")
 }
 
 // parsedAuthHeader is the structured form of an SigV4 Authorization
