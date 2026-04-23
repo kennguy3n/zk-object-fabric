@@ -18,6 +18,7 @@ It answers two questions:
 | **B2C**  | ZK Object Fabric      | ZK Object Fabric | Wasabi (Phase 1 primary) → Ceph RGW pooled cells (Phase 2+) | Backblaze B2 or Cloudflare R2 | Linode NVMe (L0 / L1) |
 | **B2B**  | ZK Object Fabric (dedicated cell) | ZK Object Fabric | Ceph RGW dedicated cell with EC 8+3 or 10+4 | Second Ceph cell in a different failure domain | Co-located NVMe per cell |
 | **BYOC** | Customer | ZK Object Fabric (SaaS) | Customer's own S3-compatible backend (AWS S3, GCP, Azure via S3 shim) | Customer responsibility | Customer responsibility |
+| **Dev / Demo** | Developer laptop (Docker) | ZK Object Fabric (in-memory) | `local_fs_dev` (filesystem) | None | In-memory LRU (L0) |
 
 ### B2C — multi-tenant shared fabric
 
@@ -69,12 +70,32 @@ It answers two questions:
   commitment) and want the fabric's ZK semantics + S3 gateway on top
   of their existing spend.
 
+### Dev / Demo — Docker container, zero dependencies
+
+- **Primary**: `local_fs_dev` — a filesystem-backed adapter that
+  stores pieces under `/data/objects` inside the container. Backed by
+  a Docker volume for persistence across restarts.
+- **Control plane**: In-memory. Tenant records loaded from
+  `demo/tenants.json` at startup; manifests stored in the in-memory
+  `ManifestStore`. No Postgres required.
+- **Billing**: `LoggerSink` — structured-log events to stdout.
+- **Cache**: In-memory LRU (`memory_cache.go`). No disk cache
+  configured by default; operators can set `gateway.cache_path` in
+  `demo/config.json` to enable `DiskCache`.
+- **Use cases**: Local development, integration testing for downstream
+  services (zk-drive, kmail), CI pipelines, demos. Not suitable for
+  production — tenant state is ephemeral and there is no replication
+  or durability beyond the local filesystem.
+- **Quick start**: `docker compose up --build` from the repo root.
+  S3 API on `:8080`, console on `:8081`. Demo credentials in
+  `demo/tenants.json`.
+
 ## Provider adapter matrix
 
 | Adapter | Package | Phase | Role | Status |
 | --- | --- | --- | --- | --- |
 | `wasabi`        | [`providers/wasabi`](../providers/wasabi)               | 1 | B2C primary (cold origin) | Wired on AWS SDK v2; registered as default provider in `cmd/gateway`; exercised by the S3 compliance suite via `s3_generic` fake. 90-day minimum-storage guardrails shipped. |
-| `local_fs_dev`  | [`providers/local_fs_dev`](../providers/local_fs_dev)   | 1 | Dev / conformance loopback | Wired; drives the Phase 2 S3 compliance suite (`tests/s3_compat`), the migration suite, and the benchmark runner. |
+| `local_fs_dev`  | [`providers/local_fs_dev`](../providers/local_fs_dev)   | 1 | Dev / conformance loopback | Wired; drives the Phase 2 S3 compliance suite (`tests/s3_compat`), the migration suite, and the benchmark runner. Also serves as the backend for the Docker demo container (`demo/config.json`). |
 | `s3_generic`    | [`providers/s3_generic`](../providers/s3_generic)       | 1 | Shared S3-compatible base | Wired on AWS SDK v2. ETag normalization (PR #6). |
 | `ceph_rgw`      | [`providers/ceph_rgw`](../providers/ceph_rgw)           | 2 | B2B / sovereign primary | Scaffold — Config, constructor, Capabilities, CostModel, PlacementLabels. Passes conformance against a fake S3 backend; Phase 3 wires a real RGW cluster. |
 | `backblaze_b2`  | [`providers/backblaze_b2`](../providers/backblaze_b2)   | 2 | B2C alternative          | Scaffold — Config, constructor, descriptive methods. |
@@ -128,3 +149,4 @@ the four deployment points below. All use a 4 MiB stripe.
 - [PROPOSAL.md §3.9](PROPOSAL.md) — placement DSL and erasure-coding
 - [PROPOSAL.md §4](PROPOSAL.md) — migration engine
 - [PROGRESS.md](PROGRESS.md) — phase-gated tracker
+- [demo/README.md](../demo/README.md) — Docker demo quick-start and downstream integration guide
