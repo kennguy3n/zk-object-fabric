@@ -1,0 +1,27 @@
+{
+  "env": "demo",
+  "gateway": {
+    "listen_addr": ":8080",
+    "read_timeout": "30s",
+    "write_timeout": "30s",
+    "max_request_bytes": 5368709120,
+    "cache_path": ""
+  },
+  "console": {
+    "listen_addr": ":8081",
+    "read_timeout": "30s",
+    "write_timeout": "30s",
+    "admin_token": ""
+  },
+  "providers": {
+    "local_fs_dev": {
+      "root_path": "/data/objects"
+    }
+  },
+  "billing": {
+    "clickhouse_url": ""
+  },
+  "control_plane": {
+    "metadata_dsn": ""
+  }
+}

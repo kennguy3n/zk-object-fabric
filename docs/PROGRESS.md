@@ -426,17 +426,20 @@ Checklist:
       `config.providers.storj.access_grant` is set. PR #19 review findings
       (ContentType guard, ListObjects page cap, OAuth login fast-path,
       VerifiedCheck gate, verify endpoint auth, Vite proxy) are all resolved.
-- [ ] Lightweight Docker demo container. `Dockerfile` (multi-stage:
+- [x] Lightweight Docker demo container. `Dockerfile` (multi-stage:
       Go build + Vite frontend build + Alpine runtime),
       `docker-compose.yml`, `demo/config.json`, `demo/tenants.json`,
       and `.dockerignore`. The container runs the gateway in dev mode
       (`local_fs_dev` backend, in-memory manifest store, logger
       billing sink) with the S3 API on `:8080` and the console API
-      on `:8081`. Pre-loaded demo tenant credentials allow immediate
-      use with any S3-compatible client. Intended as a backend for
-      downstream services (zk-drive, kmail) during development and
-      integration testing. Object data persists in a Docker volume;
-      tenant and manifest state is in-memory only.
+      on `:8081`. Pre-loaded demo tenant credentials (`demo-access-key`
+      and the `kmail-access-key` pair scoped to tenant
+      `kmail-tenant-001`) allow immediate use with any S3-compatible
+      client. Verified as the backend for kmail's Stalwart blob store
+      — the same S3 API that serves Phase 1 Wasabi and Phase 2 Ceph
+      RGW deploys now serves kmail's local dev stack. Object data
+      persists in the `zk-data` Docker volume; tenant and manifest
+      state is in-memory only.
 
 ### Avoid early customers with
 

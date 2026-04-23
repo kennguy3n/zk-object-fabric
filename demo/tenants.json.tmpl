@@ -1,0 +1,60 @@
+[
+  {
+    "access_key": "${DEMO_ACCESS_KEY}",
+    "secret_key": "${DEMO_SECRET_KEY}",
+    "tenant": {
+      "id": "demo-tenant-001",
+      "name": "Demo Tenant",
+      "contract_type": "b2c_pooled",
+      "license_tier": "beta",
+      "keys": {
+        "root_key_ref": "cmk://demo/root",
+        "dek_policy": "per_object"
+      },
+      "placement_default": {
+        "policy_ref": "p_demo_default"
+      },
+      "budgets": {
+        "egress_tb_month": 0,
+        "requests_per_sec": 0
+      },
+      "abuse": {
+        "anomaly_profile": "default",
+        "cdn_shielding": "disabled"
+      },
+      "billing": {
+        "currency": "USD",
+        "invoice_group": "demo"
+      }
+    }
+  },
+  {
+    "access_key": "${KMAIL_ACCESS_KEY}",
+    "secret_key": "${KMAIL_SECRET_KEY}",
+    "tenant": {
+      "id": "kmail-tenant-001",
+      "name": "kmail-dev",
+      "contract_type": "b2c_pooled",
+      "license_tier": "beta",
+      "keys": {
+        "root_key_ref": "cmk://kmail/dev/root",
+        "dek_policy": "per_object"
+      },
+      "placement_default": {
+        "policy_ref": "p_demo_default"
+      },
+      "budgets": {
+        "egress_tb_month": 0,
+        "requests_per_sec": 0
+      },
+      "abuse": {
+        "anomaly_profile": "default",
+        "cdn_shielding": "disabled"
+      },
+      "billing": {
+        "currency": "USD",
+        "invoice_group": "demo"
+      }
+    }
+  }
+]
