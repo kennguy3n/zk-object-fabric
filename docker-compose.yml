@@ -1,0 +1,33 @@
+# ZK Object Fabric — one-command demo stack.
+#
+# Builds the multi-stage Dockerfile at the repo root and runs the
+# gateway in dev mode: local_fs_dev backend rooted at /data/objects,
+# in-memory manifest / tenant store, logger billing sink, S3 API on
+# :8080, console API on :8081. Tenant bindings are pre-loaded from
+# demo/tenants.json.
+#
+# See demo/README.md for downstream integration examples (kmail,
+# zk-drive). Object data persists in the zk-data volume; manifest
+# and tenant state are in-memory and reset on container restart.
+
+services:
+  zk-fabric:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zk-fabric
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - zk-data:/data/objects
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  zk-data:

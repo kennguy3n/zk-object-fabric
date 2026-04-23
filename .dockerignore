@@ -1,0 +1,35 @@
+# Keep the build context small and reproducible.
+.git
+.github
+.gitignore
+.dockerignore
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store
+*.swp
+
+# Go build artefacts
+bin/
+dist/
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Frontend artefacts — the Dockerfile's node stage rebuilds
+# these from source in a clean node_modules.
+frontend/node_modules
+frontend/dist
+frontend/playwright-report
+frontend/test-results
+
+# Test assets that do not contribute to the runtime binary.
+tests/
+**/testdata/
+
+# Docs don't affect the binary.
+docs/
+README.md
+LICENSE

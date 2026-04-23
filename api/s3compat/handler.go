@@ -155,6 +155,16 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.UploadPart(w, r)
 			return
 		}
+		// Bucket-level PUT (s3 mb / CreateBucket). Buckets in this
+		// gateway are implicit — they come into existence the first
+		// time an object is written to them — so CreateBucket is a
+		// no-op that just returns 200 OK with a Location header so
+		// standard S3 clients like the AWS CLI see a successful
+		// response.
+		if _, key := parseBucketKey(r.URL.Path); key == "" {
+			h.PutBucket(w, r)
+			return
+		}
 		h.Put(w, r)
 	case http.MethodPost:
 		if q.Has("uploads") {
@@ -179,6 +189,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		h.Get(w, r)
 	case http.MethodHead:
+		// Bucket-level HEAD (HeadBucket) is used by S3 clients to
+		// probe existence. Buckets are implicit, so authenticate the
+		// caller and return 200 OK.
+		if _, key := parseBucketKey(r.URL.Path); key == "" {
+			h.HeadBucket(w, r)
+			return
+		}
 		h.Head(w, r)
 	case http.MethodDelete:
 		if q.Get("uploadId") != "" {
@@ -189,6 +206,36 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "method not allowed", r.URL.Path)
 	}
+}
+
+// PutBucket is a no-op CreateBucket handler. Buckets in this gateway
+// are implicit — they come into existence the first time an object is
+// written — so CreateBucket exists only so standard S3 tooling (the
+// AWS CLI's `s3 mb`, terraform, etc.) see a successful response. The
+// call must still authenticate so unauthenticated callers cannot use
+// it to enumerate bucket names.
+func (h *Handler) PutBucket(w http.ResponseWriter, r *http.Request) {
+	if _, err := h.authenticate(r); err != nil {
+		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		return
+	}
+	bucket, _ := parseBucketKey(r.URL.Path)
+	if bucket == "" {
+		writeError(w, http.StatusBadRequest, "InvalidArgument", "path must be /{bucket}", r.URL.Path)
+		return
+	}
+	w.Header().Set("Location", "/"+bucket)
+	w.WriteHeader(http.StatusOK)
+}
+
+// HeadBucket is a no-op bucket existence probe. Since buckets are
+// implicit, an authenticated HEAD always returns 200 OK.
+func (h *Handler) HeadBucket(w http.ResponseWriter, r *http.Request) {
+	if _, err := h.authenticate(r); err != nil {
+		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // Put handles S3 PUT object. It reads the request body, writes it to
