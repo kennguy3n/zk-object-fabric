@@ -31,6 +31,26 @@ const SAMPLE_POLICY = JSON.stringify(
 test.describe("placement policies", () => {
   test.beforeEach(async ({ page }) => {
     await seedAuth(page);
+    // Stub the tenant GET so PlacementPolicyPage populates its
+    // `selected` state and enables the Save button. Without a
+    // pre-existing policy the editor is in a clean-slate mode where
+    // save is disabled; this mirrors what the production UI will
+    // see after the backend has seeded at least one default policy
+    // per tenant during onboarding.
+    await page.route(/\/api\/tenants\/[^/]+\/placement$/, (route) => {
+      if (route.request().method() !== "GET") {
+        return route.fallback();
+      }
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          tenant: "t-e2e",
+          bucket: "",
+          policy: { name: "p_default", version: 1 },
+        }),
+      });
+    });
   });
 
   test("renders the placement editor", async ({ page }) => {

@@ -20,18 +20,27 @@ test.describe("auth flow", () => {
 
   test("signup form accepts email, password and tenant name", async ({ page }) => {
     await page.goto("/signup");
-    await expect(page.getByRole("heading", { name: /sign up|create|signup/i })).toBeVisible();
+    // AuthShell renders the page heading as "Tenant console · Create
+    // a tenant" (h1, see LoginPage.tsx#AuthShell); match the
+    // trailing fragment so the assertion stays stable across shell
+    // copy tweaks.
+    await expect(
+      page.getByRole("heading", { name: /create a tenant|create tenant|sign up|signup/i }),
+    ).toBeVisible();
+    await page.getByLabel(/organization|tenant|workspace/i).fill("e2e-tenant");
     await page.getByLabel(/email/i).fill("e2e@example.com");
     await page.getByLabel(/password/i).fill("correct-horse-battery-staple");
-    const tenantField = page.getByLabel(/tenant|workspace|organization/i);
-    if (await tenantField.count()) {
-      await tenantField.fill("e2e-tenant");
-    }
-    // The submit button is the form's primary CTA. We wait for the
-    // request rather than the UI to keep the assertion independent
-    // of the success-screen layout.
-    const resp = page.waitForResponse((r) => r.url().includes("/api/v1/auth/signup"));
-    await page.getByRole("button", { name: /sign up|create account|signup/i }).click();
+    // The submit button renders "Create tenant" (see
+    // SignupPage.tsx); wait for the POST rather than asserting on
+    // the success-screen layout so the test stays green regardless
+    // of what the SPA does on 2xx.
+    const resp = page.waitForResponse(
+      (r) => r.url().includes("/api/v1/auth/signup") && r.request().method() === "POST",
+      { timeout: 15_000 },
+    );
+    await page
+      .getByRole("button", { name: /create tenant|create a tenant|sign up|signup/i })
+      .click();
     const response = await resp;
     expect([200, 201, 400, 409]).toContain(response.status());
   });
@@ -40,7 +49,11 @@ test.describe("auth flow", () => {
     await page.goto("/login");
     await page.getByLabel(/email/i).fill("e2e@example.com");
     await page.getByLabel(/password/i).fill("correct-horse-battery-staple");
-    const resp = page.waitForResponse((r) => r.url().includes("/api/v1/auth/login"));
+    // Filter by method so we never catch a preflight / stray GET.
+    const resp = page.waitForResponse(
+      (r) => r.url().includes("/api/v1/auth/login") && r.request().method() === "POST",
+      { timeout: 15_000 },
+    );
     await page.getByRole("button", { name: /sign in|login/i }).click();
     const response = await resp;
     expect([200, 401]).toContain(response.status());
