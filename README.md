@@ -16,6 +16,46 @@ The fabric is designed to **start on public cloud** and migrate to
 **owned infrastructure** without changing customer-facing APIs. The same
 SDK, bucket name, object key, and URL work across every phase.
 
+## Quick start (Docker)
+
+The gateway runs as a single container with **zero external
+dependencies** — no Postgres, no ClickHouse, no cloud credentials.
+It uses the `local_fs_dev` filesystem backend, in-memory manifests,
+and the logger billing sink.
+
+```bash
+docker compose up --build
+```
+
+| Port   | Service         |
+| ------ | --------------- |
+| `:8080` | S3-compatible API |
+| `:8081` | Console API      |
+
+Demo tenant credentials (pre-loaded from `demo/tenants.json`):
+
+| Field        | Value              |
+| ------------ | ------------------ |
+| Access Key   | `demo-access-key`  |
+| Secret Key   | `demo-secret-key`  |
+
+Try it with the AWS CLI:
+
+```bash
+aws --endpoint-url http://localhost:8080 s3 mb s3://mybucket
+aws --endpoint-url http://localhost:8080 s3 cp myfile.txt s3://mybucket/
+aws --endpoint-url http://localhost:8080 s3 ls s3://mybucket/
+```
+
+Any S3-compatible client (AWS SDK, MinIO client, boto3) works.
+Downstream services like **zk-drive** or **kmail** point their S3
+client at `http://localhost:8080` (or `http://zk-fabric:8080` when
+running inside the same Docker Compose network).
+
+> **Note**: tenant and manifest state is in-memory and lost on
+> container restart. Object data persists in the `zk-data` Docker
+> volume. This mode is for development and demos only.
+
 The S3 API is the phase-invariant contract. The same `aws s3 cp`,
 `boto3`, or `@aws-sdk/client-s3` command works in Phase 1 (Wasabi),
 Phase 2 (Ceph RGW), and Phase 3 (owned DC) without any client-side
@@ -238,6 +278,13 @@ key mode.
 
 ```
 zk-object-fabric/
+  Dockerfile             # Multi-stage build: Go gateway + React frontend
+  docker-compose.yml     # One-command demo: docker compose up --build
+  .dockerignore
+  demo/
+    config.json          # Minimal gateway config (local_fs_dev, in-memory stores)
+    tenants.json         # Pre-loaded demo tenant with HMAC credentials
+    README.md            # Demo usage guide, downstream integration examples
   api/s3_compat/
     handler/          # S3 API request handlers (PUT, GET, HEAD, DELETE, LIST, multipart)
     presigned/        # Presigned URL generation and validation

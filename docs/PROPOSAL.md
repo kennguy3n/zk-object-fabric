@@ -680,6 +680,59 @@ Rules:
 - Charge separately for non-cacheable egress (large single-read
   transfers, public downloads without a CDN).
 
+### 3.13 Lightweight container deployment (dev / demo)
+
+The gateway is packaged as a single Docker container for local
+development, integration testing, and demo environments. This is the
+recommended way for downstream services (zk-drive, kmail, or any
+S3-consuming application) to run a local ZK Object Fabric backend.
+
+#### What the container includes
+
+- **Go gateway binary** — built from `cmd/gateway/main.go` with all
+  provider adapters compiled in.
+- **React console frontend** — Vite production build served by the
+  console API on `:8081`.
+- **Demo config** (`demo/config.json`) — `local_fs_dev` backend with
+  root at `/data/objects`, in-memory manifest store, logger billing
+  sink, cache at `/data/cache`.
+- **Demo tenant** (`demo/tenants.json`) — a pre-loaded tenant with
+  HMAC credentials so S3 clients can authenticate immediately.
+
+#### What the container does NOT include
+
+- No Postgres, ClickHouse, or any external database.
+- No cloud provider credentials (Wasabi, B2, R2, Storj, AWS).
+- No TLS termination (intended to sit behind a reverse proxy or be
+  used on `localhost`).
+
+#### Networking
+
+| Port    | Service                |
+| ------- | ---------------------- |
+| `:8080` | S3-compatible data API |
+| `:8081` | Console / admin API    |
+
+Downstream services running in the same Docker Compose network
+address the gateway as `http://zk-fabric:8080`. External clients
+use `http://localhost:8080`.
+
+#### Data persistence
+
+Object bytes written to `local_fs_dev` persist in the `zk-data`
+Docker volume across container restarts. Tenant records, manifests,
+and billing counters are in-memory and reset on restart. This is
+acceptable for dev / demo; production deployments use Postgres-backed
+stores and the ClickHouse billing sink.
+
+#### Relationship to production deployment
+
+The container runs the **same gateway binary** as production. The
+only differences are the config file (which selects `local_fs_dev`
+instead of `wasabi` / `ceph_rgw`) and the store backends (in-memory
+instead of Postgres). Switching from the demo container to a
+production deployment is a config change, not a code change.
+
 ---
 
 ## 4. Migration Design
