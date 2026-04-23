@@ -10,12 +10,14 @@ import react from "@vitejs/plugin-react";
 // the SPA's same-origin fetch hits the console mux instead of the
 // S3 mux (which 404s on /api/*).
 //
-// VITE_CONSOLE_URL overrides the default for environments where the
-// console is reachable on a different host/port (e.g. staging).
-const CONSOLE_TARGET =
-  (typeof import.meta !== "undefined" &&
-    (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_CONSOLE_URL) ||
-  "http://localhost:8081";
+// `process` is available because Vite evaluates this config in a
+// Node ESM context. `import.meta.env` is NOT populated at config
+// evaluation time (Vite's define-replacement only targets app code),
+// so operators who need to point at a staging console must export
+// VITE_CONSOLE_URL in the shell before running `vite` / `vite build`
+// / `vite preview`. See vitejs/vite#15088 for the upstream note.
+declare const process: { env: Record<string, string | undefined> };
+const CONSOLE_TARGET = process.env.VITE_CONSOLE_URL || "http://localhost:8081";
 
 export default defineConfig({
   plugins: [react()],
