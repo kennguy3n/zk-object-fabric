@@ -598,12 +598,27 @@ func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, tenantID 
 	r.Body = http.MaxBytesReader(w, r.Body, maxBucketPayloadBytes)
 	var req createBucketRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("bucket payload exceeds %d bytes", maxBucketPayloadBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "decode bucket: "+err.Error())
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
 		writeError(w, http.StatusBadRequest, "bucket name is required")
+		return
+	}
+	// parsePath splits DELETE /api/tenants/{id}/buckets/{name} on "/"
+	// and Go's net/http decodes %2F to "/" before ServeHTTP sees the
+	// path, so a name containing "/" would be creatable but never
+	// deletable through the console. Reject the separator (and
+	// backslash, for symmetry on Windows-style inputs) up front so
+	// the lifecycle stays round-trippable.
+	if strings.ContainsAny(req.Name, "/\\") {
+		writeError(w, http.StatusBadRequest, "bucket name must not contain '/' or '\\'")
 		return
 	}
 	bucket, err := h.cfg.Buckets.CreateBucket(r.Context(), tenantID, req.Name, req.PlacementPolicyRef)
