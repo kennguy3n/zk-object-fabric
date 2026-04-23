@@ -72,7 +72,12 @@ jobs:
 
       - name: Install Playwright browsers
         working-directory: frontend
-        run: npx playwright install --with-deps chromium
+        # playwright.config.ts enables both chromium and firefox projects;
+        # installing only chromium (`--with-deps chromium`) makes the firefox
+        # project fail with "Executable doesn't exist at .../firefox". Install
+        # everything declared in the config so the suite runs against every
+        # browser the project gates on.
+        run: npx playwright install --with-deps
 
       - name: Run Playwright e2e
         working-directory: frontend

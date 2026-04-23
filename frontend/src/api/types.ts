@@ -58,13 +58,16 @@ export interface Bucket {
   bytesStored: number;
 }
 
+// ApiKey mirrors the backend's APIKeyDescriptor (api/console/handler.go).
+// The list endpoint only populates accessKey + createdAt; secretKey is
+// additionally present on the create response (one-time display) and
+// lastUsedAt is surfaced by the gateway when the auth layer starts
+// recording it — both are optional so the list view renders without
+// a second fetch.
 export interface ApiKey {
-  id: string;
   accessKey: string;
-  // SecretKey is only returned at creation time. Subsequent reads
-  // surface accessKey + createdAt only.
-  secretKey?: string;
   createdAt: string;
+  secretKey?: string;
   lastUsedAt?: string;
 }
 

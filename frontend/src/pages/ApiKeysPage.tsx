@@ -86,7 +86,7 @@ export function ApiKeysPage() {
               </tr>
             )}
             {keys.map((k) => (
-              <tr key={k.id}>
+              <tr key={k.accessKey}>
                 <td style={{ fontFamily: "monospace" }}>{k.accessKey}</td>
                 <td>{new Date(k.createdAt).toLocaleString()}</td>
                 <td>{k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : "never"}</td>
@@ -98,7 +98,7 @@ export function ApiKeysPage() {
                         return;
                       }
                       try {
-                        await api.revokeApiKey(k.id);
+                        await api.revokeApiKey(k.accessKey);
                         await refresh();
                       } catch (err) {
                         setError(err instanceof Error ? err.message : String(err));

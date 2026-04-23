@@ -96,13 +96,25 @@ export class ApiClient {
   }
 
   // --- placement policies --------------------------------------
+  //
+  // The backend stores a single Policy per tenant and returns it as
+  // placement_policy.Policy ({tenant, bucket, policy: {...}}). The
+  // SPA's editor models policies as an editable list keyed by id, so
+  // the client adapts the wire shape into a one-element array on
+  // read and translates the editor's yaml field back into the
+  // backend's JSON Policy on write. The "yaml" editor is JSON under
+  // the hood in Phase 1; the same canonical form is what the gateway
+  // accepts, so a round-trip through the textarea is lossless.
 
   async listPlacementPolicies(): Promise<PlacementPolicy[]> {
-    return this.get("/placement");
+    const raw = await this.get<BackendPlacementPolicy>("/placement");
+    return [backendToFrontendPolicy(raw)];
   }
 
   async savePlacementPolicy(policy: Omit<PlacementPolicy, "updatedAt">): Promise<PlacementPolicy> {
-    return this.put("/placement", policy);
+    const body = frontendToBackendPolicy(policy);
+    const raw = await this.put<BackendPlacementPolicy>("/placement", body);
+    return backendToFrontendPolicy(raw);
   }
 
   // --- dedicated cells (b2b_dedicated / sovereign only) --------
@@ -160,6 +172,42 @@ export class ApiError extends Error {
     super(`API error ${status}: ${message}`);
     this.name = "ApiError";
   }
+}
+
+// BackendPlacementPolicy mirrors placement_policy.Policy on the
+// gateway side (metadata/placement_policy/policy.go). Phase 1 does not
+// emit an updated_at timestamp, so the frontend synthesizes one at
+// read time for display purposes only.
+interface BackendPlacementPolicy {
+  tenant: string;
+  bucket?: string;
+  policy: Record<string, unknown>;
+}
+
+function backendToFrontendPolicy(raw: BackendPlacementPolicy): PlacementPolicy {
+  // id is stable per (tenant, bucket) so the editor's keyed list
+  // does not lose selection across saves. name is surfaced to the
+  // sidebar as a label; default buckets render as "default".
+  const bucket = raw.bucket ?? "";
+  return {
+    id: bucket ? `${raw.tenant}/${bucket}` : raw.tenant,
+    name: bucket || "default",
+    yaml: JSON.stringify({ tenant: raw.tenant, bucket, policy: raw.policy ?? {} }, null, 2),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function frontendToBackendPolicy(p: Omit<PlacementPolicy, "updatedAt">): BackendPlacementPolicy {
+  // The editor stores the canonical JSON Policy document in the
+  // yaml field; we parse it back into the wire shape the gateway
+  // expects. Invalid JSON surfaces as a client-side error via the
+  // thrown SyntaxError before any network round-trip is wasted.
+  const parsed = JSON.parse(p.yaml) as Partial<BackendPlacementPolicy>;
+  return {
+    tenant: parsed.tenant ?? p.id.split("/")[0] ?? "",
+    bucket: parsed.bucket ?? "",
+    policy: (parsed.policy ?? {}) as Record<string, unknown>,
+  };
 }
 
 // Shared default client. Tenant-scoped routes (tenants, usage,

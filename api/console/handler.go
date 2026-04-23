@@ -346,12 +346,20 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	switch suffix {
 	case "":
+		if sub != "" {
+			writeError(w, http.StatusNotFound, "unknown subresource "+sub)
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		h.getTenant(w, r, tenantID)
 	case "usage":
+		if sub != "" {
+			writeError(w, http.StatusNotFound, "unknown subresource usage/"+sub)
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
