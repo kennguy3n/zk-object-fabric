@@ -565,6 +565,9 @@ func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request, tenantID, ac
 
 // listBuckets handles GET /api/tenants/{id}/buckets.
 func (h *Handler) listBuckets(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
 	if h.cfg.Buckets == nil {
 		writeJSON(w, http.StatusOK, []BucketDescriptor{})
 		return
@@ -591,6 +594,9 @@ const maxBucketPayloadBytes int64 = 8 * 1024
 
 // createBucket handles POST /api/tenants/{id}/buckets.
 func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
 	if h.cfg.Buckets == nil {
 		writeError(w, http.StatusServiceUnavailable, "bucket store not configured")
 		return
@@ -631,6 +637,9 @@ func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, tenantID 
 
 // deleteBucket handles DELETE /api/tenants/{id}/buckets/{name}.
 func (h *Handler) deleteBucket(w http.ResponseWriter, r *http.Request, tenantID, name string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
 	if h.cfg.Buckets == nil {
 		writeError(w, http.StatusServiceUnavailable, "bucket store not configured")
 		return
@@ -644,6 +653,9 @@ func (h *Handler) deleteBucket(w http.ResponseWriter, r *http.Request, tenantID,
 
 // listDedicatedCells handles GET /api/tenants/{id}/dedicated-cells.
 func (h *Handler) listDedicatedCells(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
 	if h.cfg.Cells == nil {
 		writeJSON(w, http.StatusOK, []DedicatedCellDescriptor{})
 		return
@@ -743,6 +755,25 @@ func (h *Handler) putPlacement(w http.ResponseWriter, r *http.Request, tenantID 
 		return
 	}
 	writeJSON(w, http.StatusOK, pol)
+}
+
+// ensureTenantExists is the shared 404 guard for tenant-scoped
+// handlers. Every /api/tenants/{id}/... route bottoms out in a store
+// that would otherwise silently accept data for a tenant the gateway
+// never minted — orphaning buckets, keys, or placement rows. Centralise
+// the lookup so callers only have to branch on a single bool and all
+// routes stay consistent with createKey/listKeys/deleteKey which
+// already enforce this.
+func (h *Handler) ensureTenantExists(w http.ResponseWriter, tenantID string) bool {
+	if h.cfg.Tenants == nil {
+		writeError(w, http.StatusServiceUnavailable, "tenant store not configured")
+		return false
+	}
+	if _, ok := h.cfg.Tenants.LookupTenant(tenantID); !ok {
+		writeError(w, http.StatusNotFound, "tenant not found")
+		return false
+	}
+	return true
 }
 
 // parsePath splits /api/tenants/{id}[/suffix[/sub]] into

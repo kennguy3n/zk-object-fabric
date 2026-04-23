@@ -88,8 +88,8 @@ export function ApiKeysPage() {
             {keys.map((k) => (
               <tr key={k.accessKey}>
                 <td style={{ fontFamily: "monospace" }}>{k.accessKey}</td>
-                <td>{new Date(k.createdAt).toLocaleString()}</td>
-                <td>{k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : "never"}</td>
+                <td>{formatTimestamp(k.createdAt)}</td>
+                <td>{k.lastUsedAt ? formatTimestamp(k.lastUsedAt) : "never"}</td>
                 <td style={{ textAlign: "right" }}>
                   <button
                     className="danger"
@@ -115,6 +115,23 @@ export function ApiKeysPage() {
       </div>
     </div>
   );
+}
+
+// formatTimestamp renders an ISO timestamp as a locale string, but
+// collapses Go's zero time (0001-01-01T00:00:00Z) and any other
+// unparseable / pre-epoch value to "unknown". The list endpoint
+// returns zero timestamps when the binding schema predates the
+// createdAt column; rendering those as "1/1/1" in the UI was
+// confusing operators into thinking keys were decades old.
+function formatTimestamp(value: string | undefined): string {
+  if (!value) {
+    return "unknown";
+  }
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() <= 1) {
+    return "unknown";
+  }
+  return d.toLocaleString();
 }
 
 function Code({ label, value }: { label: string; value: string }) {
