@@ -19,12 +19,17 @@ import react from "@vitejs/plugin-react";
 declare const process: { env: Record<string, string | undefined> };
 const CONSOLE_TARGET = process.env.VITE_CONSOLE_URL || "http://localhost:8081";
 
+// The proxy prefix uses a trailing slash so it matches /api/tenants/…
+// and /api/v1/auth/… but NOT the SPA route /api-keys — a bare "/api"
+// prefix is a substring match that would 404 the React page.
+const API_PROXY_PREFIX = "/api/";
+
 export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
     proxy: {
-      "/api": {
+      [API_PROXY_PREFIX]: {
         target: CONSOLE_TARGET,
         changeOrigin: true,
       },
@@ -36,11 +41,11 @@ export default defineConfig({
   // server does not know about auth routes. Mirror the dev proxy on
   // preview so the Playwright e2e suite (which boots the preview
   // build; see playwright.config.ts) and operators running the same
-  // bundle locally both reach the gateway at :8080.
+  // bundle locally both reach the console mux.
   preview: {
     port: 4173,
     proxy: {
-      "/api": {
+      [API_PROXY_PREFIX]: {
         target: CONSOLE_TARGET,
         changeOrigin: true,
       },
