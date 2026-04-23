@@ -2,6 +2,7 @@ package console
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,26 @@ type AuthStore interface {
 	// an error, and an unknown tenant returns an error so the
 	// verify endpoint can surface a 404 to the caller.
 	MarkVerified(tenantID string) error
+
+	// SetVerificationToken binds an opaque random token to a
+	// tenant row. The signup handler mints the token with
+	// crypto/rand and embeds it in the outbound verification
+	// email; the /api/v1/auth/verify endpoint then resolves the
+	// token back to a tenant without accepting the raw tenant ID
+	// from a possibly hostile caller. An unknown tenant returns
+	// an error so signup can roll back cleanly.
+	SetVerificationToken(tenantID, token string) error
+
+	// ConsumeVerificationToken atomically looks up the tenant row
+	// bound to token, marks it verified, clears the stored token
+	// so it cannot be replayed, and returns the resolved tenant
+	// ID. Implementations MUST compare the stored token against
+	// the caller-supplied token in constant time. An empty token
+	// or a token that matches no row must return an error — the
+	// verify handler translates that into a uniform 401 so a
+	// probing caller cannot enumerate which tenants are pending
+	// verification.
+	ConsumeVerificationToken(token string) (tenantID string, err error)
 }
 
 // TokenStore maps opaque bearer tokens to tenant IDs. It is used by
@@ -84,6 +105,11 @@ type memoryAuthRow struct {
 	PasswordHash string
 	TenantID     string
 	Verified     bool
+	// VerificationToken is the random token minted at signup
+	// time. It is stored server-side and compared (constant time)
+	// against the token carried in the verification email. Empty
+	// once the token has been consumed.
+	VerificationToken string
 }
 
 // NewMemoryAuthStore returns an empty store.
@@ -157,11 +183,56 @@ func (s *MemoryAuthStore) MarkVerified(tenantID string) error {
 	for email, row := range s.users {
 		if row.TenantID == tenantID {
 			row.Verified = true
+			row.VerificationToken = ""
 			s.users[email] = row
 			return nil
 		}
 	}
 	return fmt.Errorf("console: tenant %q not found", tenantID)
+}
+
+// SetVerificationToken implements AuthStore.
+func (s *MemoryAuthStore) SetVerificationToken(tenantID, token string) error {
+	if tenantID == "" {
+		return errors.New("console: tenant_id is required")
+	}
+	if token == "" {
+		return errors.New("console: verification token is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for email, row := range s.users {
+		if row.TenantID == tenantID {
+			row.VerificationToken = token
+			s.users[email] = row
+			return nil
+		}
+	}
+	return fmt.Errorf("console: tenant %q not found", tenantID)
+}
+
+// ConsumeVerificationToken implements AuthStore. Comparisons use
+// crypto/subtle so a timing-sensitive caller cannot probe which
+// tenant a stored token belongs to.
+func (s *MemoryAuthStore) ConsumeVerificationToken(token string) (string, error) {
+	if token == "" {
+		return "", errors.New("console: verification token is required")
+	}
+	supplied := []byte(token)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for email, row := range s.users {
+		if row.VerificationToken == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare(supplied, []byte(row.VerificationToken)) == 1 {
+			row.Verified = true
+			row.VerificationToken = ""
+			s.users[email] = row
+			return row.TenantID, nil
+		}
+	}
+	return "", errors.New("console: verification token invalid or expired")
 }
 
 // MemoryTokenStore is a process-local TokenStore.
@@ -213,8 +284,13 @@ type AuthHooks struct {
 
 	// SendVerificationEmail is called after a successful signup so
 	// the user can verify their email. A nil hook skips the email
-	// — the Phase 3 scaffold default.
-	SendVerificationEmail func(email, tenantID string) error
+	// — the Phase 3 scaffold default. The hook receives the
+	// opaque per-signup token that must appear in the verify
+	// request; production implementations embed the token in the
+	// email link (e.g. https://console.example.com/verify?token=…)
+	// so only a caller who received the email can satisfy the
+	// /api/v1/auth/verify endpoint.
+	SendVerificationEmail func(email, tenantID, token string) error
 
 	// ResolveOAuth resolves an OAuth bearer token submitted via
 	// signupRequest.OAuthToken into a provider-issued subject
@@ -381,12 +457,14 @@ func (h *AuthHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 }
 
 // verifyRequest is the payload POSTed to /api/v1/auth/verify. The
-// frontend's dashboard mounts a "resend verification" button that
-// submits the tenant ID returned on signup; production will replace
-// the bare tenant ID with a signed token that only the email link
-// carries, but the scaffold's contract is stable across that swap.
+// opaque Token is the random value the gateway minted at signup and
+// embedded in the outbound verification email link; only a caller
+// that received the email (or holds the user's mailbox) can produce
+// it. The endpoint intentionally does not accept a bare tenant ID —
+// the tenant ID is returned to the signup caller in the clear and
+// would let any signed-up user self-verify without the email step.
 type verifyRequest struct {
-	TenantID string `json:"tenantId"`
+	Token string `json:"token"`
 }
 
 func (h *AuthHandler) verify(w http.ResponseWriter, r *http.Request) {
@@ -400,15 +478,20 @@ func (h *AuthHandler) verify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decode verify: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.TenantID) == "" {
-		writeError(w, http.StatusBadRequest, "tenantId is required")
+	token := strings.TrimSpace(req.Token)
+	if token == "" {
+		writeError(w, http.StatusBadRequest, "token is required")
 		return
 	}
-	if err := h.cfg.Auth.MarkVerified(req.TenantID); err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+	tenantID, err := h.cfg.Auth.ConsumeVerificationToken(token)
+	if err != nil {
+		// 401 rather than 404 so a probing caller cannot
+		// distinguish a malformed / unknown token from one that
+		// was already consumed.
+		writeError(w, http.StatusUnauthorized, "invalid or expired verification token")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"verified": true, "tenantId": req.TenantID})
+	writeJSON(w, http.StatusOK, map[string]any{"verified": true, "tenantId": tenantID})
 }
 
 func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
@@ -552,10 +635,26 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Kick off the verification email (no-op by default; see
-	// AuthHooks.SendVerificationEmail).
+	// Mint a per-signup verification token that only the
+	// outbound email carries. Storing it on the user row before
+	// calling SendVerificationEmail means the verify endpoint
+	// cannot be raced by a caller that reuses a token captured
+	// from an earlier signup — every signup has its own fresh
+	// token. A failure here must roll back the user and tenant
+	// records so the email address is not permanently locked out.
 	if h.cfg.Hooks.SendVerificationEmail != nil {
-		if err := h.cfg.Hooks.SendVerificationEmail(req.Email, tenantID); err != nil {
+		vtoken, err := newVerificationToken()
+		if err != nil {
+			rollbackUserAndTenant("mint verification token")
+			writeError(w, http.StatusInternalServerError, "mint verification token: "+err.Error())
+			return
+		}
+		if err := h.cfg.Auth.SetVerificationToken(tenantID, vtoken); err != nil {
+			rollbackUserAndTenant("store verification token")
+			writeError(w, http.StatusInternalServerError, "store verification token: "+err.Error())
+			return
+		}
+		if err := h.cfg.Hooks.SendVerificationEmail(req.Email, tenantID, vtoken); err != nil {
 			// Signup still succeeds: the user can re-request
 			// verification from the dashboard. Callers that
 			// want hard-fail semantics can swap the hook for
@@ -699,4 +798,17 @@ func defaultTenantIDGenerator() (string, error) {
 		return "", fmt.Errorf("console: rand tenant id: %w", err)
 	}
 	return "t-" + hex.EncodeToString(buf), nil
+}
+
+// newVerificationToken mints a 32-byte hex-encoded random token used
+// as the bearer secret in outbound verification emails. 32 bytes of
+// entropy keep the token unguessable at any realistic signup volume
+// while remaining short enough to fit comfortably in a URL query
+// parameter.
+func newVerificationToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("console: rand verification token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
 }

@@ -52,11 +52,11 @@ type smtpSender func(addr string, a smtp.Auth, from string, to []string, msg []b
 // email-send failures as non-fatal — see auth_handler.go §signup —
 // so the user still gets a tenant and the operator can replay
 // delivery from a background retry queue.
-func NewSESEmailSender(cfg SESEmailConfig) (func(email, tenantID string) error, error) {
+func NewSESEmailSender(cfg SESEmailConfig) (func(email, tenantID, token string) error, error) {
 	return newSESEmailSenderWithSMTP(cfg, smtp.SendMail)
 }
 
-func newSESEmailSenderWithSMTP(cfg SESEmailConfig, send smtpSender) (func(email, tenantID string) error, error) {
+func newSESEmailSenderWithSMTP(cfg SESEmailConfig, send smtpSender) (func(email, tenantID, token string) error, error) {
 	from := strings.TrimSpace(cfg.FromAddress)
 	if from == "" {
 		return nil, errors.New("ses: FromAddress is required")
@@ -97,12 +97,21 @@ func newSESEmailSenderWithSMTP(cfg SESEmailConfig, send smtpSender) (func(email,
 		auth = smtp.PlainAuth("", user, pass, host)
 	}
 
-	return func(email, tenantID string) error {
+	return func(email, tenantID, token string) error {
 		to := strings.TrimSpace(email)
 		if to == "" {
 			return errors.New("ses: recipient email is required")
 		}
-		verifyURL := verifyBase + "?tenant=" + url.QueryEscape(tenantID)
+		if strings.TrimSpace(token) == "" {
+			// A missing token would render the email useless —
+			// the receiving user could not satisfy the verify
+			// endpoint. Fail loudly so the signup rollback fires
+			// instead of shipping a broken link.
+			return errors.New("ses: verification token is required")
+		}
+		verifyURL := verifyBase +
+			"?tenant=" + url.QueryEscape(tenantID) +
+			"&token=" + url.QueryEscape(token)
 		msg := buildVerificationMessage(from, to, tenantID, verifyURL)
 		return send(addr, auth, from, []string{to}, msg)
 	}, nil
