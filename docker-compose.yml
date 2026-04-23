@@ -22,10 +22,11 @@ services:
     volumes:
       - zk-data:/data/objects
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "nc", "-z", "localhost", "8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
 
 volumes:
