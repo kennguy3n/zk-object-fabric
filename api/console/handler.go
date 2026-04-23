@@ -115,6 +115,20 @@ type Config struct {
 	Usage      UsageQuery
 	Placements PlacementStore
 
+	// AdminAuth is the per-request admin-authorization check. The
+	// tenant / usage / keys / placement routes all consult it
+	// before serving; a nil hook disables the check (suitable for
+	// dev, hostile otherwise). Operators wire a bearer-token or
+	// HMAC verifier against cfg.Console.AdminToken in
+	// cmd/gateway/main.go.
+	//
+	// The check runs only for tenant-subresource requests; the
+	// public auth endpoints (/api/v1/auth/signup, /login) and the
+	// usage-stream SSE endpoint enforce their own auth semantics
+	// (signup is intentionally unauthenticated, login returns a
+	// token, SSE checks the token on the query string).
+	AdminAuth func(r *http.Request) bool
+
 	// Auth is the email → (password hash, tenant ID) store the
 	// B2C signup / login handler reads and writes. When nil the
 	// auth endpoints return 503 so the control plane can ship
@@ -246,6 +260,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.AdminAuth != nil && !h.cfg.AdminAuth(r) {
+		writeError(w, http.StatusUnauthorized, "admin authorization required")
+		return
+	}
 	tenantID, suffix, ok := parsePath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid path, expected /api/tenants/{id}[/subresource]")

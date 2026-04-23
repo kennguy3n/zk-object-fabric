@@ -34,6 +34,14 @@ type TenantStore interface {
 	// (_, false) if no such binding exists.
 	LookupByAccessKey(accessKey string) (TenantBinding, bool)
 
+	// LookupByTenantID returns the first binding whose Tenant.ID
+	// matches tenantID. When the tenant was created via
+	// CreateTenant but has no API key binding yet, the returned
+	// binding carries the tenant record with empty AccessKey /
+	// SecretKey fields so rate-limit middleware that only needs
+	// the Tenant still gets a usable result.
+	LookupByTenantID(tenantID string) (TenantBinding, bool)
+
 	// CreateTenant registers a tenant record with no API key
 	// bindings yet. It returns an error if a tenant with the same
 	// ID is already registered. The tenant-console signup handler
@@ -48,6 +56,18 @@ type TenantStore interface {
 	// record behind. Implementations should treat a missing
 	// tenantID as a no-op (return nil) rather than an error.
 	DeleteTenant(tenantID string) error
+
+	// AddBinding registers a TenantBinding. Implementations should
+	// reject duplicate AccessKey values or silently replace them
+	// at their discretion; the console adapter layered on top of
+	// TenantStore guards against accidental credential swaps.
+	AddBinding(b TenantBinding) error
+
+	// Size returns the number of access-key bindings in the
+	// store. The gateway's startup path uses this to decide
+	// whether to enable the rate limiter / abuse guard; zero
+	// bindings means a dev / test deploy with no tenants wired.
+	Size() int
 }
 
 // MemoryTenantStore is the Phase 2 in-memory TenantStore.

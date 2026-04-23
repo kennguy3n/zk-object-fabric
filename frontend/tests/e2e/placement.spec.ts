@@ -35,8 +35,11 @@ test.describe("placement policies", () => {
     const editor = page.locator("textarea").first();
     if (await editor.count()) {
       await editor.fill(SAMPLE_POLICY);
+      // Tenant-scoped routes live under /api/ (see
+      // api/console/handler.go:Handler.Register); the v1 prefix
+      // belongs to auth only.
       const req = page.waitForRequest(
-        (r) => r.url().includes("/api/v1/placement-policies/") && r.method() === "PUT",
+        (r) => r.url().includes("/api/placement-policies/") && r.method() === "PUT",
       );
       const save = page.getByRole("button", { name: /save/i }).first();
       await save.click();

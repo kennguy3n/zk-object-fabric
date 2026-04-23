@@ -74,6 +74,16 @@ type Config struct {
 	// means AnonymousTenant.
 	Auth Authenticator
 
+	// VerifiedCheck, when non-nil, is consulted on PUT to gate
+	// the tenant's first upload on email verification. It returns
+	// (verified, tracked): tracked=false means the tenant was
+	// not created via the B2C console signup flow (e.g. an HMAC
+	// binding loaded from a JSON file) and the gate is skipped;
+	// tracked=true with verified=false makes Put return 403 with
+	// an EmailNotVerified error code so the SPA can prompt the
+	// user to click the verification link before retrying.
+	VerifiedCheck func(tenantID string) (verified, tracked bool)
+
 	// Billing receives usage events. Optional.
 	Billing BillingSink
 
@@ -194,6 +204,14 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
 		return
+	}
+	if h.cfg.VerifiedCheck != nil {
+		if verified, tracked := h.cfg.VerifiedCheck(tenantID); tracked && !verified {
+			writeError(w, http.StatusForbidden, "EmailNotVerified",
+				"verify your email address before uploading; check your inbox or POST /api/v1/auth/verify with your tenantId",
+				r.URL.Path)
+			return
+		}
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
 	if bucket == "" || key == "" {

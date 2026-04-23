@@ -530,7 +530,7 @@ func minFloat(a, b float64) float64 {
 // RateLimitLookup signature. The burst is the same as rps when no
 // explicit burst is configured: the Phase 2 tenant record carries
 // only a single RequestsPerSec knob.
-func TenantBudgetsLookup(store *MemoryTenantStore) RateLimitLookup {
+func TenantBudgetsLookup(store TenantStore) RateLimitLookup {
 	return func(tenantID string) (int, int, bool) {
 		b, ok := store.LookupByTenantID(tenantID)
 		if !ok {

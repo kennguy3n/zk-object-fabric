@@ -8,21 +8,33 @@ import type {
 } from "./types";
 
 // ApiClient is the thin wrapper the SPA uses to reach the gateway's
-// /api/v1/ management API. It is intentionally tiny: just fetch +
-// JSON + an Authorization header. Feature code never pokes fetch
-// directly so swapping the transport (msw for tests, a batching
-// client, etc.) is a one-file change.
+// management API. Auth endpoints live under /api/v1/auth/ because
+// the backend handler registers them under that versioned prefix
+// (see api/console/auth_handler.go), while tenant-scoped routes
+// (tenants, usage, keys, placement) live under /api/ to match the
+// mux registered in api/console/handler.go:Handler.Register. Feature
+// code never pokes fetch directly so swapping the transport (msw
+// for tests, a batching client, etc.) is a one-file change.
 export class ApiClient {
-  constructor(private readonly baseUrl: string, private token?: string) {}
+  constructor(
+    private readonly baseUrl: string,
+    private token?: string,
+    private readonly authBaseUrl: string = `${baseUrl}/v1/auth`,
+  ) {}
 
   setToken(token: string | undefined) {
     this.token = token;
   }
 
   // --- auth -----------------------------------------------------
+  //
+  // Auth routes intentionally bypass the tenant-scoped baseUrl and
+  // hit /api/v1/auth/* directly so the versioned contract in
+  // api/console/auth_handler.go is preserved even if the tenant
+  // routes ever drop or bump their own version prefix.
 
   async login(email: string, password: string): Promise<{ tenant: Tenant; token: string }> {
-    return this.post("/auth/login", { email, password });
+    return this.requestAt("POST", `${this.authBaseUrl}/login`, { email, password });
   }
 
   async signup(input: {
@@ -30,7 +42,7 @@ export class ApiClient {
     password: string;
     tenantName: string;
   }): Promise<{ tenant: Tenant; token: string }> {
-    return this.post("/auth/signup", input);
+    return this.requestAt("POST", `${this.authBaseUrl}/signup`, input);
   }
 
   // --- usage & dashboard ---------------------------------------
@@ -98,7 +110,11 @@ export class ApiClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    return this.requestAt(method, `${this.baseUrl}${path}`, body);
+  }
+
+  private async requestAt<T>(method: string, url: string, body?: unknown): Promise<T> {
+    const res = await fetch(url, {
       method,
       headers: {
         "Content-Type": "application/json",
@@ -124,7 +140,8 @@ export class ApiError extends Error {
   }
 }
 
-// Shared default client. In production it points at the relative
-// /api/v1 path so both dev (Vite proxy) and prod (same-origin
-// gateway) work without an explicit base URL.
-export const api = new ApiClient("/api/v1");
+// Shared default client. Tenant-scoped routes (tenants, usage,
+// keys, placement) live under /api/; auth endpoints are versioned
+// under /api/v1/auth/. Both dev (Vite proxy) and prod (same-origin
+// gateway) resolve these correctly without an explicit base URL.
+export const api = new ApiClient("/api");

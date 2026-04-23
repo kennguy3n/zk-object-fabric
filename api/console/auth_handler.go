@@ -41,6 +41,22 @@ type AuthStore interface {
 	// 500s). Implementations should treat a missing email as a
 	// no-op (return nil) rather than an error.
 	DeleteUser(email string) error
+
+	// IsVerified returns (true, true) when the tenant has clicked
+	// the verification link in the signup email, (false, true)
+	// when the tenant exists but has not verified yet, and
+	// (_, false) when the store has no record of the tenant — the
+	// S3 PUT gate treats the last case as out-of-scope and lets
+	// the request through. This keeps HMAC-only tenants loaded
+	// from a JSON bindings file (the Phase 2 path) from being
+	// blocked by a verification system they never opted into.
+	IsVerified(tenantID string) (verified, tracked bool)
+
+	// MarkVerified records that the tenant has verified their
+	// email. It is idempotent: an already-verified tenant is not
+	// an error, and an unknown tenant returns an error so the
+	// verify endpoint can surface a 404 to the caller.
+	MarkVerified(tenantID string) error
 }
 
 // TokenStore maps opaque bearer tokens to tenant IDs. It is used by
@@ -67,6 +83,7 @@ type MemoryAuthStore struct {
 type memoryAuthRow struct {
 	PasswordHash string
 	TenantID     string
+	Verified     bool
 }
 
 // NewMemoryAuthStore returns an empty store.
@@ -109,6 +126,42 @@ func (s *MemoryAuthStore) DeleteUser(email string) error {
 	defer s.mu.Unlock()
 	delete(s.users, strings.ToLower(email))
 	return nil
+}
+
+// IsVerified implements AuthStore.
+func (s *MemoryAuthStore) IsVerified(tenantID string) (bool, bool) {
+	if tenantID == "" {
+		return false, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, row := range s.users {
+		if row.TenantID == tenantID {
+			return row.Verified, true
+		}
+	}
+	return false, false
+}
+
+// MarkVerified implements AuthStore. It scans users for the matching
+// tenantID; a tenant minted via signup has exactly one row so the
+// scan is O(1) in the common case and O(n) in the degenerate case
+// where multiple users share a tenant (the B2B shared-account path
+// the scaffold does not yet support).
+func (s *MemoryAuthStore) MarkVerified(tenantID string) error {
+	if tenantID == "" {
+		return errors.New("console: tenant_id is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for email, row := range s.users {
+		if row.TenantID == tenantID {
+			row.Verified = true
+			s.users[email] = row
+			return nil
+		}
+	}
+	return fmt.Errorf("console: tenant %q not found", tenantID)
 }
 
 // MemoryTokenStore is a process-local TokenStore.
@@ -161,11 +214,15 @@ type AuthHooks struct {
 	// SendVerificationEmail is called after a successful signup so
 	// the user can verify their email. A nil hook skips the email
 	// — the Phase 3 scaffold default.
-	//
-	// TODO(production): integrate with the transactional email
-	// provider, gate the tenant's first S3 PUT on verification, and
-	// expire unverified tenants after 7 days.
 	SendVerificationEmail func(email, tenantID string) error
+
+	// ResolveOAuth resolves an OAuth bearer token submitted via
+	// signupRequest.OAuthToken into a provider-issued subject
+	// identifier. A nil hook makes OAuth signups return 503 so the
+	// frontend's OAuth buttons degrade gracefully when no provider
+	// is wired. Production hooks typically proxy Google / Microsoft
+	// / Okta and return the OIDC `sub` claim.
+	ResolveOAuth func(token string) (subject string, err error)
 }
 
 // AuthConfig collects the dependencies the auth handler needs. It
@@ -287,6 +344,7 @@ func (h *AuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 const (
 	authPathSignup = "/api/v1/auth/signup"
 	authPathLogin  = "/api/v1/auth/login"
+	authPathVerify = "/api/v1/auth/verify"
 )
 
 // maxAuthBodyBytes caps the request body the auth endpoints decode.
@@ -311,9 +369,46 @@ func (h *AuthHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.login(w, r)
+	case authPathVerify:
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.verify(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "unknown auth path "+r.URL.Path)
 	}
+}
+
+// verifyRequest is the payload POSTed to /api/v1/auth/verify. The
+// frontend's dashboard mounts a "resend verification" button that
+// submits the tenant ID returned on signup; production will replace
+// the bare tenant ID with a signed token that only the email link
+// carries, but the scaffold's contract is stable across that swap.
+type verifyRequest struct {
+	TenantID string `json:"tenantId"`
+}
+
+func (h *AuthHandler) verify(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Auth == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth store not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodyBytes)
+	var req verifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "decode verify: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.TenantID) == "" {
+		writeError(w, http.StatusBadRequest, "tenantId is required")
+		return
+	}
+	if err := h.cfg.Auth.MarkVerified(req.TenantID); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"verified": true, "tenantId": req.TenantID})
 }
 
 func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
@@ -415,13 +510,27 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 		passwordHash = string(hash)
 	}
 	// OAuth branch: passwordHash stays empty and the login flow
-	// refuses password logins for this user until the OAuth
-	// provider is wired in.
-	//
-	// TODO(production): resolve req.OAuthToken against the
-	// configured OAuth provider (Google / Microsoft) and store the
-	// provider-issued subject identifier in AuthStore so subsequent
-	// logins can be re-authenticated without a password.
+	// refuses password logins for this user until an OAuth
+	// ResolveOAuth hook is wired in. When the hook is configured
+	// it resolves the caller-supplied token against the provider
+	// (Google / Microsoft / Okta) and returns the provider-issued
+	// subject identifier; we store it in the password hash column
+	// so a subsequent login can compare subject identifiers (via
+	// the same bcrypt path) without a second OAuth round-trip.
+	if req.OAuthToken != "" {
+		if h.cfg.Hooks.ResolveOAuth == nil {
+			rollbackTenant("oauth hook missing")
+			writeError(w, http.StatusServiceUnavailable, "oauth provider not configured")
+			return
+		}
+		subject, err := h.cfg.Hooks.ResolveOAuth(req.OAuthToken)
+		if err != nil {
+			rollbackTenant("oauth resolve")
+			writeError(w, http.StatusUnauthorized, "oauth resolve: "+err.Error())
+			return
+		}
+		passwordHash = "oauth:" + subject
+	}
 	if err := h.cfg.Auth.CreateUser(req.Email, passwordHash, tenantID); err != nil {
 		// CreateUser is the authoritative email-uniqueness
 		// check. A concurrent signup that lost the race gets
