@@ -62,9 +62,18 @@ export class ApiClient {
   }
 
   // --- usage & dashboard ---------------------------------------
+  //
+  // Backend returns placement_policy-style UsageResponse ({tenant_id,
+  // start, end, counters: map[billing.Dimension]uint64}). The SPA
+  // renders UsageSnapshot (camelCase, pre-aggregated stat cards) so
+  // the client projects counter dimensions onto the snapshot shape.
+  // Keep this projection identical to usageFromStreamEvent in
+  // DashboardPage.tsx so the REST bootstrap and the SSE live frames
+  // populate the same fields.
 
   async currentUsage(): Promise<UsageSnapshot> {
-    return this.get("/usage");
+    const raw = await this.get<BackendUsageResponse>("/usage");
+    return backendToUsageSnapshot(raw);
   }
 
   // --- buckets --------------------------------------------------
@@ -194,6 +203,33 @@ function backendToFrontendPolicy(raw: BackendPlacementPolicy): PlacementPolicy {
     name: bucket || "default",
     yaml: JSON.stringify({ tenant: raw.tenant, bucket, policy: raw.policy ?? {} }, null, 2),
     updatedAt: new Date().toISOString(),
+  };
+}
+
+// BackendUsageResponse mirrors api/console/handler.go UsageResponse.
+// Counter keys are billing.Dimension strings; values are cumulative
+// counters over [start, end]. Keep the projection below aligned with
+// usageFromStreamEvent in DashboardPage.tsx so the REST bootstrap and
+// the SSE live frames render identically.
+interface BackendUsageResponse {
+  tenant_id: string;
+  start: string;
+  end: string;
+  counters: Record<string, number>;
+}
+
+function backendToUsageSnapshot(raw: BackendUsageResponse): UsageSnapshot {
+  const c = raw.counters ?? {};
+  return {
+    tenantId: raw.tenant_id,
+    storageBytes: c["storage_bytes_seconds"] ?? 0,
+    requestsLast30Days:
+      (c["put_requests"] ?? 0) +
+      (c["get_requests"] ?? 0) +
+      (c["list_requests"] ?? 0) +
+      (c["delete_requests"] ?? 0),
+    egressBytesThisMonth: c["egress_bytes"] ?? 0,
+    monthStart: raw.start,
   };
 }
 
