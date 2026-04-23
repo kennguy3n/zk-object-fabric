@@ -147,11 +147,17 @@ func (b *uplinkBridge) DeleteObject(ctx context.Context, bucket, key string) err
 	return nil
 }
 
-// ListObjects drains one page of the uplink ObjectIterator starting
-// at cursor. Storj's native iterator does not expose a per-page
-// cursor directly, so the bridge paginates one object at a time
-// and stops after a single iteration step — callers that need
-// larger pages can call ListPieces repeatedly.
+// maxListPageSize caps a single ListObjects page to match the
+// AWS S3 ListObjectsV2 convention other provider adapters already
+// follow. Storj's *uplink.ObjectIterator has no native page cap,
+// so without this bound a call against a bucket with millions of
+// keys would drain the whole iterator into memory.
+const maxListPageSize = 1000
+
+// ListObjects returns one page of up to maxListPageSize objects
+// starting at cursor. Callers resume pagination by passing the
+// returned NextCursor back in on the next call; an empty
+// NextCursor means the iterator is exhausted.
 func (b *uplinkBridge) ListObjects(
 	ctx context.Context,
 	bucket, prefix, cursor string,
@@ -172,9 +178,18 @@ func (b *uplinkBridge) ListObjects(
 		page.Objects = append(page.Objects, statResultFromObject(obj))
 		page.Keys = append(page.Keys, obj.Key)
 		page.NextCursor = obj.Key
+		if len(page.Keys) >= maxListPageSize {
+			break
+		}
 	}
 	if err := it.Err(); err != nil {
 		return ListPage{}, fmt.Errorf("uplink list: %w", err)
+	}
+	// If the iterator drained before hitting the cap there are no
+	// more objects after this page; clear NextCursor so the caller
+	// stops paginating.
+	if len(page.Keys) < maxListPageSize {
+		page.NextCursor = ""
 	}
 	return page, nil
 }
