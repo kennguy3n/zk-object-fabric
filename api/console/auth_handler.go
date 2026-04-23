@@ -612,10 +612,11 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, tenantID, ok := h.cfg.Auth.LookupUser(req.Email)
-	if !ok || hash == "" {
+	if !ok || hash == "" || strings.HasPrefix(hash, "oauth:") {
 		// Return a uniform 401 for missing user, OAuth-only
-		// accounts, and wrong-password cases so a probing caller
-		// can't distinguish them.
+		// accounts (stored as "oauth:<subject>" by signup), and
+		// wrong-password cases so a probing caller can't
+		// distinguish them.
 		writeError(w, http.StatusUnauthorized, "invalid email or password")
 		return
 	}

@@ -72,7 +72,11 @@ func (b *uplinkBridge) UploadObject(
 		_ = up.Abort()
 		return UploadedObject{}, fmt.Errorf("uplink upload copy: %w", err)
 	}
-	if len(opts.Metadata) > 0 {
+	// The S3 data plane emits PutOptions with Metadata=nil but
+	// ContentType set (see api/s3compat/handler.go); guarding only
+	// on len(opts.Metadata) would silently drop the content type on
+	// every normal PUT, so the guard considers both fields.
+	if len(opts.Metadata) > 0 || opts.ContentType != "" {
 		custom := uplink.CustomMetadata{}
 		for k, v := range opts.Metadata {
 			custom[k] = v
