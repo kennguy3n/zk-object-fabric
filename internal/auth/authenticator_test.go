@@ -1,13 +1,22 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 )
@@ -128,6 +137,186 @@ func TestHMACAuthenticator_ClockSkew(t *testing.T) {
 	req := signAndBuild(t, "GET", "/bucket/key", "", ak, sk, stale)
 	if _, err := auth.Authenticate(req); err == nil {
 		t.Fatal("Authenticate on stale request: want error, got nil")
+	}
+}
+
+// buildPresignedURL manually constructs a SigV4 query-string
+// presigned URL using this package's signRequest helper so the
+// presigned tests have a self-contained way to produce valid (and
+// deliberately invalid) URLs.
+func buildPresignedURL(t *testing.T, method, path, accessKey, secretKey string, signedAt time.Time, expiresSec int) string {
+	t.Helper()
+	const host = "example.s3.amazonaws.com"
+	stamp := signedAt.UTC().Format("20060102T150405Z")
+	date := signedAt.UTC().Format("20060102")
+	cred := accessKey + "/" + date + "/us-east-1/s3/aws4_request"
+	signed := []string{"host"}
+	q := url.Values{}
+	q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+	q.Set("X-Amz-Credential", cred)
+	q.Set("X-Amz-Date", stamp)
+	q.Set("X-Amz-Expires", strconv.Itoa(expiresSec))
+	q.Set("X-Amz-SignedHeaders", strings.Join(signed, ";"))
+	rawQuery := q.Encode()
+
+	signingReq := httptest.NewRequest(method, "http://"+host+path+"?"+rawQuery, nil)
+	signingReq.Host = host
+	signingReq.Header.Set("x-amz-date", stamp)
+	p := parsedAuthHeader{
+		AccessKey:     accessKey,
+		Date:          date,
+		Region:        "us-east-1",
+		Service:       "s3",
+		SignedHeaders: signed,
+	}
+	sig, err := signRequest(signingReq, p, secretKey)
+	if err != nil {
+		t.Fatalf("signRequest: %v", err)
+	}
+	sort.Strings(signed)
+	q.Set("X-Amz-Signature", sig)
+	return "http://" + host + path + "?" + q.Encode()
+}
+
+// fixedEndpointResolver pins the AWS SDK v2 presigner to a specific
+// host so the test can turn the resulting URL into an
+// *http.Request without relying on the default virtual-host
+// resolver.
+type fixedEndpointResolver struct {
+	host string
+}
+
+func (r fixedEndpointResolver) ResolveEndpoint(_ context.Context, _ s3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	u, err := url.Parse("http://" + r.host)
+	if err != nil {
+		return smithyendpoints.Endpoint{}, err
+	}
+	return smithyendpoints.Endpoint{URI: *u}, nil
+}
+
+func TestHMACAuthenticator_PresignedRoundTrip_AWSSDKv2(t *testing.T) {
+	store, tid, ak, sk := newStoreWithTenant(t)
+	// AWS SDK v2 presigner uses time.Now internally; peg the
+	// authenticator clock to wall time with a generous skew so the
+	// test stays deterministic on slow machines.
+	auth := &HMACAuthenticator{
+		Store:        store,
+		Region:       "us-east-1",
+		Service:      "s3",
+		Clock:        time.Now,
+		MaxClockSkew: time.Hour,
+	}
+
+	const host = "example.s3.amazonaws.com"
+	s3Client := s3.New(s3.Options{
+		Region:             "us-east-1",
+		Credentials:        credentials.NewStaticCredentialsProvider(ak, sk, ""),
+		UsePathStyle:       true,
+		EndpointResolverV2: fixedEndpointResolver{host: host},
+	})
+	presigner := s3.NewPresignClient(s3Client, func(o *s3.PresignOptions) {
+		o.Expires = 15 * time.Minute
+	})
+
+	cases := []struct {
+		name string
+		call func() (string, string, error)
+	}{
+		{
+			name: "PutObject",
+			call: func() (string, string, error) {
+				req, err := presigner.PresignPutObject(context.Background(), &s3.PutObjectInput{
+					Bucket: aws.String("bucket"),
+					Key:    aws.String("tenant-a/file/version"),
+				})
+				if err != nil {
+					return "", "", err
+				}
+				return req.Method, req.URL, nil
+			},
+		},
+		{
+			name: "GetObject",
+			call: func() (string, string, error) {
+				req, err := presigner.PresignGetObject(context.Background(), &s3.GetObjectInput{
+					Bucket: aws.String("bucket"),
+					Key:    aws.String("tenant-a/file/version"),
+				})
+				if err != nil {
+					return "", "", err
+				}
+				return req.Method, req.URL, nil
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			method, reqURL, err := tc.call()
+			if err != nil {
+				t.Fatalf("presign: %v", err)
+			}
+			httpReq := httptest.NewRequest(method, reqURL, nil)
+			got, err := auth.Authenticate(httpReq)
+			if err != nil {
+				t.Fatalf("Authenticate(%s): %v (url=%s)", tc.name, err, reqURL)
+			}
+			if got != tid {
+				t.Fatalf("tenantID = %q, want %q", got, tid)
+			}
+		})
+	}
+}
+
+func TestHMACAuthenticator_PresignedExpired(t *testing.T) {
+	store, _, ak, sk := newStoreWithTenant(t)
+	signedAt := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
+	later := signedAt.Add(2 * time.Hour)
+	auth := &HMACAuthenticator{
+		Store:        store,
+		Region:       "us-east-1",
+		Service:      "s3",
+		Clock:        func() time.Time { return later },
+		MaxClockSkew: 15 * time.Minute,
+	}
+	u := buildPresignedURL(t, "GET", "/bucket/key", ak, sk, signedAt, 15*60)
+	req := httptest.NewRequest("GET", u, nil)
+	if _, err := auth.Authenticate(req); err == nil {
+		t.Fatal("Authenticate expired presigned: want error, got nil")
+	}
+}
+
+func TestHMACAuthenticator_PresignedWrongSecret(t *testing.T) {
+	store, _, ak, _ := newStoreWithTenant(t)
+	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
+	auth := &HMACAuthenticator{
+		Store:        store,
+		Region:       "us-east-1",
+		Service:      "s3",
+		Clock:        func() time.Time { return now },
+		MaxClockSkew: time.Hour,
+	}
+	u := buildPresignedURL(t, "GET", "/bucket/key", ak, "wrong-secret", now, 900)
+	req := httptest.NewRequest("GET", u, nil)
+	if _, err := auth.Authenticate(req); err == nil {
+		t.Fatal("Authenticate presigned wrong secret: want error, got nil")
+	}
+}
+
+func TestHMACAuthenticator_PresignedTamperedQuery(t *testing.T) {
+	store, _, ak, sk := newStoreWithTenant(t)
+	now := time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC)
+	auth := &HMACAuthenticator{
+		Store:        store,
+		Region:       "us-east-1",
+		Service:      "s3",
+		Clock:        func() time.Time { return now },
+		MaxClockSkew: time.Hour,
+	}
+	u := buildPresignedURL(t, "GET", "/bucket/key", ak, sk, now, 900)
+	tampered := u + "&extra=evil"
+	req := httptest.NewRequest("GET", tampered, nil)
+	if _, err := auth.Authenticate(req); err == nil {
+		t.Fatal("Authenticate tampered presigned: want error, got nil")
 	}
 }
 
