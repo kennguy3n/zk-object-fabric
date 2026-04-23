@@ -79,6 +79,20 @@ func main() {
 	// same in-memory view of (tenant → verified) state. A Postgres
 	// implementation drops in behind the same interface.
 	authStore := console.NewMemoryAuthStore()
+	// authHooks is built once and shared between the console API
+	// and the S3 handler's email-verification gate. When
+	// SendVerificationEmail is nil (no SES / transactional email
+	// configured), no one can ever complete verification, so the
+	// S3 gate must stay OFF — otherwise every B2C signup tenant
+	// would be permanently blocked from uploading. Scaffold /
+	// HMAC-only deployments therefore run without the gate.
+	authHooks := buildAuthHooks(cfg)
+	var verifiedCheck func(tenantID string) (verified, tracked bool)
+	if authHooks.SendVerificationEmail != nil {
+		verifiedCheck = authStore.IsVerified
+	} else {
+		log.Printf("gateway: email verification hook not configured; S3 VerifiedCheck gate disabled")
+	}
 
 	cache, err := buildHotObjectCache(cfg)
 	if err != nil {
@@ -116,7 +130,7 @@ func main() {
 		Providers:      registry,
 		Placement:      placement,
 		Auth:           authenticator,
-		VerifiedCheck:  authStore.IsVerified,
+		VerifiedCheck:  verifiedCheck,
 		Billing:        billingSink,
 		Multipart:      multipartStore,
 		ErasureCoding:  erasureRegistry,
@@ -158,7 +172,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, tenantStore, authStore, billingSink)
+	consoleSrv := startConsoleAPI(cfg, tenantStore, authStore, authHooks, billingSink)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -504,6 +518,7 @@ func startConsoleAPI(
 	cfg config.Config,
 	tenantStore auth.TenantStore,
 	authStore *console.MemoryAuthStore,
+	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
 ) *http.Server {
 	if cfg.Console.ListenAddr == "" {
@@ -531,7 +546,7 @@ func startConsoleAPI(
 		Placements: placements,
 		Auth:       authStore,
 		Tokens:     tokens,
-		AuthHooks:  buildAuthHooks(cfg),
+		AuthHooks:  authHooks,
 		AdminAuth:  buildAdminAuth(cfg),
 	})
 	mux := http.NewServeMux()
