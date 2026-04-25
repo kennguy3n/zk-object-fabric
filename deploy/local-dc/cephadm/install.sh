@@ -65,7 +65,7 @@ fi
 
 cephadm bootstrap \
   --mon-ip "$mon_ip" \
-  --cluster-network "$CLUSTER_NETWORK" \
+  ${CLUSTER_NETWORK:+--cluster-network "$CLUSTER_NETWORK"} \
   --skip-monitoring-stack=false \
   --initial-dashboard-user zkof-admin \
   --allow-fqdn-hostname
