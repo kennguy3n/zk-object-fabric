@@ -724,6 +724,7 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 			timeout = 5 * time.Second
 		}
 		provCtx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
 		if _, err := h.cfg.BillingProvider.EnsureCustomer(provCtx, billing.CustomerRequest{
 			TenantID: tenantID,
 			Email:    req.Email,
@@ -738,7 +739,6 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 			log.Printf("console: signup billing-provider %q EnsureCustomer for tenant %q failed: %v",
 				h.cfg.BillingProvider.Name(), tenantID, err)
 		}
-		cancel()
 	}
 	writeJSON(w, http.StatusCreated, AuthResponse{
 		Tenant:    summarizeTenantAt(newTenant, createdAt),
