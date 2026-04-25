@@ -345,14 +345,14 @@ type ProvidersConfig struct {
 //
 // The single-region fields (Endpoint, Region, Bucket, AccessKey,
 // SecretKey) are kept for backward compatibility with Phase 1 / 2
-// configs. Phase 3 production deploys set Regions instead, so the
-// gateway registers one Wasabi provider per region under the
-// stable names "wasabi-<region>" (or the region's explicit
-// `name`). When Regions is non-empty the legacy single-region
-// fields are ignored unless the legacy fields name a region not
-// already covered by Regions, in which case they are appended
-// under the name "wasabi" for compatibility with the existing
-// preference order in pickDefaultBackend.
+// configs and register the provider under the bare name "wasabi".
+// Phase 3 production deploys set Regions instead, registering one
+// Wasabi provider per region under "wasabi-<region>" (or the
+// region's explicit `name`). The two paths are independent — both
+// can be set at once and they all register side-by-side.
+// pickDefaultBackend treats any "wasabi-*" entry as a substitute
+// for "wasabi" in its preference order, so a pure multi-region
+// config still boots with a Wasabi default.
 type WasabiConfig struct {
 	// Single-region (legacy / dev) configuration.
 	Endpoint  string `json:"endpoint"`

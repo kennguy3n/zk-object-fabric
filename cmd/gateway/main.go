@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -656,14 +657,42 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 
 // pickDefaultBackend returns the first backend name in a stable
 // preference order so the gateway boots with a usable placement
-// default even without explicit tenant policies.
+// default even without explicit tenant policies. The "wasabi" slot
+// also matches multi-region keys of the form "wasabi-<region>"
+// (registered via WasabiConfig.Regions). When several wasabi-*
+// providers are registered we pick the lexicographically smallest
+// key for determinism — operators that need a different default
+// should set an explicit tenant placement policy.
 func pickDefaultBackend(registry map[string]providers.StorageProvider) string {
 	for _, name := range []string{"wasabi", "ceph_rgw", "backblaze_b2", "cloudflare_r2", "aws_s3", "storj", "local_fs_dev"} {
 		if _, ok := registry[name]; ok {
 			return name
 		}
+		if name == "wasabi" {
+			if region := firstWasabiRegionKey(registry); region != "" {
+				return region
+			}
+		}
 	}
 	return ""
+}
+
+// firstWasabiRegionKey returns the lexicographically smallest
+// "wasabi-<region>" entry registered in registry, or "" when no
+// such entry exists. Sorting keeps the boot-time default stable
+// across restarts; Go map iteration order is randomized.
+func firstWasabiRegionKey(registry map[string]providers.StorageProvider) string {
+	var keys []string
+	for k := range registry {
+		if strings.HasPrefix(k, "wasabi-") {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	return keys[0]
 }
 
 // buildHotObjectCache returns a DiskCache when cfg.Gateway.CachePath

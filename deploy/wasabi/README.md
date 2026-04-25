@@ -42,8 +42,13 @@ country:  DE
 
 This stays compatible with the legacy single-region `provider:
 wasabi` configuration; if both are configured, both register and
-`pickDefaultBackend` prefers `wasabi` (the legacy default) for
-boot.
+`pickDefaultBackend` prefers the legacy `wasabi` entry for boot.
+A pure multi-region config (no legacy `endpoint` / `bucket` set)
+also boots with a Wasabi default — `pickDefaultBackend` falls
+through to the lexicographically-smallest `wasabi-<region>` key
+when no `wasabi` entry exists. Production deploys should pin a
+specific region as the default via tenant placement policies
+rather than relying on this fallback.
 
 ## Output
 
