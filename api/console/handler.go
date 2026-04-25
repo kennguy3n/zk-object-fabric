@@ -363,13 +363,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.AdminAuth != nil && !h.cfg.AdminAuth(r) {
-		writeError(w, http.StatusUnauthorized, "admin authorization required")
-		return
-	}
 	tenantID, suffix, sub, ok := parsePath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid path, expected /api/tenants/{id}[/subresource]")
+		return
+	}
+	// The SSE alias /api/tenants/{id}/usage/stream MUST run before
+	// AdminAuth: EventSource cannot send an Authorization header,
+	// so this path enforces its own per-tenant auth via the
+	// ?token= query param resolved against TokenStore (see
+	// UsageStreamHandler.ServeHTTP). Gating it behind AdminAuth
+	// would make the alias non-functional for the SPA — see
+	// Config.AdminAuth doc and the legacy /api/v1/usage/stream/
+	// path which is registered directly on the mux for the same
+	// reason.
+	if suffix == "usage" && sub == "stream" {
+		if h.sseHandler == nil {
+			writeError(w, http.StatusServiceUnavailable, "usage stream not configured")
+			return
+		}
+		h.sseHandler.ServeHTTP(w, r)
+		return
+	}
+	if h.cfg.AdminAuth != nil && !h.cfg.AdminAuth(r) {
+		writeError(w, http.StatusUnauthorized, "admin authorization required")
 		return
 	}
 	switch suffix {
@@ -384,29 +401,19 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		h.getTenant(w, r, tenantID)
 	case "usage":
-		switch sub {
-		case "":
-			if r.Method != http.MethodGet {
-				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-				return
-			}
-			h.getUsage(w, r, tenantID)
-		case "stream":
-			// SSE alias for /api/v1/usage/stream/{id}. The
-			// stream handler does its own tenant-scoped
-			// token check, so we deliberately bypass
-			// AdminAuth (which has already run above) and
-			// hand the request straight through. When Usage
-			// was not configured, sseHandler is nil and we
-			// 503 so the SPA can degrade gracefully.
-			if h.sseHandler == nil {
-				writeError(w, http.StatusServiceUnavailable, "usage stream not configured")
-				return
-			}
-			h.sseHandler.ServeHTTP(w, r)
-		default:
+		// usage/stream is handled before AdminAuth above so
+		// EventSource (which cannot send Authorization) can
+		// reach the SSE feed; only the synchronous /usage GET
+		// is dispatched here.
+		if sub != "" {
 			writeError(w, http.StatusNotFound, "unknown subresource usage/"+sub)
+			return
 		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.getUsage(w, r, tenantID)
 	case "keys":
 		switch r.Method {
 		case http.MethodPost:

@@ -411,6 +411,52 @@ func TestUsageStream_TenantScopedAlias_NotConfigured(t *testing.T) {
 	}
 }
 
+// TestUsageStream_TenantScopedAlias_BypassesAdminAuth is the
+// regression test for the dispatch ordering bug: EventSource cannot
+// send an Authorization header, so the alias MUST reach the SSE
+// handler even when Config.AdminAuth would otherwise reject the
+// request. Auth on this path is enforced by the SSE handler's own
+// per-tenant ?token= check (see UsageStreamHandler.ServeHTTP).
+func TestUsageStream_TenantScopedAlias_BypassesAdminAuth(t *testing.T) {
+	tokens := &fakeTokenLookup{token: "tok456", tenantID: "acme"}
+	h := New(Config{
+		Tenants:             newFakeTenantStore(sampleTenant("acme")),
+		Usage:               &fakeUsage{result: map[string]uint64{"egress_bytes": 7}},
+		Tokens:              tokens,
+		UsageStreamInterval: time.Hour,
+		// AdminAuth rejects every request — if dispatch ran it
+		// before the SSE alias check, the request would 401.
+		AdminAuth: func(*http.Request) bool { return false },
+	})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/tenants/acme/usage/stream?token=tok456", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 250*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (alias must bypass AdminAuth); body = %s",
+			rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// And the synchronous /usage path on the same handler MUST
+	// still be gated by AdminAuth — if we relaxed the gate too
+	// broadly, the regular usage endpoint would leak.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/tenants/acme/usage", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/usage status = %d, want 401 (AdminAuth still applies)", rec.Code)
+	}
+}
+
 // --- CAPTCHA rejection ------------------------------------------
 
 func TestSignup_RejectsWhenCAPTCHAHookFails(t *testing.T) {
