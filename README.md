@@ -48,9 +48,27 @@ aws --endpoint-url http://localhost:8080 s3 ls s3://mybucket/
 ```
 
 Any S3-compatible client (AWS SDK, MinIO client, boto3) works.
-Downstream services like **zk-drive** or **kmail** point their S3
-client at `http://localhost:8080` (or `http://zk-fabric:8080` when
-running inside the same Docker Compose network).
+Downstream services like **zk-drive**, **kmail**, and **Kapp
+Business Suite** (`kapp-fab`) point their S3 client at
+`http://localhost:8080` (or `http://zk-fabric:8080` when running
+inside the same Docker Compose network).
+
+### Downstream integrations
+
+The fabric currently has three reference downstream integrations,
+all using `managed` encryption mode so the gateway handles the DEK
+and the application code never sees plaintext keys:
+
+- **kmail** — Stalwart blob store backend; one tenant per kmail
+  install, credentials seeded in `demo/tenants.json`.
+- **zk-drive** — end-user file sync; per-end-user tenants, HMAC
+  pair handed out at signup.
+- **Kapp Business Suite** ([`kennguy3n/kapp-fab`](https://github.com/kennguy3n/kapp-fab))
+  — multi-tenant ERP-lite; the Kapp setup wizard provisions a
+  fabric tenant + HMAC pair + bucket via the console API at
+  `:8081` so each ERP tenant's file attachments inherit per-tenant
+  zero-knowledge encryption with no application-side key
+  management.
 
 > **Note**: tenant and manifest state is in-memory and lost on
 > container restart. Object data persists in the `zk-data` Docker
