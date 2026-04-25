@@ -159,9 +159,14 @@ func (s *PostgresTenantStore) AddBinding(b TenantBinding) error {
 // ListBindingsByTenantID returns every binding whose tenant_id
 // matches the argument. Returns an empty (non-nil) slice when no
 // rows match. See tenant_bindings schema in schema.sql.
-func (s *PostgresTenantStore) ListBindingsByTenantID(tenantID string) []TenantBinding {
+//
+// Returns the underlying error when the SELECT query or row scan
+// fails so callers (the console listKeys handler) can surface a
+// 500 instead of an empty 200 OK that would mask a database
+// outage as "no API keys".
+func (s *PostgresTenantStore) ListBindingsByTenantID(tenantID string) ([]TenantBinding, error) {
 	if tenantID == "" {
-		return []TenantBinding{}
+		return []TenantBinding{}, nil
 	}
 	const q = `
 		SELECT access_key, secret_key, tenant_json
@@ -169,7 +174,7 @@ func (s *PostgresTenantStore) ListBindingsByTenantID(tenantID string) []TenantBi
 		 WHERE tenant_id = $1`
 	rows, err := s.db.Query(q, tenantID)
 	if err != nil {
-		return []TenantBinding{}
+		return nil, fmt.Errorf("auth: query bindings for tenant %q: %w", tenantID, err)
 	}
 	defer rows.Close()
 	out := make([]TenantBinding, 0)
@@ -180,7 +185,7 @@ func (s *PostgresTenantStore) ListBindingsByTenantID(tenantID string) []TenantBi
 			tenantJSON []byte
 		)
 		if err := rows.Scan(&accessKey, &secretKey, &tenantJSON); err != nil {
-			return out
+			return nil, fmt.Errorf("auth: scan binding for tenant %q: %w", tenantID, err)
 		}
 		var t tenant.Tenant
 		if err := json.Unmarshal(tenantJSON, &t); err != nil {
@@ -188,7 +193,10 @@ func (s *PostgresTenantStore) ListBindingsByTenantID(tenantID string) []TenantBi
 		}
 		out = append(out, TenantBinding{AccessKey: accessKey, SecretKey: secretKey, Tenant: t})
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("auth: iterate bindings for tenant %q: %w", tenantID, err)
+	}
+	return out, nil
 }
 
 // RemoveBinding deletes the tenant_bindings row identified by

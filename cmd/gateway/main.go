@@ -748,7 +748,7 @@ func (c *consoleTenantAdapter) DeleteTenant(tenantID string) error {
 // stores used in tests remain usable without implementing the
 // key-management surface.
 type bindingLister interface {
-	ListBindingsByTenantID(tenantID string) []auth.TenantBinding
+	ListBindingsByTenantID(tenantID string) ([]auth.TenantBinding, error)
 	RemoveBinding(accessKey string) error
 }
 
@@ -761,7 +761,10 @@ func (c *consoleTenantAdapter) ListAPIKeys(tenantID string) ([]console.APIKeyDes
 	if !ok {
 		return nil, fmt.Errorf("gateway: tenant store does not expose binding listing")
 	}
-	bindings := bl.ListBindingsByTenantID(tenantID)
+	bindings, err := bl.ListBindingsByTenantID(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: list bindings for tenant %q: %w", tenantID, err)
+	}
 	out := make([]console.APIKeyDescriptor, 0, len(bindings))
 	for _, b := range bindings {
 		out = append(out, console.APIKeyDescriptor{
