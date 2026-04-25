@@ -1,0 +1,34 @@
+[Unit]
+Description=ZK Object Fabric S3 Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zkof
+Group=zkof
+ExecStart=/opt/zk-gateway/bin/gateway -config /etc/zk-gateway/config.json
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+# SIGTERM is the drain signal. Allow up to 60s for in-flight
+# requests to complete (matches the gateway's DrainTimeout default).
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# Environment for KMS / Vault / SES wrappers. Operators populate
+# /etc/zk-gateway/env from the deployment secret manager.
+EnvironmentFile=-/etc/zk-gateway/env
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/zkof
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

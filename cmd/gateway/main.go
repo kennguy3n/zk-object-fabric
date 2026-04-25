@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -69,7 +70,20 @@ func main() {
 		cfg = loaded
 	}
 
-	store := buildManifestStore(cfg)
+	// Open exactly one *sql.DB for the metadata DSN and share it
+	// across every Postgres-backed store. This keeps
+	// ControlPlaneConfig.MaxOpenConns as a single
+	// gateway-process-wide cap on metadata connections instead of
+	// a per-store multiplier.
+	metadataDB, err := openMetadataDB(cfg)
+	if err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
+	if metadataDB != nil {
+		defer func() { _ = metadataDB.Close() }()
+	}
+
+	store := buildManifestStore(cfg, metadataDB)
 	registry := buildProviderRegistry(context.Background(), cfg)
 	defaultBackend := pickDefaultBackend(registry)
 	if defaultBackend == "" {
@@ -77,7 +91,7 @@ func main() {
 	}
 
 	placement := placement_policy.NewEngine(defaultBackend, registry, nil)
-	tenantStore := buildTenantStore(cfg, *tenantsPath)
+	tenantStore := buildTenantStore(metadataDB, *tenantsPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	billingSink := buildBillingSink(cfg)
 	// billingProvider is the optional outbound integration to an
@@ -92,7 +106,7 @@ func main() {
 	// same view of (tenant → verified) state. The Postgres-backed
 	// store is selected when a metadata DSN is configured;
 	// otherwise the dev MemoryAuthStore is used.
-	authStore := buildAuthStore(cfg)
+	authStore := buildAuthStore(metadataDB)
 	// authHooks is built once and shared between the console API
 	// and the S3 handler's email-verification gate. When
 	// SendVerificationEmail is nil (no SES / transactional email
@@ -192,7 +206,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, tenantStore, authStore, authHooks, billingSink)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, authHooks, billingSink)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -301,17 +315,57 @@ func startRebalancer(
 	return done
 }
 
-func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {
+// applyDBConnectionPool applies the gateway's RDS / Postgres
+// connection-pool tuning from cfg.ControlPlane to the shared
+// metadata *sql.DB. The gateway opens exactly one *sql.DB per
+// metadata DSN (see openMetadataDB) and shares it across every
+// Postgres-backed store, so MaxOpenConns is the global ceiling
+// for the gateway's metadata connection count, not a per-pool
+// multiplier. Unset (zero-valued) fields leave Go's stdlib
+// defaults in place.
+func applyDBConnectionPool(db *sql.DB, cfg config.ControlPlaneConfig) {
+	if cfg.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns > 0 {
+		db.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if d := time.Duration(cfg.ConnMaxLifetime); d > 0 {
+		db.SetConnMaxLifetime(d)
+	}
+	if d := time.Duration(cfg.ConnMaxIdleTime); d > 0 {
+		db.SetConnMaxIdleTime(d)
+	}
+}
+
+// openMetadataDB opens the single shared *sql.DB the gateway uses
+// for every Postgres-backed store (manifest, auth, dedicated cell,
+// placement, tenant). All five stores share this pool so the
+// connection-count ceiling configured in
+// ControlPlaneConfig.MaxOpenConns is the gateway-process-wide cap,
+// not a per-store multiplier. Returns (nil, nil) when MetadataDSN
+// is empty (dev / in-memory mode) so callers can branch on db ==
+// nil without inspecting the config again.
+func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 	if cfg.ControlPlane.MetadataDSN == "" {
-		log.Printf("gateway: no control_plane.metadata_dsn; using in-memory manifest store (dev only)")
-		return memory.New()
+		return nil, nil
 	}
 	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
 	if err != nil {
-		log.Fatalf("gateway: open postgres: %v", err)
+		return nil, fmt.Errorf("open postgres metadata DB: %w", err)
 	}
+	applyDBConnectionPool(db, cfg.ControlPlane)
 	if err := db.Ping(); err != nil {
-		log.Fatalf("gateway: ping postgres: %v", err)
+		_ = db.Close()
+		return nil, fmt.Errorf("ping postgres metadata DB: %w", err)
+	}
+	return db, nil
+}
+
+func buildManifestStore(cfg config.Config, db *sql.DB) manifest_store.ManifestStore {
+	if db == nil {
+		log.Printf("gateway: no control_plane.metadata_dsn; using in-memory manifest store (dev only)")
+		return memory.New()
 	}
 	pgCfg := pgstore.Config{DB: db}
 	if p := cfg.Encryption.ManifestBodyKeyPath; p != "" {
@@ -500,6 +554,31 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 		}
 		registry["wasabi"] = w
 	}
+	// Per-region Wasabi providers (Phase 3 multi-region).
+	// Each region registers under its ResolvedName() so placement
+	// policies can target e.g. "wasabi-us-east-1" or
+	// "wasabi-eu-central-1" explicitly.
+	for _, r := range cfg.Providers.Wasabi.Regions {
+		if r.Endpoint == "" || r.Bucket == "" {
+			continue
+		}
+		name := r.ResolvedName()
+		if _, exists := registry[name]; exists {
+			log.Fatalf("gateway: duplicate wasabi region name %q", name)
+		}
+		w, err := wasabi.New(wasabi.Config{
+			Endpoint:  r.Endpoint,
+			Region:    r.Region,
+			Bucket:    r.Bucket,
+			AccessKey: r.AccessKey,
+			SecretKey: r.SecretKey,
+		})
+		if err != nil {
+			log.Fatalf("gateway: build wasabi region %q: %v", name, err)
+		}
+		registry[name] = w
+		log.Printf("gateway: registered wasabi region provider %q (endpoint=%s bucket=%s)", name, r.Endpoint, r.Bucket)
+	}
 	if cfg.Providers.CephRGW.Endpoint != "" {
 		c, err := ceph_rgw.New(ceph_rgw.Config{
 			Endpoint:  cfg.Providers.CephRGW.Endpoint,
@@ -578,14 +657,42 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 
 // pickDefaultBackend returns the first backend name in a stable
 // preference order so the gateway boots with a usable placement
-// default even without explicit tenant policies.
+// default even without explicit tenant policies. The "wasabi" slot
+// also matches multi-region keys of the form "wasabi-<region>"
+// (registered via WasabiConfig.Regions). When several wasabi-*
+// providers are registered we pick the lexicographically smallest
+// key for determinism — operators that need a different default
+// should set an explicit tenant placement policy.
 func pickDefaultBackend(registry map[string]providers.StorageProvider) string {
 	for _, name := range []string{"wasabi", "ceph_rgw", "backblaze_b2", "cloudflare_r2", "aws_s3", "storj", "local_fs_dev"} {
 		if _, ok := registry[name]; ok {
 			return name
 		}
+		if name == "wasabi" {
+			if region := firstWasabiRegionKey(registry); region != "" {
+				return region
+			}
+		}
 	}
 	return ""
+}
+
+// firstWasabiRegionKey returns the lexicographically smallest
+// "wasabi-<region>" entry registered in registry, or "" when no
+// such entry exists. Sorting keeps the boot-time default stable
+// across restarts; Go map iteration order is randomized.
+func firstWasabiRegionKey(registry map[string]providers.StorageProvider) string {
+	var keys []string
+	for k := range registry {
+		if strings.HasPrefix(k, "wasabi-") {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	return keys[0]
 }
 
 // buildHotObjectCache returns a DiskCache when cfg.Gateway.CachePath
@@ -712,6 +819,7 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 
 func startConsoleAPI(
 	cfg config.Config,
+	metadataDB *sql.DB,
 	tenantStore auth.TenantStore,
 	authStore console.AuthStore,
 	authHooks console.AuthHooks,
@@ -733,10 +841,10 @@ func startConsoleAPI(
 	if uq, ok := billingSink.(console.UsageQuery); ok {
 		usage = uq
 	}
-	placements := buildPlacementStore(cfg)
+	placements := buildPlacementStore(metadataDB)
 	tokens := console.NewMemoryTokenStore()
 
-	cellStore := buildDedicatedCellStore(cfg)
+	cellStore := buildDedicatedCellStore(metadataDB)
 	cellProvisioner := buildCellProvisioner(cellStore)
 
 	h := console.New(console.Config{
@@ -774,19 +882,13 @@ func startConsoleAPI(
 // metadata DSN is configured, falling back to MemoryAuthStore for
 // dev mode. The store is shared between the console signup / login
 // handler and the S3 handler's email-verification gate.
-func buildAuthStore(cfg config.Config) console.AuthStore {
-	if cfg.ControlPlane.MetadataDSN == "" {
-		return console.NewMemoryAuthStore()
-	}
-	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
-	if err != nil {
-		log.Printf("gateway: open postgres for auth store: %v; falling back to in-memory", err)
+func buildAuthStore(db *sql.DB) console.AuthStore {
+	if db == nil {
 		return console.NewMemoryAuthStore()
 	}
 	store, err := console.NewPostgresAuthStore(db)
 	if err != nil {
 		log.Printf("gateway: build postgres auth store: %v; falling back to in-memory", err)
-		_ = db.Close()
 		return console.NewMemoryAuthStore()
 	}
 	log.Printf("gateway: postgres auth store enabled")
@@ -797,19 +899,13 @@ func buildAuthStore(cfg config.Config) console.AuthStore {
 // when a metadata DSN is configured, falling back to the in-memory
 // store for dev. Production wires this so console-driven cell
 // provisioning requests persist across gateway restarts.
-func buildDedicatedCellStore(cfg config.Config) console.DedicatedCellStore {
-	if cfg.ControlPlane.MetadataDSN == "" {
-		return console.NewMemoryDedicatedCellStore()
-	}
-	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
-	if err != nil {
-		log.Printf("gateway: open postgres for dedicated cell store: %v; falling back to in-memory", err)
+func buildDedicatedCellStore(db *sql.DB) console.DedicatedCellStore {
+	if db == nil {
 		return console.NewMemoryDedicatedCellStore()
 	}
 	store, err := console.NewPostgresDedicatedCellStore(db)
 	if err != nil {
 		log.Printf("gateway: build postgres dedicated cell store: %v; falling back to in-memory", err)
-		_ = db.Close()
 		return console.NewMemoryDedicatedCellStore()
 	}
 	log.Printf("gateway: postgres dedicated cell store enabled")
@@ -895,13 +991,8 @@ func buildAuthHooks(cfg config.Config) console.AuthHooks {
 // cfg.ControlPlane.MetadataDSN is set, or an in-memory store for dev.
 // The Postgres store reuses the same DSN as the manifest store; the
 // schema migration lives in api/console/schema.sql.
-func buildPlacementStore(cfg config.Config) console.PlacementStore {
-	if cfg.ControlPlane.MetadataDSN == "" {
-		return console.NewMemoryPlacementStore()
-	}
-	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
-	if err != nil {
-		log.Printf("gateway: open postgres for placement store: %v; falling back to in-memory", err)
+func buildPlacementStore(db *sql.DB) console.PlacementStore {
+	if db == nil {
 		return console.NewMemoryPlacementStore()
 	}
 	store, err := console.NewPostgresPlacementStore(db)
@@ -1030,12 +1121,8 @@ func (noopUsageQuery) TenantUsage(ctx context.Context, tenantID string, start, e
 // file when path is supplied; the Postgres path ignores the JSON
 // file because production deploys load bindings via the console API
 // signup flow.
-func buildTenantStore(cfg config.Config, path string) auth.TenantStore {
-	if cfg.ControlPlane.MetadataDSN != "" {
-		db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
-		if err != nil {
-			log.Fatalf("gateway: open postgres for tenant store: %v", err)
-		}
+func buildTenantStore(db *sql.DB, path string) auth.TenantStore {
+	if db != nil {
 		store, err := auth.NewPostgresTenantStore(db)
 		if err != nil {
 			log.Fatalf("gateway: build postgres tenant store: %v", err)

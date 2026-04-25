@@ -1,0 +1,60 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["ZKOF/Gateway", "request_latency_p99", "method", "PUT"],
+          ["ZKOF/Gateway", "request_latency_p99", "method", "GET"],
+          ["ZKOF/Gateway", "request_latency_p99", "method", "HEAD"],
+          ["ZKOF/Gateway", "request_latency_p99", "method", "DELETE"]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "title": "Request latency p99 (ms) by method",
+        "yAxis": { "left": { "min": 0 } }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["ZKOF/Gateway", "cache_hit_ratio"],
+          ["ZKOF/Gateway", "cache_miss_ratio"]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "title": "Hot object cache hit ratio"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["ZKOF/Billing", "events_emitted"],
+          ["ZKOF/Billing", "events_flushed"],
+          ["ZKOF/Billing", "billing_flush_errors"]
+        ],
+        "period": 60,
+        "stat": "Sum",
+        "title": "Billing event throughput"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["ZKOF/Gateway", "5xx_rate"],
+          ["ZKOF/Gateway", "4xx_rate"]
+        ],
+        "period": 60,
+        "stat": "Average",
+        "title": "Error rates"
+      }
+    }
+  ]
+}

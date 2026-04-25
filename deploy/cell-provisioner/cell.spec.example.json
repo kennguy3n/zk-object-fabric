@@ -1,0 +1,9 @@
+{
+  "tenant_id":          "tenant-acme-co",
+  "region":             "local-dc-01",
+  "country":            "US",
+  "capacity_petabytes": 0.5,
+  "ec_profile":         "6+2",
+  "encryption_mode":    "managed",
+  "notes":              "Beta cell for tenant acme-co; sovereign US-only data residency."
+}
