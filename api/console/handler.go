@@ -195,6 +195,15 @@ type Config struct {
 		Emit(event billing.UsageEvent)
 	}
 
+	// BillingProvider is the optional outbound integration to a
+	// payment / subscription provider (Stripe, Chargebee, …). The
+	// signup handler calls EnsureCustomer immediately after
+	// CreateTenant commits so a freshly-minted tenant is reflected
+	// on the provider before any usage event lands. A nil provider
+	// skips the call — acceptable for dev and the HMAC-only Phase
+	// 2 path; production wires cmd/gateway/main.go's provider.
+	BillingProvider billing.BillingProvider
+
 	// AdminAuth is the per-request admin-authorization check. The
 	// tenant / usage / keys / placement routes all consult it
 	// before serving; a nil hook disables the check (suitable for
@@ -256,6 +265,11 @@ type Config struct {
 // router via ServeHTTP).
 type Handler struct {
 	cfg Config
+	// sseHandler serves the tenant-scoped usage stream alias
+	// /api/tenants/{id}/usage/stream. Set in Register when Usage
+	// is configured so dispatch can forward matching requests
+	// without registering a second handler on /api/tenants/.
+	sseHandler *UsageStreamHandler
 }
 
 // New returns a Handler with cfg defaults filled in.
@@ -303,14 +317,15 @@ func (h *Handler) Register(mux *http.ServeMux) {
 			log.Printf("console: Auth is a MemoryAuthStore — DO NOT use in production; wire a persistent AuthStore")
 		}
 		auth := NewAuthHandler(AuthConfig{
-			Tenants:     h.cfg.Tenants,
-			Auth:        h.cfg.Auth,
-			Tokens:      tokens,
-			GenerateKey: h.cfg.GenerateKey,
-			NewTenantID: h.cfg.NewTenantID,
-			Hooks:       h.cfg.AuthHooks,
-			BillingSink: h.cfg.BillingSink,
-			Now:         h.cfg.Now,
+			Tenants:         h.cfg.Tenants,
+			Auth:            h.cfg.Auth,
+			Tokens:          tokens,
+			GenerateKey:     h.cfg.GenerateKey,
+			NewTenantID:     h.cfg.NewTenantID,
+			Hooks:           h.cfg.AuthHooks,
+			BillingSink:     h.cfg.BillingSink,
+			BillingProvider: h.cfg.BillingProvider,
+			Now:             h.cfg.Now,
 		})
 		auth.Register(mux)
 	}
@@ -323,6 +338,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 			Now:      h.cfg.Now,
 		})
 		sse.Register(mux)
+		// dispatch forwards GET /api/tenants/{id}/usage/stream
+		// requests to this same handler so the console mux
+		// exposes the SSE feed under both the legacy v1 path
+		// and the tenant-scoped form.
+		h.sseHandler = sse
 	}
 }
 
@@ -343,13 +363,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.AdminAuth != nil && !h.cfg.AdminAuth(r) {
-		writeError(w, http.StatusUnauthorized, "admin authorization required")
-		return
-	}
 	tenantID, suffix, sub, ok := parsePath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid path, expected /api/tenants/{id}[/subresource]")
+		return
+	}
+	// The SSE alias /api/tenants/{id}/usage/stream MUST run before
+	// AdminAuth: EventSource cannot send an Authorization header,
+	// so this path enforces its own per-tenant auth via the
+	// ?token= query param resolved against TokenStore (see
+	// UsageStreamHandler.ServeHTTP). Gating it behind AdminAuth
+	// would make the alias non-functional for the SPA — see
+	// Config.AdminAuth doc and the legacy /api/v1/usage/stream/
+	// path which is registered directly on the mux for the same
+	// reason.
+	if suffix == "usage" && sub == "stream" {
+		if h.sseHandler == nil {
+			writeError(w, http.StatusServiceUnavailable, "usage stream not configured")
+			return
+		}
+		h.sseHandler.ServeHTTP(w, r)
+		return
+	}
+	if h.cfg.AdminAuth != nil && !h.cfg.AdminAuth(r) {
+		writeError(w, http.StatusUnauthorized, "admin authorization required")
 		return
 	}
 	switch suffix {
@@ -364,6 +401,10 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		h.getTenant(w, r, tenantID)
 	case "usage":
+		// usage/stream is handled before AdminAuth above so
+		// EventSource (which cannot send Authorization) can
+		// reach the SSE feed; only the synchronous /usage GET
+		// is dispatched here.
 		if sub != "" {
 			writeError(w, http.StatusNotFound, "unknown subresource usage/"+sub)
 			return
