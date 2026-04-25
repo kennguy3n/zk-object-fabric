@@ -479,6 +479,16 @@ Checklist:
       RGW deploys now serves kmail's local dev stack. Object data
       persists in the `zk-data` Docker volume; tenant and manifest
       state is in-memory only.
+- [x] Kapp Business Suite integration. The Kapp `kapp-fab` repo now
+      provisions a per-tenant HMAC credential pair plus a dedicated
+      bucket against the fabric console API at `:8081` during its
+      tenant setup wizard, and runs every file attachment upload /
+      download through the fabric in `managed` encryption mode so
+      ERP file attachments inherit per-tenant zero-knowledge
+      encryption. Joins kmail and zk-drive as a reference downstream
+      integration alongside the existing Stalwart blob store path.
+      Co-deploys cleanly via `docker-compose.yml` — Kapp talks to the
+      fabric on the same Compose network with no extra plumbing.
 
 ### Avoid early customers with
 
