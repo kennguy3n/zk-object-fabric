@@ -16,6 +16,7 @@
 package s3compat
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -109,7 +111,12 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
 		return
 	}
-	if err := h.cfg.Multipart.Create(&multipart.Upload{
+
+	// Lay down the multipart session's encryption state up front:
+	// managed / public_distribution uploads generate one DEK here
+	// that every UploadPart reuses, so the frames all decrypt under
+	// the same key when the GET path concatenates them.
+	upload := &multipart.Upload{
 		ID:        uploadID,
 		TenantID:  tenantID,
 		Bucket:    bucket,
@@ -117,7 +124,32 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		Backend:   backend,
 		Policy:    policy,
 		CreatedAt: h.cfg.Now(),
-	}); err != nil {
+		EncMode:   policy.EncryptionMode,
+	}
+	if IsGatewayEncrypted(policy.EncryptionMode) {
+		if h.cfg.Encryption == nil {
+			writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured",
+				"tenant policy requires managed encryption but no gateway encryption is configured", r.URL.Path)
+			return
+		}
+		dek, gerr := client_sdk.GenerateDEK()
+		if gerr != nil {
+			writeError(w, http.StatusInternalServerError, "DEKGenerationFailed", gerr.Error(), r.URL.Path)
+			return
+		}
+		wrapped, werr := h.cfg.Encryption.Wrapper.WrapDEK(dek, h.cfg.Encryption.CMK)
+		if werr != nil {
+			writeError(w, http.StatusInternalServerError, "DEKWrapFailed", werr.Error(), r.URL.Path)
+			return
+		}
+		upload.DEKMaterial = []byte(dek)
+		upload.WrappedDEK = wrapped.WrappedKey
+		upload.WrappedKeyID = wrapped.KeyID
+		upload.WrapAlgorithm = wrapped.WrapAlgorithm
+		upload.ContentAlgorithm = client_sdk.ContentAlgorithm
+	}
+
+	if err := h.cfg.Multipart.Create(upload); err != nil {
 		writeError(w, http.StatusInternalServerError, "MultipartCreateFailed", err.Error(), r.URL.Path)
 		return
 	}
@@ -166,20 +198,62 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pieceID := partPieceID(uploadID, partNumber)
-	res, err := provider.PutPiece(r.Context(), pieceID, r.Body, providers.PutOptions{
-		ContentLength: r.ContentLength,
+
+	// Apply the session's encryption mode. For managed /
+	// public_distribution we encrypt each part with the DEK
+	// captured at Create; for client_side we enforce the
+	// per-request header so a Strict ZK tenant cannot accidentally
+	// ship plaintext. SizeBytes recorded on the Part is the
+	// plaintext size so Complete can sum them into ObjectSize.
+	body := io.Reader(r.Body)
+	contentLength := r.ContentLength
+	plaintextSize := r.ContentLength
+	switch upload.EncMode {
+	case "managed", "public_distribution":
+		plaintext, rerr := io.ReadAll(r.Body)
+		if rerr != nil {
+			writeError(w, http.StatusBadRequest, "InvalidArgument", "read part body: "+rerr.Error(), r.URL.Path)
+			return
+		}
+		plaintextSize = int64(len(plaintext))
+		ciphertext, eerr := h.encryptWithDEK(plaintext, upload.DEKMaterial)
+		if eerr != nil {
+			writeError(w, http.StatusInternalServerError, "EncryptionFailed", eerr.Error(), r.URL.Path)
+			return
+		}
+		body = bytes.NewReader(ciphertext)
+		contentLength = int64(len(ciphertext))
+	case "client_side":
+		if r.Header.Get("X-Amz-Meta-Zk-Encryption") == "" {
+			writeError(w, http.StatusForbidden, "EncryptionRequired",
+				"tenant policy requires client_side encryption; set X-Amz-Meta-Zk-Encryption header", r.URL.Path)
+			return
+		}
+	}
+
+	res, err := provider.PutPiece(r.Context(), pieceID, body, providers.PutOptions{
+		ContentLength: contentLength,
 		ContentType:   r.Header.Get("Content-Type"),
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
 		return
 	}
+
+	// Record plaintext size on the Part so CompleteMultipartUpload
+	// sums the logical (user-visible) object size rather than the
+	// ciphertext-on-the-wire size. For non-encrypted uploads
+	// plaintextSize equals res.SizeBytes.
+	recordedSize := res.SizeBytes
+	if IsGatewayEncrypted(upload.EncMode) {
+		recordedSize = plaintextSize
+	}
 	if err := h.cfg.Multipart.PutPart(uploadID, multipart.Part{
 		PartNumber: partNumber,
 		PieceID:    res.PieceID,
 		Backend:    upload.Backend,
 		ETag:       res.ETag,
-		SizeBytes:  res.SizeBytes,
+		SizeBytes:  recordedSize,
 		UploadedAt: h.cfg.Now(),
 	}); err != nil {
 		// Best-effort rollback so we don't orphan the piece on the
@@ -276,6 +350,25 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 	}
 	versionID := newPieceID(tenantID, bucket, key, h.cfg.Now())
 	aggregateETag := computeMultipartETag(parts)
+
+	// Capture the session's encryption parameters on the manifest
+	// so GET can unwrap the DEK and frame-decrypt the concatenated
+	// parts. For client_side mode we only record what the tenant
+	// declared; we never saw the plaintext DEK.
+	encCfg := metadata.EncryptionConfig{Mode: upload.EncMode}
+	switch upload.EncMode {
+	case "managed", "public_distribution":
+		encCfg.Algorithm = upload.ContentAlgorithm
+		encCfg.KeyID = upload.WrappedKeyID
+		encCfg.WrappedDEK = upload.WrappedDEK
+		encCfg.WrapAlgorithm = upload.WrapAlgorithm
+	case "client_side":
+		// Pull the algorithm from the first part's declaration;
+		// the store doesn't persist headers per part, so we
+		// default to the canonical algorithm. Clients that wire
+		// their own algorithm still see the recorded mode.
+		encCfg.Algorithm = client_sdk.ContentAlgorithm
+	}
 	manifest := &metadata.ObjectManifest{
 		TenantID:        tenantID,
 		Bucket:          bucket,
@@ -284,6 +377,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		VersionID:       versionID,
 		ObjectSize:      totalSize,
 		ChunkSize:       firstPartSize(parts),
+		Encryption:      encCfg,
 		PlacementPolicy: upload.Policy,
 		Pieces:          pieces,
 		MigrationState: metadata.MigrationState{

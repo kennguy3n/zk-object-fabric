@@ -26,6 +26,8 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/console"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
+	"github.com/kennguy3n/zk-object-fabric/encryption"
+	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
@@ -125,6 +127,8 @@ func main() {
 	multipartStore := multipart.NewMemoryStore()
 	erasureRegistry := erasure_coding.DefaultRegistry()
 
+	gatewayEnc := buildGatewayEncryption(cfg.Encryption)
+
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
 		Manifests:      store,
@@ -138,6 +142,7 @@ func main() {
 		Cache:          cache,
 		CachePublisher: signalBus,
 		ReadRepair:     readRepair,
+		Encryption:     gatewayEnc,
 		NodeID:         cfg.Env,
 	}).Register(mux)
 
@@ -294,11 +299,49 @@ func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {
 	if err := db.Ping(); err != nil {
 		log.Fatalf("gateway: ping postgres: %v", err)
 	}
-	store, err := pgstore.New(pgstore.Config{DB: db})
+	pgCfg := pgstore.Config{DB: db}
+	if p := cfg.Encryption.ManifestBodyKeyPath; p != "" {
+		key, rerr := os.ReadFile(p)
+		if rerr != nil {
+			log.Fatalf("gateway: read manifest body key %q: %v", p, rerr)
+		}
+		enc, eerr := pgstore.NewAEADBodyEncryptor(key)
+		if eerr != nil {
+			log.Fatalf("gateway: build manifest body encryptor: %v", eerr)
+		}
+		pgCfg.BodyEncryptor = enc
+		log.Printf("gateway: manifest body encryption enabled (key=%s)", p)
+	}
+	store, err := pgstore.New(pgCfg)
 	if err != nil {
 		log.Fatalf("gateway: build postgres manifest store: %v", err)
 	}
 	return store
+}
+
+// buildGatewayEncryption constructs the GatewayEncryption wiring
+// the S3 handler consumes for managed / public_distribution
+// tenant policies. Returns nil when no CMK is configured, which
+// forces such policies to fail closed at PUT time rather than
+// silently degrade to plaintext storage.
+func buildGatewayEncryption(cfg config.EncryptionConfig) *s3compat.GatewayEncryption {
+	if cfg.CMKPath == "" {
+		log.Printf("gateway: no encryption.cmk_path set; managed / public_distribution tenant policies will fail with EncryptionNotConfigured")
+		return nil
+	}
+	uri := cfg.CMKURI
+	if uri == "" {
+		uri = "cmk://local/" + cfg.CMKPath
+	}
+	log.Printf("gateway: encryption configured (cmk=%s uri=%s)", cfg.CMKPath, uri)
+	return &s3compat.GatewayEncryption{
+		Wrapper: client_sdk.LocalFileWrapper{Path: cfg.CMKPath},
+		CMK: encryption.CustomerMasterKeyRef{
+			URI:         uri,
+			Version:     1,
+			HolderClass: "gateway_hsm",
+		},
+	}
 }
 
 func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]providers.StorageProvider {

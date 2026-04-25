@@ -45,12 +45,18 @@ import (
 type Config struct {
 	DB    *sql.DB
 	Table string
+	// BodyEncryptor, when non-nil, seals the manifest JSON before
+	// INSERT and opens it after SELECT. The column in the schema
+	// must be BYTEA in that case (JSONB rejects opaque bytes).
+	// Leaving this nil preserves the Phase 2 JSONB layout.
+	BodyEncryptor BodyEncryptor
 }
 
 // Store is a manifest_store.ManifestStore backed by a Postgres table.
 type Store struct {
-	db    *sql.DB
-	table string
+	db        *sql.DB
+	table     string
+	encryptor BodyEncryptor
 }
 
 // New returns a Store. It does not open or verify the database
@@ -66,7 +72,7 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(table) {
 		return nil, fmt.Errorf("postgres: invalid table name %q", table)
 	}
-	return &Store{db: cfg.DB, table: table}, nil
+	return &Store{db: cfg.DB, table: table, encryptor: cfg.BodyEncryptor}, nil
 }
 
 // Put writes or replaces a manifest row. It uses an UPSERT so the
@@ -81,6 +87,13 @@ func (s *Store) Put(ctx context.Context, key manifest_store.ManifestKey, m *meta
 	body, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("postgres: marshal manifest: %w", err)
+	}
+	if s.encryptor != nil {
+		sealed, eerr := s.encryptor.Encrypt(body)
+		if eerr != nil {
+			return fmt.Errorf("postgres: encrypt manifest body: %w", eerr)
+		}
+		body = sealed
 	}
 	q := fmt.Sprintf(`
 		INSERT INTO %s (tenant_id, bucket, object_key_hash, version_id, body)
@@ -124,6 +137,13 @@ func (s *Store) Get(ctx context.Context, key manifest_store.ManifestKey) (*metad
 		return nil, manifest_store.ErrNotFound
 	case err != nil:
 		return nil, fmt.Errorf("postgres: get manifest: %w", err)
+	}
+	if s.encryptor != nil {
+		opened, derr := s.encryptor.Decrypt(body)
+		if derr != nil {
+			return nil, fmt.Errorf("postgres: decrypt manifest body: %w", derr)
+		}
+		body = opened
 	}
 	var m metadata.ObjectManifest
 	if err := json.Unmarshal(body, &m); err != nil {
@@ -202,6 +222,13 @@ func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit
 		)
 		if err := rows.Scan(&hash, &version, &body); err != nil {
 			return manifest_store.ListResult{}, fmt.Errorf("postgres: scan manifest: %w", err)
+		}
+		if s.encryptor != nil {
+			opened, derr := s.encryptor.Decrypt(body)
+			if derr != nil {
+				return manifest_store.ListResult{}, fmt.Errorf("postgres: decrypt manifest body: %w", derr)
+			}
+			body = opened
 		}
 		var m metadata.ObjectManifest
 		if err := json.Unmarshal(body, &m); err != nil {

@@ -23,6 +23,7 @@ import (
 	"sort"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/encryption"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -56,6 +57,20 @@ func (h *Handler) putErasureCoded(
 		writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
 		return
 	}
+	plaintextSize := int64(len(body))
+
+	// Encrypt BEFORE erasure-coding so every shard is ciphertext.
+	// A partial shard recovery therefore leaks nothing about the
+	// plaintext layout. For client_side mode the body is already
+	// ciphertext (the tenant encrypted before PUT); the gateway
+	// erasure-codes the opaque bytes verbatim.
+	encMode := policy.EncryptionMode
+	encCfg, prepared, prepareOK := h.prepareErasureCodedEncryption(w, r, encMode, body)
+	if !prepareOK {
+		return
+	}
+	body = prepared
+
 	shards, err := encoder.Encode(body)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "ErasureEncodeFailed", err.Error(), r.URL.Path)
@@ -100,8 +115,9 @@ func (h *Handler) putErasureCoded(
 		ObjectKey:       key,
 		ObjectKeyHash:   hashObjectKey(key),
 		VersionID:       versionID,
-		ObjectSize:      int64(len(body)),
+		ObjectSize:      plaintextSize,
 		ChunkSize:       int64(encoder.ShardSize()),
+		Encryption:      encCfg,
 		PlacementPolicy: policy,
 		Pieces:          pieces,
 		MigrationState: metadata.MigrationState{
@@ -242,10 +258,24 @@ func (h *Handler) getErasureCoded(
 		})
 	}
 
-	plaintext, err := encoder.Decode(shards)
+	decoded, err := encoder.Decode(shards)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "ErasureDecodeFailed", err.Error(), r.URL.Path)
 		return
+	}
+
+	// For managed / public_distribution objects the encoder's
+	// output is the ciphertext the gateway produced in
+	// prepareErasureCodedEncryption; we unseal it before handing
+	// it back. client_side objects stay opaque.
+	plaintext := decoded
+	if IsGatewayEncrypted(manifest.Encryption.Mode) {
+		decrypted, derr := h.decryptFromStorage(decoded, manifest.Encryption)
+		if derr != nil {
+			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+			return
+		}
+		plaintext = decrypted
 	}
 
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
@@ -381,6 +411,51 @@ func (h *Handler) getMultipart(
 	for _, b := range bodies {
 		total += int64(len(b))
 	}
+
+	// For managed / public_distribution multipart uploads each
+	// piece is an independently-sealed ciphertext stream under the
+	// session-level DEK. The SDK's framing treats any shorter-
+	// than-chunk-size frame as terminal, so we cannot just
+	// concatenate the ciphertexts and decrypt once — we decrypt
+	// each part in isolation and concatenate the resulting
+	// plaintexts. All parts of a single upload share one wrapped
+	// DEK, so we unwrap once up front and reuse the plaintext key
+	// across every part via decryptWithDEK; this mirrors the
+	// write path, where UploadPart calls encryptWithDEK with the
+	// session DEK generated at CreateMultipartUpload time.
+	// manifest.ObjectSize records the plaintext aggregate so the
+	// integrity check below still fires.
+	if IsGatewayEncrypted(manifest.Encryption.Mode) {
+		if h.cfg.Encryption == nil {
+			writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured",
+				"object is encrypted but no gateway encryption is configured", r.URL.Path)
+			return
+		}
+		dek, uerr := h.cfg.Encryption.Wrapper.UnwrapDEK(encryption.DataEncryptionKey{
+			KeyID:         manifest.Encryption.KeyID,
+			Algorithm:     manifest.Encryption.Algorithm,
+			WrappedKey:    manifest.Encryption.WrappedDEK,
+			WrapAlgorithm: manifest.Encryption.WrapAlgorithm,
+		}, h.cfg.Encryption.CMK)
+		if uerr != nil {
+			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", uerr.Error(), r.URL.Path)
+			return
+		}
+		plaintexts := make([][]byte, len(bodies))
+		var newTotal int64
+		for i, b := range bodies {
+			pt, derr := h.decryptWithDEK(b, dek)
+			if derr != nil {
+				writeError(w, http.StatusInternalServerError, "DecryptionFailed", derr.Error(), r.URL.Path)
+				return
+			}
+			plaintexts[i] = pt
+			newTotal += int64(len(pt))
+		}
+		bodies = plaintexts
+		total = newTotal
+	}
+
 	// Integrity guard: the aggregate of the piece bodies we just
 	// pulled from the backends must match the manifest's recorded
 	// object size. A mismatch points at either manifest corruption
