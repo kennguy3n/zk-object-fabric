@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 )
@@ -176,6 +177,13 @@ type Config struct {
 	Placements PlacementStore
 	Buckets    BucketStore
 	Cells      DedicatedCellStore
+
+	// CellProvisioner accepts dedicated-cell provisioning
+	// requests submitted via POST /api/tenants/{id}/dedicated-cells.
+	// When nil the endpoint returns 503 so the operator workflow
+	// is opt-in (Phase 3 wires this only when MetadataDSN is
+	// set).
+	CellProvisioner cellops.CellProvisioner
 
 	// BillingSink receives a billing event with the
 	// TenantCreated dimension after a successful signup so the
@@ -429,11 +437,14 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "unknown subresource dedicated-cells/"+sub)
 			return
 		}
-		if r.Method != http.MethodGet {
+		switch r.Method {
+		case http.MethodGet:
+			h.listDedicatedCells(w, r, tenantID)
+		case http.MethodPost:
+			h.provisionDedicatedCell(w, r, tenantID)
+		default:
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
 		}
-		h.listDedicatedCells(w, r, tenantID)
 	default:
 		writeError(w, http.StatusNotFound, "unknown subresource "+suffix)
 	}
@@ -649,6 +660,70 @@ func (h *Handler) deleteBucket(w http.ResponseWriter, r *http.Request, tenantID,
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ProvisionDedicatedCellRequest is the JSON body POST /dedicated-cells
+// accepts. The tenant_id field is ignored — the URL path tenant
+// always wins so a forged body cannot bind a cell to a different
+// tenant.
+type ProvisionDedicatedCellRequest struct {
+	Region            string  `json:"region"`
+	Country           string  `json:"country"`
+	CapacityPetabytes float64 `json:"capacity_petabytes"`
+	ErasureProfile    string  `json:"erasure_profile"`
+	NodeCount         int     `json:"node_count"`
+}
+
+// maxCellProvisionPayloadBytes caps the request body the dedicated-cell
+// provisioning endpoint will decode. The payload is a small operator
+// request (region, country, capacity, erasure profile, node count) so
+// the cap intentionally matches the bucket-creation cap rather than the
+// larger placement-policy cap.
+const maxCellProvisionPayloadBytes int64 = 8 * 1024
+
+// provisionDedicatedCell handles POST /api/tenants/{id}/dedicated-cells.
+// The endpoint authenticates via the existing AdminAuth gate (the
+// signup self-service surface lives under /api/v1/) and delegates
+// to the wired CellProvisioner. The response is the operator-facing
+// cellops.CellStatus so a tenant or operator can poll for the
+// transition from "provisioning" to "active".
+func (h *Handler) provisionDedicatedCell(w http.ResponseWriter, r *http.Request, tenantID string) {
+	if !h.ensureTenantExists(w, tenantID) {
+		return
+	}
+	if h.cfg.CellProvisioner == nil {
+		writeError(w, http.StatusServiceUnavailable, "cell provisioner not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxCellProvisionPayloadBytes)
+	var body ProvisionDedicatedCellRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("cell provision payload exceeds %d bytes", maxCellProvisionPayloadBytes))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		return
+	}
+	req := cellops.CellRequest{
+		TenantID:          tenantID,
+		Region:            strings.TrimSpace(body.Region),
+		Country:           strings.TrimSpace(body.Country),
+		CapacityPetabytes: body.CapacityPetabytes,
+		ErasureProfile:    strings.TrimSpace(body.ErasureProfile),
+		NodeCount:         body.NodeCount,
+	}
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status, err := h.cfg.CellProvisioner.ProvisionCell(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "provision cell: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, status)
 }
 
 // listDedicatedCells handles GET /api/tenants/{id}/dedicated-cells.

@@ -63,6 +63,48 @@ type Config struct {
 	Health       HealthConfig       `json:"health"`
 	Console      ConsoleConfig      `json:"console"`
 	Encryption   EncryptionConfig   `json:"encryption"`
+	Abuse        AbuseConfig        `json:"abuse"`
+}
+
+// AbuseConfig tunes the per-region runtime knobs of the abuse
+// guard and rate limiter (internal/auth/abuse.go,
+// internal/auth/rate_limit.go) and selects an optional production
+// alert webhook the gateway fans out anomaly / budget events to in
+// addition to the billing sink.
+//
+// Operators run multiple gateway fleets per region with different
+// traffic patterns, so the EWMA baseline, anomaly multiplier, and
+// cooldown window are surfaced in the config rather than the
+// per-tenant tenant.Abuse record. Leave fields zero to inherit the
+// in-package defaults (see NewAbuseGuard / NewRateLimiter).
+type AbuseConfig struct {
+	// AnomalyMultiplier is the ratio of current egress / request
+	// rate to baseline that fires an alert. Zero inherits the
+	// 2x-of-baseline default.
+	AnomalyMultiplier float64 `json:"anomaly_multiplier"`
+
+	// AnomalyWindow is the sliding window the rate is measured
+	// over. Zero inherits the in-package default (1 minute).
+	AnomalyWindow Duration `json:"anomaly_window"`
+
+	// AnomalyCooldown debounces repeated alerts and bounds the
+	// 429 throttle window when ThrottleOnAnomaly is true. Zero
+	// inherits AnomalyWindow.
+	AnomalyCooldown Duration `json:"anomaly_cooldown"`
+
+	// ThrottleOnAnomaly returns HTTP 429 for follow-up requests
+	// inside the cooldown window when an anomaly fires. Defaults
+	// to alert-only.
+	ThrottleOnAnomaly bool `json:"throttle_on_anomaly"`
+
+	// BaselineAlpha is the EWMA weight applied to each completed
+	// window. Must be in (0, 1]; zero inherits 0.3.
+	BaselineAlpha float64 `json:"baseline_alpha"`
+
+	// AlertWebhookURL, when set, receives a JSON-encoded
+	// billing.UsageEvent for every abuse alert in addition to
+	// the billing sink. PagerDuty / Slack / generic webhook.
+	AlertWebhookURL string `json:"alert_webhook_url"`
 }
 
 // EncryptionConfig configures the gateway's DEK-wrapping material
@@ -84,6 +126,26 @@ type EncryptionConfig struct {
 	CMKPath             string `json:"cmk_path"`
 	CMKURI              string `json:"cmk_uri"`
 	ManifestBodyKeyPath string `json:"manifest_body_key_path"`
+
+	// KMSRegion configures the AWS region the KMS client connects
+	// to when CMKURI selects an AWS KMS wrapper. When empty the
+	// client honours the AWS_REGION environment variable.
+	KMSRegion string `json:"kms_region"`
+
+	// VaultAddr is the Vault server URL used when CMKURI selects
+	// the Vault transit wrapper (e.g. "https://vault.internal:8200").
+	// When empty the wrapper falls back to the VAULT_ADDR
+	// environment variable.
+	VaultAddr string `json:"vault_addr"`
+
+	// VaultToken authenticates to Vault. When empty the wrapper
+	// falls back to the VAULT_TOKEN environment variable.
+	VaultToken string `json:"vault_token"`
+
+	// VaultTransitMount overrides the default Transit mount path
+	// ("transit"). Operators that mount Transit elsewhere supply
+	// the path here.
+	VaultTransitMount string `json:"vault_transit_mount"`
 }
 
 // ConsoleConfig configures the tenant-console HTTP surface (api/console).
@@ -175,6 +237,13 @@ type ControlPlaneConfig struct {
 
 // BillingConfig configures the metering sink. When ClickHouseURL is
 // empty the gateway falls back to the development LoggerSink.
+//
+// BillingConfig.Provider is the optional outbound integration to
+// an external invoicing / payment system (Stripe, Chargebee, …).
+// Phase 3 only registers the "noop" provider; future plug-ins
+// drop in behind the billing.BillingProvider interface without
+// any other code in the codebase needing to learn about a
+// specific vendor.
 type BillingConfig struct {
 	ClickHouseURL      string   `json:"clickhouse_url"`
 	ClickHouseDatabase string   `json:"clickhouse_database"`
@@ -183,6 +252,18 @@ type BillingConfig struct {
 	ClickHousePassword string   `json:"clickhouse_password"`
 	BatchSize          int      `json:"batch_size"`
 	FlushInterval      Duration `json:"flush_interval"`
+
+	// Provider selects the BillingProvider integration. Empty
+	// (or "noop") wires the no-op default that logs every call
+	// without making outbound requests. Future plug-ins (e.g.
+	// "stripe") register themselves under this key.
+	Provider string `json:"provider"`
+
+	// ProviderConfig is a free-form key/value map handed to the
+	// selected provider's factory. Vendor-specific keys live
+	// here so adding a new provider does not require widening
+	// BillingConfig with vendor-specific fields.
+	ProviderConfig map[string]string `json:"provider_config"`
 }
 
 // HealthConfig configures the gateway fleet node health monitor.

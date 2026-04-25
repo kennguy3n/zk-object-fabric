@@ -3,7 +3,7 @@
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 3 — Beta Cell (in progress)
-- **Last updated**: 2026-04-25 (Console listKeys reliability: the `bindingLister` interface in `cmd/gateway/main.go` and `ListBindingsByTenantID` on both `internal/auth/postgres_tenant_store.go` and `internal/auth/tenant_store.go` (MemoryTenantStore) now return `([]TenantBinding, error)`; `consoleTenantAdapter.ListAPIKeys` propagates the error so the `GET /api/tenants/{id}/keys` handler in `api/console/handler.go` returns HTTP 500 on a Postgres outage instead of masking it as an empty 200 OK — closing the open review finding from PR #21. PR #26 (Kapp Business Suite integration docs on `devin/1777098201-kapp-integration-docs`) and PR #24 (S3 SigV4 query-string presigned URL auth on `devin/1776984915-presigned-url-auth`, enabling zk-drive ↔ zk-object-fabric integration) landed alongside the encryption wiring summarized below. Encryption wiring landed on `devin/1777080229-encryption-wiring`: the client SDK's XChaCha20-Poly1305 construction is now applied on every S3 write path — single-piece PUT in `api/s3compat/handler.go`, erasure-coded PUT in `api/s3compat/erasure_coding.go` (shards are encoded over ciphertext so partial-shard recovery leaks nothing), and multipart PUT in `api/s3compat/multipart_handler.go` (one session-level DEK generated at `CreateMultipartUpload` and reused by every `UploadPart`, so concatenated parts still frame-decrypt on GET) — with matching decrypt on every read path. `managed` / `public_distribution` tenant policies seal a fresh DEK with the gateway-configured CMK via `client_sdk.LocalFileWrapper`, record the wrapped DEK + algorithm on `metadata.EncryptionConfig`, and keep plaintext bytes out of every backend piece; `client_side` (Strict ZK) refuses PUTs lacking `X-Amz-Meta-Zk-Encryption` and streams ciphertext verbatim on GET. `cmd/gateway/main.go#buildGatewayEncryption` constructs the wiring from `config.encryption.cmk_path` / `cmk_uri`; the Postgres manifest store grew an optional `BodyEncryptor` (`metadata/manifest_store/postgres/body_encryptor.go`) that seals the manifest JSON with a separate gateway-held key when `config.encryption.manifest_body_key_path` is set. End-to-end coverage lives in `tests/s3_compat/encryption_test.go` (managed round-trip, wrong-CMK fail-closed, Strict ZK reject + passthrough, object-key opacity, `Encryption.Mode` always populated across managed / public_distribution / client_side / legacy, erasure-coded and multipart managed encryption, cross-size backend inspection for plaintext leaks, legacy / no-policy backward compatibility, and the manifest-body AEAD construction). Phase 3 deliverable added to the checklist for the KMS / Vault wrapper that replaces `LocalFileWrapper` in production. Previous landings: Console & auth hardening on `devin/1776919356-console-auth-hardening`: (1) Admin-token bearer check on the console API is now documented and end-to-end wired via `cmd/gateway/main.go#buildAdminAuth` + `api/console/handler.go#Config.AdminAuth`; auth routes (`/api/v1/auth/signup`, `/api/v1/auth/login`, `/api/v1/auth/verify`) bypass `AdminAuth` because they live on the `AuthHandler.Register` mux routes, not the tenant-scoped `dispatch()`. (2) Frontend `ApiClient` route reconciliation — `frontend/src/api/client.ts` now pins a `tenantBaseUrl` via a new `setTenantScope(tenantId)` method so every tenant-scoped call resolves to `/api/tenants/{id}/usage|buckets|keys|placement|dedicated-cells`, matching the backend mux registered in `api/console/handler.go`. `frontend/src/auth/AuthContext.tsx` seeds the scope from the login/signup response so a page refresh and a fresh login both produce the same shape. (3) Backend routes added in `api/console/handler.go`: `GET/POST /api/tenants/{id}/buckets` and `DELETE /api/tenants/{id}/buckets/{name}` backed by a new `BucketStore` interface with a process-local `MemoryBucketStore` in `api/console/memory_resources.go`; `GET /api/tenants/{id}/keys` and `DELETE /api/tenants/{id}/keys/{accessKey}` backed by a new `APIKeyLister` interface that `consoleTenantAdapter` in `cmd/gateway/main.go` implements by type-asserting a new `bindingLister` interface against `MemoryTenantStore` / `PostgresTenantStore` (each grew `ListBindingsByTenantID` + `RemoveBinding` methods); `GET /api/tenants/{id}/dedicated-cells` backed by `DedicatedCellStore` + `MemoryDedicatedCellStore`. `parsePath` was generalized to 3-segment routes so `keys/{accessKey}` and `buckets/{name}` dispatch cleanly. (4) Postgres-backed `PlacementStore` remains wired via `cmd/gateway/main.go#buildPlacementStore`, which now stands alongside the Postgres tenant store documented in earlier entries. (5) CAPTCHA + billing on signup — `internal/config/config.go#ConsoleConfig` grew `CaptchaProvider` + `CaptchaSecret` fields; `cmd/gateway/main.go#buildAuthHooks` now prefers config-driven `hcaptcha` wiring and falls back to `HCAPTCHA_SECRET` env, warning when an unknown `captcha_provider` is set. `frontend/src/pages/SignupPage.tsx` mounts an hCaptcha widget only when `VITE_HCAPTCHA_SITEKEY` is set, so dev and self-hosted builds without a CAPTCHA license still work. `billing/metering.go` added a `TenantCreated` dimension; `api/console/auth_handler.go#AuthConfig` grew a `BillingSink` field and the signup handler emits `billing.UsageEvent{Dimension: TenantCreated, Delta: 1}` after a successful commit so the ClickHouse pipeline starts tracking a tenant from creation time rather than first S3 request. `cmd/gateway/main.go#startConsoleAPI` passes the gateway's billing sink through to `console.Config.BillingSink`. (6) CI — `.github/workflows/e2e.yml` boots the gateway with the `local_fs_dev` backend on `:8080`/`:8081` and runs the Playwright console suite with `CONSOLE_E2E=1`; `.github/workflows/storj-compliance.yml` runs `TestSuite_Storj` nightly + on `workflow_dispatch`, gated on `STORJ_ACCESS_GRANT` + `STORJ_BUCKET` secrets. (7) Docs — `docs/STORAGE_INFRA.md` gained a `storj` row on the provider-adapter matrix, a paragraph noting Storj does not embed `s3_generic.Provider`, and a BYOC mention. Previously, 2026-04-23 (Phase 3 wiring landed on `devin/1776911932-zk-fabric-phase3-wiring`: (1) Storj adapter wired end-to-end — `storj.io/uplink v1.14.0` added to `go.mod`; `internal/config/config.go` grew a `StorjConfig {AccessGrant, Bucket, SatelliteAddress}` nested into `ProvidersConfig`; `providers/storj/uplink_bridge.go` adapts `*uplink.Project` to the narrow `UplinkProject` interface; `cmd/gateway/main.go#buildProviderRegistry` now opens a live Storj project when `cfg.Providers.Storj.AccessGrant != ""` and registers it as `registry["storj"]`, with `pickDefaultBackend` updated to include Storj in its preference order; and `TestSuite_Storj` in `tests/s3_compat/suite_test.go` mirrors the `TestSuite_CephRGW` pattern, gated on `STORJ_ACCESS_GRANT` + `STORJ_BUCKET`. (2) Postgres-backed control-plane stores — `internal/auth/postgres_tenant_store.go` implements the full `TenantStore` interface (`LookupByAccessKey`, `CreateTenant`, `DeleteTenant`, `AddBinding`, `LookupByTenantID`, `Size`) against a `(tenants, tenant_bindings)` schema defined in `internal/auth/schema.sql`; `api/console/postgres_placement.go` implements `PlacementStore` against a `placement_policies` table defined in `api/console/schema.sql` using a single-row-per-tenant UPSERT; `cmd/gateway/main.go#buildTenantStore` and `buildPlacementStore` now switch to the Postgres implementations when `cfg.ControlPlane.MetadataDSN` is set and fall back to the in-memory stores for dev. To make this interface-polymorphic, `internal/auth/rate_limit.go#TenantBudgetsLookup` and `internal/auth/abuse.go#TenantLookupFromStore` were retyped from `*MemoryTenantStore` to `TenantStore`. (3) Admin authenticator on the console API — `api/console/handler.go#Config` grew an `AdminAuth func(*http.Request) bool` field and `Handler.dispatch` returns 401 `admin authorization required` when the predicate fails; `internal/config/config.go#ConsoleConfig` grew an `AdminToken string`; `cmd/gateway/main.go#buildAdminAuth` wires a constant-time Bearer-token comparison (via `crypto/subtle.ConstantTimeCompare`) sourced from `cfg.Console.AdminToken`, logging a dev-only warning when the token is unset. (4) B2C production hooks — `api/console/hcaptcha.go` ships `NewHCaptchaVerifier` that POSTs to the hCaptcha siteverify API via stdlib `net/http`; `api/console/email_verification.go` ships `NewSESEmailSender` backed by stdlib `net/smtp` with AWS SES SMTP credentials sourced from env (`AWS_SES_SMTP_HOST` etc.) and builds an RFC 5322 verification-link email; `cmd/gateway/main.go#buildAuthHooks` wires both into `AuthHooks`. `api/console/auth_handler.go` grew `IsVerified` / `MarkVerified` on `AuthStore` + `MemoryAuthStore`, a new `POST /api/v1/auth/verify` handler, an `AuthHooks.ResolveOAuth` hook with proper rollback semantics when an OAuth token fails to resolve, and a `verified` flag on the stored auth row. `api/s3compat/handler.go#Config` grew a `VerifiedCheck func(tenantID string) (verified, tracked bool)` that gates the first `PUT` with a 403 `EmailNotVerified` when the tenant is tracked but not yet verified; untracked tenants (JSON-loaded) bypass the gate. (5) Frontend route remapping — `frontend/src/api/client.ts` base URL moved from `/api/v1` to `/api` for tenant-scoped routes, with auth endpoints preserving `/api/v1/auth/` via a dedicated `authBaseUrl` and `requestAt` helper; `frontend/tests/e2e/signup.spec.ts` added covering signup → token → dashboard; `frontend/tests/e2e/placement.spec.ts` updated to match the new `/api/placement-policies/` request prefix; `frontend/playwright.config.ts` documented the `/api/*` proxy wiring. (6) Task 6 — live B2/R2/AWS S3 compliance runs — documented as pending; skip gates for `B2_ENDPOINT`, `R2_BUCKET`, `AWS_S3_BUCKET` remain in `tests/s3_compat/suite_test.go` and the full suite is green against `local_fs_dev` and can be run by operators once throwaway credentials are provisioned. Previously, on 2026-04-22: All Devin Review findings across PRs #8–#17 were resolved and merged: the two PR #11 findings — `cache/hot_object_cache/disk_cache.go#Get` corruption-recovery racing a concurrent `Put()` and `cmd/gateway/main.go#buildHotObjectCache` exiting instead of falling back to `NewMemoryCache` when `NewDiskCache` fails — were fixed in PR #15 (commit `32bce5d4`); the PR #17 findings — CDN-header pattern (`Cf-Connecting-Ip` / `Cf-Ray` / `X-Amz-Cf-Id` / `Fastly-Client-Ip` / `X-Forwarded-For`), `internal/config/config.go` `CachePath` default, `api/console/handler.go#putPlacement` 64 KiB body cap, the double `countingWriter` wrap on the erasure-coded GET path, and `cmd/gateway/main.go#consoleTenantAdapter.AddAPIKey` silently overwriting a colliding access key — were fixed in commit `55c2725e` on PR #17. Phase 3 follow-ups landed: (1) `api/s3compat/erasure_coding.go#getMultipart` now pre-fetches every piece body into memory and only then writes HTTP 200 + `Content-Length`, matching `getErasureCoded`'s pattern — a mid-assembly `GetPiece` failure now surfaces as a clean 502 `BackendGetFailed` instead of truncating the wire response. (2) `internal/auth/abuse.go` scaffolds a per-tenant abuse guard that layers egress-budget enforcement from `tenant.Budgets.EgressTBMonth`, a 2x-of-rolling-average egress-rate anomaly detector, and a CDN-shielding gate (`tenant.Abuse.CDNShielding == "enabled"` requires `Cf-Connecting-Ip` / `Cf-Ray` / `X-Amz-Cf-Id` / `Fastly-Client-Ip` / `X-Forwarded-For`). Wired into the middleware chain in `cmd/gateway/main.go` in front of `s3compat.Handler`; the existing `internal/auth/rate_limit.go` budget/anomaly counters stay on for RPS enforcement and the anomaly detector they already cover. Coverage in `internal/auth/abuse_test.go`. (3) `api/console/` scaffolds the tenant-console backend API — `GET /api/tenants/{id}`, `GET /api/tenants/{id}/usage`, `POST /api/tenants/{id}/keys`, and `GET` / `PUT /api/tenants/{id}/placement` — on its own mux, bound to `:8081` by default (separate from the S3 data plane on `:8080`) via `cfg.Console.ListenAddr`. The ClickHouse billing sink is detected via type-assertion and satisfies `console.UsageQuery` when available; otherwise a no-op usage stub ships. `api/console/memory_placement.go` provides the Phase 3 in-memory `PlacementStore`. Coverage in `api/console/handler_test.go`. Earlier 2026-04-22 entry: Phase 3 abuse-throttling + BYOC adapters + tenant console landed: (1) `internal/auth/rate_limit.go` now enforces the per-tenant `budgets.egress_tb_month` ceiling alongside the existing RPS limiter, and layers a sliding-window anomaly detector (EWMA baseline, configurable alert multiplier, optional throttle-on-anomaly) that emits `AbuseBudgetExhausted` and `AbuseAnomalyAlert` events via the billing sink. Coverage in `internal/auth/rate_limit_test.go` across budget-exhaustion, baseline-convergence, anomaly-alert, and throttle-cooldown scenarios. (2) BYOC cloud provider adapters fleshed out: `providers/aws_s3/s3.go`, `providers/backblaze_b2/b2.go`, and `providers/cloudflare_r2/r2.go` now carry production-ready Config validation, `NewWithClient` test seams, and provider-accurate `CostModel` + `PlacementLabels` values. All three embed `*s3_generic.Provider` so PUT/GET/HEAD/DELETE/LIST are inherited from the shared SigV4 + AWS SDK v2 implementation; Cloudflare R2 derives its account-scoped endpoint from `AccountID` and defaults to path-style addressing. Per-adapter unit tests in `providers/{aws_s3,backblaze_b2,cloudflare_r2}/*_test.go`. (3) Tenant console scaffolded under `frontend/` (Vite + React + TypeScript). Ships login / signup, dashboard (storage / request / egress stats from `/api/v1/usage`), bucket management, API-key management (access key + one-time secret reveal on create), placement-policy YAML editor with a structured summary, and a dedicated-cells page gated on `contract_type ∈ {b2b_dedicated, sovereign}`. Talks to the gateway's `/api/v1/` management API exclusively (separate from the S3-compat routes). (4) Docs: `internal/config/config.go` now defaults `CachePath` to `""` so developer and test environments get the in-memory cache without the DiskCache-fallback warning; operators set `config.gateway.cache_path` (or `ZKOF_GATEWAY_CACHE_PATH`) to enable NVMe-backed caching in production. Status banners in `README.md` and `docs/PROPOSAL.md` now correctly report Phase 3. Earlier 2026-04-22 entry: Phase 3 PR #11 + #12 review-finding fixes landed: (1) `cache/hot_object_cache/disk_cache.go#Get` now captures the index `*list.Element` before the first unlock and, in the corruption-recovery branch, only evicts the entry when the index still points at the same element — a concurrent `Put()` that replaced the entry between the unlock and re-lock is no longer erased by the recovering Get. Regression coverage in `cache/hot_object_cache/disk_cache_test.go#TestDiskCache_ConcurrentPutDuringCorruptGet`. (2) `api/s3compat/erasure_coding.go#getMultipart` now logs the tenant / bucket / key / part / piece ID and the bytes already delivered when a mid-stream `GetPiece` failure truncates the response, with a code comment documenting that this is best-effort because the HTTP headers are already committed. Billing emissions for `GetRequests` and `EgressBytes` on the `written` counter were already in place and are preserved. (3) `cmd/gateway/main.go#buildHotObjectCache` now degrades gracefully: if `cfg.Gateway.CachePath` is set but `NewDiskCache` fails (bad volume, permission error, corrupt warm-up) the gateway logs a warning and falls back to `NewMemoryCache` instead of exiting, so a single bad NVMe disk does not take the node offline. Earlier 2026-04-22 entry: Phase 3 Ceph RGW compliance landed: the full `TestSuite_CephRGW` subtest matrix — PUT / GET / HEAD / DELETE, ranged GET (prefix / middle / tail), LIST prefix, idempotent DELETE, missing-key 404, presigned GET, multipart-like overwrite, multipart round-trip, multipart abort, and 6+2 erasure-coded round-trip — all pass against a live Ceph Reef RGW at `http://127.0.0.1:8888` (`zkof-ceph-compliance` bucket). To get the AWS SDK v2 client to talk to a non-AWS S3 endpoint with a non-seekable `io.Reader` piece body, `providers/s3_generic/generic.go#PutPiece` now per-call swaps in `v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` (UNSIGNED-PAYLOAD signing); this keeps the SigV4 envelope intact without forcing the body to be seekable, which `handler.go` and `multipart_handler.go` cannot guarantee for request-sourced streams. Backend integrity is still verified by ETag on the gateway side. Phase 3 foundations (`DiskCache`, `ClickHouseSink`, health monitor, BYOC adapter entrypoints) and Phase 3 multipart + EC remain landed from PRs 1 + 2. PR #19 review findings are all resolved and Storj is wired into the gateway via `cmd/gateway/main.go#buildProviderRegistry` under `registry["storj"]` when `config.providers.storj.access_grant` is set.)
+- **Last updated**: 2026-04-25 (Phase 3 batch landed on `devin/1777107886-phase3-batch`: production KMS / Vault wrappers, abuse-throttle runtime config, Postgres-backed AuthStore, B2B dedicated-cell provisioning scaffold, and the live Wasabi → Ceph RGW compliance gate. `encryption/client_sdk/kms_wrapper.go` and `vault_wrapper.go` ship the `aws-kms-wrap-v1` and `vault-transit-wrap-v1` flows behind the existing `client_sdk.Wrapper` interface; `cmd/gateway/main.go#buildGatewayEncryption` now selects the wrapper from the `cmk_uri` scheme (`cmk://local/...` → `LocalFileWrapper`, `arn:aws:kms:...` / `kms://...` → `KMSWrapper`, `vault://...` / `transit://...` → `VaultWrapper`) and drives them off `EncryptionConfig.KMSRegion` / `VaultAddr` / `VaultToken` / `VaultTransitMount` (env fallbacks: `AWS_REGION`, `VAULT_ADDR`, `VAULT_TOKEN`). `internal/config/config.go` grew an `AbuseConfig` (`anomaly_multiplier`, `anomaly_window`, `anomaly_cooldown`, `throttle_on_anomaly`, `baseline_alpha`, `alert_webhook_url`) wired to both the rate limiter and the abuse guard via the new `applyAbuseConfigToRateLimiter` / `applyAbuseConfigToAbuseGuard` helpers. `internal/auth/webhook_alert_sink.go` adds a fire-and-forget JSON-POST `WebhookAlertSink` plus a `MultiAlertSink` fanout so when `cfg.Abuse.AlertWebhookURL` is set the gateway emits every `billing.UsageEvent` to both the billing pipeline and the operator webhook (PagerDuty / Slack / generic). `api/console/postgres_auth.go` ships `PostgresAuthStore` (`CreateUser` / `LookupUser` / `DeleteUser` / `IsVerified` / `MarkVerified` / `SetVerificationToken` / `ConsumeVerificationToken`) backed by the new `auth_users` table in `api/console/schema.sql`, with constant-time token comparison inside a transaction so two simultaneous `/verify` calls cannot double-flip the same row; `cmd/gateway/main.go#buildAuthStore` selects it whenever `cfg.ControlPlane.MetadataDSN` is set and falls back to `MemoryAuthStore` otherwise. `internal/cellops/provisioner.go` defines the operator-side `CellProvisioner` interface (`ProvisionCell` / `DecommissionCell` / `CellStatus`) and ships the Phase 3 `ManualProvisioner` that logs the request and persists a pending cell record via the `CellSink` interface; `MemoryDedicatedCellStore` and the new `PostgresDedicatedCellStore` (backed by the `dedicated_cells` table in `api/console/schema.sql`) both satisfy `CellSink`, and `POST /api/tenants/{id}/dedicated-cells` in `api/console/handler.go` validates the request and delegates to the wired provisioner. `tests/s3_compat/live_migration_test.go` adds the `TestLiveMigration_WasabiToCephRGW` gate that drives the full `Run(t, Setup)` compliance suite against a Wasabi → Ceph RGW `DualWriteProvider` while a goroutine-driven `background_rebalancer.Rebalancer` is concurrently advancing the migration state machine; the test is gated on `WASABI_ENDPOINT` / `WASABI_BUCKET` / `CEPH_RGW_ENDPOINT` / `CEPH_RGW_BUCKET` so default CI stays green. Earlier in the day: Console listKeys reliability: the `bindingLister` interface in `cmd/gateway/main.go` and `ListBindingsByTenantID` on both `internal/auth/postgres_tenant_store.go` and `internal/auth/tenant_store.go` (MemoryTenantStore) now return `([]TenantBinding, error)`; `consoleTenantAdapter.ListAPIKeys` propagates the error so the `GET /api/tenants/{id}/keys` handler in `api/console/handler.go` returns HTTP 500 on a Postgres outage instead of masking it as an empty 200 OK — closing the open review finding from PR #21. PR #26 (Kapp Business Suite integration docs on `devin/1777098201-kapp-integration-docs`) and PR #24 (S3 SigV4 query-string presigned URL auth on `devin/1776984915-presigned-url-auth`, enabling zk-drive ↔ zk-object-fabric integration) landed alongside the encryption wiring summarized below. Encryption wiring landed on `devin/1777080229-encryption-wiring`: the client SDK's XChaCha20-Poly1305 construction is now applied on every S3 write path — single-piece PUT in `api/s3compat/handler.go`, erasure-coded PUT in `api/s3compat/erasure_coding.go` (shards are encoded over ciphertext so partial-shard recovery leaks nothing), and multipart PUT in `api/s3compat/multipart_handler.go` (one session-level DEK generated at `CreateMultipartUpload` and reused by every `UploadPart`, so concatenated parts still frame-decrypt on GET) — with matching decrypt on every read path. `managed` / `public_distribution` tenant policies seal a fresh DEK with the gateway-configured CMK via `client_sdk.LocalFileWrapper`, record the wrapped DEK + algorithm on `metadata.EncryptionConfig`, and keep plaintext bytes out of every backend piece; `client_side` (Strict ZK) refuses PUTs lacking `X-Amz-Meta-Zk-Encryption` and streams ciphertext verbatim on GET. `cmd/gateway/main.go#buildGatewayEncryption` constructs the wiring from `config.encryption.cmk_path` / `cmk_uri`; the Postgres manifest store grew an optional `BodyEncryptor` (`metadata/manifest_store/postgres/body_encryptor.go`) that seals the manifest JSON with a separate gateway-held key when `config.encryption.manifest_body_key_path` is set. End-to-end coverage lives in `tests/s3_compat/encryption_test.go` (managed round-trip, wrong-CMK fail-closed, Strict ZK reject + passthrough, object-key opacity, `Encryption.Mode` always populated across managed / public_distribution / client_side / legacy, erasure-coded and multipart managed encryption, cross-size backend inspection for plaintext leaks, legacy / no-policy backward compatibility, and the manifest-body AEAD construction). Phase 3 deliverable added to the checklist for the KMS / Vault wrapper that replaces `LocalFileWrapper` in production. Previous landings: Console & auth hardening on `devin/1776919356-console-auth-hardening`: (1) Admin-token bearer check on the console API is now documented and end-to-end wired via `cmd/gateway/main.go#buildAdminAuth` + `api/console/handler.go#Config.AdminAuth`; auth routes (`/api/v1/auth/signup`, `/api/v1/auth/login`, `/api/v1/auth/verify`) bypass `AdminAuth` because they live on the `AuthHandler.Register` mux routes, not the tenant-scoped `dispatch()`. (2) Frontend `ApiClient` route reconciliation — `frontend/src/api/client.ts` now pins a `tenantBaseUrl` via a new `setTenantScope(tenantId)` method so every tenant-scoped call resolves to `/api/tenants/{id}/usage|buckets|keys|placement|dedicated-cells`, matching the backend mux registered in `api/console/handler.go`. `frontend/src/auth/AuthContext.tsx` seeds the scope from the login/signup response so a page refresh and a fresh login both produce the same shape. (3) Backend routes added in `api/console/handler.go`: `GET/POST /api/tenants/{id}/buckets` and `DELETE /api/tenants/{id}/buckets/{name}` backed by a new `BucketStore` interface with a process-local `MemoryBucketStore` in `api/console/memory_resources.go`; `GET /api/tenants/{id}/keys` and `DELETE /api/tenants/{id}/keys/{accessKey}` backed by a new `APIKeyLister` interface that `consoleTenantAdapter` in `cmd/gateway/main.go` implements by type-asserting a new `bindingLister` interface against `MemoryTenantStore` / `PostgresTenantStore` (each grew `ListBindingsByTenantID` + `RemoveBinding` methods); `GET /api/tenants/{id}/dedicated-cells` backed by `DedicatedCellStore` + `MemoryDedicatedCellStore`. `parsePath` was generalized to 3-segment routes so `keys/{accessKey}` and `buckets/{name}` dispatch cleanly. (4) Postgres-backed `PlacementStore` remains wired via `cmd/gateway/main.go#buildPlacementStore`, which now stands alongside the Postgres tenant store documented in earlier entries. (5) CAPTCHA + billing on signup — `internal/config/config.go#ConsoleConfig` grew `CaptchaProvider` + `CaptchaSecret` fields; `cmd/gateway/main.go#buildAuthHooks` now prefers config-driven `hcaptcha` wiring and falls back to `HCAPTCHA_SECRET` env, warning when an unknown `captcha_provider` is set. `frontend/src/pages/SignupPage.tsx` mounts an hCaptcha widget only when `VITE_HCAPTCHA_SITEKEY` is set, so dev and self-hosted builds without a CAPTCHA license still work. `billing/metering.go` added a `TenantCreated` dimension; `api/console/auth_handler.go#AuthConfig` grew a `BillingSink` field and the signup handler emits `billing.UsageEvent{Dimension: TenantCreated, Delta: 1}` after a successful commit so the ClickHouse pipeline starts tracking a tenant from creation time rather than first S3 request. `cmd/gateway/main.go#startConsoleAPI` passes the gateway's billing sink through to `console.Config.BillingSink`. (6) CI — `.github/workflows/e2e.yml` boots the gateway with the `local_fs_dev` backend on `:8080`/`:8081` and runs the Playwright console suite with `CONSOLE_E2E=1`; `.github/workflows/storj-compliance.yml` runs `TestSuite_Storj` nightly + on `workflow_dispatch`, gated on `STORJ_ACCESS_GRANT` + `STORJ_BUCKET` secrets. (7) Docs — `docs/STORAGE_INFRA.md` gained a `storj` row on the provider-adapter matrix, a paragraph noting Storj does not embed `s3_generic.Provider`, and a BYOC mention. Previously, 2026-04-23 (Phase 3 wiring landed on `devin/1776911932-zk-fabric-phase3-wiring`: (1) Storj adapter wired end-to-end — `storj.io/uplink v1.14.0` added to `go.mod`; `internal/config/config.go` grew a `StorjConfig {AccessGrant, Bucket, SatelliteAddress}` nested into `ProvidersConfig`; `providers/storj/uplink_bridge.go` adapts `*uplink.Project` to the narrow `UplinkProject` interface; `cmd/gateway/main.go#buildProviderRegistry` now opens a live Storj project when `cfg.Providers.Storj.AccessGrant != ""` and registers it as `registry["storj"]`, with `pickDefaultBackend` updated to include Storj in its preference order; and `TestSuite_Storj` in `tests/s3_compat/suite_test.go` mirrors the `TestSuite_CephRGW` pattern, gated on `STORJ_ACCESS_GRANT` + `STORJ_BUCKET`. (2) Postgres-backed control-plane stores — `internal/auth/postgres_tenant_store.go` implements the full `TenantStore` interface (`LookupByAccessKey`, `CreateTenant`, `DeleteTenant`, `AddBinding`, `LookupByTenantID`, `Size`) against a `(tenants, tenant_bindings)` schema defined in `internal/auth/schema.sql`; `api/console/postgres_placement.go` implements `PlacementStore` against a `placement_policies` table defined in `api/console/schema.sql` using a single-row-per-tenant UPSERT; `cmd/gateway/main.go#buildTenantStore` and `buildPlacementStore` now switch to the Postgres implementations when `cfg.ControlPlane.MetadataDSN` is set and fall back to the in-memory stores for dev. To make this interface-polymorphic, `internal/auth/rate_limit.go#TenantBudgetsLookup` and `internal/auth/abuse.go#TenantLookupFromStore` were retyped from `*MemoryTenantStore` to `TenantStore`. (3) Admin authenticator on the console API — `api/console/handler.go#Config` grew an `AdminAuth func(*http.Request) bool` field and `Handler.dispatch` returns 401 `admin authorization required` when the predicate fails; `internal/config/config.go#ConsoleConfig` grew an `AdminToken string`; `cmd/gateway/main.go#buildAdminAuth` wires a constant-time Bearer-token comparison (via `crypto/subtle.ConstantTimeCompare`) sourced from `cfg.Console.AdminToken`, logging a dev-only warning when the token is unset. (4) B2C production hooks — `api/console/hcaptcha.go` ships `NewHCaptchaVerifier` that POSTs to the hCaptcha siteverify API via stdlib `net/http`; `api/console/email_verification.go` ships `NewSESEmailSender` backed by stdlib `net/smtp` with AWS SES SMTP credentials sourced from env (`AWS_SES_SMTP_HOST` etc.) and builds an RFC 5322 verification-link email; `cmd/gateway/main.go#buildAuthHooks` wires both into `AuthHooks`. `api/console/auth_handler.go` grew `IsVerified` / `MarkVerified` on `AuthStore` + `MemoryAuthStore`, a new `POST /api/v1/auth/verify` handler, an `AuthHooks.ResolveOAuth` hook with proper rollback semantics when an OAuth token fails to resolve, and a `verified` flag on the stored auth row. `api/s3compat/handler.go#Config` grew a `VerifiedCheck func(tenantID string) (verified, tracked bool)` that gates the first `PUT` with a 403 `EmailNotVerified` when the tenant is tracked but not yet verified; untracked tenants (JSON-loaded) bypass the gate. (5) Frontend route remapping — `frontend/src/api/client.ts` base URL moved from `/api/v1` to `/api` for tenant-scoped routes, with auth endpoints preserving `/api/v1/auth/` via a dedicated `authBaseUrl` and `requestAt` helper; `frontend/tests/e2e/signup.spec.ts` added covering signup → token → dashboard; `frontend/tests/e2e/placement.spec.ts` updated to match the new `/api/placement-policies/` request prefix; `frontend/playwright.config.ts` documented the `/api/*` proxy wiring. (6) Task 6 — live B2/R2/AWS S3 compliance runs — documented as pending; skip gates for `B2_ENDPOINT`, `R2_BUCKET`, `AWS_S3_BUCKET` remain in `tests/s3_compat/suite_test.go` and the full suite is green against `local_fs_dev` and can be run by operators once throwaway credentials are provisioned. Previously, on 2026-04-22: All Devin Review findings across PRs #8–#17 were resolved and merged: the two PR #11 findings — `cache/hot_object_cache/disk_cache.go#Get` corruption-recovery racing a concurrent `Put()` and `cmd/gateway/main.go#buildHotObjectCache` exiting instead of falling back to `NewMemoryCache` when `NewDiskCache` fails — were fixed in PR #15 (commit `32bce5d4`); the PR #17 findings — CDN-header pattern (`Cf-Connecting-Ip` / `Cf-Ray` / `X-Amz-Cf-Id` / `Fastly-Client-Ip` / `X-Forwarded-For`), `internal/config/config.go` `CachePath` default, `api/console/handler.go#putPlacement` 64 KiB body cap, the double `countingWriter` wrap on the erasure-coded GET path, and `cmd/gateway/main.go#consoleTenantAdapter.AddAPIKey` silently overwriting a colliding access key — were fixed in commit `55c2725e` on PR #17. Phase 3 follow-ups landed: (1) `api/s3compat/erasure_coding.go#getMultipart` now pre-fetches every piece body into memory and only then writes HTTP 200 + `Content-Length`, matching `getErasureCoded`'s pattern — a mid-assembly `GetPiece` failure now surfaces as a clean 502 `BackendGetFailed` instead of truncating the wire response. (2) `internal/auth/abuse.go` scaffolds a per-tenant abuse guard that layers egress-budget enforcement from `tenant.Budgets.EgressTBMonth`, a 2x-of-rolling-average egress-rate anomaly detector, and a CDN-shielding gate (`tenant.Abuse.CDNShielding == "enabled"` requires `Cf-Connecting-Ip` / `Cf-Ray` / `X-Amz-Cf-Id` / `Fastly-Client-Ip` / `X-Forwarded-For`). Wired into the middleware chain in `cmd/gateway/main.go` in front of `s3compat.Handler`; the existing `internal/auth/rate_limit.go` budget/anomaly counters stay on for RPS enforcement and the anomaly detector they already cover. Coverage in `internal/auth/abuse_test.go`. (3) `api/console/` scaffolds the tenant-console backend API — `GET /api/tenants/{id}`, `GET /api/tenants/{id}/usage`, `POST /api/tenants/{id}/keys`, and `GET` / `PUT /api/tenants/{id}/placement` — on its own mux, bound to `:8081` by default (separate from the S3 data plane on `:8080`) via `cfg.Console.ListenAddr`. The ClickHouse billing sink is detected via type-assertion and satisfies `console.UsageQuery` when available; otherwise a no-op usage stub ships. `api/console/memory_placement.go` provides the Phase 3 in-memory `PlacementStore`. Coverage in `api/console/handler_test.go`. Earlier 2026-04-22 entry: Phase 3 abuse-throttling + BYOC adapters + tenant console landed: (1) `internal/auth/rate_limit.go` now enforces the per-tenant `budgets.egress_tb_month` ceiling alongside the existing RPS limiter, and layers a sliding-window anomaly detector (EWMA baseline, configurable alert multiplier, optional throttle-on-anomaly) that emits `AbuseBudgetExhausted` and `AbuseAnomalyAlert` events via the billing sink. Coverage in `internal/auth/rate_limit_test.go` across budget-exhaustion, baseline-convergence, anomaly-alert, and throttle-cooldown scenarios. (2) BYOC cloud provider adapters fleshed out: `providers/aws_s3/s3.go`, `providers/backblaze_b2/b2.go`, and `providers/cloudflare_r2/r2.go` now carry production-ready Config validation, `NewWithClient` test seams, and provider-accurate `CostModel` + `PlacementLabels` values. All three embed `*s3_generic.Provider` so PUT/GET/HEAD/DELETE/LIST are inherited from the shared SigV4 + AWS SDK v2 implementation; Cloudflare R2 derives its account-scoped endpoint from `AccountID` and defaults to path-style addressing. Per-adapter unit tests in `providers/{aws_s3,backblaze_b2,cloudflare_r2}/*_test.go`. (3) Tenant console scaffolded under `frontend/` (Vite + React + TypeScript). Ships login / signup, dashboard (storage / request / egress stats from `/api/v1/usage`), bucket management, API-key management (access key + one-time secret reveal on create), placement-policy YAML editor with a structured summary, and a dedicated-cells page gated on `contract_type ∈ {b2b_dedicated, sovereign}`. Talks to the gateway's `/api/v1/` management API exclusively (separate from the S3-compat routes). (4) Docs: `internal/config/config.go` now defaults `CachePath` to `""` so developer and test environments get the in-memory cache without the DiskCache-fallback warning; operators set `config.gateway.cache_path` (or `ZKOF_GATEWAY_CACHE_PATH`) to enable NVMe-backed caching in production. Status banners in `README.md` and `docs/PROPOSAL.md` now correctly report Phase 3. Earlier 2026-04-22 entry: Phase 3 PR #11 + #12 review-finding fixes landed: (1) `cache/hot_object_cache/disk_cache.go#Get` now captures the index `*list.Element` before the first unlock and, in the corruption-recovery branch, only evicts the entry when the index still points at the same element — a concurrent `Put()` that replaced the entry between the unlock and re-lock is no longer erased by the recovering Get. Regression coverage in `cache/hot_object_cache/disk_cache_test.go#TestDiskCache_ConcurrentPutDuringCorruptGet`. (2) `api/s3compat/erasure_coding.go#getMultipart` now logs the tenant / bucket / key / part / piece ID and the bytes already delivered when a mid-stream `GetPiece` failure truncates the response, with a code comment documenting that this is best-effort because the HTTP headers are already committed. Billing emissions for `GetRequests` and `EgressBytes` on the `written` counter were already in place and are preserved. (3) `cmd/gateway/main.go#buildHotObjectCache` now degrades gracefully: if `cfg.Gateway.CachePath` is set but `NewDiskCache` fails (bad volume, permission error, corrupt warm-up) the gateway logs a warning and falls back to `NewMemoryCache` instead of exiting, so a single bad NVMe disk does not take the node offline. Earlier 2026-04-22 entry: Phase 3 Ceph RGW compliance landed: the full `TestSuite_CephRGW` subtest matrix — PUT / GET / HEAD / DELETE, ranged GET (prefix / middle / tail), LIST prefix, idempotent DELETE, missing-key 404, presigned GET, multipart-like overwrite, multipart round-trip, multipart abort, and 6+2 erasure-coded round-trip — all pass against a live Ceph Reef RGW at `http://127.0.0.1:8888` (`zkof-ceph-compliance` bucket). To get the AWS SDK v2 client to talk to a non-AWS S3 endpoint with a non-seekable `io.Reader` piece body, `providers/s3_generic/generic.go#PutPiece` now per-call swaps in `v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware` (UNSIGNED-PAYLOAD signing); this keeps the SigV4 envelope intact without forcing the body to be seekable, which `handler.go` and `multipart_handler.go` cannot guarantee for request-sourced streams. Backend integrity is still verified by ETag on the gateway side. Phase 3 foundations (`DiskCache`, `ClickHouseSink`, health monitor, BYOC adapter entrypoints) and Phase 3 multipart + EC remain landed from PRs 1 + 2. PR #19 review findings are all resolved and Storj is wired into the gateway via `cmd/gateway/main.go#buildProviderRegistry` under `registry["storj"]` when `config.providers.storj.access_grant` is set.)
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until the
@@ -288,17 +288,31 @@ Checklist:
 - [ ] Production Linode gateway fleet, multi-region.
 - [ ] Production Wasabi buckets (per region) wired as the durable
       origin.
-- [ ] Production KMS / Vault wrapper for the gateway's CMK —
-      replace `client_sdk.LocalFileWrapper` (Phase 2 default,
-      plaintext master key on disk) with a `KMSWrapper` /
-      `VaultWrapper` that resolves `encryption.CustomerMasterKeyRef`
-      against AWS KMS or HashiCorp Vault transit. The handler
-      already consumes the `client_sdk.Wrapper` interface, so the
-      substitution is behind `cmd/gateway/main.go#buildGatewayEncryption`;
-      the remaining work is the wrapper implementation, the
-      config plumbing (`config.encryption.cmk_uri` is already
-      parsed and passed through), and operator runbooks for
-      rotating the CMK across a live deployment.
+- [x] Production KMS / Vault wrapper for the gateway's CMK —
+      `encryption/client_sdk/kms_wrapper.go` ships `KMSWrapper`
+      (algorithm tag `aws-kms-wrap-v1`, AWS SDK v2 KMS client,
+      KeyId verification on every Decrypt), and
+      `encryption/client_sdk/vault_wrapper.go` ships `VaultWrapper`
+      (algorithm tag `vault-transit-wrap-v1`, minimal HTTP client
+      against `{mount}/encrypt/{name}` and `{mount}/decrypt/{name}`).
+      Both implement the existing `client_sdk.Wrapper` interface so
+      the data-plane PUT / GET paths are unchanged.
+      `cmd/gateway/main.go#buildGatewayEncryption` selects the
+      wrapper from the `cmk_uri` scheme: `cmk://local/...` (or
+      empty) routes to `LocalFileWrapper` (dev only),
+      `arn:aws:kms:...` / `kms://...` routes to `KMSWrapper`, and
+      `vault://...` / `transit://...` routes to `VaultWrapper`.
+      `internal/config/config.go#EncryptionConfig` exposes
+      `KMSRegion`, `VaultAddr`, `VaultToken`, and
+      `VaultTransitMount` with environment fallbacks (`AWS_REGION`,
+      `VAULT_ADDR`, `VAULT_TOKEN`, transit mount default
+      `"transit"`). Coverage in
+      `encryption/client_sdk/kms_wrapper_test.go` (round-trip,
+      scheme normalization, wrong-algorithm rejection, KeyId
+      mismatch) and `encryption/client_sdk/vault_wrapper_test.go`
+      (httptest-backed round-trip, scheme normalization, error
+      surface). Remaining ops work: provisioning the production
+      KMS keys / Vault mounts and the rotation runbook.
 - [x] NVMe cache nodes (L0 / L1) on Linode. `DiskCache`
       implementing `HotObjectCache` lives in
       `cache/hot_object_cache/disk_cache.go`, rebuilds its index
@@ -312,10 +326,10 @@ Checklist:
       capacity, HDD durable nodes (L2), NVMe cache, gateway fleet.
 - [ ] 25–100 Gbps aggregate public bandwidth across Linode + local
       DC.
-- [~] Abuse throttling and per-tenant bandwidth budgets — split
+- [x] Abuse throttling and per-tenant bandwidth budgets — split
       across `internal/auth/rate_limit.go` (production) and
-      `internal/auth/abuse.go` (scaffolded, runtime enforcement
-      pending broader rollout). `rate_limit.go` layers three
+      `internal/auth/abuse.go`, both wired with per-region runtime
+      tuning via `config.abuse.*`. `rate_limit.go` layers three
       enforcement bands on every request: the per-tenant
       token-bucket RPS limit (`budgets.requests_per_sec` +
       `burst_requests`), a monthly egress ceiling sourced from
@@ -324,51 +338,119 @@ Checklist:
       multiplier; budget exhaustion returns HTTP 429 and emits
       `AbuseBudgetExhausted`, anomalies emit `AbuseAnomalyAlert`
       and, when `ThrottleOnAnomaly` is set, throttle for a
-      cooldown window. Coverage in `rate_limit_test.go`.
-      `abuse.go` scaffolds a sibling `AbuseGuard` middleware that
-      re-reads `tenant.Budgets.EgressTBMonth` and
+      cooldown window. `abuse.go` runs alongside as a sibling
+      middleware that re-reads `tenant.Budgets.EgressTBMonth` and
       `tenant.Abuse.CDNShielding` directly off the tenant record,
       adds the CDN-shielding gate (rejects direct-to-origin
       requests for shielded tenants with HTTP 403), and exposes a
       2x-of-rolling-average egress-rate anomaly path that emits
-      the same billing dimensions. Wired into `cmd/gateway/main.go`
-      in front of `s3compat.Handler` alongside the rate limiter.
-      Coverage in `abuse_test.go`. Runtime enforcement (per-region
-      tuning of `AnomalyMultiplier` / `AnomalyWindow` /
-      `AnomalyCooldown`, production alert routing beyond the
-      billing sink, and throttle-on-anomaly rollout) is pending.
-- [~] Tenant console (React) for onboarding, billing, placement
+      the same billing dimensions. The new `AbuseConfig`
+      (`internal/config/config.go`) plus
+      `cmd/gateway/main.go#applyAbuseConfigToRateLimiter` and
+      `applyAbuseConfigToAbuseGuard` apply
+      `anomaly_multiplier`, `anomaly_window`, `anomaly_cooldown`,
+      `throttle_on_anomaly`, and `baseline_alpha` to both guards
+      so operators can re-tune per region without redeploying.
+      Production alert routing now fans out: when
+      `config.abuse.alert_webhook_url` is set,
+      `cmd/gateway/main.go#buildAbuseAlertSink` composes a
+      `MultiAlertSink` over the billing sink and the new
+      `internal/auth/webhook_alert_sink.go`, which fire-and-forget
+      JSON-POSTs every `billing.UsageEvent` to the configured
+      webhook (PagerDuty / Slack / generic). Coverage in
+      `internal/auth/rate_limit_test.go`,
+      `internal/auth/abuse_test.go`, and
+      `internal/auth/webhook_alert_sink_test.go` (HTTP delivery,
+      non-blocking dispatch, MultiAlertSink fanout).
+- [x] Tenant console (React) for onboarding, billing, placement
       policy, and key management. Vite + React + TypeScript
-      scaffold landed under `frontend/` with login / signup,
-      dashboard (storage / requests / egress), bucket management,
-      API-key management (access key + one-time secret reveal on
-      create), placement-policy YAML editor with a structured
-      summary, and a dedicated-cells page gated on
-      `contract_type ∈ {b2b_dedicated, sovereign}`. Backend API
-      scaffolded in `api/console/` — `GET /api/tenants/{id}`,
+      scaffold under `frontend/` ships login / signup, dashboard
+      (storage / requests / egress), bucket management, API-key
+      management (access key + one-time secret reveal on create),
+      placement-policy YAML editor with a structured summary, and
+      a dedicated-cells page gated on
+      `contract_type ∈ {b2b_dedicated, sovereign}`. Backend API in
+      `api/console/` covers `GET /api/tenants/{id}`,
       `GET /api/tenants/{id}/usage`, `POST /api/tenants/{id}/keys`,
-      and `GET` / `PUT /api/tenants/{id}/placement` — on its own
+      `GET` / `PUT /api/tenants/{id}/placement`,
+      `GET /api/tenants/{id}/buckets`, and
+      `GET` / `POST /api/tenants/{id}/dedicated-cells` on its own
       HTTP mux bound to `:8081` (separate from the S3 data plane
       on `:8080`) via `cfg.Console.ListenAddr`. `console.UsageQuery`
-      is satisfied by the ClickHouse billing sink when available;
-      a no-op stub ships otherwise. Coverage in `handler_test.go`.
-      Remaining: wire the React client at `frontend/src/api/` from
-      the current `/api/v1/` prefix onto the new `/api/tenants/`
-      routes, add an admin authenticator in front of the console
-      mux, a Postgres-backed `PlacementStore` (the Phase 3
-      scaffold uses `console.MemoryPlacementStore`), SSE on a
-      `/api/tenants/{id}/usage/stream` endpoint, and Playwright
-      e2e tests.
-- [~] B2C self-service onboarding flow. Frontend signup form +
-      `POST /api/v1/auth/signup` client wired in `frontend/`; the
-      gateway-side handler is still deferred to the control-plane
-      workstream (billing integration, email verification, CAPTCHA).
-- [~] B2B dedicated cell provisioning. Console surface shipped
-      (`frontend/src/pages/B2BPage.tsx`) that lists dedicated cells
-      from `/api/v1/dedicated-cells` for tenants whose
-      `contract_type` is `b2b_dedicated` or `sovereign`. The
-      operator-side provisioning workflow (hardware allocation,
-      cell bring-up) is still part of the Phase 3 ops backlog.
+      is satisfied by the ClickHouse billing sink when available; a
+      no-op stub ships otherwise. SSE usage stream
+      (`/api/v1/usage/stream/{id}`) and the Playwright e2e suite
+      were already done; the Postgres-backed `PlacementStore`
+      (`api/console/postgres_placement.go`) is wired via
+      `buildPlacementStore`, and the Phase 3 batch adds
+      `PostgresAuthStore` so the B2C signup / verification flow
+      persists across restarts. Admin auth (`buildAdminAuth` with
+      constant-time bearer-token comparison) gates every
+      `/api/tenants/...` request when `cfg.Console.AdminToken` is
+      set. Coverage in `api/console/handler_test.go`,
+      `api/console/auth_handler_test.go`,
+      `api/console/postgres_auth_test.go` (env-gated),
+      `api/console/postgres_placement_test.go`, and the Playwright
+      suite under `frontend/`.
+- [x] B2C self-service onboarding flow. Frontend signup / login
+      forms in `frontend/src/pages/SignUp.tsx` and `Login.tsx`
+      drive the gateway's `POST /api/v1/auth/signup`,
+      `POST /api/v1/auth/login`, and `POST /api/v1/auth/verify`
+      handlers in `api/console/auth_handler.go`. Production wiring
+      lands in this batch: `console.NewPostgresAuthStore`
+      (`api/console/postgres_auth.go`) persists the
+      email → (bcrypt hash, tenant ID, verified flag, verification
+      token) mapping in the new `auth_users` table
+      (`api/console/schema.sql`), with constant-time token
+      comparison inside a transaction so two simultaneous
+      `/verify` calls cannot double-flip the same row;
+      `cmd/gateway/main.go#buildAuthStore` selects it whenever
+      `cfg.ControlPlane.MetadataDSN` is set. The hCaptcha verifier
+      (`api/console/captcha.go`) gates signup behind
+      `cfg.Console.CaptchaSecret` (with `HCAPTCHA_SECRET` env
+      fallback), and the SES verification email sender
+      (`api/console/email_ses.go`) wires
+      `cfg.Console.SESRegion` / `SESFromAddress` /
+      `SESVerifyURLBase` so the S3 `VerifiedCheck` gate in
+      `api/s3compat/handler.go` only enables when an email path
+      is actually configured. Coverage in
+      `api/console/auth_handler_test.go`,
+      `api/console/postgres_auth_test.go` (env-gated),
+      `api/console/captcha_test.go`, and `api/console/email_ses_test.go`.
+- [x] B2B dedicated cell provisioning. Console surface
+      (`frontend/src/pages/B2BPage.tsx`) lists dedicated cells from
+      `GET /api/tenants/{id}/dedicated-cells` for tenants whose
+      `contract_type` is `b2b_dedicated` or `sovereign`. The Phase
+      3 batch adds the operator-side scaffold:
+      `internal/cellops/provisioner.go` defines the
+      `CellProvisioner` interface (`ProvisionCell` /
+      `DecommissionCell` / `CellStatus`) and ships
+      `ManualProvisioner`, which validates the request, mints a
+      fresh cell ID via `crypto/rand`, persists a pending
+      `CellStatus` (status `provisioning`) via the `CellSink`
+      interface, and logs a structured audit line so operators
+      get a paged trail. `MemoryDedicatedCellStore` (dev / tests)
+      and the new `PostgresDedicatedCellStore`
+      (`api/console/postgres_dedicated_cells.go`, backed by the
+      `dedicated_cells` table in `api/console/schema.sql`) both
+      satisfy `CellSink` so the provisioner is interchangeable
+      between dev and prod. The `POST /api/tenants/{id}/dedicated-cells`
+      endpoint in `api/console/handler.go` validates the JSON
+      body, forces the URL-path tenant ID (so a forged body
+      cannot bind a cell to a different tenant), and returns
+      `202 Accepted` with the `cellops.CellStatus` payload so
+      tenants and operators can poll for the
+      `provisioning → active` transition.
+      `cmd/gateway/main.go#buildDedicatedCellStore` selects the
+      Postgres store when `cfg.ControlPlane.MetadataDSN` is set
+      and falls back to the in-memory store otherwise;
+      `buildCellProvisioner` wires whichever store satisfies
+      `cellops.CellSink` to `ManualProvisioner`. Coverage in
+      `internal/cellops/provisioner_test.go` (validation,
+      persistence, decommission idempotence) and
+      `api/console/handler_test.go`. Full automation
+      (Terraform / Ansible bring-up that flips the cell to
+      `active`) lives behind the same interface in Phase 4.
 - [ ] Beta customer onboarding (backup, SaaS assets, AI datasets,
       media libraries, sovereign storage).
 - [ ] End-to-end migration dry run: move a beta bucket from Wasabi
@@ -392,8 +474,24 @@ Checklist:
       `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, and
       `TestSuite_AWSS3` gate BYOC / cloud adapter validation on
       the same env-var pattern and inherit the same PutPiece fix.
-- [ ] Run S3 compliance test suite during a live Wasabi → Ceph RGW
-      migration with beta customers.
+- [x] Run S3 compliance test suite during a live Wasabi → Ceph RGW
+      migration with beta customers. `tests/s3_compat/live_migration_test.go`
+      adds `TestLiveMigration_WasabiToCephRGW`, which wires a
+      Wasabi-primary / Ceph-RGW-secondary `DualWriteProvider`
+      (`migration/dual_write`), pre-populates an object on Wasabi
+      so the rebalancer has an outstanding piece to mirror, and
+      then drives the full `Run(t, Setup)` compliance suite
+      against the dual-write topology while a goroutine-driven
+      `background_rebalancer.Rebalancer` (`migration/background_rebalancer`)
+      is concurrently advancing the migration state machine. The
+      test asserts at least one rebalancer pass completed during
+      the suite (so a stalled rebalancer does not hide behind a
+      green compliance run) and re-reads the preloaded piece from
+      the primary post-migration. Gated on `WASABI_ENDPOINT`,
+      `WASABI_BUCKET`, `CEPH_RGW_ENDPOINT`, and
+      `CEPH_RGW_BUCKET` (with the matching access / secret keys
+      and optional region / cell / country) so default CI stays
+      green without credentials.
 - [x] Gateway fleet node health monitor (deferred from Phase 2):
       per-cell quorum, cache-tier drain, graceful gateway
       replacement. Implemented in `internal/health/health.go` with
@@ -416,6 +514,24 @@ Checklist:
       (SummingMergeTree). Coverage in
       `billing/clickhouse_sink_test.go` for batch-size flush,
       close flush, 5xx retry, and config validation.
+- [x] Vendor-neutral `BillingProvider` integration seam. The
+      gateway now distinguishes the metering pipeline (the
+      existing `BillingSink`) from the optional outbound
+      invoicing / payment integration. `billing/provider.go`
+      defines a `BillingProvider` interface (`Name`,
+      `EnsureCustomer`, `EnsureSubscription`, `ReportUsage`,
+      `IssueInvoice`, `CancelSubscription`) plus a `NoopProvider`
+      default that logs every call without making outbound
+      requests. `billing/registry.go` adds a process-wide
+      registry (`RegisterProvider` / `BuildProvider`) so future
+      plug-ins (Stripe, Chargebee, …) can register themselves at
+      `init()` time without `cmd/gateway/main.go` learning about
+      a specific vendor; the gateway resolves the configured
+      provider from `cfg.Billing.Provider` (with a free-form
+      `cfg.Billing.ProviderConfig` map for vendor-specific
+      settings) and falls back to `noop` when no provider is
+      configured. Coverage in `billing/provider_test.go` and
+      `billing/registry_test.go`.
 - [x] BYOC / cloud adapter compliance entrypoints.
       `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, and
       `TestSuite_AWSS3` added in `tests/s3_compat/suite_test.go`

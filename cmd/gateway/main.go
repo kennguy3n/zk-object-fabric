@@ -23,6 +23,9 @@ import (
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
+
 	"github.com/kennguy3n/zk-object-fabric/api/console"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
@@ -31,6 +34,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
+	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
@@ -76,12 +80,19 @@ func main() {
 	tenantStore := buildTenantStore(cfg, *tenantsPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	billingSink := buildBillingSink(cfg)
+	// billingProvider is the optional outbound integration to an
+	// invoicing / payment system. The default is the no-op
+	// provider so deployments without a real plug-in still get a
+	// working gateway and a full audit trail.
+	billingProvider := buildBillingProvider(cfg)
+	_ = billingProvider // reserved for future invoice / subscription wiring (Phase 4+)
 	// authStore is the B2C signup / login backing store. Created
 	// here (rather than inside startConsoleAPI) so the S3 handler's
 	// VerifiedCheck hook and the console's auth routes share the
-	// same in-memory view of (tenant → verified) state. A Postgres
-	// implementation drops in behind the same interface.
-	authStore := console.NewMemoryAuthStore()
+	// same view of (tenant → verified) state. The Postgres-backed
+	// store is selected when a metadata DSN is configured;
+	// otherwise the dev MemoryAuthStore is used.
+	authStore := buildAuthStore(cfg)
 	// authHooks is built once and shared between the console API
 	// and the S3 handler's email-verification gate. When
 	// SendVerificationEmail is nil (no SES / transactional email
@@ -148,11 +159,13 @@ func main() {
 
 	handler := http.Handler(mux)
 	if tenantStore.Size() > 0 {
+		alertSink := buildAbuseAlertSink(cfg.Abuse, billingSink)
 		rl := auth.NewRateLimiter(
 			auth.TenantBudgetsLookup(tenantStore),
 			auth.TenantResolverFromAuth(authenticator),
 		)
-		rl.AlertSink = billingSink
+		rl.AlertSink = alertSink
+		applyAbuseConfigToRateLimiter(rl, cfg.Abuse)
 		// The abuse guard layers per-tenant egress bandwidth
 		// budgets, 2x-of-baseline anomaly detection, and the
 		// CDN-shielding gate in front of the S3 handler. It
@@ -162,7 +175,8 @@ func main() {
 			auth.TenantLookupFromStore(tenantStore),
 			auth.TenantResolverFromAuth(authenticator),
 		)
-		ag.AlertSink = billingSink
+		ag.AlertSink = alertSink
+		applyAbuseConfigToAbuseGuard(ag, cfg.Abuse)
 		handler = ag.Middleware(rl.Middleware(mux))
 	}
 
@@ -321,27 +335,146 @@ func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {
 
 // buildGatewayEncryption constructs the GatewayEncryption wiring
 // the S3 handler consumes for managed / public_distribution
-// tenant policies. Returns nil when no CMK is configured, which
-// forces such policies to fail closed at PUT time rather than
-// silently degrade to plaintext storage.
+// tenant policies. The wrapper is selected from cfg.CMKURI:
+//
+//   - "" or "cmk://local/..."   → LocalFileWrapper (Phase 2 default;
+//     plaintext master key on disk; suitable for dev only).
+//   - "arn:aws:kms:..." or "kms://..." → KMSWrapper backed by AWS KMS.
+//   - "vault://..." or "transit://..." → VaultWrapper backed by
+//     HashiCorp Vault's Transit engine.
+//
+// Returns nil when no CMK is configured, which forces managed /
+// public_distribution tenant policies to fail closed at PUT time
+// rather than silently degrade to plaintext storage.
 func buildGatewayEncryption(cfg config.EncryptionConfig) *s3compat.GatewayEncryption {
-	if cfg.CMKPath == "" {
-		log.Printf("gateway: no encryption.cmk_path set; managed / public_distribution tenant policies will fail with EncryptionNotConfigured")
-		return nil
-	}
 	uri := cfg.CMKURI
-	if uri == "" {
+	if uri == "" && cfg.CMKPath != "" {
 		uri = "cmk://local/" + cfg.CMKPath
 	}
-	log.Printf("gateway: encryption configured (cmk=%s uri=%s)", cfg.CMKPath, uri)
+	if uri == "" {
+		log.Printf("gateway: no encryption.cmk_uri / cmk_path set; managed / public_distribution tenant policies will fail with EncryptionNotConfigured")
+		return nil
+	}
+
+	wrapper, holderClass, err := selectGatewayWrapper(cfg, uri)
+	if err != nil {
+		log.Fatalf("gateway: build encryption wrapper: %v", err)
+	}
+	log.Printf("gateway: encryption configured (uri=%s holder=%s)", uri, holderClass)
 	return &s3compat.GatewayEncryption{
-		Wrapper: client_sdk.LocalFileWrapper{Path: cfg.CMKPath},
+		Wrapper: wrapper,
 		CMK: encryption.CustomerMasterKeyRef{
 			URI:         uri,
 			Version:     1,
-			HolderClass: "gateway_hsm",
+			HolderClass: holderClass,
 		},
 	}
+}
+
+// selectGatewayWrapper returns the client_sdk.Wrapper bound to uri
+// plus the encryption.CustomerMasterKeyRef.HolderClass tag the
+// manifest records on every wrapped DEK. The tag drives runbook
+// decisions when an operator inspects a manifest in the field.
+func selectGatewayWrapper(cfg config.EncryptionConfig, uri string) (client_sdk.Wrapper, string, error) {
+	switch {
+	case strings.HasPrefix(uri, "arn:aws:kms:"), strings.HasPrefix(uri, "kms://"):
+		region := cfg.KMSRegion
+		if region == "" {
+			region = os.Getenv("AWS_REGION")
+		}
+		ctx := context.Background()
+		opts := []func(*awsconfig.LoadOptions) error{}
+		if region != "" {
+			opts = append(opts, awsconfig.WithRegion(region))
+		}
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+		if err != nil {
+			return nil, "", fmt.Errorf("load aws config: %w", err)
+		}
+		client := kms.NewFromConfig(awsCfg)
+		return client_sdk.NewKMSWrapper(client), "aws_kms", nil
+
+	case strings.HasPrefix(uri, "vault://"), strings.HasPrefix(uri, "transit://"):
+		addr := cfg.VaultAddr
+		if addr == "" {
+			addr = os.Getenv("VAULT_ADDR")
+		}
+		token := cfg.VaultToken
+		if token == "" {
+			token = os.Getenv("VAULT_TOKEN")
+		}
+		if addr == "" || token == "" {
+			return nil, "", fmt.Errorf("vault wrapper requires VAULT_ADDR/VAULT_TOKEN (set encryption.vault_addr / vault_token in config or the env vars)")
+		}
+		mount := cfg.VaultTransitMount
+		if mount == "" {
+			mount = client_sdk.DefaultVaultMount
+		}
+		return client_sdk.NewVaultWrapper(addr, token, mount), "vault_transit", nil
+
+	default:
+		// Default and "cmk://local/..." fall through to the
+		// local-file wrapper. Fail loudly when CMKPath is empty
+		// so operators don't accidentally ship without a usable
+		// wrapper.
+		if cfg.CMKPath == "" {
+			return nil, "", fmt.Errorf("local file wrapper requires encryption.cmk_path when cmk_uri is %q", uri)
+		}
+		return client_sdk.LocalFileWrapper{Path: cfg.CMKPath}, "gateway_hsm", nil
+	}
+}
+
+// buildAbuseAlertSink composes the abuse / rate-limit alert sink.
+// The billing sink is always wired (durable metering) and an
+// optional WebhookAlertSink is fanned out alongside it when
+// cfg.AlertWebhookURL is set.
+func buildAbuseAlertSink(cfg config.AbuseConfig, billingSink auth.AlertSink) auth.AlertSink {
+	if cfg.AlertWebhookURL == "" {
+		return billingSink
+	}
+	webhook := auth.NewWebhookAlertSink(cfg.AlertWebhookURL)
+	webhook.Logger = log.New(os.Stdout, "abuse_webhook ", log.LstdFlags)
+	log.Printf("gateway: abuse alert webhook enabled (%s)", cfg.AlertWebhookURL)
+	return auth.NewMultiAlertSink(billingSink, webhook)
+}
+
+// applyAbuseConfigToAbuseGuard copies the per-region runtime knobs
+// from cfg onto the abuse guard. Zero values fall through so the
+// in-package defaults remain authoritative when an operator has
+// not customized them.
+func applyAbuseConfigToAbuseGuard(g *auth.AbuseGuard, cfg config.AbuseConfig) {
+	if cfg.AnomalyMultiplier > 0 {
+		g.AnomalyMultiplier = cfg.AnomalyMultiplier
+	}
+	if cfg.AnomalyWindow > 0 {
+		g.AnomalyWindow = cfg.AnomalyWindow.ToDuration()
+	}
+	if cfg.AnomalyCooldown > 0 {
+		g.AnomalyCooldown = cfg.AnomalyCooldown.ToDuration()
+	}
+	if cfg.BaselineAlpha > 0 {
+		g.BaselineAlpha = cfg.BaselineAlpha
+	}
+	g.ThrottleOnAnomaly = cfg.ThrottleOnAnomaly
+}
+
+// applyAbuseConfigToRateLimiter copies the same per-region runtime
+// knobs onto the rate limiter so abuse guard and rate limiter
+// share the same baseline EWMA / multiplier / cooldown semantics.
+func applyAbuseConfigToRateLimiter(l *auth.RateLimiter, cfg config.AbuseConfig) {
+	if cfg.AnomalyMultiplier > 0 {
+		l.AnomalyMultiplier = cfg.AnomalyMultiplier
+	}
+	if cfg.AnomalyWindow > 0 {
+		l.AnomalyWindow = cfg.AnomalyWindow.ToDuration()
+	}
+	if cfg.AnomalyCooldown > 0 {
+		l.AnomalyCooldown = cfg.AnomalyCooldown.ToDuration()
+	}
+	if cfg.BaselineAlpha > 0 {
+		l.BaselineAlpha = cfg.BaselineAlpha
+	}
+	l.ThrottleOnAnomaly = cfg.ThrottleOnAnomaly
 }
 
 func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]providers.StorageProvider {
@@ -508,6 +641,25 @@ func buildBillingSink(cfg config.Config) interface {
 	return sink
 }
 
+// buildBillingProvider resolves the configured BillingProvider via
+// billing.BuildProvider. An empty cfg.Billing.Provider falls back to
+// the no-op provider so the gateway boots without an outbound
+// integration. Plug-ins (Stripe, Chargebee, …) register themselves
+// at init() time via billing.RegisterProvider; the gateway does not
+// import vendor packages directly.
+func buildBillingProvider(cfg config.Config) billing.BillingProvider {
+	provider, err := billing.BuildProvider(billing.ProviderFactoryConfig{
+		Name:     cfg.Billing.Provider,
+		Settings: cfg.Billing.ProviderConfig,
+		Logger:   log.New(os.Stdout, "billing.provider ", log.LstdFlags),
+	})
+	if err != nil {
+		log.Fatalf("gateway: build billing provider: %v", err)
+	}
+	log.Printf("gateway: billing provider %q wired", provider.Name())
+	return provider
+}
+
 // startHealthMonitor starts the gateway fleet node health monitor
 // and, when a listen address is configured, the internal HTTP
 // endpoints it exposes. The monitor shares ctx with the other
@@ -561,7 +713,7 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 func startConsoleAPI(
 	cfg config.Config,
 	tenantStore auth.TenantStore,
-	authStore *console.MemoryAuthStore,
+	authStore console.AuthStore,
 	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
 ) *http.Server {
@@ -584,17 +736,21 @@ func startConsoleAPI(
 	placements := buildPlacementStore(cfg)
 	tokens := console.NewMemoryTokenStore()
 
+	cellStore := buildDedicatedCellStore(cfg)
+	cellProvisioner := buildCellProvisioner(cellStore)
+
 	h := console.New(console.Config{
-		Tenants:     tenants,
-		Usage:       usage,
-		Placements:  placements,
-		Auth:        authStore,
-		Tokens:      tokens,
-		AuthHooks:   authHooks,
-		AdminAuth:   buildAdminAuth(cfg),
-		BillingSink: billingSink,
-		Buckets:     console.NewMemoryBucketStore(),
-		Cells:       console.NewMemoryDedicatedCellStore(),
+		Tenants:         tenants,
+		Usage:           usage,
+		Placements:      placements,
+		Auth:            authStore,
+		Tokens:          tokens,
+		AuthHooks:       authHooks,
+		AdminAuth:       buildAdminAuth(cfg),
+		BillingSink:     billingSink,
+		Buckets:         console.NewMemoryBucketStore(),
+		Cells:           cellStore,
+		CellProvisioner: cellProvisioner,
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -612,6 +768,68 @@ func startConsoleAPI(
 		}
 	}()
 	return srv
+}
+
+// buildAuthStore returns the Postgres-backed AuthStore when a
+// metadata DSN is configured, falling back to MemoryAuthStore for
+// dev mode. The store is shared between the console signup / login
+// handler and the S3 handler's email-verification gate.
+func buildAuthStore(cfg config.Config) console.AuthStore {
+	if cfg.ControlPlane.MetadataDSN == "" {
+		return console.NewMemoryAuthStore()
+	}
+	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
+	if err != nil {
+		log.Printf("gateway: open postgres for auth store: %v; falling back to in-memory", err)
+		return console.NewMemoryAuthStore()
+	}
+	store, err := console.NewPostgresAuthStore(db)
+	if err != nil {
+		log.Printf("gateway: build postgres auth store: %v; falling back to in-memory", err)
+		_ = db.Close()
+		return console.NewMemoryAuthStore()
+	}
+	log.Printf("gateway: postgres auth store enabled")
+	return store
+}
+
+// buildDedicatedCellStore returns the Postgres-backed cell store
+// when a metadata DSN is configured, falling back to the in-memory
+// store for dev. Production wires this so console-driven cell
+// provisioning requests persist across gateway restarts.
+func buildDedicatedCellStore(cfg config.Config) console.DedicatedCellStore {
+	if cfg.ControlPlane.MetadataDSN == "" {
+		return console.NewMemoryDedicatedCellStore()
+	}
+	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
+	if err != nil {
+		log.Printf("gateway: open postgres for dedicated cell store: %v; falling back to in-memory", err)
+		return console.NewMemoryDedicatedCellStore()
+	}
+	store, err := console.NewPostgresDedicatedCellStore(db)
+	if err != nil {
+		log.Printf("gateway: build postgres dedicated cell store: %v; falling back to in-memory", err)
+		_ = db.Close()
+		return console.NewMemoryDedicatedCellStore()
+	}
+	log.Printf("gateway: postgres dedicated cell store enabled")
+	return store
+}
+
+// buildCellProvisioner returns a ManualProvisioner backed by store
+// when store satisfies cellops.CellSink. The Phase 3 in-memory and
+// Postgres dedicated-cell stores both do; a future custom store
+// that does not implement CellSink simply gets a nil provisioner
+// and the POST /dedicated-cells endpoint reports
+// 503 service unavailable.
+func buildCellProvisioner(store console.DedicatedCellStore) cellops.CellProvisioner {
+	sink, ok := store.(cellops.CellSink)
+	if !ok {
+		return nil
+	}
+	prov := cellops.NewManualProvisioner(sink)
+	prov.Logger = log.New(os.Stdout, "cellops ", log.LstdFlags)
+	return prov
 }
 
 // buildAdminAuth returns a bearer-token verifier when cfg.Console
