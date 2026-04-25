@@ -674,6 +674,13 @@ type ProvisionDedicatedCellRequest struct {
 	NodeCount         int     `json:"node_count"`
 }
 
+// maxCellProvisionPayloadBytes caps the request body the dedicated-cell
+// provisioning endpoint will decode. The payload is a small operator
+// request (region, country, capacity, erasure profile, node count) so
+// the cap intentionally matches the bucket-creation cap rather than the
+// larger placement-policy cap.
+const maxCellProvisionPayloadBytes int64 = 8 * 1024
+
 // provisionDedicatedCell handles POST /api/tenants/{id}/dedicated-cells.
 // The endpoint authenticates via the existing AdminAuth gate (the
 // signup self-service surface lives under /api/v1/) and delegates
@@ -688,8 +695,14 @@ func (h *Handler) provisionDedicatedCell(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusServiceUnavailable, "cell provisioner not configured")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxCellProvisionPayloadBytes)
 	var body ProvisionDedicatedCellRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("cell provision payload exceeds %d bytes", maxCellProvisionPayloadBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}

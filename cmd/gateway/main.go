@@ -80,6 +80,12 @@ func main() {
 	tenantStore := buildTenantStore(cfg, *tenantsPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	billingSink := buildBillingSink(cfg)
+	// billingProvider is the optional outbound integration to an
+	// invoicing / payment system. The default is the no-op
+	// provider so deployments without a real plug-in still get a
+	// working gateway and a full audit trail.
+	billingProvider := buildBillingProvider(cfg)
+	_ = billingProvider // reserved for future invoice / subscription wiring (Phase 4+)
 	// authStore is the B2C signup / login backing store. Created
 	// here (rather than inside startConsoleAPI) so the S3 handler's
 	// VerifiedCheck hook and the console's auth routes share the
@@ -633,6 +639,25 @@ func buildBillingSink(cfg config.Config) interface {
 		log.Fatalf("gateway: build clickhouse billing sink: %v", err)
 	}
 	return sink
+}
+
+// buildBillingProvider resolves the configured BillingProvider via
+// billing.BuildProvider. An empty cfg.Billing.Provider falls back to
+// the no-op provider so the gateway boots without an outbound
+// integration. Plug-ins (Stripe, Chargebee, …) register themselves
+// at init() time via billing.RegisterProvider; the gateway does not
+// import vendor packages directly.
+func buildBillingProvider(cfg config.Config) billing.BillingProvider {
+	provider, err := billing.BuildProvider(billing.ProviderFactoryConfig{
+		Name:     cfg.Billing.Provider,
+		Settings: cfg.Billing.ProviderConfig,
+		Logger:   log.New(os.Stdout, "billing.provider ", log.LstdFlags),
+	})
+	if err != nil {
+		log.Fatalf("gateway: build billing provider: %v", err)
+	}
+	log.Printf("gateway: billing provider %q wired", provider.Name())
+	return provider
 }
 
 // startHealthMonitor starts the gateway fleet node health monitor

@@ -237,6 +237,13 @@ type ControlPlaneConfig struct {
 
 // BillingConfig configures the metering sink. When ClickHouseURL is
 // empty the gateway falls back to the development LoggerSink.
+//
+// BillingConfig.Provider is the optional outbound integration to
+// an external invoicing / payment system (Stripe, Chargebee, …).
+// Phase 3 only registers the "noop" provider; future plug-ins
+// drop in behind the billing.BillingProvider interface without
+// any other code in the codebase needing to learn about a
+// specific vendor.
 type BillingConfig struct {
 	ClickHouseURL      string   `json:"clickhouse_url"`
 	ClickHouseDatabase string   `json:"clickhouse_database"`
@@ -245,6 +252,18 @@ type BillingConfig struct {
 	ClickHousePassword string   `json:"clickhouse_password"`
 	BatchSize          int      `json:"batch_size"`
 	FlushInterval      Duration `json:"flush_interval"`
+
+	// Provider selects the BillingProvider integration. Empty
+	// (or "noop") wires the no-op default that logs every call
+	// without making outbound requests. Future plug-ins (e.g.
+	// "stripe") register themselves under this key.
+	Provider string `json:"provider"`
+
+	// ProviderConfig is a free-form key/value map handed to the
+	// selected provider's factory. Vendor-specific keys live
+	// here so adding a new provider does not require widening
+	// BillingConfig with vendor-specific fields.
+	ProviderConfig map[string]string `json:"provider_config"`
 }
 
 // HealthConfig configures the gateway fleet node health monitor.

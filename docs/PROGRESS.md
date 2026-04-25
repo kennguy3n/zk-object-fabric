@@ -514,6 +514,24 @@ Checklist:
       (SummingMergeTree). Coverage in
       `billing/clickhouse_sink_test.go` for batch-size flush,
       close flush, 5xx retry, and config validation.
+- [x] Vendor-neutral `BillingProvider` integration seam. The
+      gateway now distinguishes the metering pipeline (the
+      existing `BillingSink`) from the optional outbound
+      invoicing / payment integration. `billing/provider.go`
+      defines a `BillingProvider` interface (`Name`,
+      `EnsureCustomer`, `EnsureSubscription`, `ReportUsage`,
+      `IssueInvoice`, `CancelSubscription`) plus a `NoopProvider`
+      default that logs every call without making outbound
+      requests. `billing/registry.go` adds a process-wide
+      registry (`RegisterProvider` / `BuildProvider`) so future
+      plug-ins (Stripe, Chargebee, …) can register themselves at
+      `init()` time without `cmd/gateway/main.go` learning about
+      a specific vendor; the gateway resolves the configured
+      provider from `cfg.Billing.Provider` (with a free-form
+      `cfg.Billing.ProviderConfig` map for vendor-specific
+      settings) and falls back to `noop` when no provider is
+      configured. Coverage in `billing/provider_test.go` and
+      `billing/registry_test.go`.
 - [x] BYOC / cloud adapter compliance entrypoints.
       `TestSuite_BackblazeB2`, `TestSuite_CloudflareR2`, and
       `TestSuite_AWSS3` added in `tests/s3_compat/suite_test.go`
