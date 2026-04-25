@@ -23,6 +23,7 @@ import (
 	"sort"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/encryption"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -417,15 +418,35 @@ func (h *Handler) getMultipart(
 	// than-chunk-size frame as terminal, so we cannot just
 	// concatenate the ciphertexts and decrypt once — we decrypt
 	// each part in isolation and concatenate the resulting
-	// plaintexts. manifest.ObjectSize records the plaintext
-	// aggregate so the integrity check below still fires.
+	// plaintexts. All parts of a single upload share one wrapped
+	// DEK, so we unwrap once up front and reuse the plaintext key
+	// across every part via decryptWithDEK; this mirrors the
+	// write path, where UploadPart calls encryptWithDEK with the
+	// session DEK generated at CreateMultipartUpload time.
+	// manifest.ObjectSize records the plaintext aggregate so the
+	// integrity check below still fires.
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
+		if h.cfg.Encryption == nil {
+			writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured",
+				"object is encrypted but no gateway encryption is configured", r.URL.Path)
+			return
+		}
+		dek, uerr := h.cfg.Encryption.Wrapper.UnwrapDEK(encryption.DataEncryptionKey{
+			KeyID:         manifest.Encryption.KeyID,
+			Algorithm:     manifest.Encryption.Algorithm,
+			WrappedKey:    manifest.Encryption.WrappedDEK,
+			WrapAlgorithm: manifest.Encryption.WrapAlgorithm,
+		}, h.cfg.Encryption.CMK)
+		if uerr != nil {
+			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", uerr.Error(), r.URL.Path)
+			return
+		}
 		plaintexts := make([][]byte, len(bodies))
 		var newTotal int64
 		for i, b := range bodies {
-			pt, derr := h.decryptFromStorage(b, manifest.Encryption)
+			pt, derr := h.decryptWithDEK(b, dek)
 			if derr != nil {
-				writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+				writeError(w, http.StatusInternalServerError, "DecryptionFailed", derr.Error(), r.URL.Path)
 				return
 			}
 			plaintexts[i] = pt
