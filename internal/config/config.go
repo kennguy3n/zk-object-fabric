@@ -230,12 +230,14 @@ type GatewayConfig struct {
 // ControlPlaneConfig configures the AWS-hosted control plane surface
 // the gateway talks to.
 //
-// The connection-pool fields tune the RDS-backed *sql.DB sessions
-// used by every Postgres-backed store (manifest, tenant, auth,
-// placement, dedicated cell). Production deploys typically set
-// MaxOpenConns to 2× the gateway's CPU count and ConnMaxLifetime to
-// a value comfortably under RDS Proxy's idle-connection timeout
-// (10 minutes by default).
+// The connection-pool fields tune the single RDS-backed *sql.DB
+// the gateway opens for the metadata DSN. All five Postgres-backed
+// stores (manifest, tenant, auth, placement, dedicated cell) share
+// that one pool, so MaxOpenConns is the gateway-process-wide cap
+// on metadata connections — not a per-store multiplier. Production
+// deploys typically set MaxOpenConns to 2× the gateway's CPU count
+// and ConnMaxLifetime to a value comfortably under RDS Proxy's
+// idle-connection timeout (10 minutes by default).
 type ControlPlaneConfig struct {
 	MetadataDSN string `json:"metadata_dsn"`
 	AuthIssuer  string `json:"auth_issuer"`

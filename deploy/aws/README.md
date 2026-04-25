@@ -72,6 +72,16 @@ gateway's RDS pool:
 }
 ```
 
+The gateway opens exactly one `*sql.DB` per metadata DSN and shares
+it across all five Postgres-backed stores (manifest, tenant, auth,
+placement, dedicated cell), so `max_open_conns` is the
+gateway-process-wide cap on metadata connections — not a per-store
+multiplier. Sizing rule of thumb: `max_open_conns ≈ 2× CPU` per
+gateway process; multiply by the gateway-fleet size for total
+connections against RDS, then confirm that's well below the
+instance's `max_connections` (or, with RDS Proxy, the proxy's
+client connection limit).
+
 The `conn_max_lifetime` should sit comfortably under RDS Proxy's
 default 10-minute idle timeout; if the gateway fleet is wired
 through RDS Proxy, set both `conn_max_lifetime` and
