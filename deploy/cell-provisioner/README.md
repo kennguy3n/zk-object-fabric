@@ -125,12 +125,19 @@ ssh mon-01 "sudo /opt/zkof/cephadm/install.sh \
 
 ```bash
 ./apply_placement.sh \
+  --console-url https://console.zkof.example \
+  --admin-token "$ZKOF_ADMIN_TOKEN" \
   --tenant tenant-acme-co \
-  --cell  "$ZKOF_CELL_ID" \
   --provider ceph_rgw \
   --country US \
   --ec-profile 6+2
 ```
+
+The placement-policy DSL routes by provider name, region, and
+country — it has no first-class `cell_id` selector. To pin a
+tenant to a specific dedicated cell, register the cell's RGW
+endpoint under a unique provider name (via `register_cell.sh` in
+the previous step) and pass that name as `--provider` here.
 
 ### 6. Hot-load the provider
 

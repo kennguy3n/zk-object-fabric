@@ -4,7 +4,7 @@
 # warning and exits 0.
 set -euo pipefail
 
-CLUSTER_NAME="${1:-zkof-beta-cell-01}"
+CLUSTER_NAME="zkof-beta-cell-01"
 PUBLIC_NETWORK=""
 CLUSTER_NETWORK=""
 RGW_REALM=""
