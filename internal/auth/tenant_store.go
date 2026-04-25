@@ -195,7 +195,11 @@ func (s *MemoryTenantStore) Size() int {
 // keys list; the slice is freshly allocated so callers may safely
 // retain it. Returns an empty (non-nil) slice when no bindings are
 // registered for the tenant.
-func (s *MemoryTenantStore) ListBindingsByTenantID(tenantID string) []TenantBinding {
+//
+// The error return mirrors the PostgresTenantStore signature so
+// callers can surface a 500 on a real backend failure; the
+// in-memory implementation never errors and always returns nil.
+func (s *MemoryTenantStore) ListBindingsByTenantID(tenantID string) ([]TenantBinding, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]TenantBinding, 0)
@@ -204,7 +208,7 @@ func (s *MemoryTenantStore) ListBindingsByTenantID(tenantID string) []TenantBind
 			out = append(out, b)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // RemoveBinding deletes the binding identified by accessKey. It is
