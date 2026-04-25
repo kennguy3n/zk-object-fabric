@@ -101,6 +101,13 @@ type Config struct {
 	// single-piece write.
 	ErasureCoding *erasure_coding.Registry
 
+	// Encryption configures gateway-side encryption for "managed"
+	// and "public_distribution" modes. Required when any tenant
+	// policy uses those modes; a nil value causes managed-mode
+	// PUTs to fail with EncryptionNotConfigured rather than
+	// silently storing plaintext.
+	Encryption *GatewayEncryption
+
 	// Cache is the L0/L1 hot object cache consulted on the GET path.
 	// Optional; nil disables caching.
 	Cache hot_object_cache.HotObjectCache
@@ -286,14 +293,30 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	encMode := policy.EncryptionMode
+	encCfg, body, contentLength, plaintextSize, ok := h.prepareSinglePieceEncryption(w, r, encMode)
+	if !ok {
+		return
+	}
+
 	pieceID := newPieceID(tenantID, bucket, key, h.cfg.Now())
-	putRes, err := provider.PutPiece(r.Context(), pieceID, r.Body, providers.PutOptions{
-		ContentLength: r.ContentLength,
+	putRes, err := provider.PutPiece(r.Context(), pieceID, body, providers.PutOptions{
+		ContentLength: contentLength,
 		ContentType:   r.Header.Get("Content-Type"),
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
 		return
+	}
+
+	// ObjectSize must reflect what the client will read back, not
+	// the bytes we actually wrote to the backend. For managed /
+	// public_distribution modes we unseal on the GET path so
+	// ObjectSize is the plaintext size; for client_side the client
+	// stores and retrieves the bytes verbatim.
+	objectSize := putRes.SizeBytes
+	if IsGatewayEncrypted(encMode) {
+		objectSize = plaintextSize
 	}
 
 	manifest := &metadata.ObjectManifest{
@@ -302,8 +325,9 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		ObjectKey:       key,
 		ObjectKeyHash:   hashObjectKey(key),
 		VersionID:       pieceID,
-		ObjectSize:      putRes.SizeBytes,
+		ObjectSize:      objectSize,
 		ChunkSize:       putRes.SizeBytes,
+		Encryption:      encCfg,
 		PlacementPolicy: policy,
 		Pieces: []metadata.Piece{{
 			PieceID: putRes.PieceID,
@@ -375,13 +399,50 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		ObjectKeyHash: manifest.ObjectKeyHash,
 		VersionID:     manifest.VersionID,
 	}
-	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
+
+	// For gateway-encrypted objects (managed / public_distribution)
+	// the backend pieces are ciphertext with self-framing nonces, so
+	// we must fetch the whole piece to decrypt and only then slice
+	// to the requested byte range. Client_side objects are opaque
+	// ciphertext from the gateway's view — byte ranges land on
+	// ciphertext bytes and the client owns the framing.
+	effectiveRange := byteRange
+	if IsGatewayEncrypted(manifest.Encryption.Mode) {
+		effectiveRange = nil
+	}
+
+	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, effectiveRange, tenantID, bucket)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
 		return
 	}
 	defer body.Close()
 	_ = served
+
+	if IsGatewayEncrypted(manifest.Encryption.Mode) {
+		ciphertext, rerr := io.ReadAll(body)
+		if rerr != nil {
+			writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
+			return
+		}
+		plaintext, derr := h.decryptFromStorage(ciphertext, manifest.Encryption)
+		if derr != nil {
+			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+			return
+		}
+		if byteRange != nil {
+			end := byteRange.End
+			if end < 0 || end >= int64(len(plaintext)) {
+				end = int64(len(plaintext)) - 1
+			}
+			if byteRange.Start < 0 || byteRange.Start > end+1 {
+				writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
+				return
+			}
+			plaintext = plaintext[byteRange.Start : end+1]
+		}
+		body = io.NopCloser(bytes.NewReader(plaintext))
+	}
 
 	if piece.Hash != "" {
 		w.Header().Set("ETag", quote(piece.Hash))

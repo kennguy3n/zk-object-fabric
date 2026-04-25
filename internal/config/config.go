@@ -62,6 +62,28 @@ type Config struct {
 	Billing      BillingConfig      `json:"billing"`
 	Health       HealthConfig       `json:"health"`
 	Console      ConsoleConfig      `json:"console"`
+	Encryption   EncryptionConfig   `json:"encryption"`
+}
+
+// EncryptionConfig configures the gateway's DEK-wrapping material
+// for "managed" and "public_distribution" tenant policies, plus
+// the optional manifest body encryption key.
+//
+// Phase 2 wires the wrapper to a 32-byte local key file
+// (CMKPath). Phase 3 replaces this with a KMS ARN or Vault
+// transit path; both are consumed through the same
+// client_sdk.Wrapper interface.
+//
+// ManifestBodyKeyPath is the separate gateway-held key the
+// Postgres manifest store uses to seal manifest JSON at rest
+// (see metadata/manifest_store/postgres BodyEncryptor). A tenant
+// or operator with only Postgres access cannot read manifests
+// when this is set. Leave empty to keep the Phase 2 JSONB
+// layout.
+type EncryptionConfig struct {
+	CMKPath             string `json:"cmk_path"`
+	CMKURI              string `json:"cmk_uri"`
+	ManifestBodyKeyPath string `json:"manifest_body_key_path"`
 }
 
 // ConsoleConfig configures the tenant-console HTTP surface (api/console).

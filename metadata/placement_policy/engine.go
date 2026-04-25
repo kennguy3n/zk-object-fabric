@@ -92,6 +92,7 @@ func (e *Engine) ResolveBackend(tenantID, bucket, objectKey string) (string, met
 		AllowedBackends:   eligible,
 		MinFailureDomains: 1,
 		HotCache:          policy.Spec.Placement.CacheLocation != "",
+		EncryptionMode:    policy.Spec.Encryption.Mode,
 	}, nil
 }
 

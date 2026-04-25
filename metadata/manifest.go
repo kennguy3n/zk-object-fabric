@@ -38,13 +38,21 @@ type ObjectManifest struct {
 //
 // Mode values (shared with encryption.EncryptionMode and
 // placement_policy.EncryptionSpec):
+//   - "":                    legacy / pre-encryption object (backward compat)
 //   - "client_side":         strict zero-knowledge, customer-held DEK
 //   - "managed":             gateway-side encryption (confidential managed storage)
 //   - "public_distribution": ciphertext at rest, plaintext at the edge
+//
+// For "managed" and "public_distribution" the gateway wraps the
+// per-object DEK with its CMK and stores the sealed bytes on
+// WrappedDEK so the GET path can unwrap them at read time. For
+// "client_side" these fields are empty — the client holds the DEK.
 type EncryptionConfig struct {
 	Mode              string `json:"mode"`
 	Algorithm         string `json:"algorithm"`
 	KeyID             string `json:"key_id"`
+	WrappedDEK        []byte `json:"wrapped_dek,omitempty"`
+	WrapAlgorithm     string `json:"wrap_algorithm,omitempty"`
 	ManifestEncrypted bool   `json:"manifest_encrypted"`
 }
 
@@ -127,6 +135,14 @@ type PlacementPolicy struct {
 	// objects on this tenant/bucket. Empty means single-piece
 	// writes (the provider's own durability takes over).
 	ErasureProfile string `json:"erasure_profile,omitempty"`
+
+	// EncryptionMode is the per-object encryption mode chosen by
+	// the tenant's policy at PUT time. Valid values mirror
+	// EncryptionConfig.Mode ("client_side", "managed",
+	// "public_distribution"). Empty means the tenant has no
+	// policy and the gateway treats the object as legacy /
+	// unencrypted for backward compatibility.
+	EncryptionMode string `json:"encryption_mode,omitempty"`
 }
 
 // Validate performs minimal structural checks on a manifest. It is not

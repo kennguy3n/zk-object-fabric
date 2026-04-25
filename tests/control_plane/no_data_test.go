@@ -83,6 +83,24 @@ func rawBytesTypes() []reflect.Type {
 	}
 }
 
+// sealedKeyMaterialFields enumerates control-plane byte-slice fields
+// that hold sealed (never-plaintext) key material rather than
+// customer object payloads. Wrapped DEKs are tens of bytes of
+// ciphertext produced by a KMS / CMK wrap; storing them on the
+// manifest is the whole point of envelope encryption, so they are
+// explicitly NOT a zero-customer-data violation.
+//
+// Any addition to this list requires a review-time argument that
+// the field is (a) always sealed / encrypted and (b) never carries
+// object-body bytes.
+var sealedKeyMaterialFields = map[string]bool{
+	"metadata.EncryptionConfig.WrappedDEK":                      true,
+	"metadata.ObjectManifest.Encryption.WrappedDEK":             true,
+	"ManifestStore.Get.Out[0].Encryption.WrappedDEK":            true,
+	"ManifestStore.Put.In[2].Encryption.WrappedDEK":             true,
+	"ManifestStore.List.Out[0].Manifests[*].Encryption.WrappedDEK": true,
+}
+
 // fieldPathFor walks a struct recursively and reports any field
 // whose type matches one of rawBytesTypes. It ignores field types
 // from the standard library time/json packages (time.Time carries
@@ -108,6 +126,9 @@ func fieldPathFor(t reflect.Type, prefix string, visited map[reflect.Type]bool) 
 		for i := 0; i < t.NumField(); i++ {
 			f := t.Field(i)
 			path := prefix + "." + f.Name
+			if sealedKeyMaterialFields[path] {
+				continue
+			}
 			if violated, why := fieldViolates(f.Type); violated {
 				violations = append(violations, path+": "+why)
 				continue

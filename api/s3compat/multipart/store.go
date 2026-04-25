@@ -58,6 +58,15 @@ type Part struct {
 }
 
 // Upload is the server-side record of an in-flight multipart session.
+//
+// Encryption fields (EncMode, DEKMaterial, WrappedDEK, …) are
+// populated at CreateMultipartUpload time when the tenant's policy
+// calls for gateway-side encryption. They are in-memory only:
+// DEKMaterial (the plaintext DEK) is never persisted, so a
+// multi-node multipart session store must hold these on a durable
+// encrypted channel (Phase 3). The wrapped form and key
+// identifiers are recorded on the final manifest so GET can
+// unwrap after the fact.
 type Upload struct {
 	ID        string
 	TenantID  string
@@ -66,6 +75,23 @@ type Upload struct {
 	Backend   string
 	Policy    metadata.PlacementPolicy
 	CreatedAt time.Time
+
+	// EncMode mirrors PlacementPolicy.EncryptionMode captured at
+	// Create time ("", "client_side", "managed", or
+	// "public_distribution").
+	EncMode string
+	// DEKMaterial is the plaintext DEK used to seal every part
+	// of a managed / public_distribution upload. Empty for
+	// client_side and legacy modes.
+	DEKMaterial []byte
+	// WrappedDEK, WrappedKeyID, WrapAlgorithm, and
+	// ContentAlgorithm are the per-object crypto parameters the
+	// gateway records on the final manifest so the GET path can
+	// unwrap the DEK and frame-decrypt the concatenated parts.
+	WrappedDEK       []byte
+	WrappedKeyID     string
+	WrapAlgorithm    string
+	ContentAlgorithm string
 
 	mu    sync.Mutex
 	parts map[int]Part
