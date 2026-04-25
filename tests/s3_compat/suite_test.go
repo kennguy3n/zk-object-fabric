@@ -33,7 +33,9 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
+	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
@@ -67,6 +69,12 @@ type Setup struct {
 	Manifests manifest_store.ManifestStore
 	Providers map[string]providers.StorageProvider
 	Default   string
+	// Auth, when non-nil, is wired into the gateway as the request
+	// authenticator. Most subtests leave it nil so the gateway
+	// falls back to AnonymousTenant; the presigned-URL subtest
+	// sets it to a real HMACAuthenticator so the query-string
+	// SigV4 signature is actually verified.
+	Auth s3compat.Authenticator
 }
 
 // server stands up the gateway handler behind an httptest.Server and
@@ -84,6 +92,7 @@ func newServer(t *testing.T, setup Setup) *server {
 		Manifests:     setup.Manifests,
 		Providers:     setup.Providers,
 		Placement:     fixedPlacement{backend: setup.Default},
+		Auth:          setup.Auth,
 		Multipart:     multipart.NewMemoryStore(),
 		ErasureCoding: erasure_coding.DefaultRegistry(),
 		Now:           time.Now,
@@ -117,6 +126,7 @@ func Run(t *testing.T, setup Setup) {
 	t.Run("DeleteIsIdempotent", func(t *testing.T) { testDeleteIdempotent(t, setup) })
 	t.Run("MissingKeyReturns404", func(t *testing.T) { testMissingKey(t, setup) })
 	t.Run("PresignedGet", func(t *testing.T) { testPresignedGet(t, setup) })
+	t.Run("PresignedGetExpired", func(t *testing.T) { testPresignedGetExpired(t, setup) })
 	t.Run("MultipartLikeOverwrite", func(t *testing.T) { testMultipartLikeOverwrite(t, setup) })
 	t.Run("MultipartRoundTrip", func(t *testing.T) { testMultipartRoundTrip(t, setup) })
 	t.Run("MultipartAbort", func(t *testing.T) { testMultipartAbort(t, setup) })
@@ -291,8 +301,32 @@ func testMissingKey(t *testing.T, setup Setup) {
 	}
 }
 
+// authenticatedSetup returns a copy of setup with an in-memory
+// HMACAuthenticator wired in that recognises the SDK client's
+// "test" / "test" credentials. The presigned-URL subtests use this
+// so the query-string SigV4 signature is actually verified end to
+// end (PUT and GET both flow through Authenticate). skew controls
+// the authenticator's MaxClockSkew so the expired-URL test can use
+// a tight value while normal tests use a generous one.
+func authenticatedSetup(t *testing.T, setup Setup, skew time.Duration) Setup {
+	t.Helper()
+	store := auth.NewMemoryTenantStore()
+	if err := store.AddBinding(auth.TenantBinding{
+		AccessKey: "test",
+		SecretKey: "test",
+		Tenant:    tenant.Tenant{ID: "tenant-test", Name: "tenant-test"},
+	}); err != nil {
+		t.Fatalf("AddBinding: %v", err)
+	}
+	a := auth.NewHMACAuthenticator(store)
+	a.MaxClockSkew = skew
+	out := setup
+	out.Auth = a
+	return out
+}
+
 func testPresignedGet(t *testing.T, setup Setup) {
-	s := newServer(t, setup)
+	s := newServer(t, authenticatedSetup(t, setup, time.Hour))
 	key := "presign.txt"
 	body := []byte("presigned body")
 	if _, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
@@ -311,9 +345,10 @@ func testPresignedGet(t *testing.T, setup Setup) {
 	if err != nil {
 		t.Fatalf("PresignGetObject: %v", err)
 	}
-	// Phase 2 does not yet enforce presigned-URL signatures, but the
-	// URL must be usable: it must target the gateway and return the
-	// object body over plain HTTP GET.
+	// With auth enabled the presigned URL's query-string SigV4
+	// signature is verified by the gateway end to end. The URL
+	// must target the gateway and return the object body over
+	// plain HTTP GET (no Authorization header).
 	if !strings.HasPrefix(req.URL, s.ts.URL) {
 		t.Fatalf("presigned URL %q does not target test server %q", req.URL, s.ts.URL)
 	}
@@ -334,6 +369,61 @@ func testPresignedGet(t *testing.T, setup Setup) {
 	}
 	if !bytes.Equal(data, body) {
 		t.Fatalf("presigned body = %q, want %q", data, body)
+	}
+}
+
+// testPresignedGetExpired generates a presigned URL with a short
+// expiry, waits past it, and asserts the gateway rejects the
+// signature. With auth enabled this exercises the
+// X-Amz-Expires gate inside PresignedV4Strategy.
+func testPresignedGetExpired(t *testing.T, setup Setup) {
+	// Use the loosest setup the SDK / handler will accept (1h skew)
+	// for the PUT — it signs and runs immediately, so no expiry is
+	// in play yet — and a tight (100ms) skew on a separate server
+	// for the expired GET so the wait stays under a few seconds on
+	// slow CI machines.
+	putSrv := newServer(t, authenticatedSetup(t, setup, time.Hour))
+	key := "presign-expired.txt"
+	body := []byte("expired body")
+	if _, err := putSrv.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(putSrv.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(body),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// The two servers share the same Setup (including the same
+	// ManifestStore + Providers map), so the object PUT through
+	// putSrv is visible to getSrv. Only the authenticator (and
+	// httptest.Server) differ.
+	getSrv := newServer(t, authenticatedSetup(t, setup, 100*time.Millisecond))
+
+	// Build a presigner against getSrv so the URL targets the
+	// short-skew handler.
+	presigner := s3.NewPresignClient(getSrv.client)
+	req, err := presigner.PresignGetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(getSrv.bucket),
+		Key:    aws.String(key),
+	}, s3.WithPresignExpires(time.Second))
+	if err != nil {
+		t.Fatalf("PresignGetObject: %v", err)
+	}
+
+	// Wait past expiry plus the authenticator's clock skew so the
+	// gateway treats the URL as expired.
+	time.Sleep(2 * time.Second)
+
+	resp, err := http.Get(req.URL)
+	if err != nil {
+		t.Fatalf("GET presigned URL: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("presigned GET on expired URL returned 200, want a 4xx error")
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("presigned GET expired status = %d, want %d", resp.StatusCode, http.StatusForbidden)
 	}
 }
 
