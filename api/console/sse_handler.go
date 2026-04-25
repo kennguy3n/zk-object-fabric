@@ -69,7 +69,12 @@ func NewUsageStreamHandler(cfg UsageStreamConfig) *UsageStreamHandler {
 	return &UsageStreamHandler{cfg: cfg}
 }
 
-// Register mounts the SSE endpoint under /api/v1/usage/stream/.
+// Register mounts the SSE endpoint under
+// /api/v1/usage/stream/{tenantID}. The console-mux alias at
+// /api/tenants/{tenantID}/usage/stream is dispatched by the
+// console Handler (which already owns the /api/tenants/ prefix);
+// it forwards matching requests through ServeHTTP via
+// parseUsageStreamPath, which accepts either form.
 func (h *UsageStreamHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/usage/stream/", h.ServeHTTP)
 }
@@ -236,10 +241,22 @@ func extractUsageStreamToken(r *http.Request) string {
 	return strings.TrimSpace(r.URL.Query().Get("token"))
 }
 
-// parseUsageStreamPath extracts the tenant ID from
-// /api/v1/usage/stream/{id}. A trailing slash is tolerated so the
-// frontend can normalise URLs without affecting routing.
+// parseUsageStreamPath extracts the tenant ID from either of the
+// two SSE mounts:
+//
+//   - /api/v1/usage/stream/{id} — the SPA EventSource path.
+//   - /api/tenants/{id}/usage/stream — the console-mux alias.
+//
+// A trailing slash is tolerated on both so the frontend can
+// normalise URLs without affecting routing.
 func parseUsageStreamPath(p string) (string, bool) {
+	if id, ok := parseV1UsageStreamPath(p); ok {
+		return id, true
+	}
+	return parseTenantScopedUsageStreamPath(p)
+}
+
+func parseV1UsageStreamPath(p string) (string, bool) {
 	const prefix = "/api/v1/usage/stream/"
 	if !strings.HasPrefix(p, prefix) {
 		return "", false
@@ -250,4 +267,21 @@ func parseUsageStreamPath(p string) (string, bool) {
 		return "", false
 	}
 	return rest, true
+}
+
+func parseTenantScopedUsageStreamPath(p string) (string, bool) {
+	const prefix = "/api/tenants/"
+	const suffix = "/usage/stream"
+	if !strings.HasPrefix(p, prefix) {
+		return "", false
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(p, prefix), "/")
+	if !strings.HasSuffix(rest, suffix) {
+		return "", false
+	}
+	id := strings.TrimSuffix(rest, suffix)
+	if id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
 }

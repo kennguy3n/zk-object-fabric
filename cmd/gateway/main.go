@@ -99,7 +99,6 @@ func main() {
 	// provider so deployments without a real plug-in still get a
 	// working gateway and a full audit trail.
 	billingProvider := buildBillingProvider(cfg)
-	_ = billingProvider // reserved for future invoice / subscription wiring (Phase 4+)
 	// authStore is the B2C signup / login backing store. Created
 	// here (rather than inside startConsoleAPI) so the S3 handler's
 	// VerifiedCheck hook and the console's auth routes share the
@@ -206,7 +205,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, authHooks, billingSink)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, authHooks, billingSink, billingProvider)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -824,6 +823,7 @@ func startConsoleAPI(
 	authStore console.AuthStore,
 	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
+	billingProvider billing.BillingProvider,
 ) *http.Server {
 	if cfg.Console.ListenAddr == "" {
 		return nil
@@ -856,6 +856,7 @@ func startConsoleAPI(
 		AuthHooks:       authHooks,
 		AdminAuth:       buildAdminAuth(cfg),
 		BillingSink:     billingSink,
+		BillingProvider: billingProvider,
 		Buckets:         console.NewMemoryBucketStore(),
 		Cells:           cellStore,
 		CellProvisioner: cellProvisioner,

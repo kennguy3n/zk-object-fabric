@@ -1,12 +1,15 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
 )
@@ -229,6 +232,182 @@ func TestSignup_EmitsTenantCreatedBillingEvent(t *testing.T) {
 	}
 	if evt.TenantID == "" {
 		t.Fatalf("event TenantID is empty")
+	}
+}
+
+// --- BillingProvider EnsureCustomer wiring ----------------------
+
+// recordingBillingProvider captures EnsureCustomer calls made by the
+// signup flow so tests can assert the per-signup CustomerRequest
+// shape without standing up a real provider.
+type recordingBillingProvider struct {
+	mu       sync.Mutex
+	requests []billing.CustomerRequest
+	err      error
+}
+
+func (p *recordingBillingProvider) Name() string { return "recording" }
+
+func (p *recordingBillingProvider) EnsureCustomer(ctx context.Context, req billing.CustomerRequest) (billing.CustomerHandle, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.requests = append(p.requests, req)
+	if p.err != nil {
+		return billing.CustomerHandle{}, p.err
+	}
+	return billing.CustomerHandle{Provider: "recording", ProviderRef: "cus_" + req.TenantID}, nil
+}
+
+func (p *recordingBillingProvider) EnsureSubscription(ctx context.Context, req billing.SubscriptionRequest) (billing.SubscriptionHandle, error) {
+	return billing.SubscriptionHandle{}, nil
+}
+func (p *recordingBillingProvider) ReportUsage(ctx context.Context, events []billing.UsageEvent) error {
+	return nil
+}
+func (p *recordingBillingProvider) IssueInvoice(ctx context.Context, req billing.InvoiceRequest) (billing.InvoiceHandle, error) {
+	return billing.InvoiceHandle{}, nil
+}
+func (p *recordingBillingProvider) CancelSubscription(ctx context.Context, subscriptionID string) error {
+	return nil
+}
+
+func TestSignup_CallsBillingProviderEnsureCustomer(t *testing.T) {
+	provider := &recordingBillingProvider{}
+	h := NewAuthHandler(AuthConfig{
+		Tenants:         newFakeTenantStore(),
+		Auth:            NewMemoryAuthStore(),
+		Tokens:          NewMemoryTokenStore(),
+		BillingProvider: provider,
+	})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	body := strings.NewReader(`{"email":"customer@example.com","password":"SuperSecretPass123","tenantName":"Acme Inc"}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/signup", body)
+	req.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	if len(provider.requests) != 1 {
+		t.Fatalf("provider requests = %d, want 1", len(provider.requests))
+	}
+	got := provider.requests[0]
+	if got.Email != "customer@example.com" {
+		t.Errorf("CustomerRequest.Email = %q, want %q", got.Email, "customer@example.com")
+	}
+	if got.Name != "Acme Inc" {
+		t.Errorf("CustomerRequest.Name = %q, want %q", got.Name, "Acme Inc")
+	}
+	if got.TenantID == "" {
+		t.Errorf("CustomerRequest.TenantID is empty")
+	}
+	if got.Metadata["signup_path"] != "b2c_self_service" {
+		t.Errorf("CustomerRequest.Metadata[signup_path] = %q, want %q",
+			got.Metadata["signup_path"], "b2c_self_service")
+	}
+}
+
+// TestSignup_EnsureCustomerFailureDoesNotRollBackTenant verifies a
+// failed EnsureCustomer is logged but the signup still returns 201
+// — the tenant + API key + token were already minted and the
+// provider can be reconciled later by a sweep job.
+func TestSignup_EnsureCustomerFailureDoesNotRollBackTenant(t *testing.T) {
+	provider := &recordingBillingProvider{err: errors.New("upstream 500")}
+	tenants := newFakeTenantStore()
+	h := NewAuthHandler(AuthConfig{
+		Tenants:         tenants,
+		Auth:            NewMemoryAuthStore(),
+		Tokens:          NewMemoryTokenStore(),
+		BillingProvider: provider,
+	})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	body := strings.NewReader(`{"email":"a@b.com","password":"SuperSecretPass123","tenantName":"Acme"}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/signup", body)
+	req.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	tenants.mu.Lock()
+	count := len(tenants.tenants)
+	tenants.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("tenants in store = %d, want 1 (signup must not roll back on EnsureCustomer failure)", count)
+	}
+}
+
+// --- tenant-scoped SSE alias ------------------------------------
+
+// fakeTokenLookup is a TokenStore stub that resolves a single
+// (token → tenantID) pair for the SSE alias test.
+type fakeTokenLookup struct {
+	token, tenantID string
+}
+
+func (s *fakeTokenLookup) IssueToken(tenantID string) (string, error) {
+	if s.tenantID == tenantID {
+		return s.token, nil
+	}
+	return "", errors.New("issue not supported")
+}
+
+func (s *fakeTokenLookup) ResolveToken(token string) (string, bool) {
+	if token == s.token {
+		return s.tenantID, true
+	}
+	return "", false
+}
+
+// TestUsageStream_TenantScopedAlias verifies the console-mux alias
+// /api/tenants/{id}/usage/stream resolves through the same handler
+// as the legacy /api/v1/usage/stream/{id} path.
+func TestUsageStream_TenantScopedAlias(t *testing.T) {
+	tokens := &fakeTokenLookup{token: "tok123", tenantID: "acme"}
+	h := New(Config{
+		Tenants:             newFakeTenantStore(sampleTenant("acme")),
+		Usage:               &fakeUsage{result: map[string]uint64{"egress_bytes": 42}},
+		Tokens:              tokens,
+		UsageStreamInterval: time.Hour, // ensure only the initial frame fires before we close
+	})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/tenants/acme/usage/stream?token=tok123", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 250*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "egress_bytes") {
+		t.Errorf("body missing initial frame counters; body = %s", rec.Body.String())
+	}
+}
+
+// TestUsageStream_TenantScopedAlias_NotConfigured verifies the
+// alias degrades to 503 when Usage is not configured, matching the
+// legacy /api/v1 path.
+func TestUsageStream_TenantScopedAlias_NotConfigured(t *testing.T) {
+	h := New(Config{Tenants: newFakeTenantStore(sampleTenant("acme"))})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/tenants/acme/usage/stream", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -327,6 +328,20 @@ type AuthConfig struct {
 	BillingSink interface {
 		Emit(event billing.UsageEvent)
 	}
+
+	// BillingProvider is the optional outbound integration to a
+	// payment / subscription provider. The signup handler calls
+	// EnsureCustomer immediately after the tenant record commits
+	// so a freshly-minted tenant is reflected on the provider
+	// (Stripe, Chargebee, …) before any usage event lands. A nil
+	// provider skips the call — acceptable for dev and for the
+	// HMAC-only Phase 2 path.
+	BillingProvider billing.BillingProvider
+
+	// EnsureCustomerTimeout caps the EnsureCustomer round-trip so
+	// a slow billing provider cannot wedge signup. Defaults to 5
+	// seconds when zero.
+	EnsureCustomerTimeout time.Duration
 
 	// Now returns the current time. Defaults to time.Now.
 	Now Clock
@@ -693,6 +708,37 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 			Delta:      1,
 			ObservedAt: createdAt,
 		})
+	}
+	// EnsureCustomer reflects the new tenant on the configured
+	// outbound billing provider (Stripe, Chargebee, …). The call
+	// is bounded by EnsureCustomerTimeout so a slow upstream cannot
+	// wedge signup. Failures are logged but do NOT roll the signup
+	// back: the user already has a valid tenant + API key pair, and
+	// the provider can be reconciled later by a sweep job. The
+	// no-op default ships in cmd/gateway/main.go when the operator
+	// has not configured a real provider, so this branch is safe
+	// for every deploy.
+	if h.cfg.BillingProvider != nil {
+		timeout := h.cfg.EnsureCustomerTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		provCtx, cancel := context.WithTimeout(r.Context(), timeout)
+		if _, err := h.cfg.BillingProvider.EnsureCustomer(provCtx, billing.CustomerRequest{
+			TenantID: tenantID,
+			Email:    req.Email,
+			Name:     req.TenantName,
+			Metadata: map[string]string{
+				"contract_type": string(newTenant.ContractType),
+				"license_tier":  string(newTenant.LicenseTier),
+				"placement_ref": newTenant.PlacementDefault.PolicyRef,
+				"signup_path":   "b2c_self_service",
+			},
+		}); err != nil {
+			log.Printf("console: signup billing-provider %q EnsureCustomer for tenant %q failed: %v",
+				h.cfg.BillingProvider.Name(), tenantID, err)
+		}
+		cancel()
 	}
 	writeJSON(w, http.StatusCreated, AuthResponse{
 		Tenant:    summarizeTenantAt(newTenant, createdAt),

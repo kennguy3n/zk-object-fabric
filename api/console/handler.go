@@ -195,6 +195,15 @@ type Config struct {
 		Emit(event billing.UsageEvent)
 	}
 
+	// BillingProvider is the optional outbound integration to a
+	// payment / subscription provider (Stripe, Chargebee, …). The
+	// signup handler calls EnsureCustomer immediately after
+	// CreateTenant commits so a freshly-minted tenant is reflected
+	// on the provider before any usage event lands. A nil provider
+	// skips the call — acceptable for dev and the HMAC-only Phase
+	// 2 path; production wires cmd/gateway/main.go's provider.
+	BillingProvider billing.BillingProvider
+
 	// AdminAuth is the per-request admin-authorization check. The
 	// tenant / usage / keys / placement routes all consult it
 	// before serving; a nil hook disables the check (suitable for
@@ -256,6 +265,11 @@ type Config struct {
 // router via ServeHTTP).
 type Handler struct {
 	cfg Config
+	// sseHandler serves the tenant-scoped usage stream alias
+	// /api/tenants/{id}/usage/stream. Set in Register when Usage
+	// is configured so dispatch can forward matching requests
+	// without registering a second handler on /api/tenants/.
+	sseHandler *UsageStreamHandler
 }
 
 // New returns a Handler with cfg defaults filled in.
@@ -303,14 +317,15 @@ func (h *Handler) Register(mux *http.ServeMux) {
 			log.Printf("console: Auth is a MemoryAuthStore — DO NOT use in production; wire a persistent AuthStore")
 		}
 		auth := NewAuthHandler(AuthConfig{
-			Tenants:     h.cfg.Tenants,
-			Auth:        h.cfg.Auth,
-			Tokens:      tokens,
-			GenerateKey: h.cfg.GenerateKey,
-			NewTenantID: h.cfg.NewTenantID,
-			Hooks:       h.cfg.AuthHooks,
-			BillingSink: h.cfg.BillingSink,
-			Now:         h.cfg.Now,
+			Tenants:         h.cfg.Tenants,
+			Auth:            h.cfg.Auth,
+			Tokens:          tokens,
+			GenerateKey:     h.cfg.GenerateKey,
+			NewTenantID:     h.cfg.NewTenantID,
+			Hooks:           h.cfg.AuthHooks,
+			BillingSink:     h.cfg.BillingSink,
+			BillingProvider: h.cfg.BillingProvider,
+			Now:             h.cfg.Now,
 		})
 		auth.Register(mux)
 	}
@@ -323,6 +338,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 			Now:      h.cfg.Now,
 		})
 		sse.Register(mux)
+		// dispatch forwards GET /api/tenants/{id}/usage/stream
+		// requests to this same handler so the console mux
+		// exposes the SSE feed under both the legacy v1 path
+		// and the tenant-scoped form.
+		h.sseHandler = sse
 	}
 }
 
@@ -364,15 +384,29 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		h.getTenant(w, r, tenantID)
 	case "usage":
-		if sub != "" {
+		switch sub {
+		case "":
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			h.getUsage(w, r, tenantID)
+		case "stream":
+			// SSE alias for /api/v1/usage/stream/{id}. The
+			// stream handler does its own tenant-scoped
+			// token check, so we deliberately bypass
+			// AdminAuth (which has already run above) and
+			// hand the request straight through. When Usage
+			// was not configured, sseHandler is nil and we
+			// 503 so the SPA can degrade gracefully.
+			if h.sseHandler == nil {
+				writeError(w, http.StatusServiceUnavailable, "usage stream not configured")
+				return
+			}
+			h.sseHandler.ServeHTTP(w, r)
+		default:
 			writeError(w, http.StatusNotFound, "unknown subresource usage/"+sub)
-			return
 		}
-		if r.Method != http.MethodGet {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		h.getUsage(w, r, tenantID)
 	case "keys":
 		switch r.Method {
 		case http.MethodPost:
