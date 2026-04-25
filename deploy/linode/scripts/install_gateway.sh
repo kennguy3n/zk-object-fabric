@@ -22,13 +22,17 @@ if [ -f "$INSTALL_DIR/gateway.sha256" ]; then
   old_sum=$(cat "$INSTALL_DIR/gateway.sha256")
 fi
 
-if [ "$new_sum" != "$old_sum" ]; then
-  tar -xzf "$tmp" -C "$INSTALL_DIR"
-  echo "$new_sum" > "$INSTALL_DIR/gateway.sha256"
-  systemctl restart zk-gateway || systemctl start zk-gateway
-fi
-
+# Ensure the runtime user exists before any systemctl invocation: the
+# systemd unit hard-codes User=zkof, so starting the service before the
+# user is created leaves the host in a wedged state.
 if ! id -u zkof >/dev/null 2>&1; then
   useradd --system --home /var/lib/zkof --shell /usr/sbin/nologin zkof
 fi
 chown -R zkof:zkof /var/lib/zkof /etc/zk-gateway
+
+if [ "$new_sum" != "$old_sum" ]; then
+  tar -xzf "$tmp" -C "$INSTALL_DIR"
+  echo "$new_sum" > "$INSTALL_DIR/gateway.sha256"
+  chown -R zkof:zkof "$INSTALL_DIR"
+  systemctl restart zk-gateway || systemctl start zk-gateway
+fi

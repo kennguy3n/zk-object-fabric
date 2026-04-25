@@ -8,29 +8,33 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONSOLE_URL=""
 ADMIN_TOKEN=""
 SPEC=""
-DECOMMISSION_CELL=""
+DECOMMISSION=0
+CELL_ID=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --console-url)   CONSOLE_URL="$2"; shift 2;;
     --admin-token)   ADMIN_TOKEN="$2"; shift 2;;
     --spec)          SPEC="$2"; shift 2;;
-    --decommission)  DECOMMISSION_CELL="$2"; shift 2;;
+    --decommission)  DECOMMISSION=1; shift;;
+    --cell)          CELL_ID="$2"; shift 2;;
     *) echo "unknown flag: $1" >&2; exit 2;;
   esac
 done
 
-if [ -n "$DECOMMISSION_CELL" ]; then
-  echo "==> decommissioning cell $DECOMMISSION_CELL"
+: "${CONSOLE_URL:?--console-url required}"
+: "${ADMIN_TOKEN:?--admin-token required}"
+
+if [ "$DECOMMISSION" -eq 1 ]; then
+  : "${CELL_ID:?--cell required when --decommission is set}"
+  echo "==> decommissioning cell $CELL_ID"
   curl -fsS -X DELETE \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
-    "$CONSOLE_URL/api/admin/dedicated-cells/$DECOMMISSION_CELL"
+    "$CONSOLE_URL/api/admin/dedicated-cells/$CELL_ID"
   echo "decommission request accepted; the gateway will drain via the migration state machine."
   exit 0
 fi
 
-: "${CONSOLE_URL:?--console-url required}"
-: "${ADMIN_TOKEN:?--admin-token required}"
 : "${SPEC:?--spec required}"
 
 if [ ! -f "$SPEC" ]; then

@@ -34,10 +34,34 @@ chmod +x /usr/local/sbin/cephadm
 cephadm add-repo --release reef
 cephadm install ceph-common
 
-mon_ip=$(ip -4 -j addr show | jq -r --arg net "$PUBLIC_NETWORK" '.[]
-  | .addr_info[]
-  | select(.scope=="global")
-  | .local' | head -1)
+# Pick the first global-scope IPv4 that falls inside PUBLIC_NETWORK
+# (so multi-homed nodes with a separate cluster network don't pin the
+# mon to the wrong interface). When PUBLIC_NETWORK is empty fall back
+# to the first global-scope IPv4 on the host.
+all_ips=$(ip -4 -j addr show | jq -r '.[] | .addr_info[] | select(.scope=="global") | .local')
+if [ -n "$PUBLIC_NETWORK" ]; then
+  mon_ip=$(printf '%s\n' "$all_ips" | python3 -c '
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+for line in sys.stdin:
+    ip = line.strip()
+    if not ip:
+        continue
+    try:
+        if ipaddress.ip_address(ip) in net:
+            print(ip)
+            break
+    except ValueError:
+        continue
+' "$PUBLIC_NETWORK")
+else
+  mon_ip=$(printf '%s\n' "$all_ips" | head -1)
+fi
+
+if [ -z "$mon_ip" ]; then
+  echo "no global-scope IPv4 address found inside ${PUBLIC_NETWORK:-<host>}" >&2
+  exit 1
+fi
 
 cephadm bootstrap \
   --mon-ip "$mon_ip" \
