@@ -1,0 +1,25 @@
+{
+  "providers": {
+    "ceph_rgw": {
+      "endpoint":   "https://rgw.zkof-beta-cell-01.local:7480",
+      "region":     "local-dc-01",
+      "bucket":     "zkof-beta-cell-01-primary",
+      "access_key": "${CEPH_RGW_AK}",
+      "secret_key": "${CEPH_RGW_SK}",
+      "cell":       "beta-cell-01",
+      "country":    "US"
+    }
+  },
+  "migration": {
+    "targets": [
+      {
+        "primary":   "wasabi-us-east-1",
+        "secondary": "ceph_rgw",
+        "rebalancer": {
+          "rate_bytes_per_sec": 1073741824,
+          "max_concurrent":     8
+        }
+      }
+    ]
+  }
+}

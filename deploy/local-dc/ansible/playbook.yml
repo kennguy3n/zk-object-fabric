@@ -1,0 +1,54 @@
+# OS hardening + cephadm install across every host in the inventory.
+# After this completes, run cephadm/install.sh on the bootstrap node
+# and then `ceph orch host add` for the rest.
+---
+- name: Prepare hosts for Ceph Reef
+  hosts: ceph
+  become: true
+  tasks:
+    - name: Ensure required packages are installed
+      apt:
+        name:
+          - chrony
+          - lvm2
+          - jq
+          - python3
+          - curl
+          - apt-transport-https
+          - ca-certificates
+        state: present
+        update_cache: true
+
+    - name: Disable swap (Ceph recommendation)
+      command: swapoff -a
+      changed_when: false
+
+    - name: Persist swap-off
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^(.*\sswap\s.*)$'
+        line: '#\1'
+        backrefs: true
+
+    - name: Configure ulimits for ceph
+      pam_limits:
+        domain: '*'
+        limit_type: '-'
+        limit_item: nofile
+        value: 1048576
+
+    - name: Add cephadm installer
+      get_url:
+        url: https://download.ceph.com/rpm-reef/el9/noarch/cephadm
+        dest: /usr/local/sbin/cephadm
+        mode: '0755'
+
+    - name: Install ceph repos
+      command: /usr/local/sbin/cephadm add-repo --release reef
+      args:
+        creates: /etc/apt/sources.list.d/ceph.list
+
+    - name: Install ceph-common
+      command: /usr/local/sbin/cephadm install ceph-common
+      args:
+        creates: /usr/bin/ceph

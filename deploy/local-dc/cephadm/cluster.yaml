@@ -1,0 +1,43 @@
+# Ceph orchestrator service spec. Apply with:
+#   cephadm shell -- ceph orch apply -i cluster.yaml
+---
+service_type: mon
+placement:
+  count: 3
+  label: "mon"
+---
+service_type: mgr
+placement:
+  count: 2
+  label: "mgr"
+---
+service_type: rgw
+service_id: zkof-beta
+placement:
+  count: 3
+  label: "rgw"
+spec:
+  rgw_frontend_port: 7480
+  rgw_realm: zkof
+  rgw_zone: zkof-beta
+---
+service_type: osd
+service_id: zkof-osd-hdd
+placement:
+  label: "osd"
+data_devices:
+  rotational: 1
+db_devices:
+  paths:
+    - /dev/disk/by-path/pci-0000:00:1f.0-nvme-1
+encrypted: true
+---
+service_type: prometheus
+placement:
+  count: 1
+  label: "monitoring"
+---
+service_type: grafana
+placement:
+  count: 1
+  label: "monitoring"

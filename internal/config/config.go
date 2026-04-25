@@ -229,10 +229,37 @@ type GatewayConfig struct {
 
 // ControlPlaneConfig configures the AWS-hosted control plane surface
 // the gateway talks to.
+//
+// The connection-pool fields tune the RDS-backed *sql.DB sessions
+// used by every Postgres-backed store (manifest, tenant, auth,
+// placement, dedicated cell). Production deploys typically set
+// MaxOpenConns to 2× the gateway's CPU count and ConnMaxLifetime to
+// a value comfortably under RDS Proxy's idle-connection timeout
+// (10 minutes by default).
 type ControlPlaneConfig struct {
 	MetadataDSN string `json:"metadata_dsn"`
 	AuthIssuer  string `json:"auth_issuer"`
 	BillingURL  string `json:"billing_url"`
+
+	// MaxOpenConns caps concurrent open connections to the metadata
+	// database. Zero means use Go's default (unlimited), which is
+	// fine for dev but can saturate RDS in production.
+	MaxOpenConns int `json:"max_open_conns"`
+
+	// MaxIdleConns caps idle connections kept in the pool. Zero
+	// means use Go's default (2). RDS Proxy deployments commonly
+	// set this to MaxOpenConns to keep the pool warm.
+	MaxIdleConns int `json:"max_idle_conns"`
+
+	// ConnMaxLifetime caps how long a single connection may live
+	// before the pool retires it. Zero means connections live
+	// forever; production deploys should set this below the
+	// upstream proxy's idle timeout.
+	ConnMaxLifetime Duration `json:"conn_max_lifetime"`
+
+	// ConnMaxIdleTime caps how long an idle connection may sit in
+	// the pool before retirement. Zero means no limit.
+	ConnMaxIdleTime Duration `json:"conn_max_idle_time"`
 }
 
 // BillingConfig configures the metering sink. When ClickHouseURL is
@@ -313,12 +340,55 @@ type ProvidersConfig struct {
 }
 
 // WasabiConfig configures the Phase 1 primary storage backend.
+//
+// The single-region fields (Endpoint, Region, Bucket, AccessKey,
+// SecretKey) are kept for backward compatibility with Phase 1 / 2
+// configs. Phase 3 production deploys set Regions instead, so the
+// gateway registers one Wasabi provider per region under the
+// stable names "wasabi-<region>" (or the region's explicit
+// `name`). When Regions is non-empty the legacy single-region
+// fields are ignored unless the legacy fields name a region not
+// already covered by Regions, in which case they are appended
+// under the name "wasabi" for compatibility with the existing
+// preference order in pickDefaultBackend.
 type WasabiConfig struct {
+	// Single-region (legacy / dev) configuration.
 	Endpoint  string `json:"endpoint"`
 	Region    string `json:"region"`
 	Bucket    string `json:"bucket"`
 	AccessKey string `json:"access_key"`
 	SecretKey string `json:"secret_key"`
+
+	// Regions enumerates per-region Wasabi providers. Each entry
+	// becomes its own StorageProvider keyed in the registry under
+	// `Name` (defaulting to "wasabi-<Region>") so PlacementPolicy
+	// can target a specific region by name.
+	Regions []WasabiRegionConfig `json:"regions"`
+}
+
+// WasabiRegionConfig configures a single Wasabi region.
+type WasabiRegionConfig struct {
+	// Name is the registry key under which this region is
+	// registered. Defaults to "wasabi-<Region>" when empty.
+	Name string `json:"name"`
+
+	Endpoint  string `json:"endpoint"`
+	Region    string `json:"region"`
+	Bucket    string `json:"bucket"`
+	AccessKey string `json:"access_key"`
+	SecretKey string `json:"secret_key"`
+}
+
+// ResolvedName returns the registry key for this region,
+// computing the "wasabi-<Region>" default when Name is empty.
+func (w WasabiRegionConfig) ResolvedName() string {
+	if w.Name != "" {
+		return w.Name
+	}
+	if w.Region != "" {
+		return "wasabi-" + w.Region
+	}
+	return "wasabi"
 }
 
 // LocalFSDevConfig configures the developer-loopback adapter used by

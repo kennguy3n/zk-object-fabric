@@ -1,0 +1,31 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["ZKOF/Auth", "abuse_anomaly_alerts"],
+          ["ZKOF/Auth", "abuse_budget_exhausted"]
+        ],
+        "period": 60,
+        "stat": "Sum",
+        "title": "Abuse alerts per minute"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["ZKOF/Auth", "throttled_requests", "reason", "rps"],
+          ["ZKOF/Auth", "throttled_requests", "reason", "egress_budget"],
+          ["ZKOF/Auth", "throttled_requests", "reason", "anomaly_cooldown"]
+        ],
+        "period": 60,
+        "stat": "Sum",
+        "title": "Throttled requests by reason"
+      }
+    }
+  ]
+}

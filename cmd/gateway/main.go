@@ -301,6 +301,25 @@ func startRebalancer(
 	return done
 }
 
+// applyDBConnectionPool applies the gateway's RDS / Postgres
+// connection-pool tuning from cfg.ControlPlane to every *sql.DB
+// the gateway opens. It is a no-op for unset (zero-valued) fields
+// so dev configs keep Go's stdlib defaults.
+func applyDBConnectionPool(db *sql.DB, cfg config.ControlPlaneConfig) {
+	if cfg.MaxOpenConns > 0 {
+		db.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns > 0 {
+		db.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if d := time.Duration(cfg.ConnMaxLifetime); d > 0 {
+		db.SetConnMaxLifetime(d)
+	}
+	if d := time.Duration(cfg.ConnMaxIdleTime); d > 0 {
+		db.SetConnMaxIdleTime(d)
+	}
+}
+
 func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {
 	if cfg.ControlPlane.MetadataDSN == "" {
 		log.Printf("gateway: no control_plane.metadata_dsn; using in-memory manifest store (dev only)")
@@ -310,6 +329,7 @@ func buildManifestStore(cfg config.Config) manifest_store.ManifestStore {
 	if err != nil {
 		log.Fatalf("gateway: open postgres: %v", err)
 	}
+	applyDBConnectionPool(db, cfg.ControlPlane)
 	if err := db.Ping(); err != nil {
 		log.Fatalf("gateway: ping postgres: %v", err)
 	}
@@ -499,6 +519,31 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 			log.Fatalf("gateway: build wasabi: %v", err)
 		}
 		registry["wasabi"] = w
+	}
+	// Per-region Wasabi providers (Phase 3 multi-region).
+	// Each region registers under its ResolvedName() so placement
+	// policies can target e.g. "wasabi-us-east-1" or
+	// "wasabi-eu-central-1" explicitly.
+	for _, r := range cfg.Providers.Wasabi.Regions {
+		if r.Endpoint == "" || r.Bucket == "" {
+			continue
+		}
+		name := r.ResolvedName()
+		if _, exists := registry[name]; exists {
+			log.Fatalf("gateway: duplicate wasabi region name %q", name)
+		}
+		w, err := wasabi.New(wasabi.Config{
+			Endpoint:  r.Endpoint,
+			Region:    r.Region,
+			Bucket:    r.Bucket,
+			AccessKey: r.AccessKey,
+			SecretKey: r.SecretKey,
+		})
+		if err != nil {
+			log.Fatalf("gateway: build wasabi region %q: %v", name, err)
+		}
+		registry[name] = w
+		log.Printf("gateway: registered wasabi region provider %q (endpoint=%s bucket=%s)", name, r.Endpoint, r.Bucket)
 	}
 	if cfg.Providers.CephRGW.Endpoint != "" {
 		c, err := ceph_rgw.New(ceph_rgw.Config{
@@ -783,6 +828,7 @@ func buildAuthStore(cfg config.Config) console.AuthStore {
 		log.Printf("gateway: open postgres for auth store: %v; falling back to in-memory", err)
 		return console.NewMemoryAuthStore()
 	}
+	applyDBConnectionPool(db, cfg.ControlPlane)
 	store, err := console.NewPostgresAuthStore(db)
 	if err != nil {
 		log.Printf("gateway: build postgres auth store: %v; falling back to in-memory", err)
@@ -806,6 +852,7 @@ func buildDedicatedCellStore(cfg config.Config) console.DedicatedCellStore {
 		log.Printf("gateway: open postgres for dedicated cell store: %v; falling back to in-memory", err)
 		return console.NewMemoryDedicatedCellStore()
 	}
+	applyDBConnectionPool(db, cfg.ControlPlane)
 	store, err := console.NewPostgresDedicatedCellStore(db)
 	if err != nil {
 		log.Printf("gateway: build postgres dedicated cell store: %v; falling back to in-memory", err)
@@ -904,6 +951,7 @@ func buildPlacementStore(cfg config.Config) console.PlacementStore {
 		log.Printf("gateway: open postgres for placement store: %v; falling back to in-memory", err)
 		return console.NewMemoryPlacementStore()
 	}
+	applyDBConnectionPool(db, cfg.ControlPlane)
 	store, err := console.NewPostgresPlacementStore(db)
 	if err != nil {
 		log.Printf("gateway: build postgres placement store: %v; falling back to in-memory", err)
@@ -1036,6 +1084,7 @@ func buildTenantStore(cfg config.Config, path string) auth.TenantStore {
 		if err != nil {
 			log.Fatalf("gateway: open postgres for tenant store: %v", err)
 		}
+		applyDBConnectionPool(db, cfg.ControlPlane)
 		store, err := auth.NewPostgresTenantStore(db)
 		if err != nil {
 			log.Fatalf("gateway: build postgres tenant store: %v", err)

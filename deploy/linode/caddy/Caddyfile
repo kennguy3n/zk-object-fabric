@@ -1,0 +1,53 @@
+# Caddy reverse proxy for the ZK Object Fabric gateway. Terminates
+# TLS on :443 and proxies to the local gateway. Blocks /internal/*
+# from external clients so only the NodeBalancer health probe
+# (which talks to :8080 directly over the private network) can
+# reach it.
+
+{
+  email ops@zkof.example
+  servers {
+    timeouts {
+      read_body 5m
+      read_header 30s
+      write 5m
+      idle 5m
+    }
+  }
+}
+
+s3.{$ZKOF_DOMAIN} {
+  encode zstd gzip
+
+  # Block /internal/* from public clients.
+  @internal path /internal/*
+  handle @internal {
+    respond 404
+  }
+
+  reverse_proxy 127.0.0.1:8080 {
+    transport http {
+      keepalive 5m
+      keepalive_idle_conns 16
+    }
+    flush_interval -1
+  }
+
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options    "nosniff"
+    X-Frame-Options           "DENY"
+    Referrer-Policy           "no-referrer"
+  }
+}
+
+console.{$ZKOF_DOMAIN} {
+  encode zstd gzip
+  reverse_proxy 127.0.0.1:8081
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options    "nosniff"
+    X-Frame-Options           "DENY"
+    Referrer-Policy           "strict-origin-when-cross-origin"
+  }
+}

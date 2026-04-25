@@ -1,0 +1,32 @@
+{
+  "providers": {
+    "wasabi": {
+      "regions": [
+        {
+          "name":       "wasabi-us-east-1",
+          "endpoint":   "https://s3.us-east-1.wasabisys.com",
+          "region":     "us-east-1",
+          "bucket":     "zkof-us-east-1-prod",
+          "access_key": "${WASABI_US_EAST_1_AK}",
+          "secret_key": "${WASABI_US_EAST_1_SK}"
+        },
+        {
+          "name":       "wasabi-eu-central-1",
+          "endpoint":   "https://s3.eu-central-1.wasabisys.com",
+          "region":     "eu-central-1",
+          "bucket":     "zkof-eu-central-1-prod",
+          "access_key": "${WASABI_EU_CENTRAL_1_AK}",
+          "secret_key": "${WASABI_EU_CENTRAL_1_SK}"
+        },
+        {
+          "name":       "wasabi-ap-northeast-1",
+          "endpoint":   "https://s3.ap-northeast-1.wasabisys.com",
+          "region":     "ap-northeast-1",
+          "bucket":     "zkof-ap-northeast-1-prod",
+          "access_key": "${WASABI_AP_NORTHEAST_1_AK}",
+          "secret_key": "${WASABI_AP_NORTHEAST_1_SK}"
+        }
+      ]
+    }
+  }
+}
