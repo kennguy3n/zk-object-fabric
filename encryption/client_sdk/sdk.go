@@ -66,6 +66,15 @@ func (o Options) chunkSize() int {
 	return DefaultChunkSize
 }
 
+// ErrConvergentNonceNotImplemented is returned by EncryptObject /
+// DecryptObject when Options.ConvergentNonce is set. The flag is
+// scaffolding for Phase 3.5 Pattern C dedup (docs/PROPOSAL.md §3.14)
+// and is not yet wired through to the per-chunk nonce derivation, so
+// honoring it would silently produce non-deterministic ciphertext
+// and defeat dedup. Returning an error keeps callers from depending
+// on a no-op until the wiring lands.
+var ErrConvergentNonceNotImplemented = errors.New("client_sdk: convergent nonce mode not yet implemented")
+
 // EncryptObject returns a reader that yields the encrypted, chunk-
 // framed form of plaintext. The caller reads the returned stream
 // until EOF and writes the bytes to storage; nothing in the SDK
@@ -73,6 +82,9 @@ func (o Options) chunkSize() int {
 func EncryptObject(plaintext io.Reader, dek DataEncryptionKey, opts Options) (io.Reader, error) {
 	if plaintext == nil {
 		return nil, errors.New("client_sdk: plaintext is required")
+	}
+	if opts.ConvergentNonce {
+		return nil, ErrConvergentNonceNotImplemented
 	}
 	aead, err := chacha20poly1305.NewX(dek)
 	if err != nil {
@@ -91,6 +103,9 @@ func EncryptObject(plaintext io.Reader, dek DataEncryptionKey, opts Options) (io
 func DecryptObject(ciphertext io.Reader, dek DataEncryptionKey, opts Options) (io.Reader, error) {
 	if ciphertext == nil {
 		return nil, errors.New("client_sdk: ciphertext is required")
+	}
+	if opts.ConvergentNonce {
+		return nil, ErrConvergentNonceNotImplemented
 	}
 	aead, err := chacha20poly1305.NewX(dek)
 	if err != nil {
