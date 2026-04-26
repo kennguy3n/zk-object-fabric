@@ -593,7 +593,7 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 		}
 		registry["ceph_rgw"] = c
 	}
-	if cfg.Providers.BackblazeB2.Bucket != "" {
+	if cfg.Providers.BackblazeB2.Endpoint != "" {
 		b, err := backblaze_b2.New(backblaze_b2.Config{
 			Endpoint:  cfg.Providers.BackblazeB2.Endpoint,
 			Region:    cfg.Providers.BackblazeB2.Region,
@@ -606,7 +606,7 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 		}
 		registry["backblaze_b2"] = b
 	}
-	if cfg.Providers.CloudflareR2.Bucket != "" {
+	if cfg.Providers.CloudflareR2.AccountID != "" || cfg.Providers.CloudflareR2.Endpoint != "" {
 		r, err := cloudflare_r2.New(cloudflare_r2.Config{
 			AccountID: cfg.Providers.CloudflareR2.AccountID,
 			Endpoint:  cfg.Providers.CloudflareR2.Endpoint,
@@ -619,7 +619,7 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 		}
 		registry["cloudflare_r2"] = r
 	}
-	if cfg.Providers.AWSS3.Bucket != "" {
+	if cfg.Providers.AWSS3.Region != "" {
 		a, err := aws_s3.New(aws_s3.Config{
 			Region:    cfg.Providers.AWSS3.Region,
 			Bucket:    cfg.Providers.AWSS3.Bucket,
