@@ -75,6 +75,14 @@ type Workload struct {
 	// before LIST scenarios execute. Used for the 10M / 100M / 1B
 	// targets below.
 	ListObjectCount int64
+
+	// DedupHitFraction is the fraction of PUTs whose plaintext is
+	// already known to the gateway when the scenario starts. The
+	// driver pre-warms the content_index with HitFraction * total
+	// PUT objects before the run begins so the steady-state hit
+	// ratio is deterministic. 0.0 disables pre-warming. Used by
+	// the Phase 3.5 B2C-80%-dup and B2B-60%-dup scenarios.
+	DedupHitFraction float64
 }
 
 // Target is a single pass/fail assertion against a measured metric.
@@ -141,6 +149,23 @@ const (
 	// origin egress, Linode transit, and local-DC peering). Per
 	// docs/PROGRESS.md "Key Metrics to Track".
 	MetricNetworkCostUSDPerTB Metric = "network_cost_usd_per_tb"
+
+	// MetricDedupHitRatio is the fraction of PUT requests that
+	// landed on an existing content_index entry. The Phase 3.5
+	// targets are 0.8 for the B2C scenario and 0.6 for the B2B
+	// scenario.
+	MetricDedupHitRatio Metric = "dedup_hit_ratio"
+
+	// MetricDedupBytesSavedRatio is the fraction of inbound
+	// plaintext bytes the gateway avoided writing to the backend
+	// because of dedup. Reported as DedupBytesSaved / inboundBytes
+	// over the scenario window.
+	MetricDedupBytesSavedRatio Metric = "dedup_bytes_saved_ratio"
+
+	// MetricDedupPutLatencyOverheadP95 is the additional p95 PUT
+	// latency the content_index lookup adds compared to a dedup-
+	// off baseline. Phase 3.5 cap is 5 ms.
+	MetricDedupPutLatencyOverheadP95 Metric = "dedup_put_latency_overhead_p95"
 )
 
 // Target values drawn from docs/PROPOSAL.md §3.11 and
@@ -373,6 +398,40 @@ func DefaultSuite() Suite {
 				},
 				Targets: []Target{
 					{Metric: MetricListP95, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "dedup-b2c-80pct",
+				Description: "Synthetic B2C workload with 80% duplicate plaintext; measures dedup hit ratio, bytes saved, and PUT latency overhead.",
+				Workload: Workload{
+					RequestMix:       map[string]float64{"PUT": 0.6, "GET": 0.4},
+					ObjectSizeBytes:  256 * 1024, // 256 KiB — typical media thumbnail
+					TenantCount:      4,
+					DurationSeconds:  600,
+					TargetRPS:        500,
+					DedupHitFraction: 0.8,
+				},
+				Targets: []Target{
+					{Metric: MetricDedupHitRatio, Min: 0.75, Unit: "ratio"},
+					{Metric: MetricDedupBytesSavedRatio, Min: 0.7, Unit: "ratio"},
+					{Metric: MetricDedupPutLatencyOverheadP95, Max: 5.0, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "dedup-b2b-60pct",
+				Description: "Synthetic B2B workload with 60% duplicate plaintext (e.g. scheduled backups, log shipping); measures dedup hit ratio, bytes saved, and PUT latency overhead.",
+				Workload: Workload{
+					RequestMix:       map[string]float64{"PUT": 0.5, "GET": 0.5},
+					ObjectSizeBytes:  4 * 1024 * 1024, // 4 MiB — typical archive shard
+					TenantCount:      8,
+					DurationSeconds:  600,
+					TargetRPS:        300,
+					DedupHitFraction: 0.6,
+				},
+				Targets: []Target{
+					{Metric: MetricDedupHitRatio, Min: 0.55, Unit: "ratio"},
+					{Metric: MetricDedupBytesSavedRatio, Min: 0.5, Unit: "ratio"},
+					{Metric: MetricDedupPutLatencyOverheadP95, Max: 5.0, Unit: "ms"},
 				},
 			},
 		},

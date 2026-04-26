@@ -32,6 +32,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
@@ -385,6 +386,68 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 			PrimaryBackend: upload.Backend,
 		},
 	}
+
+	// Multipart dedup: when the upload's policy enables
+	// intra-tenant dedup AND the gateway has a content_index store
+	// wired, compute a content hash over the concatenated piece
+	// bytes. The hash is recorded on the manifest unconditionally
+	// so the DELETE path can refcount it. When the multipart
+	// upload landed as a single piece we additionally run the
+	// content_index lookup/register flow so duplicate uploads
+	// dedup correctly. Multi-piece uploads skip the lookup —
+	// the current content_index schema stores one PieceID per
+	// entry and a multi-piece object would force a more
+	// elaborate "manifest reference" representation that is out
+	// of scope for the §3.14 object-level tier.
+	if h.dedupEnabled(upload.Policy) {
+		contentHash, hashErr := h.hashAssembledPieces(r.Context(), pieces)
+		if hashErr != nil {
+			writeError(w, http.StatusInternalServerError, "DedupHashFailed", hashErr.Error(), r.URL.Path)
+			return
+		}
+		manifest.ContentHash = contentHash
+		if len(pieces) == 1 {
+			existing, lerr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
+			if lerr != nil && !errors.Is(lerr, content_index.ErrNotFound) {
+				writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lerr.Error(), r.URL.Path)
+				return
+			}
+			if existing != nil {
+				if err := h.cfg.ContentIndex.IncrementRef(r.Context(), tenantID, contentHash); err != nil {
+					writeError(w, http.StatusInternalServerError, "ContentIndexIncrementFailed", err.Error(), r.URL.Path)
+					return
+				}
+				// Drop the just-uploaded duplicate piece;
+				// the manifest will reference the canonical
+				// piece instead.
+				if provider, ok := h.cfg.Providers[parts[0].Backend]; ok {
+					_ = provider.DeletePiece(r.Context(), parts[0].PieceID)
+				}
+				manifest.Pieces[0].PieceID = existing.PieceID
+				manifest.Pieces[0].Backend = existing.Backend
+				manifest.Pieces[0].Hash = ""
+				manifest.Pieces[0].SizeBytes = existing.SizeBytes
+				manifest.MigrationState.PrimaryBackend = existing.Backend
+				h.emit(tenantID, bucket, billing.DedupHits, 1)
+				if existing.SizeBytes > 0 {
+					h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(existing.SizeBytes))
+				}
+			} else {
+				_, regErr := h.registerDedupedPiece(r.Context(), content_index.ContentIndexEntry{
+					TenantID:    tenantID,
+					ContentHash: contentHash,
+					PieceID:     parts[0].PieceID,
+					Backend:     parts[0].Backend,
+					SizeBytes:   parts[0].SizeBytes,
+				})
+				if regErr != nil {
+					writeError(w, http.StatusInternalServerError, "ContentIndexRegisterFailed", regErr.Error(), r.URL.Path)
+					return
+				}
+			}
+		}
+	}
+
 	mkey := manifest_store.ManifestKey{
 		TenantID:      tenantID,
 		Bucket:        bucket,

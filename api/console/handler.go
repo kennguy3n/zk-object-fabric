@@ -172,11 +172,12 @@ type KeyGenerator func() (accessKey, secretKey string, err error)
 
 // Config collects the dependencies Handler needs.
 type Config struct {
-	Tenants    TenantStore
-	Usage      UsageQuery
-	Placements PlacementStore
-	Buckets    BucketStore
-	Cells      DedicatedCellStore
+	Tenants       TenantStore
+	Usage         UsageQuery
+	Placements    PlacementStore
+	Buckets       BucketStore
+	Cells         DedicatedCellStore
+	DedupPolicies DedupPolicyStore
 
 	// CellProvisioner accepts dedicated-cell provisioning
 	// requests submitted via POST /api/tenants/{id}/dedicated-cells.
@@ -344,6 +345,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		// and the tenant-scoped form.
 		h.sseHandler = sse
 	}
+	h.registerDedupRoutes(mux)
 }
 
 // usageStreamWindowEffective returns UsageStreamWindow, falling back
@@ -359,6 +361,16 @@ func (c Config) usageStreamWindowEffective() time.Duration {
 // surface (reverse proxy, chi router, etc.) without going through a
 // ServeMux.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Phase 3.5: /api/v1/tenants/{tid}/buckets/{bucket}/dedup-policy
+	// is registered in Register() under a different mux prefix
+	// than the legacy /api/tenants/ surface. ServeHTTP callers
+	// (test harnesses, custom routers) need the same routing
+	// fan-out; check the prefix here so handler.ServeHTTP
+	// matches handler.Register's behavior.
+	if strings.HasPrefix(r.URL.Path, "/api/v1/tenants/") {
+		h.dispatchDedup(w, r)
+		return
+	}
 	h.dispatch(w, r)
 }
 

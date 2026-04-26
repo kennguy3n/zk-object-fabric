@@ -20,12 +20,14 @@ package client_sdk
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 )
 
 // DefaultChunkSize is the plaintext chunk size used when a caller
@@ -66,14 +68,11 @@ func (o Options) chunkSize() int {
 	return DefaultChunkSize
 }
 
-// ErrConvergentNonceNotImplemented is returned by EncryptObject /
-// DecryptObject when Options.ConvergentNonce is set. The flag is
-// scaffolding for Phase 3.5 Pattern C dedup (docs/PROPOSAL.md §3.14)
-// and is not yet wired through to the per-chunk nonce derivation, so
-// honoring it would silently produce non-deterministic ciphertext
-// and defeat dedup. Returning an error keeps callers from depending
-// on a no-op until the wiring lands.
-var ErrConvergentNonceNotImplemented = errors.New("client_sdk: convergent nonce mode not yet implemented")
+// ConvergentNonceInfo is the HKDF info prefix used when deriving
+// per-chunk nonces in convergent-nonce mode (docs/PROPOSAL.md
+// §3.14). Versioned so a future format break does not collide with
+// existing manifests.
+const ConvergentNonceInfo = "zkof-nonce-v1"
 
 // EncryptObject returns a reader that yields the encrypted, chunk-
 // framed form of plaintext. The caller reads the returned stream
@@ -83,29 +82,37 @@ func EncryptObject(plaintext io.Reader, dek DataEncryptionKey, opts Options) (io
 	if plaintext == nil {
 		return nil, errors.New("client_sdk: plaintext is required")
 	}
-	if opts.ConvergentNonce {
-		return nil, ErrConvergentNonceNotImplemented
-	}
 	aead, err := chacha20poly1305.NewX(dek)
 	if err != nil {
 		return nil, fmt.Errorf("client_sdk: new xchacha20-poly1305: %w", err)
 	}
-	return &encryptReader{
+	r := &encryptReader{
 		src:       plaintext,
 		aead:      aead,
 		chunkSize: opts.chunkSize(),
-	}, nil
+	}
+	if opts.ConvergentNonce {
+		// Hold a copy of the DEK on the reader so nextFrame can
+		// derive deterministic per-chunk nonces. The DEK is
+		// already in this process; copying does not extend its
+		// exposure.
+		r.convergent = true
+		r.dek = append([]byte(nil), dek...)
+	}
+	return r, nil
 }
 
 // DecryptObject is the mirror of EncryptObject: it walks chunk
 // frames on ciphertext and returns a reader that yields the original
 // plaintext.
+//
+// Decrypt does not branch on ConvergentNonce — the on-disk frame
+// format is identical (the nonce is stored in the frame header), so
+// the decryptor reads the nonce off the wire either way. The flag
+// is accepted for symmetry with EncryptObject.
 func DecryptObject(ciphertext io.Reader, dek DataEncryptionKey, opts Options) (io.Reader, error) {
 	if ciphertext == nil {
 		return nil, errors.New("client_sdk: ciphertext is required")
-	}
-	if opts.ConvergentNonce {
-		return nil, ErrConvergentNonceNotImplemented
 	}
 	aead, err := chacha20poly1305.NewX(dek)
 	if err != nil {
@@ -118,6 +125,24 @@ func DecryptObject(ciphertext io.Reader, dek DataEncryptionKey, opts Options) (i
 	}, nil
 }
 
+// deriveConvergentNonce returns the deterministic nonce used to
+// seal chunkIndex in convergent-nonce mode. The derivation binds
+// the nonce to (DEK, chunkIndex) so identical plaintext sealed
+// under the same convergent DEK produces byte-identical ciphertext
+// across uploads, while distinct chunk positions never collide
+// inside the same object.
+func deriveConvergentNonce(dek DataEncryptionKey, chunkIndex uint64, nonceSize int) ([]byte, error) {
+	var idxBytes [8]byte
+	binary.BigEndian.PutUint64(idxBytes[:], chunkIndex)
+	info := append([]byte(ConvergentNonceInfo), idxBytes[:]...)
+	r := hkdf.New(sha256.New, dek, nil, info)
+	nonce := make([]byte, nonceSize)
+	if _, err := io.ReadFull(r, nonce); err != nil {
+		return nil, fmt.Errorf("client_sdk: derive convergent nonce: %w", err)
+	}
+	return nonce, nil
+}
+
 // chunkHeaderSize is the bytes reserved at the head of every
 // ciphertext chunk frame: the 24-byte XChaCha20-Poly1305 nonce plus
 // the 4-byte big-endian ciphertext length that lets the decryptor
@@ -126,11 +151,14 @@ const chunkHeaderSize = chacha20poly1305.NonceSizeX + 4
 
 // encryptReader streams ciphertext chunks on demand.
 type encryptReader struct {
-	src       io.Reader
-	aead      cipherAEAD
-	chunkSize int
-	pending   bytes.Buffer
-	eof       bool
+	src        io.Reader
+	aead       cipherAEAD
+	chunkSize  int
+	pending    bytes.Buffer
+	eof        bool
+	convergent bool
+	dek        DataEncryptionKey
+	chunkIndex uint64
 }
 
 // cipherAEAD is the subset of cipher.AEAD the SDK needs; exposed as
@@ -169,15 +197,26 @@ func (r *encryptReader) nextFrame() error {
 		return fmt.Errorf("client_sdk: read plaintext: %w", err)
 	}
 
-	nonce := make([]byte, r.aead.NonceSize())
-	if _, err := io.ReadFull(randReader, nonce); err != nil {
-		return fmt.Errorf("client_sdk: generate nonce: %w", err)
+	nonceSize := r.aead.NonceSize()
+	var nonce []byte
+	if r.convergent {
+		dn, derr := deriveConvergentNonce(r.dek, r.chunkIndex, nonceSize)
+		if derr != nil {
+			return derr
+		}
+		nonce = dn
+	} else {
+		nonce = make([]byte, nonceSize)
+		if _, err := io.ReadFull(randReader, nonce); err != nil {
+			return fmt.Errorf("client_sdk: generate nonce: %w", err)
+		}
 	}
+	r.chunkIndex++
 	sealed := r.aead.Seal(nil, nonce, buf[:n], nil)
 
 	var hdr [chunkHeaderSize]byte
-	copy(hdr[:r.aead.NonceSize()], nonce)
-	binary.BigEndian.PutUint32(hdr[r.aead.NonceSize():], uint32(len(sealed)))
+	copy(hdr[:nonceSize], nonce)
+	binary.BigEndian.PutUint32(hdr[nonceSize:], uint32(len(sealed)))
 	r.pending.Write(hdr[:])
 	r.pending.Write(sealed)
 	return nil

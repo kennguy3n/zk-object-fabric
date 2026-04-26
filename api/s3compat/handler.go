@@ -25,6 +25,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
@@ -128,6 +129,17 @@ type Config struct {
 
 	// NodeID identifies the gateway node emitting billing events.
 	NodeID string
+
+	// ContentIndex is the intra-tenant deduplication content
+	// index. When non-nil and the resolved placement policy has
+	// DedupPolicy.Enabled, the PUT path looks up
+	// (tenant_id, content_hash) and either bumps the refcount on
+	// an existing piece or registers a new entry. The DELETE
+	// path mirrors the lookup so deletes that hit a deduped
+	// object decrement the refcount instead of removing the
+	// piece. A nil store makes every PUT a fresh write
+	// regardless of policy. See docs/PROPOSAL.md §3.14.
+	ContentIndex content_index.Store
 
 	// Now, if set, returns the current time. Tests override it to
 	// make manifests deterministic.
@@ -294,6 +306,17 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	encMode := policy.EncryptionMode
+
+	// Dedup path: when policy enables intra-tenant dedup AND the
+	// gateway has a content_index store wired, route through the
+	// pattern-specific lookup/register flow before touching the
+	// backend. EC-coded objects are excluded above so the dedup
+	// flow always runs against a single piece.
+	if h.dedupEnabled(policy) && (encMode == "" || IsGatewayEncrypted(encMode) || encMode == "client_side") {
+		h.putDeduped(w, r, tenantID, bucket, key, backendName, provider, policy)
+		return
+	}
+
 	encCfg, body, contentLength, plaintextSize, ok := h.prepareSinglePieceEncryption(w, r, encMode)
 	if !ok {
 		return
@@ -663,18 +686,58 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ManifestDeleteFailed", err.Error(), r.URL.Path)
 		return
 	}
+	// Reference-counted DELETE: when the manifest carries a
+	// ContentHash AND the gateway has a content_index store
+	// wired, decrement the per-(tenant, content_hash) refcount.
+	// The piece is removed from the backend only when the new
+	// count reaches zero. Manifests that predate Phase 3.5 (no
+	// ContentHash) take the original path and delete pieces
+	// directly.
+	if manifest.ContentHash != "" && h.cfg.ContentIndex != nil {
+		newCount, derr := h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, manifest.ContentHash)
+		switch {
+		case errors.Is(derr, content_index.ErrNotFound):
+			// Index row is gone but the manifest still
+			// pointed at it — fall through to a
+			// best-effort piece delete to clean up.
+			h.deletePiecesBestEffort(r, manifest)
+		case derr != nil:
+			writeError(w, http.StatusInternalServerError, "ContentIndexDecrementFailed", derr.Error(), r.URL.Path)
+			return
+		case newCount == 0:
+			// Last reference: remove the piece from the
+			// backend, then drop the index row.
+			h.deletePiecesBestEffort(r, manifest)
+			if err := h.cfg.ContentIndex.Delete(r.Context(), tenantID, manifest.ContentHash); err != nil && !errors.Is(err, content_index.ErrNotFound) {
+				writeError(w, http.StatusInternalServerError, "ContentIndexDeleteFailed", err.Error(), r.URL.Path)
+				return
+			}
+		default:
+			// newCount > 0: the piece is still referenced
+			// by another manifest in this tenant. Leave
+			// it on the backend.
+			h.emit(tenantID, bucket, billing.DedupRefCount, uint64(newCount))
+		}
+	} else {
+		h.deletePiecesBestEffort(r, manifest)
+	}
+
+	h.emit(tenantID, bucket, billing.DeleteRequests, 1)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deletePiecesBestEffort removes every piece referenced by the
+// manifest from its backend. Errors are swallowed: the manifest is
+// already gone so any surviving pieces are user-invisible orphans
+// that the GC sweep picks up.
+func (h *Handler) deletePiecesBestEffort(r *http.Request, manifest *metadata.ObjectManifest) {
 	for _, piece := range manifest.Pieces {
 		provider, ok := h.cfg.Providers[piece.Backend]
 		if !ok {
 			continue
 		}
-		// Best-effort: the manifest is already gone so the object is
-		// user-invisible. Any surviving pieces are orphans for GC.
 		_ = provider.DeletePiece(r.Context(), piece.PieceID)
 	}
-
-	h.emit(tenantID, bucket, billing.DeleteRequests, 1)
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // List handles S3 LIST bucket (ListObjectsV2). It is exported so

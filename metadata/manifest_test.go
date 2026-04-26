@@ -115,6 +115,36 @@ func TestObjectManifest_KnownJSONShape(t *testing.T) {
 	}
 }
 
+func TestObjectManifest_ContentHashJSONRoundTrip(t *testing.T) {
+	m := sampleManifest()
+	m.ContentHash = "blake3:0123456789abcdef"
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"content_hash":"blake3:0123456789abcdef"`)) {
+		t.Fatalf("serialized manifest missing content_hash: %s", data)
+	}
+	var got ObjectManifest
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.ContentHash != m.ContentHash {
+		t.Fatalf("ContentHash round-trip: got %q want %q", got.ContentHash, m.ContentHash)
+	}
+
+	// content_hash is omitempty: an unset field must not appear
+	// in the wire bytes so legacy manifests stay byte-identical.
+	m.ContentHash = ""
+	data, err = json.Marshal(m)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if bytes.Contains(data, []byte("content_hash")) {
+		t.Fatalf("empty ContentHash leaked into JSON: %s", data)
+	}
+}
+
 func keys(m map[string]any) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

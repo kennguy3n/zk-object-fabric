@@ -38,6 +38,8 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
+	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
+	cipostgres "github.com/kennguy3n/zk-object-fabric/metadata/content_index/postgres"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
@@ -84,6 +86,7 @@ func main() {
 	}
 
 	store := buildManifestStore(cfg, metadataDB)
+	contentIndex := buildContentIndex(cfg, metadataDB)
 	registry := buildProviderRegistry(context.Background(), cfg)
 	defaultBackend := pickDefaultBackend(registry)
 	if defaultBackend == "" {
@@ -167,6 +170,7 @@ func main() {
 		CachePublisher: signalBus,
 		ReadRepair:     readRepair,
 		Encryption:     gatewayEnc,
+		ContentIndex:   contentIndex,
 		NodeID:         cfg.Env,
 	}).Register(mux)
 
@@ -359,6 +363,33 @@ func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("ping postgres metadata DB: %w", err)
 	}
 	return db, nil
+}
+
+// buildContentIndex returns the intra-tenant deduplication index
+// store. Postgres-backed when MetadataDSN is configured AND the
+// dedup feature is enabled in cfg.Dedup; in-memory otherwise. The
+// in-memory store is process-local and loses every entry on
+// restart, so it MUST NOT be used in production with dedup enabled.
+//
+// When cfg.Dedup.Enabled is false the function returns nil so the
+// S3 handler short-circuits the dedup path: every PUT writes a
+// fresh piece, every DELETE removes it directly, and the store is
+// never consulted.
+func buildContentIndex(cfg config.Config, db *sql.DB) content_index.Store {
+	if !cfg.Dedup.Enabled {
+		log.Printf("gateway: dedup disabled (dedup.enabled = false); content_index store will not be built")
+		return nil
+	}
+	if db == nil {
+		log.Printf("gateway: dedup enabled with no metadata_dsn; using in-memory content_index store (dev only — entries do NOT survive restart)")
+		return content_index.NewMemoryStore()
+	}
+	store, err := cipostgres.New(cipostgres.Config{DB: db})
+	if err != nil {
+		log.Fatalf("gateway: build postgres content_index store: %v", err)
+	}
+	log.Printf("gateway: postgres content_index store enabled (default_scope=%s default_level=%s)", cfg.Dedup.DefaultScope, cfg.Dedup.DefaultLevel)
+	return store
 }
 
 func buildManifestStore(cfg config.Config, db *sql.DB) manifest_store.ManifestStore {
@@ -860,6 +891,7 @@ func startConsoleAPI(
 		Buckets:         console.NewMemoryBucketStore(),
 		Cells:           cellStore,
 		CellProvisioner: cellProvisioner,
+		DedupPolicies:   console.NewMemoryDedupPolicyStore(),
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)

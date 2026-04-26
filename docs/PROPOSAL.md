@@ -3,7 +3,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
 > Status: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant
-> Deduplication (NOT STARTED). Phase 4 — Production & Scale (NOT
+> Deduplication (COMPLETE). Phase 4 — Production & Scale (NOT
 > STARTED). This document defines the target architecture, not the
 > current implementation. See [PROGRESS.md](PROGRESS.md) for build status.
 

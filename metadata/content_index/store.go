@@ -25,6 +25,19 @@ import (
 // when no row exists for `(tenant_id, content_hash)`.
 var ErrNotFound = errors.New("content_index: entry not found")
 
+// ErrAlreadyExists is returned by Register when a row already
+// exists for `(tenant_id, content_hash)`. The PUT path treats this
+// as a race-recovery signal: drop the just-written piece and call
+// IncrementRef on the existing row instead.
+var ErrAlreadyExists = errors.New("content_index: entry already exists")
+
+// ErrInvalidRefCount is returned by DecrementRef when the existing
+// RefCount is already zero or negative. The schema's CHECK
+// constraint forbids RefCount < 0; this sentinel surfaces the
+// programmer error of decrementing a row that should have already
+// been deleted.
+var ErrInvalidRefCount = errors.New("content_index: invalid refcount")
+
 // ContentIndexEntry is a single row in the content_index table.
 //
 // See docs/PROPOSAL.md §3.14.3 for the canonical schema; the SQL
