@@ -69,6 +69,11 @@ and the application code never sees plaintext keys:
   `:8081` so each ERP tenant's file attachments inherit per-tenant
   zero-knowledge encryption with no application-side key
   management.
+- **KChat** — MLS-based encrypted messaging; uses `client_side`
+  encryption mode with convergent dedup (Pattern C from
+  [docs/INTEGRATION.md](docs/INTEGRATION.md)) for cross-group file
+  deduplication while preserving MLS forward secrecy on the message
+  channel.
 
 > **Note**: tenant and manifest state is in-memory and lost on
 > container restart. Object data persists in the `zk-data` Docker
@@ -78,6 +83,10 @@ The S3 API is the phase-invariant contract. The same `aws s3 cp`,
 `boto3`, or `@aws-sdk/client-s3` command works in Phase 1 (Wasabi),
 Phase 2 (Ceph RGW), and Phase 3 (owned DC) without any client-side
 changes. Backend migrations are invisible to the API consumer.
+
+Phase 3.5 adds intra-tenant deduplication — see
+[docs/INTEGRATION.md](docs/INTEGRATION.md) for the external app
+integration guide.
 
 It serves two audiences:
 
@@ -110,6 +119,11 @@ It serves two audiences:
   egress is metered and priced transparently.
 - **Multi-tenant** — per-tenant encryption, placement policies, egress
   budgets, billing counters, and abuse controls.
+- **Intra-tenant deduplication** — object-level dedup across all backends
+  (gateway ContentIndex), plus block-level dedup on Ceph RGW cells.
+  Three integration patterns for external apps: single-upload/N-readers,
+  gateway-convergent (transparent), and client-side convergent (Strict ZK
+  compatible). See [docs/INTEGRATION.md](docs/INTEGRATION.md).
 - **Cell architecture for horizontal scale** — independent cells of
   2–20 PB usable capacity in the local DC phase, each with its own
   metadata, repair queues, and failure domains.
