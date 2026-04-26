@@ -64,6 +64,32 @@ type Config struct {
 	Console      ConsoleConfig      `json:"console"`
 	Encryption   EncryptionConfig   `json:"encryption"`
 	Abuse        AbuseConfig        `json:"abuse"`
+	Dedup        DedupConfig        `json:"dedup"`
+}
+
+// DedupConfig configures intra-tenant deduplication. Cross-tenant
+// dedup is permanently excluded from the fabric, so DefaultScope
+// is always "intra_tenant"; the field exists only to make the
+// invariant visible in operator-facing config.
+//
+// See docs/PROPOSAL.md §3.14.
+type DedupConfig struct {
+	// Enabled gates dedup at the gateway level. When false the
+	// content_index store is unused and every PUT writes a
+	// fresh piece. Defaults to false; per-bucket / per-object
+	// policy still has to opt in via PlacementPolicy.DedupPolicy.
+	Enabled bool `json:"enabled"`
+
+	// DefaultScope is always "intra_tenant". Surfaced in config
+	// to make the invariant explicit.
+	DefaultScope string `json:"default_scope"`
+
+	// DefaultLevel selects the default dedup tier when a tenant
+	// policy does not override it. Valid values:
+	//   - "object":       gateway content_index only (all backends).
+	//   - "object+block": object-level + Ceph RGW native chunk dedup
+	//                     (dedicated B2B cells only).
+	DefaultLevel string `json:"default_level"`
 }
 
 // AbuseConfig tunes the per-region runtime knobs of the abuse

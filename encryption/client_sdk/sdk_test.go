@@ -187,3 +187,16 @@ func TestLocalFileWrapper_WrongCMKRef(t *testing.T) {
 		t.Fatal("UnwrapDEK with different CMK URI: want error, got nil")
 	}
 }
+
+func TestEncryptObject_ConvergentNonceUnimplemented(t *testing.T) {
+	dek, err := GenerateDEK()
+	if err != nil {
+		t.Fatalf("GenerateDEK: %v", err)
+	}
+	if _, err := EncryptObject(bytes.NewReader([]byte("x")), dek, Options{ConvergentNonce: true}); err != ErrConvergentNonceNotImplemented {
+		t.Fatalf("EncryptObject with ConvergentNonce=true: want ErrConvergentNonceNotImplemented, got %v", err)
+	}
+	if _, err := DecryptObject(bytes.NewReader([]byte("x")), dek, Options{ConvergentNonce: true}); err != ErrConvergentNonceNotImplemented {
+		t.Fatalf("DecryptObject with ConvergentNonce=true: want ErrConvergentNonceNotImplemented, got %v", err)
+	}
+}

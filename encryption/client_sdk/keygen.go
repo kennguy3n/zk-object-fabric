@@ -2,6 +2,7 @@ package client_sdk
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 
@@ -24,4 +25,15 @@ func GenerateDEK() (DataEncryptionKey, error) {
 		return nil, fmt.Errorf("client_sdk: generate dek: %w", err)
 	}
 	return DataEncryptionKey(k), nil
+}
+
+// DeriveConvergentDEK derives a deterministic DEK from the content
+// hash and tenant ID using HKDF-SHA256. Identical plaintext within
+// the same tenant produces the same DEK, enabling dedup. Trade-off:
+// the stored file loses forward secrecy. See docs/PROPOSAL.md §3.14.
+func DeriveConvergentDEK(contentHash []byte, tenantID string) (DataEncryptionKey, error) {
+	// TODO(phase-3.5): implement HKDF-SHA256(contentHash, salt=tenantID)
+	_ = contentHash
+	_ = tenantID
+	return nil, errors.New("client_sdk: convergent DEK not yet implemented")
 }
