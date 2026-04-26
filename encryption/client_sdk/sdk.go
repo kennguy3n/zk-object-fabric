@@ -48,6 +48,15 @@ type DataEncryptionKey []byte
 // DefaultChunkSize.
 type Options struct {
 	ChunkSize int
+
+	// ConvergentNonce switches the SDK from random per-chunk
+	// nonces to deterministic, content-derived nonces so that
+	// identical plaintext (sealed under a convergent DEK from
+	// DeriveConvergentDEK) produces identical ciphertext. Required
+	// for Pattern C (client-side intra-tenant deduplication); see
+	// docs/PROPOSAL.md §3.14. Trade-off: stored ciphertext loses
+	// forward secrecy. Default false (random nonces, FS preserved).
+	ConvergentNonce bool
 }
 
 func (o Options) chunkSize() int {

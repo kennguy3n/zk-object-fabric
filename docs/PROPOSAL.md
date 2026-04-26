@@ -2,8 +2,9 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 3 — Beta Cell (COMPLETE). Phase 4 — Production & Scale
-> (NOT STARTED). This document defines the target architecture, not the
+> Status: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant
+> Deduplication (NOT STARTED). Phase 4 — Production & Scale (NOT
+> STARTED). This document defines the target architecture, not the
 > current implementation. See [PROGRESS.md](PROGRESS.md) for build status.
 
 ---
@@ -579,10 +580,27 @@ the data.
   origin remains encrypted; distribution is explicitly public.
 
 Per-object DEKs, encrypted manifests, and CMK support apply to all ZK
-and confidential modes. **No cross-tenant deduplication** is enabled
-by default. Convergent-encryption buckets may be offered as an
-explicit opt-in for specific corpora (backup archives) where the
-content-identity leak is acceptable.
+and confidential modes. **No cross-tenant deduplication** is ever
+enabled — it is permanently incompatible with the zero-knowledge model.
+
+**Intra-tenant deduplication** is supported via three integration
+patterns documented in [INTEGRATION.md](INTEGRATION.md):
+
+- **Pattern A** (single upload, N readers): no dedup logic needed.
+  One PUT, N GETs. Works with all encryption modes.
+- **Pattern B** (gateway convergent): for `managed` and
+  `public_distribution` modes. The gateway derives a convergent DEK
+  from `BLAKE3(plaintext)` so identical content within the same
+  tenant produces identical ciphertext. Transparent to S3 clients.
+- **Pattern C** (client-side convergent): for `client_side` (Strict
+  ZK) mode. The client SDK derives the DEK and nonces from content
+  so identical plaintext produces identical ciphertext. The gateway
+  deduplicates on `BLAKE3(ciphertext)` without seeing plaintext.
+  Trade-off: stored file loses forward secrecy.
+
+Supported scenarios: B2C community (viral files, shared media within
+a tenant) and B2B org (company-wide documents within an enterprise
+tenant).
 
 Encryption is transparent to the S3 API. In Strict ZK mode, the SDK
 encrypts before calling `PutObject` and decrypts after `GetObject` —
@@ -732,6 +750,240 @@ only differences are the config file (which selects `local_fs_dev`
 instead of `wasabi` / `ceph_rgw`) and the store backends (in-memory
 instead of Postgres). Switching from the demo container to a
 production deployment is a config change, not a code change.
+
+### 3.14 Intra-tenant deduplication
+
+#### 3.14.1 Design principle
+
+Deduplication operates **exclusively within a single tenant's
+namespace**. Cross-tenant deduplication is permanently excluded from
+the fabric: it would let one tenant probe for content held by
+another, defeating the zero-knowledge guarantee. Two product
+scenarios drive intra-tenant dedup:
+
+- **B2C community**: viral files and shared media inside a single
+  consumer-tenant (e.g. a meme reposted N times in a KChat
+  community lands as one stored object).
+- **B2B org**: a company-wide document (handbook, policy PDF,
+  onboarding deck) referenced by many users inside one enterprise
+  tenant lands as one stored object.
+
+#### 3.14.2 Three integration patterns
+
+| Pattern | Encryption mode                       | Who computes content hash       | Dedup mechanism                 | Client changes needed                       |
+| ------- | ------------------------------------- | ------------------------------- | ------------------------------- | ------------------------------------------- |
+| A       | any mode                              | N/A                             | none — single upload, N readers | none                                        |
+| B       | `managed`, `public_distribution`      | gateway: `BLAKE3(plaintext)`    | ContentIndex on plaintext hash  | none                                        |
+| C       | `client_side` (convergent variant)    | client SDK: `BLAKE3(plaintext)` | ContentIndex on ciphertext hash | `ConvergentNonce` + `DeriveConvergentDEK`   |
+
+Pattern A is application-level reuse: one tenant uploads once, the
+application's permission system grants N readers access to the same
+object. The fabric is unchanged.
+
+Patterns B and C are storage-level dedup: the second PUT of the same
+content hash within the same tenant resolves to the existing piece
+and only increments a refcount. They differ only in **who** computes
+the content hash and **what** is hashed (plaintext vs. ciphertext),
+which falls out of the encryption mode.
+
+#### 3.14.3 Object-level dedup (all backends)
+
+**Pattern B — gateway convergent (managed / public_distribution):**
+
+1. Client `PUT` carries plaintext.
+2. Gateway streams plaintext through BLAKE3 and computes
+   `content_hash = BLAKE3(plaintext)`.
+3. Gateway looks up `(tenant_id, content_hash)` in `content_index`.
+4. **Hit**: gateway increments `ref_count`, writes a manifest that
+   points at the existing `piece_id`, and returns a synthetic
+   `ETag` matching the deduped object. No backend write.
+5. **Miss**: gateway derives `DEK = HKDF(content_hash, salt=tenant_id)`,
+   encrypts with XChaCha20-Poly1305, writes the piece to the
+   provider, and `INSERT`s the `content_index` row.
+
+**Pattern C — client-side convergent (Strict ZK):**
+
+1. Client SDK streams plaintext through BLAKE3 and computes
+   `content_hash = BLAKE3(plaintext)`.
+2. SDK derives `DEK = HKDF(content_hash, salt=tenant_id)` and
+   uses content-derived nonces (`ConvergentNonce: true`) so
+   identical plaintext produces identical ciphertext.
+3. SDK uploads ciphertext. Gateway hashes ciphertext on the wire
+   and computes `content_hash_cipher = BLAKE3(ciphertext)`.
+4. Gateway looks up `(tenant_id, content_hash_cipher)` in
+   `content_index`. Hit → refcount++, manifest reuse. Miss →
+   write piece, insert row.
+
+In both patterns the gateway never sees cross-tenant content: the
+`content_index` primary key is `(tenant_id, content_hash)`.
+
+ContentIndex schema:
+
+```sql
+CREATE TABLE content_index (
+    tenant_id     TEXT        NOT NULL,
+    content_hash  TEXT        NOT NULL,
+    piece_id      TEXT        NOT NULL,
+    backend       TEXT        NOT NULL,
+    ref_count     INT         NOT NULL DEFAULT 1,
+    size_bytes    BIGINT      NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, content_hash)
+);
+
+CREATE INDEX content_index_piece_id ON content_index (piece_id);
+```
+
+The `piece_id` index supports orphan GC and reverse lookups when the
+provider reports a missing piece.
+
+#### 3.14.4 Block-level dedup (Ceph RGW only)
+
+Object-level dedup catches whole-file duplicates. For partial overlap
+(two near-identical PDFs, two builds of the same archive, large
+documents that share boilerplate), Ceph offers **native dedup at the
+RADOS layer** via its dedup pool tier with content-defined chunking.
+
+This runs entirely beneath the gateway: the gateway PUTs encrypted
+pieces to Ceph as usual, and Ceph identifies duplicate variable-sized
+chunks across the tenant's pool and stores them once. The gateway
+does not implement chunk-level dedup logic itself.
+
+Block-level dedup is **dedicated B2B cells only**. It requires Ceph
+RGW, so it does not apply to Wasabi / B2 / R2 backends, and it
+requires per-tenant pool isolation so chunk pools cannot cross
+tenants. B2C community traffic on shared cells uses object-level
+dedup only.
+
+#### 3.14.5 Reference-counted deletes
+
+`DELETE` on a deduplicated object follows a refcount-decrement path:
+
+1. Gateway resolves the manifest and finds `(tenant_id,
+   content_hash)`.
+2. `UPDATE content_index SET ref_count = ref_count - 1 WHERE
+   tenant_id = $1 AND content_hash = $2 RETURNING ref_count`.
+3. If `ref_count > 0`: only the manifest is deleted; the piece
+   stays.
+4. If `ref_count = 0`: gateway calls `provider.DeletePiece` to
+   remove the ciphertext from the backend, then `DELETE`s the
+   `content_index` row.
+
+A background **orphan GC** worker handles crash recovery: it scans
+`content_index` rows whose `piece_id` no longer corresponds to any
+manifest within the tenant and reclaims them. This bounds the damage
+window of a crash between the manifest delete and the refcount
+decrement.
+
+#### 3.14.6 Encryption constraints
+
+| Encryption mode                       | Dedup pattern | Notes                                                         |
+| ------------------------------------- | ------------- | ------------------------------------------------------------- |
+| `managed`                             | B             | gateway derives DEK from plaintext hash                       |
+| `public_distribution`                 | B             | gateway derives DEK from plaintext hash                       |
+| `client_side` (convergent variant)    | C             | client SDK derives DEK; opt-in per bucket / per object        |
+| `client_side` (random DEK — default)  | none          | random per-object DEK ⇒ ciphertext never matches; FS retained |
+
+Convergent encryption is an **explicit opt-in** at the bucket or
+object level. The default Strict ZK mode keeps random DEKs and full
+forward secrecy on stored files; Pattern C is enabled only when the
+tenant accepts the FS trade-off in exchange for dedup.
+
+#### 3.14.7 MLS compatibility
+
+KChat / KMail group messaging uses MLS (RFC 9420). MLS provides two
+distinct properties:
+
+- **Forward Secrecy (FS) of the message channel**: a compromised
+  current key cannot decrypt past messages. Driven by epoch ratchet.
+- **Post-Compromise Security (PCS)**: a future epoch heals from a
+  current compromise. Driven by member key rotation.
+
+These are properties of the **message channel** and are fully
+preserved regardless of which dedup pattern is used for the
+underlying file blob: dedup happens at the storage layer, after
+the application has already encrypted the message envelope.
+
+The constraint is that the **file CEK must be independent of MLS
+epoch secrets**. Concretely: do **NOT** derive the file CEK from
+`exporter_secret` (it is bound to the current MLS epoch and rotates
+on every group membership change, which would break dedup as soon
+as a member joins or leaves). Acceptable derivations:
+
+- Pattern A / B: random per-object DEK in the gateway (default), or
+  `HKDF(content_hash, salt=tenant_id)` for Pattern B convergence.
+- Pattern C: `HKDF(content_hash, salt=tenant_id)` in the client SDK.
+
+The **stored file's** forward-secrecy depends on the CEK scheme:
+
+- Random DEK → file FS preserved (no two PUTs of the same content
+  produce the same DEK).
+- Convergent DEK → file FS lost (the DEK is recoverable from the
+  content, so a future plaintext leak retroactively reveals the
+  ciphertext key).
+
+This is an explicit, documented trade-off scoped to the stored file
+only — it does not affect MLS message-channel FS or PCS. See
+[INTEGRATION.md](INTEGRATION.md) for application-side guidance.
+
+#### 3.14.8 Non-MLS applications
+
+Applications that do not use MLS (`kmail` standard mode, `zk-drive`,
+`Kapp`, vanilla S3 clients) integrate as follows:
+
+- **Pattern A**: the application shares object keys through its own
+  permission system (e.g. `zk-drive` shares a `FileVersion` row).
+  No fabric changes; works with every encryption mode.
+- **Pattern B**: no client changes. The S3 PUT is unchanged; the
+  gateway computes BLAKE3 on the plaintext and dedupes
+  transparently. Works with any S3 SDK in any language.
+- **Pattern C**: requires content-derived DEK + nonces.
+  - **Go**: use the bundled `client_sdk` with
+    `Options{ConvergentNonce: true}` and
+    `DeriveConvergentDEK(contentHash, tenantID)`.
+  - **Other languages**: implement BLAKE3 + HKDF-SHA256 against the
+    documented derivation (`DEK = HKDF(BLAKE3(plaintext),
+    salt=tenant_id, info="zkof-cdek-v1", L=32)`) and a deterministic
+    nonce scheme (`nonce_i = HKDF(DEK, info="zkof-nonce-v1" ||
+    chunk_index, L=24)`).
+
+#### 3.14.9 Fallback / DR copies
+
+Disaster-recovery copies on the secondary backend are **always full,
+non-deduped objects**. DR is for survivability, not cost: paying for
+a duplicate full copy of a deduped object is the price of being able
+to fail over without recomputing the dedup graph.
+
+| Tenant tier | Primary (deduped)        | DR copy (always full, non-deduped)    |
+| ----------- | ------------------------ | ------------------------------------- |
+| B2C         | Wasabi or shared Ceph    | Backblaze B2 or Cloudflare R2         |
+| B2B         | dedicated Ceph cell      | second dedicated Ceph cell            |
+
+`MigrationState.CloudCopy` on the manifest tracks the DR backend the
+full copy was written to. Reading from the DR copy fans out a
+side-effect-free GET against the secondary backend; promotion back
+to primary uses the existing migration engine and re-enters the
+dedup index on the way in.
+
+#### 3.14.10 What does NOT dedup
+
+By design, the following do not deduplicate against each other:
+
+- **Cross-tenant content**: `content_index` is keyed on
+  `(tenant_id, content_hash)`. Two tenants holding identical bytes
+  store two physical copies. This is permanent.
+- **`client_side` with random DEK**: the default Strict ZK mode
+  produces a fresh random DEK per object so ciphertext for the
+  same plaintext differs every PUT. The gateway has no way to
+  detect identity and writes a new piece each time.
+- **Different encryption modes on the same content**: a `managed`
+  PUT and a `client_side` (convergent) PUT of the same plaintext
+  derive DEKs through different rules and produce different
+  ciphertext, so they appear under different `content_hash` values
+  and are stored separately.
+
+These are not bugs — each follows from the encryption-mode
+guarantee that mode promises the tenant.
 
 ---
 
@@ -1052,7 +1304,7 @@ fine; production build on AGPL is not.
 | Exceed Wasabi's fair-use egress                                    | Triggers throttling or account review. Cache hit ratio is a first-class product metric.        |
 | Advertise "unlimited egress"                                       | Forces cross-subsidization that breaks at PB+ scale; invites adverse-selection workloads.      |
 | Reconstruct EC shards on every hot GET                             | EC lowers storage overhead, not read bandwidth. Hot reads must come from L0 / L1.              |
-| Enable global cross-tenant deduplication                           | Incompatible with ZK by default. Convergent-encryption buckets are opt-in only.                |
+| Enable cross-tenant deduplication                                  | Permanently incompatible with ZK. Intra-tenant dedup only, via convergent encryption (§3.14). Cross-tenant dedup is never offered. |
 | Use AGPL bases (Storj, MinIO, Garage) as production bases          | Conflicts with the proprietary license. Permitted only as reference / study material.          |
 | Build Storj-style 80/29 EC in controlled DCs                       | Tuned for untrusted peers. Wastes capacity when nodes are controlled (use 8+3 or 10+4).        |
 | Expose node-level placement in Phase 1                             | Meaningless while Wasabi owns durability. Wait until Phase 2+ for DC / rack / node knobs.      |
@@ -1175,7 +1427,7 @@ Becomes an **infrastructure company problem**. Needs:
 | Small-object overhead (metadata + per-object cost)          | Pack small objects into encrypted containers; index inside the container manifest                           |
 | Frequent uncached reads hammering Wasabi origin             | Promote to L1 / L0 once thresholds cross; decline promotion on Archive tier                                 |
 | ZK metadata leakage (names, sizes, access patterns)         | Encrypt manifests; minimize object names in logs; pad sizes where practical                                 |
-| Deduplication vs ZK conflict                                | No cross-tenant dedup by default; convergent-encryption buckets offered only as explicit opt-in             |
+| Deduplication vs ZK conflict                                | Cross-tenant dedup permanently excluded. Intra-tenant dedup via convergent encryption for managed/public_distribution (Pattern B) and client_side_convergent (Pattern C). Stored files under convergent encryption lose forward secrecy — explicit trade-off. See §3.14 and [INTEGRATION.md](INTEGRATION.md). |
 | AGPL exposure from the chosen base                          | Use SeaweedFS or Ceph RGW only in Phase 2+; AGPL bases remain reference only                                |
 | Repair storms saturating inter-DC bandwidth (Phase 2+)      | Rate-limit repair workers; prioritize by durability risk; schedule off-peak; cap per-link throughput        |
 | Placement policy bugs (data in wrong country)               | Formalize constraints in OPA; test failure domains in CI; chaos-test placement under node loss              |

@@ -23,11 +23,16 @@ type ObjectManifest struct {
 	// tenant-held material before PUT so the field carries ciphertext.
 	// Either way, LIST round-trips it back to clients so subsequent
 	// GET/HEAD/DELETE calls can address the object directly.
-	ObjectKey       string           `json:"object_key"`
-	ObjectKeyHash   string           `json:"object_key_hash"`
-	VersionID       string           `json:"version_id"`
-	ObjectSize      int64            `json:"object_size"`
-	ChunkSize       int64            `json:"chunk_size"`
+	ObjectKey     string `json:"object_key"`
+	ObjectKeyHash string `json:"object_key_hash"`
+	VersionID     string `json:"version_id"`
+	ObjectSize    int64  `json:"object_size"`
+	ChunkSize     int64  `json:"chunk_size"`
+	// ContentHash is the BLAKE3 hash used for intra-tenant dedup lookups.
+	// For Pattern B (gateway convergent): BLAKE3(plaintext).
+	// For Pattern C (client-side convergent): BLAKE3(ciphertext).
+	// Empty when dedup is not enabled on the bucket.
+	ContentHash     string           `json:"content_hash,omitempty"`
 	Encryption      EncryptionConfig `json:"encryption"`
 	PlacementPolicy PlacementPolicy  `json:"placement_policy"`
 	Pieces          []Piece          `json:"pieces"`
@@ -143,6 +148,28 @@ type PlacementPolicy struct {
 	// policy and the gateway treats the object as legacy /
 	// unencrypted for backward compatibility.
 	EncryptionMode string `json:"encryption_mode,omitempty"`
+
+	// DedupPolicy controls intra-tenant deduplication for this
+	// object. Zero value disables dedup. See docs/PROPOSAL.md
+	// §3.14.
+	DedupPolicy DedupPolicy `json:"dedup_policy,omitempty"`
+}
+
+// DedupPolicy controls intra-tenant deduplication for this object.
+// See docs/PROPOSAL.md §3.14.
+//
+// Scope is always "intra_tenant"; cross-tenant dedup is permanently
+// excluded from the fabric. Level selects the dedup tier:
+//
+//   - "object":       gateway-managed object-level dedup via
+//     metadata/content_index (all backends).
+//   - "object+block": object-level dedup plus Ceph RGW native
+//     RADOS-tier chunk dedup (dedicated B2B cells
+//     only).
+type DedupPolicy struct {
+	Enabled bool   `json:"enabled"`
+	Scope   string `json:"scope"` // always "intra_tenant"
+	Level   string `json:"level"` // "object" or "object+block"
 }
 
 // Validate performs minimal structural checks on a manifest. It is not
