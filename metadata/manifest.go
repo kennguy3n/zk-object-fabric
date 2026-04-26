@@ -150,9 +150,11 @@ type PlacementPolicy struct {
 	EncryptionMode string `json:"encryption_mode,omitempty"`
 
 	// DedupPolicy controls intra-tenant deduplication for this
-	// object. Zero value disables dedup. See docs/PROPOSAL.md
-	// §3.14.
-	DedupPolicy DedupPolicy `json:"dedup_policy,omitempty"`
+	// object. nil disables dedup; this is the field's zero value
+	// and is what `omitempty` actually omits (a value-type
+	// DedupPolicy with all zero fields is never omitted by
+	// encoding/json). See docs/PROPOSAL.md §3.14.
+	DedupPolicy *DedupPolicy `json:"dedup_policy,omitempty"`
 }
 
 // DedupPolicy controls intra-tenant deduplication for this object.

@@ -16,7 +16,7 @@ CREATE TABLE content_index (
     content_hash  TEXT        NOT NULL,
     piece_id      TEXT        NOT NULL,
     backend       TEXT        NOT NULL,
-    ref_count     INT         NOT NULL DEFAULT 1,
+    ref_count     INT         NOT NULL DEFAULT 1 CHECK (ref_count >= 0),
     size_bytes    BIGINT      NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, content_hash)
