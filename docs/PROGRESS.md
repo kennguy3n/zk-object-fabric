@@ -729,6 +729,81 @@ Checklist:
 
 ---
 
+## Phase 3.5: Intra-Tenant Deduplication
+
+**Status**: `NOT STARTED`
+
+**Goal**: add object-level and block-level intra-tenant deduplication
+to reduce storage costs for B2C community (viral/shared files) and
+B2B org (company-wide documents) workloads. Cross-tenant dedup is
+permanently excluded. Three integration patterns for external apps
+(KChat, kmail, zk-drive, Kapp, any S3 client) are documented in
+[INTEGRATION.md](INTEGRATION.md).
+
+Checklist:
+
+- [ ] `ContentHash` field on `ObjectManifest` (`metadata/manifest.go`).
+      BLAKE3 of content (plaintext for Pattern B, ciphertext for Pattern C).
+- [ ] `DedupPolicy` struct and field on `PlacementPolicy`
+      (`metadata/manifest.go`). Fields: Enabled, Scope (always
+      "intra_tenant"), Level ("object" or "object+block").
+- [ ] `ContentIndexStore` interface and Postgres implementation
+      (`metadata/content_index/`). Table: `content_index(tenant_id,
+      content_hash, piece_id, backend, ref_count, size_bytes,
+      created_at)`. Methods: Lookup, Register, IncrementRef,
+      DecrementRef, Delete.
+- [ ] `content_index` schema in `metadata/content_index/schema.sql`.
+- [ ] Gateway convergent encryption (Pattern B) in PUT path
+      (`api/s3compat/handler.go`). For `managed`/`public_distribution`
+      buckets with dedup enabled: compute BLAKE3(plaintext), derive
+      convergent DEK via HKDF-SHA256(content_hash, salt=tenant_id),
+      encrypt, compute BLAKE3(ciphertext), look up ContentIndex,
+      skip backend write if match, increment refcount.
+- [ ] Client-side convergent encryption (Pattern C) in PUT path
+      (`api/s3compat/handler.go`). For `client_side` buckets with
+      dedup enabled: compute BLAKE3(ciphertext_bytes) on the received
+      stream (gateway never sees plaintext), look up ContentIndex,
+      skip backend write if match.
+- [ ] `ConvergentNonce` option in client SDK
+      (`encryption/client_sdk/sdk.go` Options struct). When true,
+      derive nonce from BLAKE3(chunk || chunk_index)[:24] instead of
+      crypto/rand in `nextFrame()`.
+- [ ] `DeriveConvergentDEK` function in client SDK
+      (`encryption/client_sdk/keygen.go`). Derives DEK from
+      HKDF-SHA256(BLAKE3(plaintext), salt=tenant_id).
+- [ ] Reference-counted DELETE path (`api/s3compat/handler.go`).
+      Decrement ContentIndex ref_count; only call DeletePiece when
+      ref_count reaches zero; remove ContentIndex row at zero.
+- [ ] Multipart dedup (`api/s3compat/multipart_handler.go`). Compute
+      content hash at CompleteMultipartUpload over concatenated parts.
+- [ ] `DedupConfig` in `internal/config/config.go`. Fields: Enabled,
+      DefaultScope, DefaultLevel.
+- [ ] Console API endpoint for bucket dedup policy
+      (`api/console/dedup_handler.go`). POST/GET/DELETE on
+      `/api/v1/tenants/{tid}/buckets/{bucket}/dedup-policy`.
+- [ ] Ceph RGW block-level dedup operator guide in
+      `deploy/local-dc/README.md`.
+- [ ] S3 compliance tests with dedup (`tests/s3_compat/dedup_test.go`).
+      PUT identical content twice → single backend piece; DELETE one →
+      other still reads; DELETE second → piece gone. Both Pattern B
+      and Pattern C.
+- [ ] Dedup metrics in billing sink: DedupHits, DedupBytesSaved,
+      DedupRefCount.
+- [ ] Benchmark: dedup hit ratio for synthetic B2C (80% duplicate)
+      and B2B (60% duplicate) workloads.
+- [ ] `docs/INTEGRATION.md` — external app integration guide.
+
+### Constraints
+
+- Cross-tenant dedup permanently excluded. ContentIndex scoped to
+  tenant_id.
+- `client_side` with random DEK (default) cannot dedup.
+- DR copies are non-deduped full objects.
+- MLS FS/PCS are message-channel properties, fully preserved.
+  Stored file FS depends on CEK scheme (random = FS, convergent = no FS).
+
+---
+
 ## Phase 4: Production & Scale (Post-Beta)
 
 **Status**: `NOT STARTED`
@@ -736,7 +811,10 @@ Checklist:
 **Goal**: move from a single beta deployment to a production,
 multi-cell fabric with published product tiers and operational
 maturity. Wasabi remains the cloud overflow / DR backend; owned local
-DC cells become the primary origin.
+DC cells become the primary origin. Phase 3.5 (Intra-Tenant
+Deduplication) should be complete before Phase 4 begins, as dedup
+savings directly affect capacity planning and COGS projections for
+multi-cell production.
 
 Checklist:
 

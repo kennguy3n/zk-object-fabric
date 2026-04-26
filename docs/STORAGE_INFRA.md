@@ -13,12 +13,12 @@ It answers two questions:
 
 ## Deployment models
 
-| Model | Who owns the data plane | Who owns the control plane | Primary backend | Secondary / DR | Cache |
-| --- | --- | --- | --- | --- | --- |
-| **B2C**  | ZK Object Fabric      | ZK Object Fabric | Wasabi (Phase 1 primary) → Ceph RGW pooled cells (Phase 2+) | Backblaze B2 or Cloudflare R2 | Linode NVMe (L0 / L1) |
-| **B2B**  | ZK Object Fabric (dedicated cell) | ZK Object Fabric | Ceph RGW dedicated cell with EC 8+3 or 10+4 | Second Ceph cell in a different failure domain | Co-located NVMe per cell |
-| **BYOC** | Customer | ZK Object Fabric (SaaS) | Customer's own S3-compatible backend (AWS S3, GCP, Azure via S3 shim) | Customer responsibility | Customer responsibility |
-| **Dev / Demo** | Developer laptop (Docker) | ZK Object Fabric (in-memory) | `local_fs_dev` (filesystem) | None | In-memory LRU (L0) |
+| Model | Who owns the data plane | Who owns the control plane | Primary backend | Secondary / DR | Cache | Dedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| **B2C**  | ZK Object Fabric      | ZK Object Fabric | Wasabi (Phase 1 primary) → Ceph RGW pooled cells (Phase 2+) | Backblaze B2 or Cloudflare R2 | Linode NVMe (L0 / L1) | Object-level (intra-tenant, ContentIndex) |
+| **B2B**  | ZK Object Fabric (dedicated cell) | ZK Object Fabric | Ceph RGW dedicated cell with EC 8+3 or 10+4 | Second Ceph cell in a different failure domain | Co-located NVMe per cell | Object-level + block-level (Ceph dedup tier) |
+| **BYOC** | Customer | ZK Object Fabric (SaaS) | Customer's own S3-compatible backend (AWS S3, GCP, Azure via S3 shim) | Customer responsibility | Customer responsibility | Object-level (intra-tenant, if dedup policy enabled) |
+| **Dev / Demo** | Developer laptop (Docker) | ZK Object Fabric (in-memory) | `local_fs_dev` (filesystem) | None | In-memory LRU (L0) | Object-level (in-memory ContentIndex) |
 
 ### B2C — multi-tenant shared fabric
 
@@ -35,6 +35,13 @@ It answers two questions:
   [providers/wasabi/guardrails.go](../providers/wasabi/guardrails.go))
   drive hot-object promotion into the cache so per-tenant origin
   egress stays ≤ 1× stored bytes per month.
+- **Dedup**: Object-level intra-tenant dedup via the gateway's
+  `ContentIndex`. For `managed` / `public_distribution` modes, the
+  gateway derives a convergent DEK from `BLAKE3(plaintext)` (Pattern B).
+  For `client_side` convergent mode, the client SDK derives the
+  convergent DEK; the gateway deduplicates on `BLAKE3(ciphertext)`
+  without seeing plaintext (Pattern C). See
+  [INTEGRATION.md](INTEGRATION.md).
 
 ### B2B — dedicated cells with sovereign placement
 
@@ -50,6 +57,11 @@ It answers two questions:
   allow-lists. Sovereign tenants never route through the B2C pool.
 - **Cache**: Co-located NVMe tier inside the cell. No cross-cell cache
   traffic.
+- **Dedup**: Object-level intra-tenant dedup via `ContentIndex` (same
+  as B2C), plus block-level dedup via Ceph's native dedup pool tier
+  with content-defined chunking. The combination catches identical files
+  (object-level) and similar files (block-level). See
+  `deploy/local-dc/README.md` for Ceph dedup tier operator guide.
 
 ### BYOC — customer-owned backend, ZK Object Fabric as SaaS
 
@@ -142,11 +154,77 @@ the four deployment points below. All use a 4 MiB stripe.
 | 12+4    | 12+4          | 1.333x       | Wide B2B cell, prioritises COGS over fan-out |
 | 16+4    | 16+4          | 1.25x        | Cold/archival B2B cell |
 
+## Intra-tenant deduplication
+
+Deduplication in the ZK Object Fabric operates **exclusively within a
+single tenant**. Cross-tenant dedup is permanently excluded — sharing
+physical pieces across tenants would create a privacy side channel
+(tenant A could probe to learn whether tenant B holds a given file)
+and is incompatible with the per-tenant key isolation contract. Two
+scenarios are supported: **B2C community** (viral files, shared media
+inside a single SME or community tenant) and **B2B org** (company-wide
+documents, shared attachments inside a single enterprise tenant).
+
+### Object-level dedup (all backends)
+
+The gateway computes a `BLAKE3` content hash on every PUT, looks up
+`ContentIndex(tenant_id, hash)`, skips the backend write on a match,
+and increments a refcount. The mechanism is backend-agnostic: it
+works identically on Wasabi, Ceph, Storj, Backblaze B2, Cloudflare
+R2, AWS S3, and `local_fs_dev`. DELETE is reference-counted — the
+physical piece is only removed when the refcount reaches zero, at
+which point the `ContentIndex` row is dropped.
+
+### Block-level dedup (Ceph RGW only)
+
+Ceph's native dedup pool tier with content-defined chunking runs at
+the RADOS layer underneath the RGW S3 surface. It is transparent to
+the gateway — no code changes, no manifest changes. Block-level dedup
+is enabled only for B2B dedicated cells; the operator configures the
+dedup tier on the Ceph pool. See `deploy/local-dc/README.md` for the
+operator guide.
+
+### Dedup by deployment model
+
+| Model | Object-level | Block-level | DR copy deduped? |
+| --- | --- | --- | --- |
+| **B2C** | Yes (ContentIndex) | No (Wasabi has no native dedup) | No (full object on DR) |
+| **B2B** | Yes (ContentIndex) | Yes (Ceph dedup tier) | No (full object on second cell) |
+| **BYOC** | Yes (ContentIndex) | Depends on customer backend | Customer responsibility |
+| **Dev / Demo** | Yes (in-memory) | No | N/A |
+
+### Encryption requirements
+
+Dedup requires the encryption mode to produce stable ciphertext for
+identical plaintext. The mapping from encryption mode to dedup
+pattern is:
+
+| Encryption mode | Dedup pattern | Notes |
+| --- | --- | --- |
+| `managed` | Pattern B (gateway convergent) | Gateway derives DEK from `BLAKE3(plaintext)`. |
+| `public_distribution` | Pattern B (gateway convergent) | Same as `managed`; presigned-URL distribution. |
+| `client_side` + convergent | Pattern C (client convergent) | Client SDK derives DEK; gateway dedups on `BLAKE3(ciphertext)`. |
+| `client_side` + random | No dedup | Random DEK per object — ciphertext is unique. |
+
+See [INTEGRATION.md](INTEGRATION.md) for the external app
+integration guide.
+
+### MLS compatibility
+
+MLS forward secrecy (FS) and post-compromise security (PCS) are
+**message-channel** properties — they govern the chat/messaging key
+ratchet and are fully preserved. File encryption (DEK derivation,
+ciphertext storage) is decoupled from the MLS message channel, so
+convergent dedup on stored files does not weaken MLS FS/PCS on the
+message stream. See [INTEGRATION.md](INTEGRATION.md) §7 for details.
+
 ## See also
 
 - [PROPOSAL.md §2](PROPOSAL.md) — commercial envelope and cost model
 - [PROPOSAL.md §3.4](PROPOSAL.md) — StorageProvider interface contract
 - [PROPOSAL.md §3.9](PROPOSAL.md) — placement DSL and erasure-coding
+- [PROPOSAL.md §3.14](PROPOSAL.md) — intra-tenant deduplication design
 - [PROPOSAL.md §4](PROPOSAL.md) — migration engine
+- [INTEGRATION.md](INTEGRATION.md) — external app integration guide (KChat, non-MLS apps)
 - [PROGRESS.md](PROGRESS.md) — phase-gated tracker
 - [demo/README.md](../demo/README.md) — Docker demo quick-start and downstream integration guide
