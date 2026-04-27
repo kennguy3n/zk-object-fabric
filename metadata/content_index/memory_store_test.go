@@ -205,6 +205,55 @@ func TestMemoryStore_PieceIDsNilForSinglePiece(t *testing.T) {
 	}
 }
 
+func TestMemoryStore_LookupByPlaintextHash(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+
+	// Empty plaintextHash short-circuits to ErrNotFound rather
+	// than returning the first NULL-plaintext_hash entry that
+	// happens to be in the map.
+	if _, err := s.LookupByPlaintextHash(ctx, "tnt", ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Lookup empty plaintext_hash: got %v want ErrNotFound", err)
+	}
+
+	// Entry without PlaintextHash (Pattern C / legacy) must not
+	// be reachable via LookupByPlaintextHash even when the
+	// caller passes the empty string.
+	if err := s.Register(ctx, ContentIndexEntry{
+		TenantID: "tnt", ContentHash: "h-legacy", PieceID: "p-legacy", Backend: "wasabi",
+	}); err != nil {
+		t.Fatalf("Register legacy: %v", err)
+	}
+	if _, err := s.LookupByPlaintextHash(ctx, "tnt", ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LookupByPlaintextHash legacy: got %v want ErrNotFound", err)
+	}
+
+	// Entry with PlaintextHash is found by it.
+	if err := s.Register(ctx, ContentIndexEntry{
+		TenantID: "tnt", ContentHash: "h-pb", PieceID: "p-pb", Backend: "wasabi",
+		SizeBytes: 1024, PlaintextHash: "blake3:abc123",
+	}); err != nil {
+		t.Fatalf("Register PB: %v", err)
+	}
+	got, err := s.LookupByPlaintextHash(ctx, "tnt", "blake3:abc123")
+	if err != nil {
+		t.Fatalf("LookupByPlaintextHash: %v", err)
+	}
+	if got.ContentHash != "h-pb" || got.PieceID != "p-pb" || got.PlaintextHash != "blake3:abc123" {
+		t.Fatalf("LookupByPlaintextHash unexpected entry: %+v", got)
+	}
+
+	// Wrong tenant must not match.
+	if _, err := s.LookupByPlaintextHash(ctx, "other-tnt", "blake3:abc123"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LookupByPlaintextHash cross-tenant: got %v want ErrNotFound", err)
+	}
+
+	// Unknown plaintext_hash must miss.
+	if _, err := s.LookupByPlaintextHash(ctx, "tnt", "blake3:doesnotexist"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LookupByPlaintextHash unknown: got %v want ErrNotFound", err)
+	}
+}
+
 func TestMemoryStore_RejectsMissingFields(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()

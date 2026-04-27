@@ -426,24 +426,97 @@ func TestDedup_Multipart_MultiPartShareSingleCanonical(t *testing.T) {
 	}
 }
 
-// TestDedup_Multipart_MultiPart_ManagedExcluded asserts the
-// managed-mode exclusion is preserved by the multi-piece path:
-// CreateMultipartUpload mints a fresh random DEK per session, so
-// two uploads of the same plaintext under managed encryption
-// produce 2*N backend pieces — dedup MUST NOT fire.
-func TestDedup_Multipart_MultiPart_ManagedExcluded(t *testing.T) {
+// TestDedup_Multipart_MultiPart_ManagedConsolidates asserts the
+// deferred convergent consolidation path: two multipart uploads of
+// the same plaintext under `managed` encryption produce exactly
+// one backend piece. The first upload's per-part pieces (sealed
+// with the session's random DEK) are decrypted, the assembled
+// plaintext is re-encrypted with a convergent DEK derived from
+// the per-part plaintext digests, and the consolidated piece is
+// registered against the canonical plaintext_hash. The second
+// upload looks up the same plaintext_hash, increments the refcount
+// on the existing consolidated piece, and drops every newly
+// uploaded part.
+//
+// Both objects must roundtrip through GET — the manifests carry
+// independently wrapped copies of the same convergent DEK so the
+// gateway can decrypt the canonical piece for either reader.
+func TestDedup_Multipart_MultiPart_ManagedConsolidates(t *testing.T) {
 	s := newDedupServer(t, "managed")
 	parts := [][]byte{
 		bytes.Repeat([]byte("managed-multipart-part-1-"), 256),
 		bytes.Repeat([]byte("managed-multipart-part-2-"), 256),
 	}
+	want := bytes.Join(parts, nil)
 
 	uploadMultiPartMultipart(t, s, "a.bin", parts, "")
 	uploadMultiPartMultipart(t, s, "b.bin", parts, "")
 
-	wantPieces := 2 * len(parts)
-	if got := s.countPieces(t); got != wantPieces {
-		t.Fatalf("managed multipart must not dedup: got %d pieces, want %d", got, wantPieces)
+	if got := s.countPieces(t); got != 1 {
+		t.Fatalf("managed multipart must dedup to one consolidated piece, got %d", got)
+	}
+	for _, key := range []string{"a.bin", "b.bin"} {
+		out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("GetObject %s: %v", key, err)
+		}
+		got, _ := io.ReadAll(out.Body)
+		_ = out.Body.Close()
+		if !bytes.Equal(got, want) {
+			t.Fatalf("GetObject %s: roundtrip mismatch after managed multipart dedup", key)
+		}
+	}
+}
+
+// TestDedup_Multipart_MultiPart_ManagedDeleteRefcount asserts the
+// refcount contract for deferred convergent consolidation: two
+// uploads share one consolidated piece, the first DELETE leaves
+// it intact (refcount 2→1), and the second DELETE reclaims it
+// (refcount 1→0).
+func TestDedup_Multipart_MultiPart_ManagedDeleteRefcount(t *testing.T) {
+	s := newDedupServer(t, "managed")
+	parts := [][]byte{
+		bytes.Repeat([]byte("managed-multipart-refcount-1-"), 128),
+		bytes.Repeat([]byte("managed-multipart-refcount-2-"), 128),
+		bytes.Repeat([]byte("managed-multipart-refcount-3-"), 32),
+	}
+	want := bytes.Join(parts, nil)
+
+	uploadMultiPartMultipart(t, s, "a.bin", parts, "")
+	uploadMultiPartMultipart(t, s, "b.bin", parts, "")
+	if got := s.countPieces(t); got != 1 {
+		t.Fatalf("expected 1 consolidated piece after dedup, got %d", got)
+	}
+
+	if _, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String("a.bin"),
+	}); err != nil {
+		t.Fatalf("DeleteObject a: %v", err)
+	}
+	if got := s.countPieces(t); got != 1 {
+		t.Fatalf("consolidated piece must survive first DELETE, got %d", got)
+	}
+	out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String("b.bin"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject b after delete a: %v", err)
+	}
+	got, _ := io.ReadAll(out.Body)
+	_ = out.Body.Close()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("GetObject b roundtrip mismatch after delete a")
+	}
+
+	if _, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String("b.bin"),
+	}); err != nil {
+		t.Fatalf("DeleteObject b: %v", err)
+	}
+	if got := s.countPieces(t); got != 0 {
+		t.Fatalf("expected consolidated piece reclaimed after final DELETE, got %d", got)
 	}
 }
 

@@ -49,20 +49,52 @@ func (s *Store) Lookup(ctx context.Context, tenantID, contentHash string) (*cont
 	if tenantID == "" || contentHash == "" {
 		return nil, errors.New("postgres: tenant_id and content_hash are required")
 	}
-	// etag column may be NULL on rows written before Phase 3.5
-	// added the field; coalesce to empty string so the caller
-	// sees a uniform zero value. piece_ids is the multi-piece
-	// extension and is NULL for single-piece entries; we scan it
-	// into a []byte and unmarshal only when non-NULL.
+	// etag and plaintext_hash columns may be NULL on rows written
+	// before they were added; coalesce to empty string so the
+	// caller sees a uniform zero value. piece_ids is the
+	// multi-piece extension and is NULL for single-piece entries;
+	// we scan it into a []byte and unmarshal only when non-NULL.
 	q := fmt.Sprintf(`
-		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), piece_ids, created_at
+		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), piece_ids, COALESCE(plaintext_hash, ''), created_at
 		FROM %s
 		WHERE tenant_id = $1 AND content_hash = $2
 	`, s.table)
 	row := s.db.QueryRowContext(ctx, q, tenantID, contentHash)
+	return scanEntry(row)
+}
+
+// LookupByPlaintextHash returns the entry for (tenantID,
+// plaintextHash) using the plaintext_hash secondary index.
+// Returns ErrNotFound when no matching row exists. Pattern C and
+// pre-Phase-3.5 rows are excluded automatically by the partial
+// index — empty plaintext_hash values never match.
+func (s *Store) LookupByPlaintextHash(ctx context.Context, tenantID, plaintextHash string) (*content_index.ContentIndexEntry, error) {
+	if tenantID == "" {
+		return nil, errors.New("postgres: tenant_id is required")
+	}
+	if plaintextHash == "" {
+		return nil, content_index.ErrNotFound
+	}
+	q := fmt.Sprintf(`
+		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), piece_ids, COALESCE(plaintext_hash, ''), created_at
+		FROM %s
+		WHERE tenant_id = $1 AND plaintext_hash = $2
+		LIMIT 1
+	`, s.table)
+	row := s.db.QueryRowContext(ctx, q, tenantID, plaintextHash)
+	return scanEntry(row)
+}
+
+// scanEntry pulls a content_index row off either a *sql.Row or
+// *sql.Rows. Centralised so Lookup, LookupByPlaintextHash, and the
+// row-iterating callers stay consistent on column order and
+// piece_ids unmarshaling.
+func scanEntry(row interface {
+	Scan(dest ...any) error
+}) (*content_index.ContentIndexEntry, error) {
 	var e content_index.ContentIndexEntry
 	var pieceIDsRaw []byte
-	if err := row.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &pieceIDsRaw, &e.CreatedAt); err != nil {
+	if err := row.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &pieceIDsRaw, &e.PlaintextHash, &e.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, content_index.ErrNotFound
 		}
@@ -102,11 +134,11 @@ func (s *Store) Register(ctx context.Context, entry content_index.ContentIndexEn
 		}
 	}
 	q := fmt.Sprintf(`
-		INSERT INTO %s (tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, etag, piece_ids)
-		VALUES ($1, $2, $3, $4, 1, $5, NULLIF($6, ''), $7)
+		INSERT INTO %s (tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, etag, piece_ids, plaintext_hash)
+		VALUES ($1, $2, $3, $4, 1, $5, NULLIF($6, ''), $7, NULLIF($8, ''))
 		ON CONFLICT (tenant_id, content_hash) DO NOTHING
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes, entry.ETag, nullableJSON(pieceIDsJSON))
+	res, err := s.db.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes, entry.ETag, nullableJSON(pieceIDsJSON), entry.PlaintextHash)
 	if err != nil {
 		return fmt.Errorf("postgres: content_index register: %w", err)
 	}
@@ -224,7 +256,7 @@ func (s *Store) ScanAll(ctx context.Context, tenantID string) ([]content_index.C
 		return nil, errors.New("postgres: tenant_id is required")
 	}
 	q := fmt.Sprintf(`
-		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), piece_ids, created_at
+		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), piece_ids, COALESCE(plaintext_hash, ''), created_at
 		FROM %s
 		WHERE tenant_id = $1
 	`, s.table)
@@ -237,7 +269,7 @@ func (s *Store) ScanAll(ctx context.Context, tenantID string) ([]content_index.C
 	for rows.Next() {
 		var e content_index.ContentIndexEntry
 		var pieceIDsRaw []byte
-		if err := rows.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &pieceIDsRaw, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &pieceIDsRaw, &e.PlaintextHash, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("postgres: content_index scan row: %w", err)
 		}
 		if len(pieceIDsRaw) > 0 {
