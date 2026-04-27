@@ -17,6 +17,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -726,5 +727,198 @@ func TestCreateMultipartUpload_ResidencyViolation(t *testing.T) {
 	h2.CreateMultipartUpload(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("CreateMultipartUpload with matching residency status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+}
+
+// recordingAudit captures every AuditEntry the handler records so
+// tests can assert on the (operation, backend, country) tuple
+// emitted by each S3 op.
+type recordingAudit struct {
+	mu      sync.Mutex
+	entries []AuditEntry
+}
+
+func (r *recordingAudit) Record(_ context.Context, e AuditEntry) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries = append(r.entries, e)
+	return nil
+}
+
+func (r *recordingAudit) operations() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.entries))
+	for _, e := range r.entries {
+		out = append(out, e.Operation)
+	}
+	return out
+}
+
+// ecPlacement returns a placement that points every object at a
+// single backend with the named ErasureProfile.
+type ecPlacement struct {
+	backend string
+	profile string
+}
+
+func (p ecPlacement) ResolveBackend(string, string, string) (string, metadata.PlacementPolicy, error) {
+	return p.backend, metadata.PlacementPolicy{
+		AllowedBackends: []string{p.backend},
+		ErasureProfile:  p.profile,
+	}, nil
+}
+
+func TestGetErasureCoded_AuditsOnSuccess(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance:    ComplianceHooks{Audit: audit},
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC GET status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Body.Len(); got != len(body) {
+		t.Fatalf("EC GET body length = %d, want %d", got, len(body))
+	}
+
+	ops := audit.operations()
+	if len(ops) != 2 || ops[0] != "PUT" || ops[1] != "GET" {
+		t.Fatalf("EC audit ops = %v, want [PUT GET]", ops)
+	}
+	getEntry := audit.entries[1]
+	if getEntry.PieceBackend != "test" {
+		t.Errorf("EC GET audit backend = %q, want %q", getEntry.PieceBackend, "test")
+	}
+	if getEntry.BackendCountry != "US" {
+		t.Errorf("EC GET audit country = %q, want US", getEntry.BackendCountry)
+	}
+	if getEntry.Bucket != "bucket" || getEntry.ObjectKey != "ec-obj" {
+		t.Errorf("EC GET audit (bucket, key) = (%q, %q), want (bucket, ec-obj)", getEntry.Bucket, getEntry.ObjectKey)
+	}
+}
+
+func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "DE"}
+	audit := &recordingAudit{}
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests:  store,
+		Providers:  map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:  fixedPlacement{backend: "test"},
+		Multipart:  mpStore,
+		Now:        func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{Audit: audit},
+	})
+
+	// Create + upload two parts + complete to land a multipart
+	// manifest in the store.
+	req := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+	if uploadID == "" {
+		t.Fatal("CreateMultipartUpload returned empty UploadId")
+	}
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("part-1-"), 1024),
+		bytes.Repeat([]byte("part-2-"), 1024),
+	}
+	type completedPart struct {
+		PartNumber int
+		ETag       string
+	}
+	completed := make([]completedPart, 0, len(parts))
+	for i, body := range parts {
+		partNum := i + 1
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		rec := httptest.NewRecorder()
+		h.UploadPart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, want 200; body=%s", partNum, rec.Code, rec.Body)
+		}
+		etag := strings.Trim(rec.Header().Get("ETag"), `"`)
+		if etag == "" {
+			t.Fatalf("UploadPart %d returned empty ETag", partNum)
+		}
+		completed = append(completed, completedPart{PartNumber: partNum, ETag: etag})
+	}
+
+	completeBody := completeMultipartUploadRequest{}
+	for _, p := range completed {
+		completeBody.Parts = append(completeBody.Parts, completeUploadEntry{
+			PartNumber: p.PartNumber,
+			ETag:       p.ETag,
+		})
+	}
+	completeXML, err := xml.Marshal(completeBody)
+	if err != nil {
+		t.Fatalf("marshal complete body: %v", err)
+	}
+	url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID)
+	req = httptest.NewRequest(http.MethodPost, url, bytes.NewReader(completeXML))
+	rec = httptest.NewRecorder()
+	h.CompleteMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// GET should round-trip and add a GET audit record.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/mp-obj", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("multipart GET status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	wantBytes := append(append([]byte{}, parts[0]...), parts[1]...)
+	if !bytes.Equal(rec.Body.Bytes(), wantBytes) {
+		t.Fatalf("multipart GET body mismatch: got %d bytes, want %d", rec.Body.Len(), len(wantBytes))
+	}
+
+	ops := audit.operations()
+	if len(ops) != 2 || ops[0] != "PUT" || ops[1] != "GET" {
+		t.Fatalf("multipart audit ops = %v, want [PUT GET]", ops)
+	}
+	getEntry := audit.entries[1]
+	if getEntry.PieceBackend != "test" {
+		t.Errorf("multipart GET audit backend = %q, want %q", getEntry.PieceBackend, "test")
+	}
+	if getEntry.BackendCountry != "DE" {
+		t.Errorf("multipart GET audit country = %q, want DE", getEntry.BackendCountry)
+	}
+	if getEntry.PieceID == "" {
+		t.Errorf("multipart GET audit PieceID is empty; want first piece ID")
 	}
 }
