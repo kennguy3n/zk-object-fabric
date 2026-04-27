@@ -86,3 +86,17 @@ export interface DedicatedCell {
   capacityPetabytes: number;
   utilization: number; // 0..1
 }
+
+// TierConfig mirrors metadata/tenant/tier_config.go TierConfig.
+// Surfaced by GET /api/v1/tiers and rendered by TiersPage.
+export interface TierConfig {
+  tier: LicenseTier;
+  display_name: string;
+  default_ec_profile: string;
+  cache_policy: string;
+  dedup_policy: string;
+  egress_budget_tb_month: number;
+  price_per_tb_month: number;
+  placement_mode: string;
+  country_locked: boolean;
+}
