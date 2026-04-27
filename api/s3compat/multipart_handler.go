@@ -485,9 +485,30 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		VersionID:     manifest.VersionID,
 	}
 	if err := h.cfg.Manifests.Put(r.Context(), mkey, manifest); err != nil {
-		// Don't orphan pieces on a manifest failure; best-effort
-		// cleanup like the single-piece Put path.
+		// Roll back any dedup state we touched before deleting
+		// pieces, mirroring the single-PUT putDeduped path. We
+		// MUST drop the refcount before any piece-delete; we MUST
+		// NOT delete the registered canonical piece because that
+		// would leave the content_index pointing at a deleted
+		// piece for any concurrent uploader who Lookup'd between
+		// our Register and this rollback.
+		if manifest.ContentHash != "" && h.cfg.ContentIndex != nil {
+			_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, manifest.ContentHash)
+		}
+		// Best-effort piece cleanup. Skip the piece that the
+		// content_index now references (manifest.Pieces[0] —
+		// that's either the just-registered canonical piece or
+		// the existing canonical piece on a hit / lost-race).
+		// In the dedup-disabled or multi-piece case manifest
+		// pieces line up with parts, so the skip is a no-op.
+		var keep string
+		if manifest.ContentHash != "" && len(manifest.Pieces) == 1 {
+			keep = manifest.Pieces[0].PieceID
+		}
 		for _, p := range parts {
+			if p.PieceID == keep {
+				continue
+			}
 			if provider, ok := h.cfg.Providers[p.Backend]; ok {
 				_ = provider.DeletePiece(r.Context(), p.PieceID)
 			}
