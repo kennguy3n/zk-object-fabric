@@ -49,6 +49,7 @@ import (
 	pgstore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/postgres"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
+	"github.com/kennguy3n/zk-object-fabric/internal/repair"
 	"github.com/kennguy3n/zk-object-fabric/migration/background_rebalancer"
 	"github.com/kennguy3n/zk-object-fabric/migration/cross_cell"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
@@ -168,6 +169,7 @@ func main() {
 
 	multipartStore := multipart.NewMemoryStore()
 	erasureRegistry := erasure_coding.DefaultRegistry()
+	repairDone := startRepairQueue(workerCtx, cfg.Repair, store, registry, erasureRegistry)
 
 	gatewayEnc := buildGatewayEncryption(cfg.Encryption)
 
@@ -291,6 +293,9 @@ func main() {
 	}
 	if crossCellDone != nil {
 		<-crossCellDone
+	}
+	if repairDone != nil {
+		<-repairDone
 	}
 }
 
@@ -1491,5 +1496,45 @@ func startCrossCellReplicator(
 		_ = r.Run(ctx)
 	}()
 	log.Printf("gateway: started cross-cell replicator src=%s dst=%s scope=%d", cfg.SourceCellID, cfg.DestCellID, len(scope))
+	return done
+}
+
+// startRepairQueue runs the automated repair queue when the
+// operator enables it. The queue polls a Ceph manager health
+// endpoint, identifies degraded shards, and re-encodes affected
+// erasure-coded manifests. The ManifestScanner used here is a
+// noop — production deployments are expected to inject their own
+// CRUSH-aware scanner via repair.RepairQueue.Scanner before
+// calling Run; the scaffold only ensures the goroutine lifecycle
+// and config wiring are in place.
+func startRepairQueue(
+	ctx context.Context,
+	cfg config.RepairConfig,
+	manifests manifest_store.ManifestStore,
+	registry map[string]providers.StorageProvider,
+	ec *erasure_coding.Registry,
+) <-chan struct{} {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.CephEndpoint == "" {
+		log.Printf("repair: queue enabled but ceph_endpoint is empty; skipping")
+		return nil
+	}
+	src := &repair.CephHealthClient{
+		Endpoint:  cfg.CephEndpoint,
+		AuthToken: cfg.AuthToken,
+	}
+	q := repair.NewRepairQueue(src, repair.NoopScanner{}, manifests, registry, ec)
+	if d, err := time.ParseDuration(cfg.PollInterval); err == nil && d > 0 {
+		q.PollInterval = d
+	}
+	q.Logger = log.New(os.Stdout, "repair ", log.LstdFlags)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = q.Run(ctx)
+	}()
+	log.Printf("gateway: started repair queue endpoint=%s", cfg.CephEndpoint)
 	return done
 }
