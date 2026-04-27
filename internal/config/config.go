@@ -121,7 +121,7 @@ type CrossCellConfig struct {
 	Enabled      bool                  `json:"enabled"`
 	SourceCellID string                `json:"source_cell_id"`
 	DestCellID   string                `json:"dest_cell_id"`
-	ScanInterval string                `json:"scan_interval"`
+	ScanInterval Duration              `json:"scan_interval"`
 	Scope        []CrossCellScopeEntry `json:"scope"`
 }
 
@@ -139,10 +139,10 @@ type CrossCellScopeEntry struct {
 // non-empty, is forwarded as a Bearer token on the health
 // request.
 type RepairConfig struct {
-	Enabled      bool   `json:"enabled"`
-	CephEndpoint string `json:"ceph_endpoint"`
-	AuthToken    string `json:"auth_token"`
-	PollInterval string `json:"poll_interval"`
+	Enabled      bool     `json:"enabled"`
+	CephEndpoint string   `json:"ceph_endpoint"`
+	AuthToken    string   `json:"auth_token"`
+	PollInterval Duration `json:"poll_interval"`
 }
 
 

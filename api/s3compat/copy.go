@@ -232,11 +232,18 @@ func (h *Handler) writeCopyManifest(
 ) {
 	dstHash := hashObjectKey(dstKey)
 	dstVersion := piece.PieceID
+	// Both copy paths preserve the source's plaintext object
+	// size; gateway encryption is opaque to the copy path.
 	objectSize := srcManifest.ObjectSize
-	if !dedupCopy && piece.SizeBytes > 0 {
-		// Non-dedup copy preserves the source's plaintext size
-		// (gateway encryption is opaque to the copy path).
-		objectSize = srcManifest.ObjectSize
+	// Only propagate ContentHash on the dedup-aware fast path.
+	// On the non-dedup fall-through we minted a fresh piece that
+	// is NOT tracked in content_index; carrying the source's
+	// hash would cause a subsequent DELETE on the destination to
+	// decrement the source's refcount via the refcount-aware
+	// path and corrupt accounting.
+	contentHash := ""
+	if dedupCopy {
+		contentHash = srcManifest.ContentHash
 	}
 	manifest := &metadata.ObjectManifest{
 		TenantID:        tenantID,
@@ -246,7 +253,7 @@ func (h *Handler) writeCopyManifest(
 		VersionID:       dstVersion,
 		ObjectSize:      objectSize,
 		ChunkSize:       srcManifest.ChunkSize,
-		ContentHash:     srcManifest.ContentHash,
+		ContentHash:     contentHash,
 		Encryption:      srcManifest.Encryption,
 		PlacementPolicy: srcManifest.PlacementPolicy,
 		Pieces:          []metadata.Piece{piece},

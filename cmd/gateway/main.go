@@ -226,7 +226,7 @@ func main() {
 		)
 		ag.AlertSink = alertSink
 		applyAbuseConfigToAbuseGuard(ag, cfg.Abuse)
-		handler = ag.Middleware(rl.Middleware(mux))
+		handler = ag.Middleware(rl.Middleware(handler))
 	}
 
 	srv := &http.Server{
@@ -1486,7 +1486,7 @@ func startCrossCellReplicator(
 		cross_cell.Cell{ID: cfg.DestCellID, Manifests: manifests, Provider: dst},
 		scope,
 	)
-	if d, err := time.ParseDuration(cfg.ScanInterval); err == nil && d > 0 {
+	if d := time.Duration(cfg.ScanInterval); d > 0 {
 		r.Interval = d
 	}
 	r.Logger = log.New(os.Stdout, "cross_cell ", log.LstdFlags)
@@ -1526,7 +1526,7 @@ func startRepairQueue(
 		AuthToken: cfg.AuthToken,
 	}
 	q := repair.NewRepairQueue(src, repair.NoopScanner{}, manifests, registry, ec)
-	if d, err := time.ParseDuration(cfg.PollInterval); err == nil && d > 0 {
+	if d := time.Duration(cfg.PollInterval); d > 0 {
 		q.PollInterval = d
 	}
 	q.Logger = log.New(os.Stdout, "repair ", log.LstdFlags)

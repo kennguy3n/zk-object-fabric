@@ -87,6 +87,17 @@ func (p *AutomatedProvisioner) clock() time.Time {
 	return time.Now()
 }
 
+// idGen returns a non-nil cell-ID generator. Callers may set
+// IDGenerator=nil (e.g. struct-literal construction); fall back
+// to defaultCellID so ProvisionCell never panics on a nil func
+// call. Mirrors ManualProvisioner.idGen.
+func (p *AutomatedProvisioner) idGen() func() (string, error) {
+	if p.IDGenerator != nil {
+		return p.IDGenerator
+	}
+	return defaultCellID
+}
+
 // ProvisionCell implements CellProvisioner.
 func (p *AutomatedProvisioner) ProvisionCell(ctx context.Context, req CellRequest) (CellStatus, error) {
 	if p == nil || p.Sink == nil || p.Runner == nil {
@@ -95,7 +106,7 @@ func (p *AutomatedProvisioner) ProvisionCell(ctx context.Context, req CellReques
 	if err := req.Validate(); err != nil {
 		return CellStatus{}, err
 	}
-	id, err := p.IDGenerator()
+	id, err := p.idGen()()
 	if err != nil {
 		return CellStatus{}, fmt.Errorf("cellops: mint cell id: %w", err)
 	}
@@ -113,10 +124,11 @@ func (p *AutomatedProvisioner) ProvisionCell(ctx context.Context, req CellReques
 		UpdatedAt:         now,
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if err := p.Sink.UpsertDedicatedCell(ctx, status); err != nil {
+		p.mu.Unlock()
 		return CellStatus{}, fmt.Errorf("cellops: persist cell: %w", err)
 	}
+	p.mu.Unlock()
 	apply := func() {
 		out, runErr := p.Runner.Apply(context.Background(), map[string]string{
 			"cell_id":         id,
@@ -137,6 +149,19 @@ func (p *AutomatedProvisioner) ProvisionCell(ctx context.Context, req CellReques
 				return
 			}
 		}
+		// Re-read the cell row before flipping to StatusActive
+		// so a concurrent DecommissionCell that already moved
+		// the cell to StatusDecommissioning is not silently
+		// reverted by the background apply.
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		current, ok, err := p.Sink.GetDedicatedCell(context.Background(), id)
+		if err != nil || !ok {
+			return
+		}
+		if current.Status != StatusProvisioning {
+			return
+		}
 		_ = p.Sink.UpdateCellStatus(context.Background(), id, StatusActive)
 	}
 	if p.WaitForCompletion {
@@ -155,6 +180,11 @@ func (p *AutomatedProvisioner) DecommissionCell(ctx context.Context, cellID stri
 	if cellID == "" {
 		return errors.New("cellops: cell_id is required")
 	}
+	// Hold p.mu across the check-and-update so two concurrent
+	// calls for the same cell cannot both pass the idempotency
+	// guard and both fire Destroy. Matches ManualProvisioner.
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	current, ok, err := p.Sink.GetDedicatedCell(ctx, cellID)
 	if err != nil {
 		return fmt.Errorf("cellops: load cell: %w", err)

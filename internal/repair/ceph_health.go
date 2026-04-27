@@ -74,8 +74,13 @@ func (c *CephHealthClient) Poll(ctx context.Context) (HealthSignal, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
 		return HealthSignal{}, err
 	}
+	// Treat only the explicit HEALTH_OK status as healthy. An
+	// empty / missing status field is suspicious — the Ceph API
+	// shape may have drifted or auth may be silently returning a
+	// stripped doc — and silently flagging it healthy would
+	// disable the repair queue without a signal.
 	sig := HealthSignal{
-		Healthy:    doc.Status == "" || doc.Status == "HEALTH_OK",
+		Healthy:    doc.Status == "HEALTH_OK",
 		ObservedAt: time.Now(),
 	}
 	if sig.Healthy {

@@ -136,7 +136,7 @@ export class ApiClient {
   // --- product tiers (read-only, not tenant-scoped) ------------
 
   async listTierConfigs(): Promise<TierConfig[]> {
-    return this.requestAt("GET", "/api/v1/tiers");
+    return this.requestAt("GET", `${this.rootBaseUrl}/v1/tiers`);
   }
 
   // --- transport ------------------------------------------------

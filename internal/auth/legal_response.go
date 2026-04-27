@@ -64,9 +64,13 @@ func (h LegalHold) Matches(tenantID, bucket, objectKey string) bool {
 type LegalHoldStore interface {
 	Create(ctx context.Context, hold LegalHold) error
 	Release(ctx context.Context, id string) error
+	Get(ctx context.Context, id string) (LegalHold, error)
 	List(ctx context.Context, tenantID string) ([]LegalHold, error)
 	Active(ctx context.Context, tenantID, bucket, objectKey string) ([]LegalHold, error)
 }
+
+// ErrLegalHoldNotFound is returned by Get when no hold matches id.
+var ErrLegalHoldNotFound = errors.New("legal_hold: not found")
 
 // MemoryLegalHoldStore is an in-memory LegalHoldStore. Safe for
 // concurrent use; appends and lookups are O(n) which is fine for
@@ -118,6 +122,17 @@ func (s *MemoryLegalHoldStore) Release(_ context.Context, id string) error {
 	h.ReleasedAt = s.clock()
 	s.holds[id] = h
 	return nil
+}
+
+// Get returns the hold with the given id, or ErrLegalHoldNotFound.
+func (s *MemoryLegalHoldStore) Get(_ context.Context, id string) (LegalHold, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	h, ok := s.holds[id]
+	if !ok {
+		return LegalHold{}, ErrLegalHoldNotFound
+	}
+	return h, nil
 }
 
 // List returns every hold for tenantID.

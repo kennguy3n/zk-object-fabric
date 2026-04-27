@@ -168,21 +168,60 @@ func (r *Replicator) scanScope(ctx context.Context, sk ScopeKey) {
 // source provider to the destination provider, then writes a
 // replica manifest into the destination manifest store. The
 // piece IDs are preserved so dest manifests address the same
-// blobs by ID as the source.
+// blobs by ID as the source. Pieces whose Backend is already
+// the destination cell are skipped to keep ticks idempotent.
+//
+// The replica manifest is a deep-copied clone of the source so
+// rewriting Piece.Backend to r.Dest.ID does not mutate the
+// source manifest in shared-store deployments. Without the
+// rewrite the S3 GET path on the destination would route reads
+// back to the source backend and the mirrored bytes would be
+// orphaned.
 func (r *Replicator) replicateOne(ctx context.Context, m *metadata.ObjectManifest) error {
-	for _, p := range m.Pieces {
+	replica := cloneManifestForReplica(m, r.Dest.ID)
+	for i, p := range m.Pieces {
+		if p.Backend == r.Dest.ID {
+			// Already on the destination — skip the copy
+			// but keep the manifest write so a stale
+			// replica row is refreshed in shared-store
+			// deployments.
+			continue
+		}
 		if err := r.copyPiece(ctx, p); err != nil {
 			return err
 		}
+		replica.Pieces[i].Backend = r.Dest.ID
 		r.copied.Add(1)
 	}
-	key := manifest_store.ManifestKey{
-		TenantID:      m.TenantID,
-		Bucket:        m.Bucket,
-		ObjectKeyHash: m.ObjectKeyHash,
-		VersionID:     m.VersionID,
+	// Skip the manifest write when the source and dest share a
+	// manifest store: a Put under the same key would overwrite
+	// the source manifest and corrupt the source-side Backend
+	// pointers. A future per-cell manifest store will let us
+	// always Put.
+	if r.Source.Manifests == r.Dest.Manifests {
+		return nil
 	}
-	return r.Dest.Manifests.Put(ctx, key, m)
+	key := manifest_store.ManifestKey{
+		TenantID:      replica.TenantID,
+		Bucket:        replica.Bucket,
+		ObjectKeyHash: replica.ObjectKeyHash,
+		VersionID:     replica.VersionID,
+	}
+	return r.Dest.Manifests.Put(ctx, key, replica)
+}
+
+// cloneManifestForReplica returns a deep copy of m suitable for
+// mutation by the replicator. Only the slices the replicator
+// rewrites (Pieces) need element-level cloning today; the rest
+// is a shallow copy of the immutable header fields.
+func cloneManifestForReplica(m *metadata.ObjectManifest, destCellID string) *metadata.ObjectManifest {
+	out := *m
+	out.Pieces = make([]metadata.Piece, len(m.Pieces))
+	copy(out.Pieces, m.Pieces)
+	for i := range out.Pieces {
+		out.Pieces[i].Backend = destCellID
+	}
+	return &out
 }
 
 func (r *Replicator) copyPiece(ctx context.Context, p metadata.Piece) error {
