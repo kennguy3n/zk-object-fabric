@@ -571,15 +571,17 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var country string
-	if prov, ok := h.cfg.Providers[upload.Backend]; ok {
-		country = prov.PlacementLabels().Country
-	}
+	auditBackend := upload.Backend
 	var auditPieceID string
 	if len(manifest.Pieces) > 0 {
 		auditPieceID = manifest.Pieces[0].PieceID
+		auditBackend = manifest.Pieces[0].Backend
 	}
-	h.audit(r, "PUT", tenantID, bucket, key, auditPieceID, upload.Backend, country)
+	var country string
+	if prov, ok := h.cfg.Providers[auditBackend]; ok {
+		country = prov.PlacementLabels().Country
+	}
+	h.audit(r, "PUT", tenantID, bucket, key, auditPieceID, auditBackend, country)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
