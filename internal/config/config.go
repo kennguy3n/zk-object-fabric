@@ -65,6 +65,25 @@ type Config struct {
 	Encryption   EncryptionConfig   `json:"encryption"`
 	Abuse        AbuseConfig        `json:"abuse"`
 	Dedup        DedupConfig        `json:"dedup"`
+	Tracing      TracingConfig      `json:"tracing"`
+	Metrics      MetricsConfig      `json:"metrics"`
+}
+
+// TracingConfig configures the OpenTelemetry-style request
+// tracer wired into the gateway. When Enabled is false the
+// gateway uses a no-op tracer; when true and Endpoint is set, a
+// real exporter is constructed in cmd/gateway.
+type TracingConfig struct {
+	Enabled     bool   `json:"enabled"`
+	Endpoint    string `json:"endpoint"`
+	ServiceName string `json:"service_name"`
+}
+
+// MetricsConfig gates the Prometheus metrics endpoint. Path
+// defaults to /internal/metrics.
+type MetricsConfig struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path"`
 }
 
 // DedupConfig configures intra-tenant deduplication. Cross-tenant
