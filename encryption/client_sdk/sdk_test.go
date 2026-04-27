@@ -188,15 +188,96 @@ func TestLocalFileWrapper_WrongCMKRef(t *testing.T) {
 	}
 }
 
-func TestEncryptObject_ConvergentNonceUnimplemented(t *testing.T) {
-	dek, err := GenerateDEK()
+func TestEncryptObject_ConvergentNonce_Determinism(t *testing.T) {
+	hash := []byte("blake3:cafebabe")
+	dek, err := DeriveConvergentDEK(hash, "tnt_a")
 	if err != nil {
-		t.Fatalf("GenerateDEK: %v", err)
+		t.Fatalf("DeriveConvergentDEK: %v", err)
 	}
-	if _, err := EncryptObject(bytes.NewReader([]byte("x")), dek, Options{ConvergentNonce: true}); err != ErrConvergentNonceNotImplemented {
-		t.Fatalf("EncryptObject with ConvergentNonce=true: want ErrConvergentNonceNotImplemented, got %v", err)
+	plain := bytes.Repeat([]byte("abcd"), 1024) // multi-chunk
+	enc1, err := EncryptObject(bytes.NewReader(plain), dek, Options{ChunkSize: 256, ConvergentNonce: true})
+	if err != nil {
+		t.Fatalf("EncryptObject: %v", err)
 	}
-	if _, err := DecryptObject(bytes.NewReader([]byte("x")), dek, Options{ConvergentNonce: true}); err != ErrConvergentNonceNotImplemented {
-		t.Fatalf("DecryptObject with ConvergentNonce=true: want ErrConvergentNonceNotImplemented, got %v", err)
+	ct1, err := io.ReadAll(enc1)
+	if err != nil {
+		t.Fatalf("read ct1: %v", err)
+	}
+	enc2, err := EncryptObject(bytes.NewReader(plain), dek, Options{ChunkSize: 256, ConvergentNonce: true})
+	if err != nil {
+		t.Fatalf("EncryptObject: %v", err)
+	}
+	ct2, err := io.ReadAll(enc2)
+	if err != nil {
+		t.Fatalf("read ct2: %v", err)
+	}
+	if !bytes.Equal(ct1, ct2) {
+		t.Fatal("convergent nonce mode produced non-deterministic ciphertext")
+	}
+
+	// Round-trip the deterministic ciphertext to verify decrypt
+	// works against the wire format. The decryptor reads nonces
+	// from the frame header so it does not need ConvergentNonce.
+	dec, err := DecryptObject(bytes.NewReader(ct1), dek, Options{ChunkSize: 256})
+	if err != nil {
+		t.Fatalf("DecryptObject: %v", err)
+	}
+	got, err := io.ReadAll(dec)
+	if err != nil {
+		t.Fatalf("read plaintext: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("convergent round-trip mismatch")
+	}
+}
+
+func TestEncryptObject_ConvergentNonce_DistinctChunkIndicesProduceDistinctNonces(t *testing.T) {
+	dek, err := DeriveConvergentDEK([]byte("h"), "tnt")
+	if err != nil {
+		t.Fatalf("DeriveConvergentDEK: %v", err)
+	}
+	// Two chunks of distinct plaintext: the on-wire nonces (the
+	// first 24 bytes of each frame) must differ even though both
+	// are deterministically derived from the same DEK.
+	plain := append(bytes.Repeat([]byte{1}, 16), bytes.Repeat([]byte{2}, 16)...)
+	enc, err := EncryptObject(bytes.NewReader(plain), dek, Options{ChunkSize: 16, ConvergentNonce: true})
+	if err != nil {
+		t.Fatalf("EncryptObject: %v", err)
+	}
+	ct, err := io.ReadAll(enc)
+	if err != nil {
+		t.Fatalf("read ct: %v", err)
+	}
+	frameLen := chunkHeaderSize + 16 + 16 // header + plaintext + poly1305 tag
+	if len(ct) < 2*frameLen {
+		t.Fatalf("expected at least 2 frames, got %d bytes", len(ct))
+	}
+	nonce1 := ct[:24]
+	nonce2 := ct[frameLen : frameLen+24]
+	if bytes.Equal(nonce1, nonce2) {
+		t.Fatal("chunk nonces collided")
+	}
+}
+
+func TestEncryptObject_ConvergentNonce_MatchesDeriveHelper(t *testing.T) {
+	dek, err := DeriveConvergentDEK([]byte("h"), "tnt")
+	if err != nil {
+		t.Fatalf("DeriveConvergentDEK: %v", err)
+	}
+	want, err := deriveConvergentNonce(dek, 0, 24)
+	if err != nil {
+		t.Fatalf("deriveConvergentNonce: %v", err)
+	}
+	enc, err := EncryptObject(bytes.NewReader([]byte("x")), dek, Options{ChunkSize: 16, ConvergentNonce: true})
+	if err != nil {
+		t.Fatalf("EncryptObject: %v", err)
+	}
+	ct, err := io.ReadAll(enc)
+	if err != nil {
+		t.Fatalf("read ct: %v", err)
+	}
+	got := ct[:24]
+	if !bytes.Equal(got, want) {
+		t.Fatalf("first-chunk nonce mismatch: got %x want %x", got, want)
 	}
 }

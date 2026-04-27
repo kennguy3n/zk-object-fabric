@@ -158,3 +158,88 @@ host-level reweighting alerts).
 - [`deploy/cell-provisioner/`](../cell-provisioner/) — operator-side
   cell provisioning that drives `POST /api/tenants/{id}/dedicated-cells`.
 - [`docs/runbooks/beta-onboarding.md`](../../docs/runbooks/beta-onboarding.md).
+
+## Block-level deduplication (Phase 3.5 §3.14)
+
+The Ceph RGW build of zk-object-fabric supports an *opt-in*
+intra-tenant block-level dedup tier on top of the gateway's
+object-level dedup. RADOS Pacific+ exposes a content-defined
+chunking dedup pool that fingerprints chunks below the object
+boundary; combined with the gateway's `level: "object+block"`
+policy this lets a tenant share storage even when only the first
+few MiB of two objects are identical (e.g. log-shipping,
+scheduled-backup deltas, mostly-immutable archives).
+
+### Enabling on a tenant
+
+1. **Provision a dedicated cell** for the tenant. Object+block
+   dedup requires per-tenant pool isolation: cross-tenant blocks
+   are *never* shared. The `POST /api/tenants/{id}/dedicated-cells`
+   endpoint creates the dedicated cell record; the operator then
+   provisions the underlying Ceph pool layout via the cell
+   provisioner.
+2. **Create the dedup pool tier**. The recommended layout is a
+   replicated `cache` tier in front of the object data pool with
+   `dedup-tier` enabled and CDC chunking set to 64 KiB:
+   ```
+   ceph osd pool create tenant-{id}.rgw.buckets.data 256 256 replicated
+   ceph osd pool create tenant-{id}.dedup-cdc 64 64 replicated
+   ceph osd tier add tenant-{id}.rgw.buckets.data tenant-{id}.dedup-cdc
+   ceph osd tier cache-mode tenant-{id}.dedup-cdc dedup
+   ceph osd pool set tenant-{id}.dedup-cdc dedup_cdc_chunk_size 65536
+   ceph osd pool set tenant-{id}.dedup-cdc dedup_cdc_algorithm fastcdc
+   ```
+3. **Mark the bucket** with `object+block` dedup via the console:
+   ```
+   curl -X POST -H 'Content-Type: application/json' \
+        -d '{"enabled":true,"scope":"intra_tenant","level":"object+block"}' \
+        $CONSOLE/api/v1/tenants/$TID/buckets/$BUCKET/dedup-policy
+   ```
+   The console rejects `object+block` unless the tenant has a
+   dedicated cell *and* the bucket's placement resolves to a
+   Ceph RGW backend (the `bucketResolvesToCephRGW` guardrail in
+   `api/console/dedup_handler.go`).
+
+### Per-tenant pool isolation
+
+Cross-tenant block-level dedup is permanently excluded from the
+product per docs/PROPOSAL.md §1.2. Every tenant runs with its
+own data pool, dedup CDC pool, and CMK; the Ceph object IDs are
+prefixed with the tenant ID so a misconfigured pool does not
+silently start sharing chunks across tenants. Operators MUST
+verify pool ownership annotations match the tenant before
+attaching the dedup tier:
+```
+ceph osd pool ls detail | grep dedup-cdc | grep tenant-$TID
+```
+
+### Monitoring dedup ratio
+
+The `ceph-mgr dashboard` exposes per-pool dedup ratios under
+**Pools → tenant-{id}.dedup-cdc → Statistics**. The gateway's
+ClickHouse billing pipeline (see `billing/`) emits the matching
+counters per tenant:
+
+| Dimension                      | Source                                        |
+|--------------------------------|-----------------------------------------------|
+| `dedup_hits`                   | `api/s3compat/dedup.go` (gateway PUT path)    |
+| `dedup_bytes_saved`            | `api/s3compat/dedup.go` (gateway PUT path)    |
+| `dedup_ref_count`              | `api/s3compat/handler.go` Delete path         |
+| `ceph_dedup_chunk_pool_bytes`  | `ceph-mgr` Prometheus exporter (Phase 4)      |
+
+Operators reconcile gateway-reported `dedup_bytes_saved` against
+the Ceph-reported chunk pool size to surface configuration drift
+(gateway thinks it deduped, Ceph didn't actually share the
+block) within the daily ops review.
+
+### Disabling
+
+Disabling object+block dedup is a one-call flip:
+```
+curl -X DELETE $CONSOLE/api/v1/tenants/$TID/buckets/$BUCKET/dedup-policy
+```
+The gateway stops registering new content_index entries
+immediately; existing entries are reference-counted down by the
+DELETE path until they reach zero. The Ceph dedup tier may be
+torn down once `dedup_ref_count == 0` for every (tenant_id,
+content_hash) row that pointed at the pool.

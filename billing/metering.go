@@ -72,6 +72,24 @@ const (
 	// start tracking the tenant from its creation instant rather
 	// than waiting for the first S3 request. Delta is always 1.
 	TenantCreated Dimension = "tenant_created"
+
+	// DedupHits counts PUT requests that landed on an existing
+	// content_index entry within the tenant. Each event represents
+	// one PUT that did NOT trigger a backend write because the
+	// gateway recognized convergent ciphertext. Delta is always 1.
+	DedupHits Dimension = "dedup_hits"
+
+	// DedupBytesSaved sums the on-wire ciphertext sizes the gateway
+	// avoided writing because of intra-tenant dedup. Operators
+	// reconcile DedupBytesSaved against StorageBytesSeconds to
+	// quantify the dedup ratio per tenant per bucket.
+	DedupBytesSaved Dimension = "dedup_bytes_saved"
+
+	// DedupRefCount is a sample, not a counter: emitted on PUT and
+	// DELETE so the billing pipeline can reconstruct the running
+	// reference count for hot content. Delta carries the new
+	// refcount value.
+	DedupRefCount Dimension = "dedup_ref_count"
 )
 
 // UsageEvent is a single raw event emitted by the gateway. The billing

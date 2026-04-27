@@ -18,6 +18,11 @@ CREATE TABLE content_index (
     backend       TEXT        NOT NULL,
     ref_count     INT         NOT NULL DEFAULT 1 CHECK (ref_count >= 0),
     size_bytes    BIGINT      NOT NULL DEFAULT 0,
+    -- etag is the original PUT response ETag the first uploader saw.
+    -- Recorded so subsequent dedup-hit PUTs / GETs / HEADs return the
+    -- same ETag a non-dedup PUT of the same content would have. NULL
+    -- for entries written before Phase 3.5 added the column.
+    etag          TEXT        NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, content_hash)
 );

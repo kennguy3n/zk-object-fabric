@@ -28,10 +28,13 @@ type ObjectManifest struct {
 	VersionID     string `json:"version_id"`
 	ObjectSize    int64  `json:"object_size"`
 	ChunkSize     int64  `json:"chunk_size"`
-	// ContentHash is the BLAKE3 hash used for intra-tenant dedup lookups.
-	// For Pattern B (gateway convergent): BLAKE3(plaintext).
-	// For Pattern C (client-side convergent): BLAKE3(ciphertext).
-	// Empty when dedup is not enabled on the bucket.
+	// ContentHash is the BLAKE3 hash used for intra-tenant dedup lookups,
+	// stored as "blake3:<hex>". For both Pattern B (gateway convergent)
+	// and Pattern C (client-side convergent) it is BLAKE3(ciphertext) —
+	// i.e. the bytes the gateway would have written to the backend. Pattern
+	// B's plaintext hash is held only transiently to derive the convergent
+	// DEK and is never persisted on the manifest. Empty when dedup is not
+	// enabled on the bucket.
 	ContentHash     string           `json:"content_hash,omitempty"`
 	Encryption      EncryptionConfig `json:"encryption"`
 	PlacementPolicy PlacementPolicy  `json:"placement_policy"`

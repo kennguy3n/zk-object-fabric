@@ -25,6 +25,28 @@ import (
 // when no row exists for `(tenant_id, content_hash)`.
 var ErrNotFound = errors.New("content_index: entry not found")
 
+// ErrAlreadyExists is returned by Register when a row already
+// exists for `(tenant_id, content_hash)`. The PUT path treats this
+// as a race-recovery signal: drop the just-written piece and call
+// IncrementRef on the existing row instead.
+var ErrAlreadyExists = errors.New("content_index: entry already exists")
+
+// ErrInvalidRefCount is returned by DecrementRef when the existing
+// RefCount is already zero or negative. The schema's CHECK
+// constraint forbids RefCount < 0; this sentinel surfaces the
+// programmer error of decrementing a row that should have already
+// been deleted.
+var ErrInvalidRefCount = errors.New("content_index: invalid refcount")
+
+// ErrRefCountNonZero is returned by Delete when the row exists but
+// its RefCount is greater than zero. The DELETE handler races
+// concurrent PUTs that may IncrementRef between the caller's
+// DecrementRef returning 0 and this Delete; surfacing it as a
+// distinct error lets the handler skip the backend piece deletion
+// (the piece is still needed by the racing uploader) without
+// confusing it with the row-actually-missing case.
+var ErrRefCountNonZero = errors.New("content_index: ref_count not zero")
+
 // ContentIndexEntry is a single row in the content_index table.
 //
 // See docs/PROPOSAL.md §3.14.3 for the canonical schema; the SQL
@@ -59,6 +81,14 @@ type ContentIndexEntry struct {
 	// SizeBytes is the on-wire size of the deduped piece. Used
 	// for billing reconciliation and orphan-GC accounting.
 	SizeBytes int64
+
+	// ETag is the original PUT response ETag for the canonical
+	// piece (i.e. the value the first uploader's S3 client saw
+	// in the PUT response). Recorded at Register time so that a
+	// dedup-hit PUT, GET, and HEAD return the same ETag any
+	// non-dedup PUT of the same content would have returned.
+	// Optional for entries written before this field existed.
+	ETag string
 
 	// CreatedAt is set by the store at first INSERT.
 	CreatedAt time.Time
@@ -97,9 +127,14 @@ type Store interface {
 	// no row exists.
 	DecrementRef(ctx context.Context, tenantID, contentHash string) (newCount int, err error)
 
-	// Delete removes the row for (tenantID, contentHash). The
-	// caller is expected to have already deleted the underlying
-	// piece from the backend. Returns ErrNotFound if no row
-	// exists.
+	// Delete removes the row for (tenantID, contentHash) only
+	// when its RefCount is zero. Returns ErrNotFound if no row
+	// exists, and ErrRefCountNonZero if a concurrent
+	// IncrementRef bumped the count between the caller's
+	// DecrementRef and this Delete. The caller MUST attempt
+	// Delete BEFORE deleting the backend piece, and skip the
+	// backend piece deletion when this method returns
+	// ErrRefCountNonZero — the racing uploader is now the
+	// canonical reference.
 	Delete(ctx context.Context, tenantID, contentHash string) error
 }
