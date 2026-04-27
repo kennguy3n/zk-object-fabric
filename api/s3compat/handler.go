@@ -10,6 +10,7 @@ package s3compat
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
@@ -141,9 +142,55 @@ type Config struct {
 	// regardless of policy. See docs/PROPOSAL.md §3.14.
 	ContentIndex content_index.Store
 
+	// Compliance hooks the gateway up to the data-residency
+	// pre-flight check and audit trail. Both fields are optional;
+	// when nil the gateway behaves as it did before Phase 4.
+	Compliance ComplianceHooks
+
 	// Now, if set, returns the current time. Tests override it to
 	// make manifests deterministic.
 	Now func() time.Time
+}
+
+// ComplianceHooks is the optional residency / audit surface
+// supplied by cmd/gateway. The handler depends only on minimal
+// interfaces so the compliance package does not have to import
+// api/s3compat (avoiding an import cycle).
+type ComplianceHooks struct {
+	// Residency is the pre-flight check called from the PUT path.
+	// nil disables the check.
+	Residency ResidencyChecker
+
+	// Audit, when non-nil, receives one Record per PUT / DELETE /
+	// GET that the handler successfully services.
+	Audit AuditRecorder
+}
+
+// ResidencyChecker matches *compliance.ResidencyEnforcer.Check.
+type ResidencyChecker interface {
+	Check(tenantID, backendCountry string, policyResidency []string) error
+}
+
+// AuditRecorder is the subset of compliance.AuditStore the
+// handler uses on the hot path.
+type AuditRecorder interface {
+	Record(ctx context.Context, entry AuditEntry) error
+}
+
+// AuditEntry mirrors compliance.AuditEntry. Defined here as a
+// shape-compatible struct so the s3compat package does not have
+// to import internal/compliance directly. cmd/gateway adapts the
+// two via a thin shim.
+type AuditEntry struct {
+	TenantID       string
+	Operation      string
+	Bucket         string
+	ObjectKey      string
+	PieceID        string
+	PieceBackend   string
+	BackendCountry string
+	Timestamp      time.Time
+	RequestID      string
 }
 
 // Handler routes S3-compatible requests to the gateway's internal
@@ -312,6 +359,15 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.cfg.Compliance.Residency != nil {
+		if err := h.cfg.Compliance.Residency.Check(
+			tenantID, provider.PlacementLabels().Country, policy.Residency,
+		); err != nil {
+			writeError(w, http.StatusForbidden, "DataResidencyViolation", err.Error(), r.URL.Path)
+			return
+		}
+	}
+
 	if policy.ErasureProfile != "" {
 		h.putErasureCoded(w, r, tenantID, bucket, key, backendName, provider, policy)
 		return
@@ -399,10 +455,31 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	if putRes.SizeBytes > 0 {
 		h.emit(tenantID, bucket, billing.StorageBytesSeconds, uint64(putRes.SizeBytes))
 	}
+	h.audit(r, "PUT", tenantID, bucket, key, pieceID, backendName, provider.PlacementLabels().Country)
 
 	w.Header().Set("ETag", quote(putRes.ETag))
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.WriteHeader(http.StatusOK)
+}
+
+// audit writes a single AuditEntry through the configured
+// compliance hook, if any. Errors are logged but never propagate
+// to the caller — auditing is best-effort.
+func (h *Handler) audit(r *http.Request, op, tenantID, bucket, key, pieceID, backend, country string) {
+	if h.cfg.Compliance.Audit == nil {
+		return
+	}
+	_ = h.cfg.Compliance.Audit.Record(r.Context(), AuditEntry{
+		TenantID:       tenantID,
+		Operation:      op,
+		Bucket:         bucket,
+		ObjectKey:      key,
+		PieceID:        pieceID,
+		PieceBackend:   backend,
+		BackendCountry: country,
+		Timestamp:      h.cfg.Now(),
+		RequestID:      r.Header.Get("x-amz-request-id"),
+	})
 }
 
 // Get handles S3 GET object.

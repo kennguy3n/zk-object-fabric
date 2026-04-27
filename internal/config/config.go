@@ -67,6 +67,7 @@ type Config struct {
 	Dedup        DedupConfig        `json:"dedup"`
 	Tracing      TracingConfig      `json:"tracing"`
 	Metrics      MetricsConfig      `json:"metrics"`
+	Compliance   ComplianceConfig   `json:"compliance"`
 }
 
 // TracingConfig configures the OpenTelemetry-style request
@@ -84,6 +85,28 @@ type TracingConfig struct {
 type MetricsConfig struct {
 	Enabled bool   `json:"enabled"`
 	Path    string `json:"path"`
+}
+
+// ComplianceConfig configures the data-residency enforcer and the
+// audit trail. When neither field is enabled the gateway behaves
+// as it did before Phase 4: no residency check, no audit rows.
+type ComplianceConfig struct {
+	// ResidencyEnabled gates the pre-flight residency check on
+	// the PUT path. Uses the per-tenant country allowlist
+	// (Postgres tenant_country_allowlist or StaticAllowlist) and
+	// any per-object Residency hints baked into the placement
+	// policy.
+	ResidencyEnabled bool `json:"residency_enabled"`
+
+	// AuditEnabled gates writing one compliance_audit row per
+	// successful PUT.
+	AuditEnabled bool `json:"audit_enabled"`
+
+	// StaticAllowlist seeds a tenant -> country list directly
+	// from config. Keys are tenant IDs; values are ISO 3166-1
+	// alpha-2 country codes. Used by deployments that do not run
+	// a Postgres metadata DB.
+	StaticAllowlist map[string][]string `json:"static_allowlist"`
 }
 
 // DedupConfig configures intra-tenant deduplication. Cross-tenant

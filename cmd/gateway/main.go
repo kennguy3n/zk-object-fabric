@@ -36,6 +36,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
+	"github.com/kennguy3n/zk-object-fabric/internal/compliance"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
 	"github.com/kennguy3n/zk-object-fabric/internal/metrics"
@@ -173,6 +174,7 @@ func main() {
 		}
 		mux.Handle(path, metricsRegistry.Handler())
 	}
+	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB)
 	s3compat.New(s3compat.Config{
 		Manifests:      store,
 		Providers:      registry,
@@ -187,6 +189,7 @@ func main() {
 		ReadRepair:     readRepair,
 		Encryption:     gatewayEnc,
 		ContentIndex:   contentIndex,
+		Compliance:     complianceHooks,
 		NodeID:         cfg.Env,
 	}).Register(mux)
 
@@ -1298,4 +1301,74 @@ func statusClass(code int) string {
 	default:
 		return "1xx"
 	}
+}
+
+// buildComplianceHooks constructs the residency enforcer and
+// audit recorder that the s3compat handler consults. Both fields
+// of the returned ComplianceHooks may be nil; the handler treats
+// nil as "feature disabled".
+func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB) s3compat.ComplianceHooks {
+	hooks := s3compat.ComplianceHooks{}
+	if cfg.ResidencyEnabled {
+		var lookup compliance.AllowlistLookup
+		if len(cfg.StaticAllowlist) > 0 {
+			lookup = compliance.StaticAllowlist(cfg.StaticAllowlist)
+		} else if db != nil {
+			lookup = postgresAllowlistLookup(db)
+		}
+		hooks.Residency = compliance.NewResidencyEnforcer(lookup)
+	}
+	if cfg.AuditEnabled {
+		var store compliance.AuditStore
+		if db != nil {
+			store = compliance.NewPostgresAuditStore(db)
+		} else {
+			store = compliance.NewMemoryAuditStore()
+		}
+		hooks.Audit = &auditAdapter{store: store}
+	}
+	return hooks
+}
+
+// postgresAllowlistLookup queries the tenant_country_allowlist
+// table to enumerate allowed countries for a tenant.
+func postgresAllowlistLookup(db *sql.DB) compliance.AllowlistLookup {
+	const q = `SELECT country FROM tenant_country_allowlist WHERE tenant_id = $1`
+	return func(tenantID string) ([]string, error) {
+		rows, err := db.Query(q, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var c string
+			if err := rows.Scan(&c); err != nil {
+				return nil, err
+			}
+			out = append(out, c)
+		}
+		return out, rows.Err()
+	}
+}
+
+// auditAdapter forwards s3compat.AuditEntry rows to a
+// compliance.AuditStore. It exists because the s3compat package
+// avoids importing internal/compliance directly.
+type auditAdapter struct {
+	store compliance.AuditStore
+}
+
+func (a *auditAdapter) Record(ctx context.Context, e s3compat.AuditEntry) error {
+	return a.store.Record(ctx, compliance.AuditEntry{
+		TenantID:       e.TenantID,
+		Operation:      e.Operation,
+		Bucket:         e.Bucket,
+		ObjectKey:      e.ObjectKey,
+		PieceID:        e.PieceID,
+		PieceBackend:   e.PieceBackend,
+		BackendCountry: e.BackendCountry,
+		Timestamp:      e.Timestamp,
+		RequestID:      e.RequestID,
+	})
 }
