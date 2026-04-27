@@ -38,6 +38,8 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
+	"github.com/kennguy3n/zk-object-fabric/internal/metrics"
+	"github.com/kennguy3n/zk-object-fabric/internal/tracing"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	cipostgres "github.com/kennguy3n/zk-object-fabric/metadata/content_index/postgres"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
@@ -96,7 +98,13 @@ func main() {
 	placement := placement_policy.NewEngine(defaultBackend, registry, nil)
 	tenantStore := buildTenantStore(metadataDB, *tenantsPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
+	metricsRegistry := metrics.NewRegistry()
+	tracer := buildTracer(cfg.Tracing)
+
 	billingSink := buildBillingSink(cfg)
+	if cfg.Metrics.Enabled {
+		billingSink = metrics.NewMetricsBillingSink(billingSink, metricsRegistry)
+	}
 	// billingProvider is the optional outbound integration to an
 	// invoicing / payment system. The default is the no-op
 	// provider so deployments without a real plug-in still get a
@@ -158,6 +166,13 @@ func main() {
 	gatewayEnc := buildGatewayEncryption(cfg.Encryption)
 
 	mux := http.NewServeMux()
+	if cfg.Metrics.Enabled {
+		path := cfg.Metrics.Path
+		if path == "" {
+			path = "/internal/metrics"
+		}
+		mux.Handle(path, metricsRegistry.Handler())
+	}
 	s3compat.New(s3compat.Config{
 		Manifests:      store,
 		Providers:      registry,
@@ -176,6 +191,12 @@ func main() {
 	}).Register(mux)
 
 	handler := http.Handler(mux)
+	if cfg.Tracing.Enabled {
+		handler = tracer.Middleware(handler)
+	}
+	if cfg.Metrics.Enabled {
+		handler = metricsMiddleware(metricsRegistry, handler)
+	}
 	if tenantStore.Size() > 0 {
 		alertSink := buildAbuseAlertSink(cfg.Abuse, billingSink)
 		rl := auth.NewRateLimiter(
@@ -1222,4 +1243,59 @@ func buildTenantStore(db *sql.DB, path string) auth.TenantStore {
 		log.Fatalf("gateway: load tenants: %v", err)
 	}
 	return store
+}
+
+// buildTracer constructs the request tracer from config. When
+// disabled or no exporter is wired, it returns a tracer with the
+// no-op exporter so calling code does not need to nil-check.
+func buildTracer(cfg config.TracingConfig) *tracing.Tracer {
+	name := cfg.ServiceName
+	if name == "" {
+		name = "zk-object-fabric"
+	}
+	// The OTLP / Jaeger exporter is intentionally not wired here:
+	// the tracing package keeps the SDK out of the core build to
+	// keep dependency footprint small. Operators wiring a real
+	// backend can add an Exporter implementation in a build tag.
+	return tracing.New(name, tracing.NoopExporter{})
+}
+
+// metricsMiddleware wraps next with request-duration and
+// active-request bookkeeping. Each request is timed and assigned
+// a status-class label (2xx/4xx/5xx).
+func metricsMiddleware(reg *metrics.Registry, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reg.IncActive()
+		defer reg.DecActive()
+		start := time.Now()
+		sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		dur := time.Since(start).Seconds()
+		reg.ObserveRequest(r.Method, statusClass(sw.status), dur)
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func statusClass(code int) string {
+	switch {
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	case code >= 300:
+		return "3xx"
+	case code >= 200:
+		return "2xx"
+	default:
+		return "1xx"
+	}
 }
