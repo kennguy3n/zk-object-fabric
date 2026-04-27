@@ -30,6 +30,7 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/encryption"
 	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
@@ -389,17 +390,34 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 
 	// Multipart dedup: when the upload's policy enables
 	// intra-tenant dedup AND the gateway has a content_index store
-	// wired AND the upload landed as a single piece, compute a
-	// content hash over the assembled bytes and run the
+	// wired AND the upload landed as a single piece AND the
+	// encryption mode can produce convergent ciphertext, compute
+	// a content hash over the assembled bytes and run the
 	// content_index lookup/register flow so duplicate uploads
-	// dedup correctly. Multi-piece uploads are intentionally
-	// skipped: the current content_index schema stores one
-	// PieceID per entry, so multi-piece dedup would require a
-	// "manifest reference" representation that is out of scope
-	// for the §3.14 object-level tier. Hashing for multi-piece
-	// would also force an O(object size) backend read with no
-	// content_index op, which the DELETE path cannot use.
-	if h.dedupEnabled(upload.Policy) && len(pieces) == 1 {
+	// dedup correctly.
+	//
+	// Two encryption modes are deliberately excluded:
+	//
+	//   - "managed" / "public_distribution" — multipart's
+	//     CreateMultipartUpload generates a fresh random DEK per
+	//     upload (see the IsGatewayEncrypted branch above), so
+	//     two clients uploading identical plaintext produce
+	//     different ciphertext and the content_index Lookup
+	//     would always miss. Single-PUT covers these modes via
+	//     the convergent-DEK path in dedup.go (Pattern B); the
+	//     multipart path can't take that route without
+	//     redesigning per-part DEK assignment.
+	//
+	//   - multi-piece uploads (len(pieces) > 1) — the current
+	//     content_index schema stores one PieceID per entry, so
+	//     multi-piece dedup would require a "manifest reference"
+	//     representation that is out of scope for the §3.14
+	//     object-level tier. Hashing for multi-piece would also
+	//     force an O(object size) backend read with no
+	//     content_index op the DELETE path can use.
+	dedupCandidate := h.dedupEnabled(upload.Policy) && len(pieces) == 1 &&
+		(upload.EncMode == string(encryption.StrictZK) || upload.EncMode == "")
+	if dedupCandidate {
 		// deleteUploadedPart is the cleanup the early-return
 		// error paths run before the manifest is written. The
 		// multipart session has already been consumed by
