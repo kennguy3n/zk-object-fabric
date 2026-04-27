@@ -104,6 +104,13 @@ type ComplianceConfig struct {
 	// successful PUT.
 	AuditEnabled bool `json:"audit_enabled"`
 
+	// LegalHoldEnabled gates the DELETE-path legal-hold check.
+	// When true the gateway constructs a LegalHoldStore (Postgres
+	// when a metadata DB is configured, in-memory otherwise) and
+	// the s3compat handler refuses DELETEs covered by an active
+	// hold.
+	LegalHoldEnabled bool `json:"legal_hold_enabled"`
+
 	// StaticAllowlist seeds a tenant -> country list directly
 	// from config. Keys are tenant IDs; values are ISO 3166-1
 	// alpha-2 country codes. Used by deployments that do not run

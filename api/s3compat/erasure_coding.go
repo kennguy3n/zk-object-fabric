@@ -145,7 +145,7 @@ func (h *Handler) putErasureCoded(
 	if totalShardBytes > 0 {
 		h.emit(tenantID, bucket, billing.StorageBytesSeconds, totalShardBytes)
 	}
-	h.audit(r, "PUT", tenantID, bucket, key, versionID, backendName, provider.PlacementLabels().Country)
+	h.audit(r, "PUT", tenantID, bucket, key, manifest.Pieces[0].PieceID, backendName, provider.PlacementLabels().Country)
 
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.WriteHeader(http.StatusOK)
@@ -293,14 +293,18 @@ func (h *Handler) getErasureCoded(
 	// Audit the EC GET so the compliance trail is symmetric with
 	// the single-piece GET path. The shards are scattered across
 	// one or more backends; MigrationState.PrimaryBackend is the
-	// canonical attribution and matches the EC PUT audit recorded
-	// in putErasureCoded.
+	// canonical attribution and Pieces[0].PieceID is the same
+	// shard ID putErasureCoded recorded on PUT, so PUT/GET rows
+	// correlate by piece_id in the audit trail.
 	auditBackend := manifest.MigrationState.PrimaryBackend
-	var auditCountry string
+	var auditPieceID, auditCountry string
+	if len(manifest.Pieces) > 0 {
+		auditPieceID = manifest.Pieces[0].PieceID
+	}
 	if prov, ok := h.cfg.Providers[auditBackend]; ok {
 		auditCountry = prov.PlacementLabels().Country
 	}
-	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, manifest.VersionID, auditBackend, auditCountry)
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
 // isErasureCodedManifest returns true when the manifest's pieces
