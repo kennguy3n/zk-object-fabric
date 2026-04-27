@@ -101,6 +101,30 @@ func TestMemoryStore_ConcurrentIncrementRef(t *testing.T) {
 	}
 }
 
+// TestMemoryStore_DeleteRefCountNonZero asserts the conditional-Delete
+// contract that the s3compat DELETE handler relies on to close the
+// race against concurrent IncrementRefs: a Delete on an entry whose
+// RefCount is still > 0 must return ErrRefCountNonZero (not silently
+// succeed), so the handler can leave the backend piece in place.
+func TestMemoryStore_DeleteRefCountNonZero(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	if err := s.Register(ctx, ContentIndexEntry{
+		TenantID:    "tnt",
+		ContentHash: "h1",
+		PieceID:     "p1",
+		Backend:     "test",
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := s.Delete(ctx, "tnt", "h1"); !errors.Is(err, ErrRefCountNonZero) {
+		t.Fatalf("Delete with refcount=1: got %v want ErrRefCountNonZero", err)
+	}
+	if _, err := s.Lookup(ctx, "tnt", "h1"); err != nil {
+		t.Fatalf("entry must still exist after refused Delete: %v", err)
+	}
+}
+
 func TestMemoryStore_RejectsMissingFields(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()

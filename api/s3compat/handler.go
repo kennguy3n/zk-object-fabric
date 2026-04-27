@@ -710,11 +710,29 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "ContentIndexDecrementFailed", derr.Error(), r.URL.Path)
 			return
 		case newCount == 0:
-			// Last reference: remove the piece from the
-			// backend, then drop the index row.
-			h.deletePiecesBestEffort(r, manifest)
-			if err := h.cfg.ContentIndex.Delete(r.Context(), tenantID, manifest.ContentHash); err != nil && !errors.Is(err, content_index.ErrNotFound) {
-				writeError(w, http.StatusInternalServerError, "ContentIndexDeleteFailed", err.Error(), r.URL.Path)
+			// Last reference: drop the index row FIRST and
+			// only delete the backend piece on a successful
+			// conditional Delete. This closes the race where
+			// a concurrent PUT does Lookup+IncrementRef
+			// between our DecrementRef returning 0 and the
+			// piece deletion: if the racer wins, our Delete
+			// reports ErrRefCountNonZero and we leave the
+			// piece in place for the new manifest.
+			delErr := h.cfg.ContentIndex.Delete(r.Context(), tenantID, manifest.ContentHash)
+			switch {
+			case delErr == nil:
+				h.deletePiecesBestEffort(r, manifest)
+			case errors.Is(delErr, content_index.ErrNotFound):
+				// Row vanished out from under us (e.g.
+				// background GC). The piece may still
+				// be referenced elsewhere — best-effort
+				// cleanup is unsafe, so leave it.
+			case errors.Is(delErr, content_index.ErrRefCountNonZero):
+				// A concurrent uploader bumped the
+				// refcount; the piece is still needed.
+				// Skip the backend delete entirely.
+			default:
+				writeError(w, http.StatusInternalServerError, "ContentIndexDeleteFailed", delErr.Error(), r.URL.Path)
 				return
 			}
 		default:

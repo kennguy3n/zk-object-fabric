@@ -336,7 +336,16 @@ func (h *Handler) putDeduped(
 
 	var pieceID, pieceBackend, pieceHash, pieceLocator string
 	var sizeOnWire int64
+	// dedupHitEffective is true when this PUT did not actually
+	// store new bytes on the backend — either because the
+	// content_index Lookup hit (res.Hit) OR because the Register
+	// race was lost and the manifest was redirected to the
+	// canonical piece. The billing path uses it to suppress
+	// StorageBytesSeconds for the race-lost case (the canonical
+	// piece was already counted by the original uploader).
+	dedupHitEffective := false
 	if res.Hit {
+		dedupHitEffective = true
 		pieceID = res.Existing.PieceID
 		pieceBackend = res.Existing.Backend
 		// Reuse the canonical ETag the first uploader's PUT
@@ -402,6 +411,7 @@ func (h *Handler) putDeduped(
 			pieceHash = canonical.ETag
 			pieceLocator = ""
 			sizeOnWire = canonical.SizeBytes
+			dedupHitEffective = true
 			h.emit(tenantID, bucket, billing.DedupHits, 1)
 			if canonical.SizeBytes > 0 {
 				h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(canonical.SizeBytes))
@@ -467,7 +477,13 @@ func (h *Handler) putDeduped(
 	}
 
 	h.emit(tenantID, bucket, billing.PutRequests, 1)
-	if !res.Hit && sizeOnWire > 0 {
+	// Only emit StorageBytesSeconds when this PUT actually wrote
+	// new bytes to the backend. dedupHitEffective covers both the
+	// straight Lookup-hit and the race-lost-Register path; without
+	// the second guard a race-lost PUT would double-count storage
+	// (the canonical piece was billed when the original uploader
+	// stored it).
+	if !dedupHitEffective && sizeOnWire > 0 {
 		h.emit(tenantID, bucket, billing.StorageBytesSeconds, uint64(sizeOnWire))
 	}
 

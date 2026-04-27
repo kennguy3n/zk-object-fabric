@@ -96,13 +96,19 @@ func (s *MemoryStore) DecrementRef(_ context.Context, tenantID, contentHash stri
 	return e.RefCount, nil
 }
 
-// Delete removes the row.
+// Delete removes the row only when RefCount is zero. Returns
+// ErrRefCountNonZero when a concurrent IncrementRef raced with the
+// caller's DecrementRef.
 func (s *MemoryStore) Delete(_ context.Context, tenantID, contentHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := memoryKey{tenantID, contentHash}
-	if _, ok := s.entries[k]; !ok {
+	e, ok := s.entries[k]
+	if !ok {
 		return ErrNotFound
+	}
+	if e.RefCount > 0 {
+		return ErrRefCountNonZero
 	}
 	delete(s.entries, k)
 	return nil

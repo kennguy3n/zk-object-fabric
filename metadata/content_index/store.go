@@ -38,6 +38,15 @@ var ErrAlreadyExists = errors.New("content_index: entry already exists")
 // been deleted.
 var ErrInvalidRefCount = errors.New("content_index: invalid refcount")
 
+// ErrRefCountNonZero is returned by Delete when the row exists but
+// its RefCount is greater than zero. The DELETE handler races
+// concurrent PUTs that may IncrementRef between the caller's
+// DecrementRef returning 0 and this Delete; surfacing it as a
+// distinct error lets the handler skip the backend piece deletion
+// (the piece is still needed by the racing uploader) without
+// confusing it with the row-actually-missing case.
+var ErrRefCountNonZero = errors.New("content_index: ref_count not zero")
+
 // ContentIndexEntry is a single row in the content_index table.
 //
 // See docs/PROPOSAL.md §3.14.3 for the canonical schema; the SQL
@@ -118,9 +127,14 @@ type Store interface {
 	// no row exists.
 	DecrementRef(ctx context.Context, tenantID, contentHash string) (newCount int, err error)
 
-	// Delete removes the row for (tenantID, contentHash). The
-	// caller is expected to have already deleted the underlying
-	// piece from the backend. Returns ErrNotFound if no row
-	// exists.
+	// Delete removes the row for (tenantID, contentHash) only
+	// when its RefCount is zero. Returns ErrNotFound if no row
+	// exists, and ErrRefCountNonZero if a concurrent
+	// IncrementRef bumped the count between the caller's
+	// DecrementRef and this Delete. The caller MUST attempt
+	// Delete BEFORE deleting the backend piece, and skip the
+	// backend piece deletion when this method returns
+	// ErrRefCountNonZero — the racing uploader is now the
+	// canonical reference.
 	Delete(ctx context.Context, tenantID, contentHash string) error
 }

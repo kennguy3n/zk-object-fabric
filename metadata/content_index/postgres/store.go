@@ -158,13 +158,19 @@ func (s *Store) DecrementRef(ctx context.Context, tenantID, contentHash string) 
 	return newCount, nil
 }
 
-// Delete removes the row for (tenantID, contentHash).
+// Delete removes the row for (tenantID, contentHash) only when
+// ref_count is zero. The DELETE is conditional on ref_count = 0 so
+// a concurrent PUT that IncrementRef'd between our caller's
+// DecrementRef returning 0 and this Delete is preserved. We then
+// disambiguate "row gone" from "row bumped" with a follow-up
+// SELECT so the caller can choose to skip the backend piece
+// deletion in the bumped case.
 func (s *Store) Delete(ctx context.Context, tenantID, contentHash string) error {
 	if tenantID == "" || contentHash == "" {
 		return errors.New("postgres: tenant_id and content_hash are required")
 	}
 	q := fmt.Sprintf(`
-		DELETE FROM %s WHERE tenant_id = $1 AND content_hash = $2
+		DELETE FROM %s WHERE tenant_id = $1 AND content_hash = $2 AND ref_count = 0
 	`, s.table)
 	res, err := s.db.ExecContext(ctx, q, tenantID, contentHash)
 	if err != nil {
@@ -174,10 +180,20 @@ func (s *Store) Delete(ctx context.Context, tenantID, contentHash string) error 
 	if err != nil {
 		return fmt.Errorf("postgres: content_index delete rows affected: %w", err)
 	}
-	if n == 0 {
-		return content_index.ErrNotFound
+	if n > 0 {
+		return nil
 	}
-	return nil
+	// Row was either gone already or had a non-zero ref_count.
+	// Cheap probe to surface the difference.
+	probe := fmt.Sprintf(`SELECT 1 FROM %s WHERE tenant_id = $1 AND content_hash = $2`, s.table)
+	var exists int
+	if err := s.db.QueryRowContext(ctx, probe, tenantID, contentHash).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return content_index.ErrNotFound
+		}
+		return fmt.Errorf("postgres: content_index delete probe: %w", err)
+	}
+	return content_index.ErrRefCountNonZero
 }
 
 // isCheckViolation reports whether err looks like a Postgres CHECK
