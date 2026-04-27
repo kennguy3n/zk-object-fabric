@@ -184,6 +184,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutBucket(w, r)
 			return
 		}
+		// CopyObject is a PUT with x-amz-copy-source set. The
+		// header carries the source /{bucket}/{key} so the
+		// destination request body is empty.
+		if r.Header.Get("x-amz-copy-source") != "" {
+			h.Copy(w, r)
+			return
+		}
 		h.Put(w, r)
 	case http.MethodPost:
 		if q.Has("uploads") {
@@ -199,6 +206,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		bucket, key := parseBucketKey(r.URL.Path)
 		if key == "" && q.Has("uploads") {
 			h.ListMultipartUploads(w, r, bucket)
+			return
+		}
+		// ListObjectVersions is bucket-level GET ?versions.
+		if key == "" && q.Has("versions") {
+			h.ListObjectVersions(w, r, bucket)
 			return
 		}
 		// LIST is a bucket-level GET (no key, or ?list-type=2).
@@ -668,10 +680,13 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		TenantID:      tenantID,
 		Bucket:        bucket,
 		ObjectKeyHash: hashObjectKey(key),
+		VersionID:     r.URL.Query().Get("versionId"),
 	}
 	// Latest version: leave VersionID empty; concrete stores resolve
 	// the current version by (tenant, bucket, object_key_hash). The
-	// Postgres and in-memory implementations both honour that.
+	// Postgres and in-memory implementations both honour that. When
+	// the request includes ?versionId=, that specific version is
+	// targeted instead.
 	manifest, err := h.cfg.Manifests.Get(r.Context(), mkey)
 	if err != nil {
 		// S3 DeleteObject is idempotent: a missing object is a
@@ -857,6 +872,7 @@ func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.
 		TenantID:      tenantID,
 		Bucket:        bucket,
 		ObjectKeyHash: hashObjectKey(key),
+		VersionID:     r.URL.Query().Get("versionId"),
 	}
 	manifest, err := h.cfg.Manifests.Get(r.Context(), mkey)
 	if err != nil {

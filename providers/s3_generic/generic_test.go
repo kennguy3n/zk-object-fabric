@@ -46,6 +46,12 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, _ *s3.ListObjectsV2Input, _ ..
 	}, nil
 }
 
+func (f *fakeS3) CopyObject(_ context.Context, _ *s3.CopyObjectInput, _ ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
+	return &s3.CopyObjectOutput{
+		CopyObjectResult: &s3types.CopyObjectResult{ETag: aws.String(f.putETag)},
+	}, nil
+}
+
 func newTestProvider(t *testing.T, fake *fakeS3) *Provider {
 	t.Helper()
 	p, err := NewWithClient(Config{

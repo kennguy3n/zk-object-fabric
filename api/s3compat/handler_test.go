@@ -485,3 +485,88 @@ func TestParseHTTPRange(t *testing.T) {
 		t.Error("parseHTTPRange(start>size) should error")
 	}
 }
+
+func TestCopyObject_SameBucket_NoDedup(t *testing.T) {
+	h, fake, _, store := newTestHandler()
+	body := []byte("copy-me")
+	// PUT source.
+	pr := httptest.NewRequest(http.MethodPut, "/bucket/src.txt", bytes.NewReader(body))
+	pw := httptest.NewRecorder()
+	h.Put(pw, pr)
+	if pw.Code != http.StatusOK {
+		t.Fatalf("Put src: %d %s", pw.Code, pw.Body.String())
+	}
+	// COPY -> dst.
+	cr := httptest.NewRequest(http.MethodPut, "/bucket/dst.txt", nil)
+	cr.Header.Set("x-amz-copy-source", "/bucket/src.txt")
+	cw := httptest.NewRecorder()
+	h.Copy(cw, cr)
+	if cw.Code != http.StatusOK {
+		t.Fatalf("Copy: %d %s", cw.Code, cw.Body.String())
+	}
+	// GET dst returns the same body.
+	gr := httptest.NewRequest(http.MethodGet, "/bucket/dst.txt", nil)
+	gw := httptest.NewRecorder()
+	h.Get(gw, gr)
+	if gw.Code != http.StatusOK {
+		t.Fatalf("Get dst: %d %s", gw.Code, gw.Body.String())
+	}
+	if !bytes.Equal(gw.Body.Bytes(), body) {
+		t.Fatalf("dst body = %q, want %q", gw.Body.Bytes(), body)
+	}
+	// Two distinct piece IDs in fake provider (no dedup wired).
+	if len(fake.pieces) != 2 {
+		t.Fatalf("fake pieces = %d, want 2", len(fake.pieces))
+	}
+	// Both manifests resolvable.
+	for _, key := range []string{"src.txt", "dst.txt"} {
+		mkey := manifest_store.ManifestKey{
+			TenantID:      "anonymous",
+			Bucket:        "bucket",
+			ObjectKeyHash: hashObjectKey(key),
+		}
+		if _, err := store.Get(context.Background(), mkey); err != nil {
+			t.Fatalf("manifest %s: %v", key, err)
+		}
+	}
+}
+
+func TestCopyObject_MissingSource(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	cr := httptest.NewRequest(http.MethodPut, "/bucket/dst.txt", nil)
+	cr.Header.Set("x-amz-copy-source", "/bucket/missing.txt")
+	cw := httptest.NewRecorder()
+	h.Copy(cw, cr)
+	if cw.Code != http.StatusNotFound {
+		t.Fatalf("Copy missing: %d %s", cw.Code, cw.Body.String())
+	}
+}
+
+func TestParseCopySource(t *testing.T) {
+	cases := []struct {
+		in              string
+		bucket, key, ver string
+		wantErr          bool
+	}{
+		{"/b/k", "b", "k", "", false},
+		{"b/k", "b", "k", "", false},
+		{"b/nested/k", "b", "nested/k", "", false},
+		{"b/k?versionId=abc", "b", "k", "abc", false},
+		{"", "", "", "", true},
+		{"bonly", "", "", "", true},
+		{"b/", "", "", "", true},
+	}
+	for _, c := range cases {
+		bk, ky, vr, err := parseCopySource(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("parseCopySource(%q) err=%v wantErr=%v", c.in, err, c.wantErr)
+			continue
+		}
+		if c.wantErr {
+			continue
+		}
+		if bk != c.bucket || ky != c.key || vr != c.ver {
+			t.Errorf("parseCopySource(%q) = %q %q %q, want %q %q %q", c.in, bk, ky, vr, c.bucket, c.key, c.ver)
+		}
+	}
+}

@@ -90,6 +90,12 @@ type DedupConfig struct {
 	//   - "object+block": object-level + Ceph RGW native chunk dedup
 	//                     (dedicated B2B cells only).
 	DefaultLevel string `json:"default_level"`
+
+	// OrphanGCInterval gates the background orphan-row sweep that
+	// removes content_index rows whose piece is no longer
+	// referenced by any live manifest. Zero (or unset) disables
+	// the sweep; values like "30m" or "1h" enable it.
+	OrphanGCInterval Duration `json:"orphan_gc_interval"`
 }
 
 // AbuseConfig tunes the per-region runtime knobs of the abuse

@@ -137,4 +137,19 @@ type Store interface {
 	// ErrRefCountNonZero — the racing uploader is now the
 	// canonical reference.
 	Delete(ctx context.Context, tenantID, contentHash string) error
+
+	// ScanAll returns every content_index row for the given
+	// tenant. It is used by the orphan GC sweep to identify
+	// rows whose piece is no longer referenced by any live
+	// manifest. Implementations MAY page or stream internally
+	// but the surface returns the full slice; callers are
+	// expected to invoke it on a per-tenant basis so the slice
+	// stays bounded.
+	ScanAll(ctx context.Context, tenantID string) ([]ContentIndexEntry, error)
+
+	// ListTenants returns the set of distinct tenant_ids that
+	// have at least one content_index row. The orphan GC sweep
+	// uses it to enumerate work without requiring an external
+	// tenant directory.
+	ListTenants(ctx context.Context) ([]string, error)
 }

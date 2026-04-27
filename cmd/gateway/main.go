@@ -148,6 +148,7 @@ func main() {
 	readRepair.Logger = log.New(os.Stdout, "read_repair ", log.LstdFlags)
 
 	rebalancerDone := startRebalancer(workerCtx, cfg.Rebalancer, store, registry)
+	orphanGCDone := startOrphanGC(workerCtx, cfg.Dedup, contentIndex, store, registry)
 
 	healthMon := startHealthMonitor(workerCtx, cfg.Health, cache)
 
@@ -256,6 +257,54 @@ func main() {
 	if rebalancerDone != nil {
 		<-rebalancerDone
 	}
+	if orphanGCDone != nil {
+		<-orphanGCDone
+	}
+}
+
+// startOrphanGC spins up the content_index orphan sweep when
+// dedup is enabled and an interval is configured. The sweep
+// removes content_index rows whose piece is no longer referenced
+// by any live manifest in the tenant. Returns nil when no GC is
+// started.
+func startOrphanGC(
+	ctx context.Context,
+	d config.DedupConfig,
+	idx content_index.Store,
+	store manifest_store.ManifestStore,
+	registry map[string]providers.StorageProvider,
+) <-chan struct{} {
+	if !d.Enabled || d.OrphanGCInterval.ToDuration() <= 0 {
+		return nil
+	}
+	if idx == nil {
+		log.Printf("gateway: orphan_gc disabled — content index not configured")
+		return nil
+	}
+	resolver := func(backend string) (content_index.PieceDeleter, bool) {
+		p, ok := registry[backend]
+		if !ok {
+			return nil, false
+		}
+		return p, true
+	}
+	gc, err := content_index.NewOrphanGC(content_index.OrphanGCConfig{
+		Index:     idx,
+		Manifests: store,
+		Resolver:  resolver,
+		Interval:  d.OrphanGCInterval.ToDuration(),
+		Logger:    log.New(os.Stdout, "orphan_gc ", log.LstdFlags),
+	})
+	if err != nil {
+		log.Printf("gateway: orphan_gc disabled — config error: %v", err)
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		gc.Run(ctx)
+	}()
+	return done
 }
 
 // startRebalancer spins up the background_rebalancer on a ticker

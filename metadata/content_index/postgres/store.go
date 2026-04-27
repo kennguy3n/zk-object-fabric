@@ -196,6 +196,61 @@ func (s *Store) Delete(ctx context.Context, tenantID, contentHash string) error 
 	return content_index.ErrRefCountNonZero
 }
 
+// ScanAll returns every content_index row for the given tenant.
+// The orphan GC sweep uses this to walk all live entries; the
+// caller drives a separate manifest probe per row.
+func (s *Store) ScanAll(ctx context.Context, tenantID string) ([]content_index.ContentIndexEntry, error) {
+	if tenantID == "" {
+		return nil, errors.New("postgres: tenant_id is required")
+	}
+	q := fmt.Sprintf(`
+		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), created_at
+		FROM %s
+		WHERE tenant_id = $1
+	`, s.table)
+	rows, err := s.db.QueryContext(ctx, q, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: content_index scan: %w", err)
+	}
+	defer rows.Close()
+	out := make([]content_index.ContentIndexEntry, 0)
+	for rows.Next() {
+		var e content_index.ContentIndexEntry
+		if err := rows.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("postgres: content_index scan row: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: content_index scan iter: %w", err)
+	}
+	return out, nil
+}
+
+// ListTenants returns the distinct tenant_ids that have at least
+// one content_index row. Used by the orphan GC sweep to enumerate
+// per-tenant work.
+func (s *Store) ListTenants(ctx context.Context) ([]string, error) {
+	q := fmt.Sprintf(`SELECT DISTINCT tenant_id FROM %s ORDER BY tenant_id`, s.table)
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: content_index list tenants: %w", err)
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("postgres: content_index list tenants row: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: content_index list tenants iter: %w", err)
+	}
+	return out, nil
+}
+
 // isCheckViolation reports whether err looks like a Postgres CHECK
 // constraint failure. It does string matching to avoid importing a
 // concrete driver type.

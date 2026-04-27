@@ -59,6 +59,7 @@ type S3API interface {
 	HeadObject(ctx context.Context, in *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	CopyObject(ctx context.Context, in *s3.CopyObjectInput, opts ...func(*s3.Options)) (*s3.CopyObjectOutput, error)
 }
 
 // Provider is the shared S3-compatible StorageProvider.
@@ -242,6 +243,51 @@ func (p *Provider) DeletePiece(ctx context.Context, pieceID string) error {
 		return fmt.Errorf("s3_generic: delete %s/%s: %w", p.cfg.Bucket, pieceID, err)
 	}
 	return nil
+}
+
+// CopyPiece performs an S3 server-side CopyObject. Both source
+// and destination must be in the same bucket configured on this
+// Provider; cross-bucket copies require operating against a
+// different Provider instance pointed at the destination bucket.
+//
+// The returned PutResult mirrors a fresh PUT: PieceID is the new
+// object key, ETag is the server-side hash, SizeBytes is queried
+// from the destination via HeadObject so callers can persist it
+// in the manifest.
+func (p *Provider) CopyPiece(ctx context.Context, srcPieceID, dstPieceID string) (providers.PutResult, error) {
+	if srcPieceID == "" || dstPieceID == "" {
+		return providers.PutResult{}, errors.New("s3_generic: srcPieceID and dstPieceID are required")
+	}
+	// CopySource must be url-encoded "bucket/key".
+	src := p.cfg.Bucket + "/" + srcPieceID
+	out, err := p.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(p.cfg.Bucket),
+		Key:        aws.String(dstPieceID),
+		CopySource: aws.String(src),
+	})
+	if err != nil {
+		return providers.PutResult{}, fmt.Errorf("s3_generic: copy %s -> %s/%s: %w", src, p.cfg.Bucket, dstPieceID, err)
+	}
+	res := providers.PutResult{
+		PieceID: dstPieceID,
+		Backend: p.cfg.Name,
+		Locator: p.cfg.Bucket + "/" + dstPieceID,
+	}
+	if out.CopyObjectResult != nil {
+		res.ETag = normalizeETag(aws.ToString(out.CopyObjectResult.ETag))
+	}
+	// CopyObject does not return content length; query it.
+	head, herr := p.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(p.cfg.Bucket),
+		Key:    aws.String(dstPieceID),
+	})
+	if herr == nil && head != nil {
+		res.SizeBytes = aws.ToInt64(head.ContentLength)
+		if res.ETag == "" {
+			res.ETag = normalizeETag(aws.ToString(head.ETag))
+		}
+	}
+	return res, nil
 }
 
 // ListPieces paginates object IDs under prefix. cursor is the
