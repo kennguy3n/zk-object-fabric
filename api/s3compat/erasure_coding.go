@@ -289,6 +289,18 @@ func (h *Handler) getErasureCoded(
 		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
 		h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
 	}
+
+	// Audit the EC GET so the compliance trail is symmetric with
+	// the single-piece GET path. The shards are scattered across
+	// one or more backends; MigrationState.PrimaryBackend is the
+	// canonical attribution and matches the EC PUT audit recorded
+	// in putErasureCoded.
+	auditBackend := manifest.MigrationState.PrimaryBackend
+	var auditCountry string
+	if prov, ok := h.cfg.Providers[auditBackend]; ok {
+		auditCountry = prov.PlacementLabels().Country
+	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, manifest.VersionID, auditBackend, auditCountry)
 }
 
 // isErasureCodedManifest returns true when the manifest's pieces
@@ -485,6 +497,21 @@ func (h *Handler) getMultipart(
 		h.emit(tenantID, bucket, billing.EgressBytes, uint64(written))
 		h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(written))
 	}
+
+	// Audit the multipart GET so the compliance trail is symmetric
+	// with the single-piece GET path. CreateMultipartUpload pins
+	// every part of an upload to one backend, so Pieces[0].Backend
+	// is the canonical attribution for the read (and matches the
+	// PUT audit emitted from CompleteMultipartUpload).
+	var auditPieceID, auditBackend, auditCountry string
+	if len(manifest.Pieces) > 0 {
+		auditPieceID = manifest.Pieces[0].PieceID
+		auditBackend = manifest.Pieces[0].Backend
+		if prov, ok := h.cfg.Providers[auditBackend]; ok {
+			auditCountry = prov.PlacementLabels().Country
+		}
+	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
 // rollbackEC deletes pieces written during a failed EC put so the
