@@ -366,8 +366,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// than the legacy /api/tenants/ surface. ServeHTTP callers
 	// (test harnesses, custom routers) need the same routing
 	// fan-out; check the prefix here so handler.ServeHTTP
-	// matches handler.Register's behavior.
-	if strings.HasPrefix(r.URL.Path, "/api/v1/tenants/") {
+	// matches handler.Register's behavior. Guard on
+	// DedupPolicies != nil so deployments that skip the dedup
+	// API surface do not nil-deref inside dispatchDedup.
+	if h.cfg.DedupPolicies != nil && strings.HasPrefix(r.URL.Path, "/api/v1/tenants/") {
 		h.dispatchDedup(w, r)
 		return
 	}

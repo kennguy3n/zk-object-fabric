@@ -311,8 +311,13 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	// gateway has a content_index store wired, route through the
 	// pattern-specific lookup/register flow before touching the
 	// backend. EC-coded objects are excluded above so the dedup
-	// flow always runs against a single piece.
-	if h.dedupEnabled(policy) && (encMode == "" || IsGatewayEncrypted(encMode) || encMode == "client_side") {
+	// flow always runs against a single piece. Empty encryption
+	// mode is intentionally NOT routed here: prepareDedupedPut
+	// only knows the managed/public_distribution (Pattern B) and
+	// client_side (Pattern C) flows and would 500 on an empty
+	// mode — leave plaintext-on-backend tenants on the legacy
+	// non-dedup path.
+	if h.dedupEnabled(policy) && (IsGatewayEncrypted(encMode) || encMode == "client_side") {
 		h.putDeduped(w, r, tenantID, bucket, key, backendName, provider, policy)
 		return
 	}

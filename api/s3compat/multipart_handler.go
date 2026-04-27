@@ -433,7 +433,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 					h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(existing.SizeBytes))
 				}
 			} else {
-				_, regErr := h.registerDedupedPiece(r.Context(), content_index.ContentIndexEntry{
+				raceLost, regErr := h.registerDedupedPiece(r.Context(), content_index.ContentIndexEntry{
 					TenantID:    tenantID,
 					ContentHash: contentHash,
 					PieceID:     parts[0].PieceID,
@@ -441,8 +441,38 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 					SizeBytes:   parts[0].SizeBytes,
 				})
 				if regErr != nil {
+					// Best-effort cleanup of the orphaned piece
+					// so we don't leave billable storage behind.
+					if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
+						_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
+					}
 					writeError(w, http.StatusInternalServerError, "ContentIndexRegisterFailed", regErr.Error(), r.URL.Path)
 					return
+				}
+				if raceLost {
+					// A concurrent uploader registered first.
+					// Drop the duplicate piece and redirect the
+					// manifest at the canonical copy — mirrors
+					// the single-PUT race-recovery path in
+					// dedup.go so the on-disk and refcount
+					// views stay consistent.
+					if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
+						_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
+					}
+					canonical, lookupErr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
+					if lookupErr != nil {
+						writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lookupErr.Error(), r.URL.Path)
+						return
+					}
+					manifest.Pieces[0].PieceID = canonical.PieceID
+					manifest.Pieces[0].Backend = canonical.Backend
+					manifest.Pieces[0].Hash = ""
+					manifest.Pieces[0].SizeBytes = canonical.SizeBytes
+					manifest.MigrationState.PrimaryBackend = canonical.Backend
+					h.emit(tenantID, bucket, billing.DedupHits, 1)
+					if canonical.SizeBytes > 0 {
+						h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(canonical.SizeBytes))
+					}
 				}
 			}
 		}
