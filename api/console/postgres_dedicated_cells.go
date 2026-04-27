@@ -134,6 +134,44 @@ func (s *PostgresDedicatedCellStore) GetDedicatedCell(ctx context.Context, cellI
 	return c, true, nil
 }
 
+// ListAllCells implements cellops.CellLister.
+func (s *PostgresDedicatedCellStore) ListAllCells(ctx context.Context) ([]cellops.CellStatus, error) {
+	return s.queryCells(ctx, `SELECT cell_id, tenant_id, region, country, status,
+		capacity_petabytes, utilization, erasure_profile, node_count,
+		created_at, updated_at FROM dedicated_cells ORDER BY cell_id`)
+}
+
+// ListCellsByTenant implements cellops.CellLister.
+func (s *PostgresDedicatedCellStore) ListCellsByTenant(ctx context.Context, tenantID string) ([]cellops.CellStatus, error) {
+	return s.queryCells(ctx, `SELECT cell_id, tenant_id, region, country, status,
+		capacity_petabytes, utilization, erasure_profile, node_count,
+		created_at, updated_at FROM dedicated_cells WHERE tenant_id = $1
+		ORDER BY cell_id`, tenantID)
+}
+
+func (s *PostgresDedicatedCellStore) queryCells(ctx context.Context, q string, args ...interface{}) ([]cellops.CellStatus, error) {
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("console: query cells: %w", err)
+	}
+	defer rows.Close()
+	out := make([]cellops.CellStatus, 0)
+	for rows.Next() {
+		var c cellops.CellStatus
+		var statusText string
+		if err := rows.Scan(
+			&c.CellID, &c.TenantID, &c.Region, &c.Country, &statusText,
+			&c.CapacityPetabytes, &c.Utilization, &c.ErasureProfile,
+			&c.NodeCount, &c.CreatedAt, &c.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("console: scan cell: %w", err)
+		}
+		c.Status = cellops.ProvisionStatus(statusText)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // UpdateCellStatus implements cellops.CellSink.
 func (s *PostgresDedicatedCellStore) UpdateCellStatus(ctx context.Context, cellID string, status cellops.ProvisionStatus) error {
 	if cellID == "" {
