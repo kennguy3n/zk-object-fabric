@@ -1340,6 +1340,21 @@ func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB) s3compat.Comp
 		}
 		hooks.Audit = &auditAdapter{store: store}
 	}
+	if cfg.LegalHoldEnabled {
+		var store auth.LegalHoldStore
+		if db != nil {
+			pg, err := auth.NewPostgresLegalHoldStore(db)
+			if err != nil {
+				log.Printf("gateway: legal hold store: %v; falling back to in-memory", err)
+				store = auth.NewMemoryLegalHoldStore()
+			} else {
+				store = pg
+			}
+		} else {
+			store = auth.NewMemoryLegalHoldStore()
+		}
+		hooks.LegalHoldStore = &legalHoldAdapter{store: store}
+	}
 	return hooks
 }
 
@@ -1384,6 +1399,25 @@ func (a *auditAdapter) Record(ctx context.Context, e s3compat.AuditEntry) error 
 		Timestamp:      e.Timestamp,
 		RequestID:      e.RequestID,
 	})
+}
+
+// legalHoldAdapter converts auth.LegalHold records into the
+// s3compat.LegalHoldEntry shape so the s3compat package does not
+// have to import internal/auth.
+type legalHoldAdapter struct {
+	store auth.LegalHoldStore
+}
+
+func (a *legalHoldAdapter) Active(ctx context.Context, tenantID, bucket, objectKey string) ([]s3compat.LegalHoldEntry, error) {
+	holds, err := a.store.Active(ctx, tenantID, bucket, objectKey)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]s3compat.LegalHoldEntry, len(holds))
+	for i, h := range holds {
+		out[i] = s3compat.LegalHoldEntry{ID: h.ID}
+	}
+	return out, nil
 }
 
 // registerCellProviders enumerates active dedicated cells via
