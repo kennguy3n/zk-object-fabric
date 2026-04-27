@@ -39,6 +39,7 @@ func requirePostgres(t *testing.T) *sql.DB {
 			backend       TEXT        NOT NULL,
 			ref_count     INT         NOT NULL DEFAULT 1 CHECK (ref_count >= 0),
 			size_bytes    BIGINT      NOT NULL DEFAULT 0,
+			etag          TEXT        NULL,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (tenant_id, content_hash)
 		)`); err != nil {
