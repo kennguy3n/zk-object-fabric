@@ -403,6 +403,13 @@ func (h *Handler) putDeduped(
 			_ = provider.DeletePiece(r.Context(), pieceID)
 			canonical, lookupErr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, res.ContentHash)
 			if lookupErr != nil {
+				// Roll back the IncrementRef that
+				// registerDedupedPiece already performed:
+				// no manifest will be written for this PUT,
+				// so leaving the bump in place would
+				// permanently inflate the canonical entry's
+				// refcount and prevent eventual cleanup.
+				_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, res.ContentHash)
 				writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lookupErr.Error(), r.URL.Path)
 				return
 			}

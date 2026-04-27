@@ -466,6 +466,14 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 					}
 					canonical, lookupErr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
 					if lookupErr != nil {
+						// Roll back the IncrementRef that
+						// registerDedupedPiece already performed:
+						// no manifest will be written for this
+						// upload, so leaving the bump in place
+						// would permanently inflate the canonical
+						// entry's refcount and prevent eventual
+						// cleanup.
+						_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, contentHash)
 						writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lookupErr.Error(), r.URL.Path)
 						return
 					}
