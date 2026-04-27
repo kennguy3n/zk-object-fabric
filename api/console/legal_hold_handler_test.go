@@ -66,7 +66,10 @@ func TestLegalHoldHandler_ReleaseRejectsCrossTenant(t *testing.T) {
 	resp.Body.Close()
 
 	// Try to release the same hold ID under tenant B.
-	resp2, _ := http.Post(srv.URL+"/api/v1/tenants/B/legal-hold/"+created.ID+"/release", "", nil)
+	resp2, err := http.Post(srv.URL+"/api/v1/tenants/B/legal-hold/"+created.ID+"/release", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-tenant release status=%d, want 404", resp2.StatusCode)
