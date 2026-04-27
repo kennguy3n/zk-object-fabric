@@ -43,18 +43,36 @@ INSERT INTO compliance_audit (
 	return nil
 }
 
-// Query implements AuditStore.
+// Query implements AuditStore. When rng.Start and/or rng.End are
+// zero the corresponding bound is omitted, matching the
+// MemoryAuditStore behaviour where a zero TimeRange returns all
+// entries for the tenant.
 func (s *PostgresAuditStore) Query(ctx context.Context, tenantID string, rng TimeRange) ([]AuditEntry, error) {
 	if s.db == nil {
 		return nil, fmt.Errorf("compliance: postgres audit store: nil db")
 	}
-	const q = `
+
+	base := `
 SELECT tenant_id, operation, bucket, object_key, piece_id,
        piece_backend, backend_country, request_id, recorded_at
   FROM compliance_audit
- WHERE tenant_id = $1 AND recorded_at BETWEEN $2 AND $3
- ORDER BY recorded_at ASC`
-	rows, err := s.db.QueryContext(ctx, q, tenantID, rng.Start.UTC(), rng.End.UTC())
+ WHERE tenant_id = $1`
+	args := []interface{}{tenantID}
+	idx := 2
+
+	if !rng.Start.IsZero() && !rng.End.IsZero() {
+		base += fmt.Sprintf(" AND recorded_at BETWEEN $%d AND $%d", idx, idx+1)
+		args = append(args, rng.Start.UTC(), rng.End.UTC())
+	} else if !rng.Start.IsZero() {
+		base += fmt.Sprintf(" AND recorded_at >= $%d", idx)
+		args = append(args, rng.Start.UTC())
+	} else if !rng.End.IsZero() {
+		base += fmt.Sprintf(" AND recorded_at <= $%d", idx)
+		args = append(args, rng.End.UTC())
+	}
+
+	base += " ORDER BY recorded_at ASC"
+	rows, err := s.db.QueryContext(ctx, base, args...)
 	if err != nil {
 		return nil, fmt.Errorf("compliance: query audit: %w", err)
 	}

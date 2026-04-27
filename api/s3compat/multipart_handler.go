@@ -104,10 +104,21 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "InvalidPlacement", err.Error(), r.URL.Path)
 		return
 	}
-	if _, ok := h.cfg.Providers[backend]; !ok {
+	provider, ok := h.cfg.Providers[backend]
+	if !ok {
 		writeError(w, http.StatusInternalServerError, "BackendNotRegistered", "backend "+backend+" is not in the provider registry", r.URL.Path)
 		return
 	}
+
+	if h.cfg.Compliance.Residency != nil {
+		if err := h.cfg.Compliance.Residency.Check(
+			tenantID, provider.PlacementLabels().Country, policy.Residency,
+		); err != nil {
+			writeError(w, http.StatusForbidden, "DataResidencyViolation", err.Error(), r.URL.Path)
+			return
+		}
+	}
+
 	uploadID, err := newUploadID()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
@@ -559,6 +570,16 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "ManifestPutFailed", err.Error(), r.URL.Path)
 		return
 	}
+
+	var country string
+	if prov, ok := h.cfg.Providers[upload.Backend]; ok {
+		country = prov.PlacementLabels().Country
+	}
+	var auditPieceID string
+	if len(manifest.Pieces) > 0 {
+		auditPieceID = manifest.Pieces[0].PieceID
+	}
+	h.audit(r, "PUT", tenantID, bucket, key, auditPieceID, upload.Backend, country)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-version-id", manifest.VersionID)

@@ -286,6 +286,11 @@ func (h *Handler) writeCopyManifest(
 	}
 
 	h.emit(tenantID, dstBucket, billing.PutRequests, 1)
+	var copyCountry string
+	if prov, ok := h.cfg.Providers[backend]; ok {
+		copyCountry = prov.PlacementLabels().Country
+	}
+	h.audit(r, "COPY", tenantID, dstBucket, dstKey, piece.PieceID, backend, copyCountry)
 
 	res := CopyObjectResult{
 		ETag:         quote(piece.Hash),
