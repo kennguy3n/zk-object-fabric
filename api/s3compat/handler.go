@@ -164,6 +164,10 @@ type ComplianceHooks struct {
 	// Audit, when non-nil, receives one Record per PUT / DELETE /
 	// GET that the handler successfully services.
 	Audit AuditRecorder
+
+	// LegalHoldStore, when non-nil, is consulted on the DELETE
+	// path to block deletion of objects under an active legal hold.
+	LegalHoldStore LegalHoldChecker
 }
 
 // ResidencyChecker matches *compliance.ResidencyEnforcer.Check.
@@ -175,6 +179,18 @@ type ResidencyChecker interface {
 // handler uses on the hot path.
 type AuditRecorder interface {
 	Record(ctx context.Context, entry AuditEntry) error
+}
+
+// LegalHoldChecker is the subset of auth.LegalHoldStore the
+// DELETE path consults to block deletion of held objects.
+type LegalHoldChecker interface {
+	Active(ctx context.Context, tenantID, bucket, objectKey string) ([]LegalHoldEntry, error)
+}
+
+// LegalHoldEntry mirrors auth.LegalHold so the s3compat package
+// does not import internal/auth directly.
+type LegalHoldEntry struct {
+	ID string
 }
 
 // AuditEntry mirrors compliance.AuditEntry. Defined here as a
@@ -590,6 +606,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
 		}
 	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
 }
 
 // fetchPiece consults the hot object cache (if configured) before
@@ -753,6 +770,18 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.cfg.Compliance.LegalHoldStore != nil {
+		holds, herr := h.cfg.Compliance.LegalHoldStore.Active(r.Context(), tenantID, bucket, key)
+		if herr != nil {
+			writeError(w, http.StatusInternalServerError, "LegalHoldCheckFailed", herr.Error(), r.URL.Path)
+			return
+		}
+		if len(holds) > 0 {
+			writeError(w, http.StatusForbidden, "ObjectUnderLegalHold", "object is under an active legal hold", r.URL.Path)
+			return
+		}
+	}
+
 	mkey := manifest_store.ManifestKey{
 		TenantID:      tenantID,
 		Bucket:        bucket,
@@ -838,6 +867,14 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.emit(tenantID, bucket, billing.DeleteRequests, 1)
+	if len(manifest.Pieces) > 0 {
+		p := manifest.Pieces[0]
+		var country string
+		if prov, ok := h.cfg.Providers[p.Backend]; ok {
+			country = prov.PlacementLabels().Country
+		}
+		h.audit(r, "DELETE", tenantID, bucket, key, p.PieceID, p.Backend, country)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

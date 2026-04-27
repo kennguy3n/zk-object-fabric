@@ -145,6 +145,7 @@ func (h *Handler) putErasureCoded(
 	if totalShardBytes > 0 {
 		h.emit(tenantID, bucket, billing.StorageBytesSeconds, totalShardBytes)
 	}
+	h.audit(r, "PUT", tenantID, bucket, key, versionID, backendName, provider.PlacementLabels().Country)
 
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.WriteHeader(http.StatusOK)

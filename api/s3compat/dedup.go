@@ -494,6 +494,12 @@ func (h *Handler) putDeduped(
 		h.emit(tenantID, bucket, billing.StorageBytesSeconds, uint64(sizeOnWire))
 	}
 
+	var country string
+	if prov, ok := h.cfg.Providers[pieceBackend]; ok {
+		country = prov.PlacementLabels().Country
+	}
+	h.audit(r, "PUT", tenantID, bucket, key, pieceID, pieceBackend, country)
+
 	if pieceHash != "" {
 		w.Header().Set("ETag", quote(pieceHash))
 	}

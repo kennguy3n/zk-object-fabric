@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -568,5 +569,162 @@ func TestParseCopySource(t *testing.T) {
 		if bk != c.bucket || ky != c.key || vr != c.ver {
 			t.Errorf("parseCopySource(%q) = %q %q %q, want %q %q %q", c.in, bk, ky, vr, c.bucket, c.key, c.ver)
 		}
+	}
+}
+
+// fakeProviderWithCountry extends fakeProvider with a configurable country label.
+type fakeProviderWithCountry struct {
+	*fakeProvider
+	country string
+}
+
+func (f *fakeProviderWithCountry) PlacementLabels() providers.PlacementLabels {
+	return providers.PlacementLabels{Country: f.country}
+}
+
+// fakeResidencyChecker implements ResidencyChecker for tests.
+type fakeResidencyChecker struct {
+	allowed map[string]bool
+}
+
+func (f *fakeResidencyChecker) Check(tenantID, backendCountry string, policyResidency []string) error {
+	for _, c := range policyResidency {
+		if c == backendCountry {
+			return nil
+		}
+	}
+	if len(policyResidency) == 0 {
+		return nil
+	}
+	return fmt.Errorf("backend country %q not in tenant allowlist", backendCountry)
+}
+
+// fakeLegalHoldChecker implements LegalHoldChecker for tests.
+type fakeLegalHoldChecker struct {
+	holds map[string][]LegalHoldEntry
+}
+
+func (f *fakeLegalHoldChecker) Active(_ context.Context, tenantID, bucket, objectKey string) ([]LegalHoldEntry, error) {
+	key := tenantID + "/" + bucket + "/" + objectKey
+	return f.holds[key], nil
+}
+
+func TestDelete_BlockedByLegalHold(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	bill := &recordingBilling{}
+	holdChecker := &fakeLegalHoldChecker{
+		holds: map[string][]LegalHoldEntry{
+			"anonymous/bucket/held-obj": {{ID: "hold-1"}},
+		},
+	}
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   bill,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{
+			LegalHoldStore: holdChecker,
+		},
+	})
+
+	// PUT an object
+	req := httptest.NewRequest(http.MethodPut, "/bucket/held-obj", bytes.NewReader([]byte("data")))
+	req.ContentLength = 4
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// DELETE should be blocked
+	req = httptest.NewRequest(http.MethodDelete, "/bucket/held-obj", nil)
+	rec = httptest.NewRecorder()
+	h.Delete(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("DELETE status = %d, want 403; body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "ObjectUnderLegalHold") {
+		t.Errorf("DELETE body should contain ObjectUnderLegalHold, got: %s", rec.Body)
+	}
+
+	// Verify the object still exists
+	if len(fake.pieces) != 1 {
+		t.Errorf("piece should still exist, got %d pieces", len(fake.pieces))
+	}
+
+	// DELETE an object without a hold should succeed
+	req = httptest.NewRequest(http.MethodPut, "/bucket/free-obj", bytes.NewReader([]byte("data")))
+	req.ContentLength = 4
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodDelete, "/bucket/free-obj", nil)
+	rec = httptest.NewRecorder()
+	h.Delete(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE of non-held object status = %d, want 204; body=%s", rec.Code, rec.Body)
+	}
+}
+
+// residencyPlacement returns a placement with a Residency allowlist.
+type residencyPlacement struct {
+	backend   string
+	residency []string
+}
+
+func (p residencyPlacement) ResolveBackend(string, string, string) (string, metadata.PlacementPolicy, error) {
+	return p.backend, metadata.PlacementPolicy{
+		AllowedBackends: []string{p.backend},
+		Residency:       p.residency,
+	}, nil
+}
+
+func TestCreateMultipartUpload_ResidencyViolation(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	providerWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	bill := &recordingBilling{}
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": providerWithCountry},
+		Placement: residencyPlacement{backend: "test", residency: []string{"DE"}},
+		Billing:   bill,
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{
+			Residency: &fakeResidencyChecker{},
+		},
+	})
+
+	// CreateMultipartUpload should be rejected: backend is US, tenant allows only DE
+	req := httptest.NewRequest(http.MethodPost, "/bucket/key?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("CreateMultipartUpload status = %d, want 403; body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "DataResidencyViolation") {
+		t.Errorf("body should contain DataResidencyViolation, got: %s", rec.Body)
+	}
+
+	// With matching residency, it should succeed
+	h2 := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": providerWithCountry},
+		Placement: residencyPlacement{backend: "test", residency: []string{"US"}},
+		Billing:   bill,
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{
+			Residency: &fakeResidencyChecker{},
+		},
+	})
+	req = httptest.NewRequest(http.MethodPost, "/bucket/key?uploads", nil)
+	rec = httptest.NewRecorder()
+	h2.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload with matching residency status = %d, want 200; body=%s", rec.Code, rec.Body)
 	}
 }
