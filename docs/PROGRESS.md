@@ -827,6 +827,18 @@ Checklist:
 - DR copies are non-deduped full objects.
 - MLS FS/PCS are message-channel properties, fully preserved.
   Stored file FS depends on CEK scheme (random = FS, convergent = no FS).
+- Multipart with `managed`/`public_distribution` encryption cannot dedup
+  (`CreateMultipartUpload` generates a fresh random DEK per session, so
+  two uploads of the same plaintext produce different ciphertext).
+- Multi-piece multipart uploads (`len(pieces) > 1`) DO dedup for
+  `client_side` and unencrypted modes via the nullable `piece_ids`
+  JSONB column on `content_index`. `managed` /
+  `public_distribution` multipart remains excluded for the
+  random-DEK reason above.
+- EC-coded objects are excluded from object-level dedup; B2B tenants
+  rely on Ceph block-level dedup at the RADOS tier instead.
+- CopyObject dedup requires a single-piece source with `ContentHash`;
+  EC and multipart sources are rejected with HTTP 501.
 
 ---
 

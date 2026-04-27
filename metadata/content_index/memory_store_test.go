@@ -125,6 +125,86 @@ func TestMemoryStore_DeleteRefCountNonZero(t *testing.T) {
 	}
 }
 
+// TestMemoryStore_PieceIDsRoundTrip asserts the multi-piece
+// extension survives Register → Lookup → ScanAll without losing
+// or aliasing the per-part metadata. The slice copy in
+// clonePieceRefs prevents callers from mutating the store's
+// internal state through a returned reference.
+func TestMemoryStore_PieceIDsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	refs := []PieceRef{
+		{PieceID: "p1", Backend: "wasabi", PartNumber: 1, SizeBytes: 5 * 1024 * 1024},
+		{PieceID: "p2", Backend: "wasabi", PartNumber: 2, SizeBytes: 5 * 1024 * 1024},
+		{PieceID: "p3", Backend: "wasabi", PartNumber: 3, SizeBytes: 1024},
+	}
+	if err := s.Register(ctx, ContentIndexEntry{
+		TenantID:    "tnt",
+		ContentHash: "multi-h",
+		PieceID:     "p1",
+		Backend:     "wasabi",
+		SizeBytes:   refs[0].SizeBytes + refs[1].SizeBytes + refs[2].SizeBytes,
+		PieceIDs:    refs,
+	}); err != nil {
+		t.Fatalf("Register multi-piece: %v", err)
+	}
+
+	got, err := s.Lookup(ctx, "tnt", "multi-h")
+	if err != nil {
+		t.Fatalf("Lookup multi-piece: %v", err)
+	}
+	if len(got.PieceIDs) != len(refs) {
+		t.Fatalf("Lookup PieceIDs len = %d want %d", len(got.PieceIDs), len(refs))
+	}
+	for i, want := range refs {
+		if got.PieceIDs[i] != want {
+			t.Fatalf("Lookup PieceIDs[%d] = %+v want %+v", i, got.PieceIDs[i], want)
+		}
+	}
+	// Mutating the returned slice must not affect the store.
+	got.PieceIDs[0].PieceID = "tampered"
+	again, _ := s.Lookup(ctx, "tnt", "multi-h")
+	if again.PieceIDs[0].PieceID != "p1" {
+		t.Fatalf("Lookup after mutation = %q want %q (slice not cloned)", again.PieceIDs[0].PieceID, "p1")
+	}
+
+	// ScanAll must surface the full slice too, since orphan GC
+	// uses it to enumerate all canonical pieces under a tenant.
+	scanned, err := s.ScanAll(ctx, "tnt")
+	if err != nil {
+		t.Fatalf("ScanAll: %v", err)
+	}
+	if len(scanned) != 1 {
+		t.Fatalf("ScanAll len = %d want 1", len(scanned))
+	}
+	if len(scanned[0].PieceIDs) != len(refs) {
+		t.Fatalf("ScanAll PieceIDs len = %d want %d", len(scanned[0].PieceIDs), len(refs))
+	}
+}
+
+// TestMemoryStore_PieceIDsNilForSinglePiece asserts that
+// single-piece entries (no PieceIDs at Register) round-trip with
+// PieceIDs == nil, not a non-nil empty slice. Downstream code
+// (postgres NULLIF, the multipart redirect helper) distinguishes
+// the two and a regression here would silently break dedup-hit
+// redirection for legacy single-piece entries.
+func TestMemoryStore_PieceIDsNilForSinglePiece(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	if err := s.Register(ctx, ContentIndexEntry{
+		TenantID: "tnt", ContentHash: "single-h", PieceID: "p1", Backend: "wasabi",
+	}); err != nil {
+		t.Fatalf("Register single-piece: %v", err)
+	}
+	got, err := s.Lookup(ctx, "tnt", "single-h")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if got.PieceIDs != nil {
+		t.Fatalf("PieceIDs = %v want nil for single-piece entry", got.PieceIDs)
+	}
+}
+
 func TestMemoryStore_RejectsMissingFields(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()

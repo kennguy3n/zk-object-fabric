@@ -23,6 +23,14 @@ CREATE TABLE content_index (
     -- same ETag a non-dedup PUT of the same content would have. NULL
     -- for entries written before Phase 3.5 added the column.
     etag          TEXT        NULL,
+    -- piece_ids is the multi-piece extension (Phase 4+ multi-part
+    -- multipart dedup). When NULL the entry is a single-piece
+    -- canonical and piece_id alone identifies the piece. When
+    -- non-NULL it is a JSON array of {piece_id, backend,
+    -- part_number, size_bytes} objects in ascending part_number
+    -- order, and piece_id holds the first element's id so existing
+    -- single-piece queries (orphan GC reverse lookup) still work.
+    piece_ids     JSONB       NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, content_hash)
 );

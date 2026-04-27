@@ -206,6 +206,34 @@ pattern is:
 | `client_side` + convergent | Pattern C (client convergent) | Client SDK derives DEK; gateway dedups on `BLAKE3(ciphertext)`. |
 | `client_side` + random | No dedup | Random DEK per object — ciphertext is unique. |
 
+### Upload method constraints
+
+The dedup pipeline depends on more than the encryption mode — the
+upload method (single-PUT vs multipart vs CopyObject vs EC) also
+gates whether dedup runs. The condensed matrix below covers the
+upload-method dimension; see
+[INTEGRATION.md §8.5](INTEGRATION.md#85-complete-dedup-scenario-matrix)
+for the complete (upload method × encryption mode) cross-product.
+
+| Upload method | Dedup supported? | Notes |
+| --- | --- | --- |
+| Single `PutObject` | Yes (Pattern B or C) | Primary dedup path |
+| Multipart (1 part) | Yes (`client_side` / unencrypted only) | `managed`/`public_distribution` excluded (random DEK per session) |
+| Multipart (N parts) | Yes (`client_side` / unencrypted only) | Per-part BLAKE3 + `piece_ids` JSONB column on `content_index` |
+| `CopyObject` | Yes (refcount fast path) | Source must be single-piece with `ContentHash` |
+| EC-coded `PutObject` | No (object-level) | Block-level dedup via Ceph RADOS tier covers this for B2B |
+
+A common large-file scenario — a chat client sending a 50 MiB
+attachment via the SDK's multipart "chunked" path in StrictZK mode
+— **does** dedup as long as the SDK emits byte-deterministic
+ciphertext (so each part hashes the same across uploads) and the
+chunking strategy is stable. Two uploads that chunk the same
+plaintext into the same N parts produce the same combined
+content-hash and share a single canonical piece set. Tenants on
+`managed` / `public_distribution` multipart still hit the
+random-DEK exclusion above and need to use single `PutObject` if
+they want dedup.
+
 See [INTEGRATION.md](INTEGRATION.md) for the external app
 integration guide.
 

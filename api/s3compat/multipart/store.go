@@ -93,8 +93,54 @@ type Upload struct {
 	WrapAlgorithm    string
 	ContentAlgorithm string
 
+	// PartHashes holds the BLAKE3 digest of every part the
+	// multipart handler streamed to the backend, keyed by
+	// PartNumber. Populated only when the upload is dedup-eligible
+	// (intra-tenant dedup enabled, encryption mode is
+	// "client_side" or unencrypted). Empty for non-dedup uploads
+	// so existing single-piece dedup callers can continue to use
+	// hashAssembledPieces unchanged.
+	//
+	// Stored on the in-memory Upload because part hashes are
+	// transient: they are produced at UploadPart time, consumed at
+	// CompleteMultipartUpload time, and never persisted. A
+	// multi-node multipart store would need to ship them on the
+	// same durable channel as DEKMaterial — see the package doc.
+	PartHashes map[int][]byte
+
 	mu    sync.Mutex
 	parts map[int]Part
+}
+
+// SetPartHash records hash as the BLAKE3 digest for the given
+// PartNumber under the upload's mutex so the multipart handler can
+// safely call it from concurrent UploadPart goroutines. The slice
+// is copied so callers may reuse their hasher buffer.
+func (u *Upload) SetPartHash(partNumber int, hash []byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.PartHashes == nil {
+		u.PartHashes = make(map[int][]byte)
+	}
+	cp := make([]byte, len(hash))
+	copy(cp, hash)
+	u.PartHashes[partNumber] = cp
+}
+
+// PartHash returns the BLAKE3 digest for partNumber and a bool
+// indicating whether one was recorded. Returns nil, false if the
+// part has no recorded hash (non-dedup upload, or the part was
+// uploaded before the dedup pipeline was wired).
+func (u *Upload) PartHash(partNumber int) ([]byte, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	h, ok := u.PartHashes[partNumber]
+	if !ok {
+		return nil, false
+	}
+	cp := make([]byte, len(h))
+	copy(cp, h)
+	return cp, true
 }
 
 // Parts returns a copy of the part set keyed by PartNumber. Callers

@@ -342,3 +342,162 @@ func TestDedup_Multipart_SinglePartShareSinglePiece(t *testing.T) {
 		t.Fatalf("expected 1 backend piece after multipart dedup, got %d", got)
 	}
 }
+
+// uploadMultiPartMultipart drives N-part multipart uploads with the
+// supplied per-part bodies for both target keys. It is the shared
+// driver for the multi-piece multipart dedup tests; the encryption
+// header is opt-in so the same helper covers the unencrypted ("")
+// mode used by TestDedup_Multipart_MultiPart_* tests and any future
+// client_side scenarios that wire up the convergent SDK.
+func uploadMultiPartMultipart(t *testing.T, s *dedupServer, key string, parts [][]byte, encHeader string) {
+	t.Helper()
+	ctx := context.Background()
+	createIn := &s3.CreateMultipartUploadInput{Bucket: aws.String(s.bucket), Key: aws.String(key)}
+	if encHeader != "" {
+		createIn.Metadata = map[string]string{"Zk-Encryption": encHeader}
+	}
+	create, err := s.client.CreateMultipartUpload(ctx, createIn)
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload %s: %v", key, err)
+	}
+	completed := make([]s3types.CompletedPart, 0, len(parts))
+	for i, body := range parts {
+		partNumber := int32(i + 1)
+		// UploadPartInput doesn't accept user metadata —
+		// CreateMultipartUpload's metadata is the only place
+		// the gateway reads the X-Amz-Meta-Zk-Encryption hint
+		// from. Per-part encryption header validation runs
+		// against the upload session's EncMode, which was
+		// captured at Create time, so this is sufficient.
+		uploadIn := &s3.UploadPartInput{
+			Bucket:     aws.String(s.bucket),
+			Key:        aws.String(key),
+			UploadId:   create.UploadId,
+			PartNumber: aws.Int32(partNumber),
+			Body:       bytes.NewReader(body),
+		}
+		out, err := s.client.UploadPart(ctx, uploadIn)
+		if err != nil {
+			t.Fatalf("UploadPart %s part %d: %v", key, partNumber, err)
+		}
+		completed = append(completed, s3types.CompletedPart{ETag: out.ETag, PartNumber: aws.Int32(partNumber)})
+	}
+	if _, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: create.UploadId,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completed},
+	}); err != nil {
+		t.Fatalf("CompleteMultipartUpload %s: %v", key, err)
+	}
+}
+
+// TestDedup_Multipart_MultiPartShareSingleCanonical asserts the
+// multi-piece dedup happy path: two multipart uploads of the same
+// 3-part body in unencrypted mode dedup to a single canonical
+// piece set, so the backend holds 3 pieces (one per part), not 6.
+// Both manifest GETs return the original concatenated bytes.
+func TestDedup_Multipart_MultiPartShareSingleCanonical(t *testing.T) {
+	s := newDedupServer(t, "")
+	parts := [][]byte{
+		bytes.Repeat([]byte("multi-piece-part-1-payload-"), 256),
+		bytes.Repeat([]byte("multi-piece-part-2-payload-"), 256),
+		bytes.Repeat([]byte("multi-piece-part-3-payload-"), 64),
+	}
+	want := bytes.Join(parts, nil)
+
+	uploadMultiPartMultipart(t, s, "a.bin", parts, "")
+	uploadMultiPartMultipart(t, s, "b.bin", parts, "")
+
+	if got := s.countPieces(t); got != len(parts) {
+		t.Fatalf("expected %d backend pieces after multi-piece dedup, got %d", len(parts), got)
+	}
+	for _, key := range []string{"a.bin", "b.bin"} {
+		out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("GetObject %s: %v", key, err)
+		}
+		got, _ := io.ReadAll(out.Body)
+		_ = out.Body.Close()
+		if !bytes.Equal(got, want) {
+			t.Fatalf("GetObject %s: %d bytes returned, want %d (multi-piece roundtrip mismatch)",
+				key, len(got), len(want))
+		}
+	}
+}
+
+// TestDedup_Multipart_MultiPart_ManagedExcluded asserts the
+// managed-mode exclusion is preserved by the multi-piece path:
+// CreateMultipartUpload mints a fresh random DEK per session, so
+// two uploads of the same plaintext under managed encryption
+// produce 2*N backend pieces — dedup MUST NOT fire.
+func TestDedup_Multipart_MultiPart_ManagedExcluded(t *testing.T) {
+	s := newDedupServer(t, "managed")
+	parts := [][]byte{
+		bytes.Repeat([]byte("managed-multipart-part-1-"), 256),
+		bytes.Repeat([]byte("managed-multipart-part-2-"), 256),
+	}
+
+	uploadMultiPartMultipart(t, s, "a.bin", parts, "")
+	uploadMultiPartMultipart(t, s, "b.bin", parts, "")
+
+	wantPieces := 2 * len(parts)
+	if got := s.countPieces(t); got != wantPieces {
+		t.Fatalf("managed multipart must not dedup: got %d pieces, want %d", got, wantPieces)
+	}
+}
+
+// TestDedup_Multipart_MultiPart_DeleteRefcount asserts that the
+// refcounted-DELETE contract holds for multi-piece dedup: two
+// uploads of the same content share one canonical piece set;
+// deleting the first object leaves all canonical pieces intact
+// (refcount drops 2→1) and the second upload still GETs
+// successfully; deleting the second object reclaims every
+// canonical piece (refcount 1→0).
+func TestDedup_Multipart_MultiPart_DeleteRefcount(t *testing.T) {
+	s := newDedupServer(t, "")
+	parts := [][]byte{
+		bytes.Repeat([]byte("multi-refcount-part-1-"), 128),
+		bytes.Repeat([]byte("multi-refcount-part-2-"), 128),
+		bytes.Repeat([]byte("multi-refcount-part-3-"), 32),
+	}
+	want := bytes.Join(parts, nil)
+
+	uploadMultiPartMultipart(t, s, "a.bin", parts, "")
+	uploadMultiPartMultipart(t, s, "b.bin", parts, "")
+	if got := s.countPieces(t); got != len(parts) {
+		t.Fatalf("expected %d pieces after dedup, got %d", len(parts), got)
+	}
+
+	// First DELETE: refcount drops to 1; pieces survive.
+	if _, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String("a.bin"),
+	}); err != nil {
+		t.Fatalf("DeleteObject a: %v", err)
+	}
+	if got := s.countPieces(t); got != len(parts) {
+		t.Fatalf("pieces must survive first DELETE, got %d want %d", got, len(parts))
+	}
+	out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String("b.bin"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject b after delete a: %v", err)
+	}
+	got, _ := io.ReadAll(out.Body)
+	_ = out.Body.Close()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("GetObject b roundtrip mismatch after delete a")
+	}
+
+	// Second DELETE: refcount drops to 0; every canonical piece
+	// is reclaimed in the same DELETE handler call.
+	if _, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String("b.bin"),
+	}); err != nil {
+		t.Fatalf("DeleteObject b: %v", err)
+	}
+	if got := s.countPieces(t); got != 0 {
+		t.Fatalf("expected all pieces removed after final DELETE, got %d", got)
+	}
+}
