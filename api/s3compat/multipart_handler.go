@@ -389,103 +389,115 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 
 	// Multipart dedup: when the upload's policy enables
 	// intra-tenant dedup AND the gateway has a content_index store
-	// wired, compute a content hash over the concatenated piece
-	// bytes. The hash is recorded on the manifest unconditionally
-	// so the DELETE path can refcount it. When the multipart
-	// upload landed as a single piece we additionally run the
+	// wired AND the upload landed as a single piece, compute a
+	// content hash over the assembled bytes and run the
 	// content_index lookup/register flow so duplicate uploads
-	// dedup correctly. Multi-piece uploads skip the lookup —
-	// the current content_index schema stores one PieceID per
-	// entry and a multi-piece object would force a more
-	// elaborate "manifest reference" representation that is out
-	// of scope for the §3.14 object-level tier.
-	if h.dedupEnabled(upload.Policy) {
+	// dedup correctly. Multi-piece uploads are intentionally
+	// skipped: the current content_index schema stores one
+	// PieceID per entry, so multi-piece dedup would require a
+	// "manifest reference" representation that is out of scope
+	// for the §3.14 object-level tier. Hashing for multi-piece
+	// would also force an O(object size) backend read with no
+	// content_index op, which the DELETE path cannot use.
+	if h.dedupEnabled(upload.Policy) && len(pieces) == 1 {
+		// deleteUploadedPart is the cleanup the early-return
+		// error paths run before the manifest is written. The
+		// multipart session has already been consumed by
+		// Complete and the client cannot retry; without this
+		// the just-uploaded part would orphan on the backend
+		// until GC.
+		deleteUploadedPart := func() {
+			if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
+				_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
+			}
+		}
 		contentHash, hashErr := h.hashAssembledPieces(r.Context(), pieces)
 		if hashErr != nil {
+			deleteUploadedPart()
 			writeError(w, http.StatusInternalServerError, "DedupHashFailed", hashErr.Error(), r.URL.Path)
 			return
 		}
 		manifest.ContentHash = contentHash
-		if len(pieces) == 1 {
-			existing, lerr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
-			if lerr != nil && !errors.Is(lerr, content_index.ErrNotFound) {
-				writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lerr.Error(), r.URL.Path)
+		existing, lerr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
+		if lerr != nil && !errors.Is(lerr, content_index.ErrNotFound) {
+			deleteUploadedPart()
+			writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lerr.Error(), r.URL.Path)
+			return
+		}
+		if existing != nil {
+			if err := h.cfg.ContentIndex.IncrementRef(r.Context(), tenantID, contentHash); err != nil {
+				deleteUploadedPart()
+				writeError(w, http.StatusInternalServerError, "ContentIndexIncrementFailed", err.Error(), r.URL.Path)
 				return
 			}
-			if existing != nil {
-				if err := h.cfg.ContentIndex.IncrementRef(r.Context(), tenantID, contentHash); err != nil {
-					writeError(w, http.StatusInternalServerError, "ContentIndexIncrementFailed", err.Error(), r.URL.Path)
+			// Drop the just-uploaded duplicate piece;
+			// the manifest will reference the canonical
+			// piece instead.
+			if provider, ok := h.cfg.Providers[parts[0].Backend]; ok {
+				_ = provider.DeletePiece(r.Context(), parts[0].PieceID)
+			}
+			// Reuse the canonical ETag so the dedup-hit
+			// CompleteMultipartUpload response and any
+			// follow-up GET/HEAD return the same ETag the
+			// first uploader's PUT response carried.
+			manifest.Pieces[0].PieceID = existing.PieceID
+			manifest.Pieces[0].Backend = existing.Backend
+			manifest.Pieces[0].Hash = existing.ETag
+			manifest.Pieces[0].SizeBytes = existing.SizeBytes
+			manifest.MigrationState.PrimaryBackend = existing.Backend
+			h.emit(tenantID, bucket, billing.DedupHits, 1)
+			if existing.SizeBytes > 0 {
+				h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(existing.SizeBytes))
+			}
+		} else {
+			raceLost, regErr := h.registerDedupedPiece(r.Context(), content_index.ContentIndexEntry{
+				TenantID:    tenantID,
+				ContentHash: contentHash,
+				PieceID:     parts[0].PieceID,
+				Backend:     parts[0].Backend,
+				SizeBytes:   parts[0].SizeBytes,
+				ETag:        parts[0].ETag,
+			})
+			if regErr != nil {
+				// Best-effort cleanup of the orphaned piece
+				// so we don't leave billable storage behind.
+				if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
+					_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
+				}
+				writeError(w, http.StatusInternalServerError, "ContentIndexRegisterFailed", regErr.Error(), r.URL.Path)
+				return
+			}
+			if raceLost {
+				// A concurrent uploader registered first.
+				// Drop the duplicate piece and redirect the
+				// manifest at the canonical copy — mirrors
+				// the single-PUT race-recovery path in
+				// dedup.go so the on-disk and refcount
+				// views stay consistent.
+				if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
+					_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
+				}
+				canonical, lookupErr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
+				if lookupErr != nil {
+					// Roll back the IncrementRef that
+					// registerDedupedPiece already performed:
+					// no manifest will be written for this
+					// upload, so leaving the bump in place
+					// would permanently inflate the canonical
+					// entry's refcount and prevent eventual
+					// cleanup.
+					_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, contentHash)
+					writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lookupErr.Error(), r.URL.Path)
 					return
 				}
-				// Drop the just-uploaded duplicate piece;
-				// the manifest will reference the canonical
-				// piece instead.
-				if provider, ok := h.cfg.Providers[parts[0].Backend]; ok {
-					_ = provider.DeletePiece(r.Context(), parts[0].PieceID)
-				}
-				// Reuse the canonical ETag so the dedup-hit
-				// CompleteMultipartUpload response and any
-				// follow-up GET/HEAD return the same ETag the
-				// first uploader's PUT response carried.
-				manifest.Pieces[0].PieceID = existing.PieceID
-				manifest.Pieces[0].Backend = existing.Backend
-				manifest.Pieces[0].Hash = existing.ETag
-				manifest.Pieces[0].SizeBytes = existing.SizeBytes
-				manifest.MigrationState.PrimaryBackend = existing.Backend
+				manifest.Pieces[0].PieceID = canonical.PieceID
+				manifest.Pieces[0].Backend = canonical.Backend
+				manifest.Pieces[0].Hash = canonical.ETag
+				manifest.Pieces[0].SizeBytes = canonical.SizeBytes
+				manifest.MigrationState.PrimaryBackend = canonical.Backend
 				h.emit(tenantID, bucket, billing.DedupHits, 1)
-				if existing.SizeBytes > 0 {
-					h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(existing.SizeBytes))
-				}
-			} else {
-				raceLost, regErr := h.registerDedupedPiece(r.Context(), content_index.ContentIndexEntry{
-					TenantID:    tenantID,
-					ContentHash: contentHash,
-					PieceID:     parts[0].PieceID,
-					Backend:     parts[0].Backend,
-					SizeBytes:   parts[0].SizeBytes,
-					ETag:        parts[0].ETag,
-				})
-				if regErr != nil {
-					// Best-effort cleanup of the orphaned piece
-					// so we don't leave billable storage behind.
-					if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
-						_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
-					}
-					writeError(w, http.StatusInternalServerError, "ContentIndexRegisterFailed", regErr.Error(), r.URL.Path)
-					return
-				}
-				if raceLost {
-					// A concurrent uploader registered first.
-					// Drop the duplicate piece and redirect the
-					// manifest at the canonical copy — mirrors
-					// the single-PUT race-recovery path in
-					// dedup.go so the on-disk and refcount
-					// views stay consistent.
-					if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
-						_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
-					}
-					canonical, lookupErr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
-					if lookupErr != nil {
-						// Roll back the IncrementRef that
-						// registerDedupedPiece already performed:
-						// no manifest will be written for this
-						// upload, so leaving the bump in place
-						// would permanently inflate the canonical
-						// entry's refcount and prevent eventual
-						// cleanup.
-						_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, contentHash)
-						writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lookupErr.Error(), r.URL.Path)
-						return
-					}
-					manifest.Pieces[0].PieceID = canonical.PieceID
-					manifest.Pieces[0].Backend = canonical.Backend
-					manifest.Pieces[0].Hash = canonical.ETag
-					manifest.Pieces[0].SizeBytes = canonical.SizeBytes
-					manifest.MigrationState.PrimaryBackend = canonical.Backend
-					h.emit(tenantID, bucket, billing.DedupHits, 1)
-					if canonical.SizeBytes > 0 {
-						h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(canonical.SizeBytes))
-					}
+				if canonical.SizeBytes > 0 {
+					h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(canonical.SizeBytes))
 				}
 			}
 		}
