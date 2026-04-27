@@ -69,6 +69,7 @@ type Config struct {
 	Metrics      MetricsConfig      `json:"metrics"`
 	Compliance   ComplianceConfig   `json:"compliance"`
 	CrossCell    CrossCellConfig    `json:"cross_cell"`
+	Repair       RepairConfig       `json:"repair"`
 }
 
 // TracingConfig configures the OpenTelemetry-style request
@@ -129,6 +130,19 @@ type CrossCellConfig struct {
 type CrossCellScopeEntry struct {
 	TenantID string `json:"tenant_id"`
 	Bucket   string `json:"bucket"`
+}
+
+// RepairConfig configures the optional automated repair queue.
+// Enabled gates the worker entirely; CephEndpoint is the URL of
+// the Ceph manager health API the queue polls; PollInterval is
+// the cadence at which the source is sampled. AuthToken, when
+// non-empty, is forwarded as a Bearer token on the health
+// request.
+type RepairConfig struct {
+	Enabled      bool   `json:"enabled"`
+	CephEndpoint string `json:"ceph_endpoint"`
+	AuthToken    string `json:"auth_token"`
+	PollInterval string `json:"poll_interval"`
 }
 
 
