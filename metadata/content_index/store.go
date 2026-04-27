@@ -73,6 +73,14 @@ type ContentIndexEntry struct {
 	// for billing reconciliation and orphan-GC accounting.
 	SizeBytes int64
 
+	// ETag is the original PUT response ETag for the canonical
+	// piece (i.e. the value the first uploader's S3 client saw
+	// in the PUT response). Recorded at Register time so that a
+	// dedup-hit PUT, GET, and HEAD return the same ETag any
+	// non-dedup PUT of the same content would have returned.
+	// Optional for entries written before this field existed.
+	ETag string
+
 	// CreatedAt is set by the store at first INSERT.
 	CreatedAt time.Time
 }

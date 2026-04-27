@@ -339,10 +339,13 @@ func (h *Handler) putDeduped(
 	if res.Hit {
 		pieceID = res.Existing.PieceID
 		pieceBackend = res.Existing.Backend
-		// We do not have the original ETag/locator handy on a
-		// hit — the manifest stores enough to round-trip, and
-		// dedup hits skip the backend so locator/hash are not
-		// necessary for correctness. Leave them empty.
+		// Reuse the canonical ETag the first uploader's PUT
+		// response returned so dedup-hit clients get the same
+		// ETag a non-dedup PUT of the same content would have.
+		// Locator is left empty: the manifest's PieceID +
+		// Backend are sufficient to round-trip GETs through
+		// the provider, and the locator is opaque to clients.
+		pieceHash = res.Existing.ETag
 		sizeOnWire = res.Existing.SizeBytes
 		// Emit dedup-hit billing dimensions so operators can
 		// reconcile bytes-saved vs. bytes-written.
@@ -376,6 +379,7 @@ func (h *Handler) putDeduped(
 			PieceID:     pieceID,
 			Backend:     pieceBackend,
 			SizeBytes:   sizeOnWire,
+			ETag:        pieceHash,
 		})
 		if regErr != nil {
 			// Best-effort cleanup of the orphaned piece so we
@@ -395,7 +399,7 @@ func (h *Handler) putDeduped(
 			}
 			pieceID = canonical.PieceID
 			pieceBackend = canonical.Backend
-			pieceHash = ""
+			pieceHash = canonical.ETag
 			pieceLocator = ""
 			sizeOnWire = canonical.SizeBytes
 			h.emit(tenantID, bucket, billing.DedupHits, 1)

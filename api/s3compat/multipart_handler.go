@@ -423,9 +423,13 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 				if provider, ok := h.cfg.Providers[parts[0].Backend]; ok {
 					_ = provider.DeletePiece(r.Context(), parts[0].PieceID)
 				}
+				// Reuse the canonical ETag so the dedup-hit
+				// CompleteMultipartUpload response and any
+				// follow-up GET/HEAD return the same ETag the
+				// first uploader's PUT response carried.
 				manifest.Pieces[0].PieceID = existing.PieceID
 				manifest.Pieces[0].Backend = existing.Backend
-				manifest.Pieces[0].Hash = ""
+				manifest.Pieces[0].Hash = existing.ETag
 				manifest.Pieces[0].SizeBytes = existing.SizeBytes
 				manifest.MigrationState.PrimaryBackend = existing.Backend
 				h.emit(tenantID, bucket, billing.DedupHits, 1)
@@ -439,6 +443,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 					PieceID:     parts[0].PieceID,
 					Backend:     parts[0].Backend,
 					SizeBytes:   parts[0].SizeBytes,
+					ETag:        parts[0].ETag,
 				})
 				if regErr != nil {
 					// Best-effort cleanup of the orphaned piece
@@ -466,7 +471,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 					}
 					manifest.Pieces[0].PieceID = canonical.PieceID
 					manifest.Pieces[0].Backend = canonical.Backend
-					manifest.Pieces[0].Hash = ""
+					manifest.Pieces[0].Hash = canonical.ETag
 					manifest.Pieces[0].SizeBytes = canonical.SizeBytes
 					manifest.MigrationState.PrimaryBackend = canonical.Backend
 					h.emit(tenantID, bucket, billing.DedupHits, 1)

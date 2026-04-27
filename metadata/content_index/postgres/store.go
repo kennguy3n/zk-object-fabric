@@ -48,14 +48,17 @@ func (s *Store) Lookup(ctx context.Context, tenantID, contentHash string) (*cont
 	if tenantID == "" || contentHash == "" {
 		return nil, errors.New("postgres: tenant_id and content_hash are required")
 	}
+	// etag column may be NULL on rows written before Phase 3.5
+	// added the field; coalesce to empty string so the caller
+	// sees a uniform zero value.
 	q := fmt.Sprintf(`
-		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, created_at
+		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), created_at
 		FROM %s
 		WHERE tenant_id = $1 AND content_hash = $2
 	`, s.table)
 	row := s.db.QueryRowContext(ctx, q, tenantID, contentHash)
 	var e content_index.ContentIndexEntry
-	if err := row.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.CreatedAt); err != nil {
+	if err := row.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &e.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, content_index.ErrNotFound
 		}
@@ -79,11 +82,11 @@ func (s *Store) Register(ctx context.Context, entry content_index.ContentIndexEn
 		return errors.New("postgres: backend is required")
 	}
 	q := fmt.Sprintf(`
-		INSERT INTO %s (tenant_id, content_hash, piece_id, backend, ref_count, size_bytes)
-		VALUES ($1, $2, $3, $4, 1, $5)
+		INSERT INTO %s (tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, etag)
+		VALUES ($1, $2, $3, $4, 1, $5, NULLIF($6, ''))
 		ON CONFLICT (tenant_id, content_hash) DO NOTHING
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes)
+	res, err := s.db.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes, entry.ETag)
 	if err != nil {
 		return fmt.Errorf("postgres: content_index register: %w", err)
 	}
