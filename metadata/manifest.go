@@ -158,6 +158,26 @@ type PlacementPolicy struct {
 	// DedupPolicy with all zero fields is never omitted by
 	// encoding/json). See docs/PROPOSAL.md §3.14.
 	DedupPolicy *DedupPolicy `json:"dedup_policy,omitempty"`
+
+	// ReplicationPolicy, when non-nil, asks the cross-cell
+	// replicator to mirror this object to a destination cell.
+	// nil disables replication for the object.
+	ReplicationPolicy *ReplicationPolicy `json:"replication_policy,omitempty"`
+}
+
+// ReplicationPolicy describes how an object is mirrored from a
+// source cell to a destination cell. Mode values:
+//
+//   - "sync":  the gateway copies the piece synchronously on the
+//              PUT critical path. Slower but RPO=0.
+//   - "async": the cross-cell replicator drains the manifest at
+//              its own cadence; the policy's RPO bound is the
+//              maximum staleness clients should expect.
+type ReplicationPolicy struct {
+	SourceCell string `json:"source_cell"`
+	DestCell   string `json:"dest_cell"`
+	Mode       string `json:"mode"`
+	RPO        string `json:"rpo,omitempty"`
 }
 
 // DedupPolicy controls intra-tenant deduplication for this object.

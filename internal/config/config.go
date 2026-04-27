@@ -68,6 +68,7 @@ type Config struct {
 	Tracing      TracingConfig      `json:"tracing"`
 	Metrics      MetricsConfig      `json:"metrics"`
 	Compliance   ComplianceConfig   `json:"compliance"`
+	CrossCell    CrossCellConfig    `json:"cross_cell"`
 }
 
 // TracingConfig configures the OpenTelemetry-style request
@@ -108,6 +109,28 @@ type ComplianceConfig struct {
 	// a Postgres metadata DB.
 	StaticAllowlist map[string][]string `json:"static_allowlist"`
 }
+
+// CrossCellConfig configures the optional cross-cell async
+// replicator. Enabled gates the worker entirely; SourceCellID /
+// DestCellID identify the (src, dst) provider names in the
+// gateway's provider registry. ScanInterval is the cadence at
+// which the scope is re-scanned; Scope is a list of (tenant,
+// bucket) tuples the worker mirrors.
+type CrossCellConfig struct {
+	Enabled      bool                  `json:"enabled"`
+	SourceCellID string                `json:"source_cell_id"`
+	DestCellID   string                `json:"dest_cell_id"`
+	ScanInterval string                `json:"scan_interval"`
+	Scope        []CrossCellScopeEntry `json:"scope"`
+}
+
+// CrossCellScopeEntry is one (tenant, bucket) tuple the
+// replicator scans on each tick.
+type CrossCellScopeEntry struct {
+	TenantID string `json:"tenant_id"`
+	Bucket   string `json:"bucket"`
+}
+
 
 // DedupConfig configures intra-tenant deduplication. Cross-tenant
 // dedup is permanently excluded from the fabric, so DefaultScope
