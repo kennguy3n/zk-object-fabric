@@ -50,6 +50,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 	"github.com/kennguy3n/zk-object-fabric/migration/background_rebalancer"
+	"github.com/kennguy3n/zk-object-fabric/migration/cross_cell"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 	"github.com/kennguy3n/zk-object-fabric/providers/aws_s3"
@@ -161,6 +162,7 @@ func main() {
 
 	rebalancerDone := startRebalancer(workerCtx, cfg.Rebalancer, store, registry)
 	orphanGCDone := startOrphanGC(workerCtx, cfg.Dedup, contentIndex, store, registry)
+	crossCellDone := startCrossCellReplicator(workerCtx, cfg.CrossCell, store, registry)
 
 	healthMon := startHealthMonitor(workerCtx, cfg.Health, cache)
 
@@ -286,6 +288,9 @@ func main() {
 	}
 	if orphanGCDone != nil {
 		<-orphanGCDone
+	}
+	if crossCellDone != nil {
+		<-crossCellDone
 	}
 }
 
@@ -1441,4 +1446,50 @@ func cellBucketFor(cfg config.Config, c cellops.CellStatus) string {
 
 func cellCredentialsFor(cfg config.Config, c cellops.CellStatus) (string, string) {
 	return cfg.Providers.CephRGW.AccessKey, cfg.Providers.CephRGW.SecretKey
+}
+
+// startCrossCellReplicator spins up the cross-cell async
+// replicator when the operator enables it. The worker is gated
+// on cfg.Enabled + valid SourceCellID/DestCellID; missing
+// providers cause a soft skip with a log line so the gateway
+// still starts.
+func startCrossCellReplicator(
+	ctx context.Context,
+	cfg config.CrossCellConfig,
+	manifests manifest_store.ManifestStore,
+	registry map[string]providers.StorageProvider,
+) <-chan struct{} {
+	if !cfg.Enabled {
+		return nil
+	}
+	src, ok := registry[cfg.SourceCellID]
+	if !ok {
+		log.Printf("cross_cell: source provider %q not registered; skipping", cfg.SourceCellID)
+		return nil
+	}
+	dst, ok := registry[cfg.DestCellID]
+	if !ok {
+		log.Printf("cross_cell: dest provider %q not registered; skipping", cfg.DestCellID)
+		return nil
+	}
+	scope := make([]cross_cell.ScopeKey, 0, len(cfg.Scope))
+	for _, e := range cfg.Scope {
+		scope = append(scope, cross_cell.ScopeKey{TenantID: e.TenantID, Bucket: e.Bucket})
+	}
+	r := cross_cell.NewReplicator(
+		cross_cell.Cell{ID: cfg.SourceCellID, Manifests: manifests, Provider: src},
+		cross_cell.Cell{ID: cfg.DestCellID, Manifests: manifests, Provider: dst},
+		scope,
+	)
+	if d, err := time.ParseDuration(cfg.ScanInterval); err == nil && d > 0 {
+		r.Interval = d
+	}
+	r.Logger = log.New(os.Stdout, "cross_cell ", log.LstdFlags)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = r.Run(ctx)
+	}()
+	log.Printf("gateway: started cross-cell replicator src=%s dst=%s scope=%d", cfg.SourceCellID, cfg.DestCellID, len(scope))
+	return done
 }
