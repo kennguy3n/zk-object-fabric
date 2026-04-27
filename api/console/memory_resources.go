@@ -161,6 +161,30 @@ func (s *MemoryDedicatedCellStore) GetDedicatedCell(ctx context.Context, cellID 
 	return c, ok, nil
 }
 
+// ListAllCells implements cellops.CellLister.
+func (s *MemoryDedicatedCellStore) ListAllCells(ctx context.Context) ([]cellops.CellStatus, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]cellops.CellStatus, 0, len(s.records))
+	for _, rec := range s.records {
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+// ListCellsByTenant implements cellops.CellLister.
+func (s *MemoryDedicatedCellStore) ListCellsByTenant(ctx context.Context, tenantID string) ([]cellops.CellStatus, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]cellops.CellStatus, 0)
+	for _, rec := range s.records {
+		if rec.TenantID == tenantID {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
 // UpdateCellStatus implements cellops.CellSink.
 func (s *MemoryDedicatedCellStore) UpdateCellStatus(ctx context.Context, cellID string, status cellops.ProvisionStatus) error {
 	if cellID == "" {

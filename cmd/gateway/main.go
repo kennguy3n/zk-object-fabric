@@ -91,6 +91,9 @@ func main() {
 	store := buildManifestStore(cfg, metadataDB)
 	contentIndex := buildContentIndex(cfg, metadataDB)
 	registry := buildProviderRegistry(context.Background(), cfg)
+	if lister, ok := buildDedicatedCellStore(metadataDB).(cellops.CellLister); ok {
+		registerCellProviders(context.Background(), registry, lister, cfg)
+	}
 	defaultBackend := pickDefaultBackend(registry)
 	if defaultBackend == "" {
 		log.Fatalf("gateway: no storage providers registered; configure at least one in config.providers")
@@ -1371,4 +1374,71 @@ func (a *auditAdapter) Record(ctx context.Context, e s3compat.AuditEntry) error 
 		Timestamp:      e.Timestamp,
 		RequestID:      e.RequestID,
 	})
+}
+
+// registerCellProviders enumerates active dedicated cells via
+// cellops.CellRegistry and registers each as a ceph_rgw provider.
+// The provider name is the cell ID, so a placement policy can
+// route to a specific cell by referencing it directly.
+//
+// A cell whose endpoint is missing is skipped (the operator-side
+// bring-up has not yet recorded one). Build failures are logged
+// but never fatal — a single broken cell must not block startup.
+func registerCellProviders(ctx context.Context, registry map[string]providers.StorageProvider, store cellops.CellLister, cfg config.Config) {
+	if store == nil {
+		return
+	}
+	reg := cellops.NewCellRegistry(store)
+	cells, err := reg.ListActiveCells(ctx)
+	if err != nil {
+		log.Printf("gateway: list active cells: %v", err)
+		return
+	}
+	for _, c := range cells {
+		endpoint := cellEndpointFor(cfg, c)
+		if endpoint == "" {
+			log.Printf("gateway: cell %q has no endpoint; skipping", c.CellID)
+			continue
+		}
+		bucket := cellBucketFor(cfg, c)
+		ak, sk := cellCredentialsFor(cfg, c)
+		p, err := ceph_rgw.New(ceph_rgw.Config{
+			Endpoint:  endpoint,
+			Region:    c.Region,
+			Bucket:    bucket,
+			AccessKey: ak,
+			SecretKey: sk,
+			Cell:      c.CellID,
+			Country:   c.Country,
+		})
+		if err != nil {
+			log.Printf("gateway: build cell provider %q: %v", c.CellID, err)
+			continue
+		}
+		if _, exists := registry[c.CellID]; exists {
+			log.Printf("gateway: cell provider %q already registered; skipping", c.CellID)
+			continue
+		}
+		registry[c.CellID] = p
+		log.Printf("gateway: registered cell provider %q (endpoint=%s region=%s country=%s)",
+			c.CellID, endpoint, c.Region, c.Country)
+	}
+}
+
+// cellEndpointFor falls back to the global ceph_rgw endpoint when
+// no per-cell endpoint is wired. A future config layout will
+// store per-cell endpoints in the cell row directly.
+func cellEndpointFor(cfg config.Config, c cellops.CellStatus) string {
+	return cfg.Providers.CephRGW.Endpoint
+}
+
+func cellBucketFor(cfg config.Config, c cellops.CellStatus) string {
+	if cfg.Providers.CephRGW.Bucket != "" {
+		return cfg.Providers.CephRGW.Bucket
+	}
+	return "cell-" + c.CellID
+}
+
+func cellCredentialsFor(cfg config.Config, c cellops.CellStatus) (string, string) {
+	return cfg.Providers.CephRGW.AccessKey, cfg.Providers.CephRGW.SecretKey
 }
