@@ -195,6 +195,28 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ .
 	}, nil
 }
 
+func (f *fakeS3) CopyObject(_ context.Context, in *s3.CopyObjectInput, _ ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	src := aws.ToString(in.CopySource)
+	// CopySource is "bucket/key" (possibly URL-encoded). Split.
+	idx := strings.IndexByte(src, '/')
+	if idx <= 0 || idx == len(src)-1 {
+		return nil, fmt.Errorf("fakeS3: invalid CopySource %q", src)
+	}
+	srcBucket, srcKey := src[:idx], src[idx+1:]
+	srcObj, ok := f.objects[fakeKey{bucket: srcBucket, key: srcKey}]
+	if !ok {
+		return nil, &s3types.NoSuchKey{Message: aws.String("fakeS3: no such source key")}
+	}
+	dstBucket := aws.ToString(in.Bucket)
+	dstKey := aws.ToString(in.Key)
+	f.objects[fakeKey{bucket: dstBucket, key: dstKey}] = srcObj
+	return &s3.CopyObjectOutput{
+		CopyObjectResult: &s3types.CopyObjectResult{ETag: aws.String(srcObj.etag)},
+	}, nil
+}
+
 // parseRange parses an HTTP Range header of the form "bytes=start-end"
 // or "bytes=start-". Suffix ranges ("bytes=-N") are not used by the
 // fabric so we do not implement them.

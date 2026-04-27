@@ -147,6 +147,51 @@ func (s *Store) List(_ context.Context, tenantID, bucket, cursor string, limit i
 	return out, nil
 }
 
+// HasManifestWithPieceID reports whether the tenant has at least
+// one manifest referencing pieceID. Used by the orphan GC worker.
+func (s *Store) HasManifestWithPieceID(_ context.Context, tenantID, pieceID string) (bool, error) {
+	if tenantID == "" || pieceID == "" {
+		return false, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for k, m := range s.byKey {
+		if k.TenantID != tenantID {
+			continue
+		}
+		for _, p := range m.Pieces {
+			if p.PieceID == pieceID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// ListVersions returns every version of (tenantID, bucket,
+// objectKeyHash) most-recent (highest insertion sequence) first.
+func (s *Store) ListVersions(_ context.Context, tenantID, bucket, objectKeyHash string) ([]*metadata.ObjectManifest, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	type row struct {
+		seq      uint64
+		manifest *metadata.ObjectManifest
+	}
+	var rows []row
+	for k, m := range s.byKey {
+		if k.TenantID != tenantID || k.Bucket != bucket || k.ObjectKeyHash != objectKeyHash {
+			continue
+		}
+		rows = append(rows, row{seq: s.seq[k], manifest: m})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].seq > rows[j].seq })
+	out := make([]*metadata.ObjectManifest, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, cloneManifest(r.manifest))
+	}
+	return out, nil
+}
+
 func cloneManifest(m *metadata.ObjectManifest) *metadata.ObjectManifest {
 	if m == nil {
 		return nil

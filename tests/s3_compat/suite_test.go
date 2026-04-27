@@ -131,6 +131,163 @@ func Run(t *testing.T, setup Setup) {
 	t.Run("MultipartRoundTrip", func(t *testing.T) { testMultipartRoundTrip(t, setup) })
 	t.Run("MultipartAbort", func(t *testing.T) { testMultipartAbort(t, setup) })
 	t.Run("ErasureRoundTrip", func(t *testing.T) { testErasureRoundTrip(t, setup) })
+	t.Run("CopyObject_SameBucket", func(t *testing.T) { testCopyObjectSameBucket(t, setup) })
+	t.Run("CopyObject_CrossKey", func(t *testing.T) { testCopyObjectCrossKey(t, setup) })
+	t.Run("VersionId_Get", func(t *testing.T) { testVersionedGet(t, setup) })
+	t.Run("ListObjectVersions", func(t *testing.T) { testListObjectVersions(t, setup) })
+}
+
+func testCopyObjectSameBucket(t *testing.T, setup Setup) {
+	s := newServer(t, setup)
+	src := "src.txt"
+	body := []byte("copy-source-payload")
+	if _, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(src),
+		Body:   bytes.NewReader(body),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	dst := "copy/dest.txt"
+	if _, err := s.client.CopyObject(context.Background(), &s3.CopyObjectInput{
+		Bucket:     aws.String(s.bucket),
+		Key:        aws.String(dst),
+		CopySource: aws.String(s.bucket + "/" + src),
+	}); err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+	got, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(dst),
+	})
+	if err != nil {
+		t.Fatalf("GetObject(dst): %v", err)
+	}
+	defer got.Body.Close()
+	data, _ := io.ReadAll(got.Body)
+	if !bytes.Equal(data, body) {
+		t.Fatalf("copy body mismatch: got %q want %q", data, body)
+	}
+}
+
+func testCopyObjectCrossKey(t *testing.T, setup Setup) {
+	s := newServer(t, setup)
+	body := []byte("two-keys")
+	if _, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String("a/k1"),
+		Body:   bytes.NewReader(body),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.client.CopyObject(context.Background(), &s3.CopyObjectInput{
+		Bucket:     aws.String(s.bucket),
+		Key:        aws.String("b/k2"),
+		CopySource: aws.String(s.bucket + "/a/k1"),
+	}); err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+	for _, k := range []string{"a/k1", "b/k2"} {
+		out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(k),
+		})
+		if err != nil {
+			t.Fatalf("GetObject(%s): %v", k, err)
+		}
+		data, _ := io.ReadAll(out.Body)
+		out.Body.Close()
+		if !bytes.Equal(data, body) {
+			t.Fatalf("Get(%s) body = %q, want %q", k, data, body)
+		}
+	}
+}
+
+func testVersionedGet(t *testing.T, setup Setup) {
+	s := newServer(t, setup)
+	key := "ver.txt"
+	put := func(payload string) string {
+		out, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader([]byte(payload)),
+		})
+		if err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+		return aws.ToString(out.VersionId)
+	}
+	v1 := put("v1-data")
+	time.Sleep(2 * time.Millisecond)
+	v2 := put("v2-data")
+	if v1 == "" || v2 == "" || v1 == v2 {
+		t.Fatalf("expected distinct version IDs, got v1=%q v2=%q", v1, v2)
+	}
+	// Latest read returns v2.
+	got, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("GetObject(latest): %v", err)
+	}
+	data, _ := io.ReadAll(got.Body)
+	got.Body.Close()
+	if string(data) != "v2-data" {
+		t.Fatalf("latest = %q, want v2-data", data)
+	}
+	// Versioned read pins v1.
+	out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket:    aws.String(s.bucket),
+		Key:       aws.String(key),
+		VersionId: aws.String(v1),
+	})
+	if err != nil {
+		t.Fatalf("GetObject(v1): %v", err)
+	}
+	data, _ = io.ReadAll(out.Body)
+	out.Body.Close()
+	if string(data) != "v1-data" {
+		t.Fatalf("v1 = %q, want v1-data", data)
+	}
+}
+
+func testListObjectVersions(t *testing.T, setup Setup) {
+	s := newServer(t, setup)
+	key := "lv.txt"
+	for _, payload := range []string{"a", "b", "c"} {
+		if _, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader([]byte(payload)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	out, err := s.client.ListObjectVersions(context.Background(), &s3.ListObjectVersionsInput{
+		Bucket: aws.String(s.bucket),
+	})
+	if err != nil {
+		t.Fatalf("ListObjectVersions: %v", err)
+	}
+	matched := 0
+	latestSeen := false
+	for _, v := range out.Versions {
+		if aws.ToString(v.Key) != key {
+			continue
+		}
+		matched++
+		if aws.ToBool(v.IsLatest) {
+			latestSeen = true
+		}
+	}
+	if matched != 3 {
+		t.Fatalf("expected 3 versions of %s, got %d", key, matched)
+	}
+	if !latestSeen {
+		t.Fatalf("no version flagged as latest")
+	}
 }
 
 func testPutGetHeadDelete(t *testing.T, setup Setup) {

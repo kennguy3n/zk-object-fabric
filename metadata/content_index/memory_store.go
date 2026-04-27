@@ -114,4 +114,35 @@ func (s *MemoryStore) Delete(_ context.Context, tenantID, contentHash string) er
 	return nil
 }
 
+// ScanAll returns every entry for the given tenant. The slice
+// order is not stable — callers must not rely on it.
+func (s *MemoryStore) ScanAll(_ context.Context, tenantID string) ([]ContentIndexEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ContentIndexEntry, 0)
+	for k, e := range s.entries {
+		if k.TenantID != tenantID {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// ListTenants returns the distinct tenant IDs that have at least
+// one entry in the store.
+func (s *MemoryStore) ListTenants(_ context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]struct{})
+	for k := range s.entries {
+		seen[k.TenantID] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	return out, nil
+}
+
 var _ Store = (*MemoryStore)(nil)

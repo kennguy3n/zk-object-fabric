@@ -47,6 +47,9 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ .
 	f.listInput = in
 	return &s3.ListObjectsV2Output{}, nil
 }
+func (f *fakeS3) CopyObject(context.Context, *s3.CopyObjectInput, ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
+	return &s3.CopyObjectOutput{}, nil
+}
 
 func newTestProvider(t *testing.T, f *fakeS3) *Provider {
 	t.Helper()

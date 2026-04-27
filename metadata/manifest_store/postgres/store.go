@@ -243,6 +243,113 @@ func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit
 	return out, nil
 }
 
+// HasManifestWithPieceID reports whether the given tenant has at
+// least one manifest whose pieces[].piece_id equals pieceID. Used
+// by the orphan GC worker.
+//
+// The query uses JSONB path-existence (@?) on the body column so
+// the planner can use a GIN index on body if one exists. Because
+// the body may be opaque BYTEA when BodyEncryptor is configured,
+// the encrypted layout is detected and the call falls back to
+// full-scan + decrypt-and-check; orphan GC is a low-frequency
+// background sweep so the slower path is acceptable.
+func (s *Store) HasManifestWithPieceID(ctx context.Context, tenantID, pieceID string) (bool, error) {
+	if tenantID == "" || pieceID == "" {
+		return false, errors.New("postgres: tenant_id and piece_id are required")
+	}
+	if s.encryptor == nil {
+		// JSONB containment query: pieces array contains an
+		// object with the given piece_id.
+		q := fmt.Sprintf(`
+			SELECT 1 FROM %s
+			WHERE tenant_id = $1
+			  AND body @> jsonb_build_object('pieces', jsonb_build_array(jsonb_build_object('piece_id', $2::text)))
+			LIMIT 1
+		`, s.table)
+		var x int
+		if err := s.db.QueryRowContext(ctx, q, tenantID, pieceID).Scan(&x); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, fmt.Errorf("postgres: has manifest with piece_id: %w", err)
+		}
+		return true, nil
+	}
+	// Encrypted body: scan + decrypt rows for the tenant. This
+	// is acceptable because orphan GC is rate-limited and the
+	// per-tenant row count is bounded by tenant policy.
+	q := fmt.Sprintf(`SELECT body FROM %s WHERE tenant_id = $1`, s.table)
+	rows, err := s.db.QueryContext(ctx, q, tenantID)
+	if err != nil {
+		return false, fmt.Errorf("postgres: has manifest with piece_id: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var body []byte
+		if err := rows.Scan(&body); err != nil {
+			return false, fmt.Errorf("postgres: has manifest scan: %w", err)
+		}
+		opened, derr := s.encryptor.Decrypt(body)
+		if derr != nil {
+			return false, fmt.Errorf("postgres: has manifest decrypt: %w", derr)
+		}
+		var m metadata.ObjectManifest
+		if err := json.Unmarshal(opened, &m); err != nil {
+			return false, fmt.Errorf("postgres: has manifest unmarshal: %w", err)
+		}
+		for _, p := range m.Pieces {
+			if p.PieceID == pieceID {
+				return true, nil
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("postgres: has manifest iter: %w", err)
+	}
+	return false, nil
+}
+
+// ListVersions returns every version of the manifest at
+// (tenantID, bucket, objectKeyHash), most-recent first.
+func (s *Store) ListVersions(ctx context.Context, tenantID, bucket, objectKeyHash string) ([]*metadata.ObjectManifest, error) {
+	if tenantID == "" || bucket == "" || objectKeyHash == "" {
+		return nil, errors.New("postgres: tenant_id, bucket, and object_key_hash are required")
+	}
+	q := fmt.Sprintf(`
+		SELECT body FROM %s
+		WHERE tenant_id = $1 AND bucket = $2 AND object_key_hash = $3
+		ORDER BY updated_at DESC
+	`, s.table)
+	rows, err := s.db.QueryContext(ctx, q, tenantID, bucket, objectKeyHash)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list versions: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*metadata.ObjectManifest, 0)
+	for rows.Next() {
+		var body []byte
+		if err := rows.Scan(&body); err != nil {
+			return nil, fmt.Errorf("postgres: list versions scan: %w", err)
+		}
+		if s.encryptor != nil {
+			opened, derr := s.encryptor.Decrypt(body)
+			if derr != nil {
+				return nil, fmt.Errorf("postgres: list versions decrypt: %w", derr)
+			}
+			body = opened
+		}
+		var m metadata.ObjectManifest
+		if err := json.Unmarshal(body, &m); err != nil {
+			return nil, fmt.Errorf("postgres: list versions unmarshal: %w", err)
+		}
+		out = append(out, &m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list versions iter: %w", err)
+	}
+	return out, nil
+}
+
 func validateKey(key manifest_store.ManifestKey) error {
 	if key.TenantID == "" {
 		return errors.New("postgres: tenant_id is required")

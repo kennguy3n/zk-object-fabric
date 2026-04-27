@@ -48,6 +48,18 @@ type ManifestStore interface {
 	// caller supplies an opaque cursor (empty for the first page) and
 	// receives a next-page cursor.
 	List(ctx context.Context, tenantID, bucket, cursor string, limit int) (ListResult, error)
+
+	// HasManifestWithPieceID reports whether the given tenant
+	// has at least one manifest that references pieceID. Used
+	// by the orphan GC worker to decide whether a piece is
+	// still live before deleting it from the backend.
+	HasManifestWithPieceID(ctx context.Context, tenantID, pieceID string) (bool, error)
+
+	// ListVersions returns every persisted version of the
+	// manifest at (tenantID, bucket, objectKeyHash), most-recent
+	// first. Used by the S3 ListObjectVersions handler. Returns
+	// an empty slice (not ErrNotFound) when no versions exist.
+	ListVersions(ctx context.Context, tenantID, bucket, objectKeyHash string) ([]*metadata.ObjectManifest, error)
 }
 
 // ListResult is a single page of manifests returned by List.
