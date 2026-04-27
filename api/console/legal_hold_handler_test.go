@@ -49,6 +49,39 @@ func TestLegalHoldHandler_IssueListRelease(t *testing.T) {
 	resp3.Body.Close()
 }
 
+func TestLegalHoldHandler_ReleaseRejectsCrossTenant(t *testing.T) {
+	store := auth.NewMemoryLegalHoldStore()
+	h := &LegalHoldHandler{Store: store}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Issue under tenant A.
+	body, _ := json.Marshal(CreateRequest{Bucket: "b", ObjectKey: "k", Reason: "case-1", IssuedBy: "ops@x"})
+	resp, err := http.Post(srv.URL+"/api/v1/tenants/A/legal-hold", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created auth.LegalHold
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	// Try to release the same hold ID under tenant B.
+	resp2, _ := http.Post(srv.URL+"/api/v1/tenants/B/legal-hold/"+created.ID+"/release", "", nil)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-tenant release status=%d, want 404", resp2.StatusCode)
+	}
+
+	// Hold must still be active.
+	got, err := store.Get(httptest.NewRequest("GET", "/", nil).Context(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Released {
+		t.Fatal("hold was released by cross-tenant request")
+	}
+}
+
 func TestLegalHoldHandler_RejectsMissingFields(t *testing.T) {
 	h := &LegalHoldHandler{Store: auth.NewMemoryLegalHoldStore()}
 	srv := httptest.NewServer(h)

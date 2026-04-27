@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"time"
@@ -131,7 +132,11 @@ func (c *CloudflareProvider) Unblock(ctx context.Context, addr string) error {
 	if c.AccountID == "" || c.APIToken == "" {
 		return errors.New("cloudflare: account_id or api_token missing")
 	}
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/firewall/access_rules/rules?configuration.value=%s", c.AccountID, addr)
+	// Escape addr because IPv6 addresses contain ":" which is a
+	// reserved character in URL query strings; passing the raw
+	// value would build an invalid URL on every IPv6 unblock.
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/firewall/access_rules/rules?configuration.value=%s",
+		c.AccountID, neturl.QueryEscape(addr))
 	return c.do(ctx, http.MethodDelete, url, nil)
 }
 

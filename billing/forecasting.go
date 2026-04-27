@@ -132,12 +132,29 @@ func (f *Forecaster) Forecast(ctx context.Context, cellID string, capacityBytes 
 	}
 	remaining := float64(capacityBytes - current)
 	secondsToFill := remaining / slope
+	// time.Duration is an int64 nanosecond count; multiplying a
+	// float seconds value by time.Second can overflow for very
+	// long fill horizons (>~292y) and wrap to a negative
+	// Duration, producing a past ProjectedFillAt and a spurious
+	// alert. Clamp at the int64-seconds ceiling and leave
+	// ProjectedFillAt zero when the projection overflows.
+	const maxSeconds = float64(math.MaxInt64 / int64(time.Second))
+	// Default the alert window via a local shadow; mutating the
+	// shared *Forecaster field at request time would race with
+	// concurrent Forecast goroutines reading the same struct.
+	alertWindow := f.AlertWindow
+	if alertWindow == 0 {
+		alertWindow = 90 * 24 * time.Hour
+	}
+	if math.IsNaN(secondsToFill) || math.IsInf(secondsToFill, 0) || secondsToFill > maxSeconds {
+		// Leave ProjectedFillAt zero so consumers can render
+		// the indefinite horizon as "no foreseeable fill".
+		res.Alert = false
+		return res, nil
+	}
 	res.ProjectedFillAt = now.Add(time.Duration(secondsToFill) * time.Second)
 	res.ProjectedFillFromNow = res.ProjectedFillAt.Sub(now).Truncate(time.Hour).String()
-	if f.AlertWindow == 0 {
-		f.AlertWindow = 90 * 24 * time.Hour
-	}
-	res.Alert = res.ProjectedFillAt.Sub(now) <= f.AlertWindow
+	res.Alert = res.ProjectedFillAt.Sub(now) <= alertWindow
 	return res, nil
 }
 

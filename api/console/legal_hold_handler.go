@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -59,7 +60,7 @@ func (h *LegalHoldHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && len(parts) == 2:
 		h.list(w, r, tenantID)
 	case r.Method == http.MethodPost && len(parts) == 4 && parts[3] == "release":
-		h.release(w, r, parts[2])
+		h.release(w, r, tenantID, parts[2])
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -116,7 +117,26 @@ func (h *LegalHoldHandler) list(w http.ResponseWriter, r *http.Request, tenantID
 	_ = json.NewEncoder(w).Encode(holds)
 }
 
-func (h *LegalHoldHandler) release(w http.ResponseWriter, r *http.Request, id string) {
+func (h *LegalHoldHandler) release(w http.ResponseWriter, r *http.Request, tenantID, id string) {
+	// Look up the hold first so an operator authenticated for
+	// tenant A cannot release tenant B's hold by guessing or
+	// scraping its ID. The path-level tenant must match the
+	// stored tenant on the hold.
+	hold, err := h.Store.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, auth.ErrLegalHoldNotFound) {
+			http.Error(w, "legal hold not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if hold.TenantID != tenantID {
+		// Return 404 (not 403) so this endpoint cannot be used
+		// to enumerate hold IDs across tenants.
+		http.Error(w, "legal hold not found", http.StatusNotFound)
+		return
+	}
 	if err := h.Store.Release(r.Context(), id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

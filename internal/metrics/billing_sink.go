@@ -5,6 +5,8 @@
 package metrics
 
 import (
+	"context"
+
 	"github.com/kennguy3n/zk-object-fabric/billing"
 )
 
@@ -46,4 +48,18 @@ func (s *MetricsBillingSink) Emit(event billing.UsageEvent) {
 	if s.Inner != nil {
 		s.Inner.Emit(event)
 	}
+}
+
+// Close forwards to the inner sink when it implements a
+// (context) closer (e.g. *billing.ClickHouseSink). Without this,
+// wrapping the billing sink hides the inner Close so the gateway
+// shutdown path skips the final flush and drops buffered events.
+func (s *MetricsBillingSink) Close(ctx context.Context) error {
+	if s == nil || s.Inner == nil {
+		return nil
+	}
+	if c, ok := s.Inner.(interface{ Close(context.Context) error }); ok {
+		return c.Close(ctx)
+	}
+	return nil
 }
