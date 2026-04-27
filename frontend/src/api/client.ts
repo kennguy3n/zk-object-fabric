@@ -4,6 +4,7 @@ import type {
   DedicatedCell,
   PlacementPolicy,
   Tenant,
+  TierConfig,
   UsageSnapshot,
 } from "./types";
 
@@ -130,6 +131,12 @@ export class ApiClient {
 
   async listDedicatedCells(): Promise<DedicatedCell[]> {
     return this.get("/dedicated-cells");
+  }
+
+  // --- product tiers (read-only, not tenant-scoped) ------------
+
+  async listTierConfigs(): Promise<TierConfig[]> {
+    return this.requestAt("GET", "/api/v1/tiers");
   }
 
   // --- transport ------------------------------------------------
