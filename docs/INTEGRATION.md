@@ -433,6 +433,170 @@ dedup is permanently excluded — within a tenant the attacker model
 is constrained, but across tenants it becomes a privacy side
 channel.
 
+## 8.5 Complete Dedup Scenario Matrix
+
+This matrix enumerates every (upload method × encryption mode)
+combination the gateway recognises and whether the dedup pipeline
+fires for it. It is the canonical answer to "will my upload dedup?"
+and is referenced from
+[STORAGE_INFRA.md](STORAGE_INFRA.md), [PROPOSAL.md](PROPOSAL.md)
+§3.14, and [PROGRESS.md](PROGRESS.md) Phase 3.5.
+
+| Upload Method | Encryption Mode | Dedup? | Reason |
+|---|---|---|---|
+| Single `PutObject` | `managed` | Yes (Pattern B) | Gateway derives convergent DEK from `BLAKE3(plaintext)` |
+| Single `PutObject` | `public_distribution` | Yes (Pattern B) | Same as `managed` |
+| Single `PutObject` | `client_side` + convergent | Yes (Pattern C) | Client SDK sends deterministic ciphertext |
+| Single `PutObject` | `client_side` + random DEK | No | Random DEK per object — ciphertext is unique |
+| Single `PutObject` | unencrypted (`""`) | No | Empty encryption mode excluded from dedup path |
+| Single `PutObject` + EC profile | Any | No | Erasure-coded objects dispatched before dedup check |
+| Multipart (1 part) | `client_side` or `""` | Yes | Single piece + convergent ciphertext |
+| Multipart (1 part) | `managed` / `public_distribution` | No | Random DEK per multipart session — ciphertext differs |
+| Multipart (N parts, N>1) | `client_side` or `""` | Yes | Per-part BLAKE3 + `piece_ids` JSONB column on `content_index` |
+| Multipart (N parts, N>1) | `managed` / `public_distribution` | No | Random DEK per multipart session — ciphertext differs |
+| `CopyObject` | Source has `ContentHash` | Yes | Refcount++ on existing piece, no data movement |
+| `CopyObject` | Source has no `ContentHash` | No | Fresh piece via server-side copy or GET+PUT |
+| `CopyObject` | Source is EC or multipart | Rejected (501) | Multi-piece sources cannot be safely refcounted |
+| `DeleteObject` | Manifest has `ContentHash` | Refcount-- | Piece removed only when refcount reaches 0 |
+| `DeleteObject` | No `ContentHash` | Direct delete | Legacy path, pieces deleted immediately |
+
+### Why multipart with `managed` / `public_distribution` doesn't dedup
+
+`CreateMultipartUpload` generates a **fresh random DEK per session**
+(see `multipart.Upload.DEKMaterial`), so two clients uploading the
+same plaintext under either of these modes encrypt under different
+keys and produce different ciphertext. The `content_index` lookup
+therefore always misses, and dedup cannot fire.
+
+Single-PUT covers these modes via the convergent-DEK path in
+`api/s3compat/dedup.go` (Pattern B), which derives
+`DEK = HKDF(BLAKE3(plaintext), salt=tenantID)` so identical
+plaintext yields identical ciphertext. The multipart path cannot
+take that route without redesigning per-part DEK assignment (the
+current model assigns one DEK per session at `CreateMultipartUpload`,
+not per-part).
+
+### Multi-part multipart uploads (N>1 parts) — supported for convergent modes
+
+Multi-part multipart uploads now dedup when the encryption mode is
+`client_side` or unencrypted (`""`). The `content_index` table
+carries a nullable `piece_ids` JSONB column that holds the
+ordered, per-part canonical piece list for a multi-piece entry;
+the schema-PK (`tenant_id`, `content_hash`) row continues to anchor
+the entry on the first piece so single-piece reverse lookups
+(orphan GC, the `piece_id` index) still work for both shapes.
+
+The gateway computes the canonical hash incrementally so it
+doesn't have to re-read every part from the backend at
+`CompleteMultipartUpload` time:
+
+1. **At UploadPart**: when the upload is dedup-eligible
+   (`multipartDedupEligible`), the gateway tees the part body
+   through a BLAKE3 hasher and stores the per-part digest on the
+   in-memory `multipart.Upload`. No backend GETs.
+2. **At CompleteMultipartUpload**: the gateway combines the
+   per-part digests in ascending PartNumber order:
+   `content_hash = BLAKE3(hash1 || hash2 || ... || hashN)`. If any
+   per-part hash is missing (e.g. the upload session was restarted)
+   the gateway falls back to `hashAssembledPieces` and reads every
+   piece from the backend.
+3. **On hit**: the manifest's `Pieces[i]` are redirected to the
+   canonical entry's `PieceIDs[i]` (matched by `PartNumber`). The
+   just-uploaded duplicate parts are deleted from the backend in a
+   single `deleteUploadedParts` sweep.
+4. **On miss**: the gateway registers a new `content_index` row
+   with `PieceIDs` populated from the upload's parts. The PK row's
+   `piece_id` field is anchored on the first part so single-piece
+   queries continue to work.
+
+`managed` / `public_distribution` multipart still cannot dedup —
+each `CreateMultipartUpload` mints a fresh random DEK so two
+clients sending the same plaintext produce different ciphertext.
+That row in the matrix above stays "No"; only the
+`client_side` / unencrypted rows lift to "Yes".
+
+### Why erasure-coded objects don't dedup
+
+EC objects are sharded into k+m pieces by `putErasureCoded` before
+the dedup check runs in `handler.go#Put`. The dedup pipeline
+operates on **single pieces** (one piece per `content_index` row);
+EC objects are inherently multi-piece and would require a separate
+shard-set refcount model.
+
+For B2B tenants on Ceph RGW, **block-level dedup at the RADOS
+layer** (Ceph's dedup pool tier with content-defined chunking)
+catches sub-object duplicates transparently underneath the gateway
+— see PROPOSAL.md §3.14.4. EC + Ceph block dedup therefore
+recovers most of what object-level dedup would have provided, with
+none of the schema complexity.
+
+### CopyObject dedup behavior
+
+`CopyObject` uses a three-tier strategy, in order:
+
+1. **Dedup-aware fast path**: when the source manifest carries a
+   `ContentHash` AND the destination tenant has a `content_index`
+   row for it, the gateway calls `ContentIndex.IncrementRef` and
+   writes a new manifest pointing at the **same `piece_id`** as the
+   source. No backend data movement occurs.
+2. **Server-side copy**: when the source has no `ContentHash` (or
+   the index row has been GC'd), the gateway delegates to the
+   provider's `CopyPiece` so the bytes copy provider-internally
+   without crossing the gateway.
+3. **GET+PUT fallback**: when the provider has no `CopyPiece`
+   support, the gateway streams the source through itself and
+   writes a fresh piece on the destination.
+
+EC and multipart sources are rejected with HTTP 501
+(`NotImplemented`): a multi-piece source has no single canonical
+`piece_id` to refcount, and the `CopyPiece` server-side path is
+not defined for sharded objects. Clients receive the same 501 for
+both source types so the failure surface is uniform.
+
+### Versioning and dedup
+
+Each version of an object has its own manifest. Overwriting a key
+creates a new manifest version (a fresh `VersionID`); the previous
+manifest survives until it is deleted explicitly or expires under a
+lifecycle rule. If the new version's content hash matches the old,
+both manifests point at the **same physical piece** and the
+`content_index` refcount is 2.
+
+Deleting a single version decrements the refcount by exactly 1.
+The piece survives as long as **any** version of any object in the
+tenant references it — including older versions of the very same
+key. The piece is removed from the backend only when the refcount
+reaches zero, which by construction is the moment the last version
+referencing it is deleted.
+
+### Cross-cell replication and dedup
+
+When the cross-cell replicator (`migration/cross_cell/replicator.go`)
+mirrors a manifest from a source cell to a destination cell, the
+**replicated manifest carries the `ContentHash` field forward** —
+but the destination cell's `content_index` does not have a
+corresponding entry. The replicated piece is therefore a **full,
+non-deduped copy on the destination cell**.
+
+Dedup on the destination cell only kicks in if a second upload of
+the same content arrives there independently and the destination
+gateway runs Pattern B / C against its own `content_index`. The
+replicator does not pre-warm the destination index because doing so
+across cell boundaries would create a privacy side channel: two
+tenants whose replicas happen to share content would otherwise
+reveal that fact through cross-cell refcount probes.
+
+### DR copies and dedup
+
+Per [PROPOSAL.md §3.14.9](PROPOSAL.md#3149-fallback--dr-copies),
+**DR copies are always full, non-deduped objects**. DR is a
+durability primitive: the goal is independent survivability of the
+plaintext content even if every dedup table on the primary cell
+were lost. Sharing pieces between primary and DR backends would
+make the DR backend a single point of failure for the dedup
+graph and is therefore explicitly forbidden by the placement
+DSL's `dr` clause.
+
 ## 9. Bucket dedup policy API
 
 The console API at `:8081` manages per-bucket dedup policy. All

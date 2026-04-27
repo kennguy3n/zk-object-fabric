@@ -17,6 +17,7 @@ package s3compat
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
@@ -28,6 +29,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zeebo/blake3"
+
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/encryption"
@@ -37,6 +40,28 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
+
+// multipartDedupEligible reports whether the upload is in a state
+// where CompleteMultipartUpload could run the content_index
+// lookup/register flow. It pre-screens UploadPart so we only pay
+// the BLAKE3 tee cost on uploads that have any chance of deduping.
+//
+// The checks mirror the ones CompleteMultipartUpload re-applies
+// after assembling the part list:
+//
+//   - dedup must be enabled on the upload's policy AND the
+//     gateway must have a content_index store wired
+//   - the encryption mode must produce convergent ciphertext
+//     (client_side or unencrypted); managed / public_distribution
+//     multipart upload sessions use a fresh random DEK per
+//     session, so two clients sending the same plaintext produce
+//     different ciphertext and the lookup would always miss
+func (h *Handler) multipartDedupEligible(upload *multipart.Upload) bool {
+	if !h.dedupEnabled(upload.Policy) {
+		return false
+	}
+	return upload.EncMode == string(encryption.StrictZK) || upload.EncMode == ""
+}
 
 // S3 initiate-multipart-upload response body (see
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html).
@@ -244,6 +269,19 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Tee the body through a BLAKE3 hasher when this upload is
+	// dedup-eligible so CompleteMultipartUpload can derive a
+	// per-part hash without re-reading the piece from the
+	// backend. We only do this for the encryption modes that
+	// produce convergent ciphertext (client_side, ""): managed /
+	// public_distribution multipart cannot dedup anyway, so the
+	// hash would be wasted work.
+	var partHasher *blake3.Hasher
+	if h.multipartDedupEligible(upload) {
+		partHasher = blake3.New()
+		body = io.TeeReader(body, partHasher)
+	}
+
 	res, err := provider.PutPiece(r.Context(), pieceID, body, providers.PutOptions{
 		ContentLength: contentLength,
 		ContentType:   r.Header.Get("Content-Type"),
@@ -251,6 +289,9 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
 		return
+	}
+	if partHasher != nil {
+		upload.SetPartHash(partNumber, partHasher.Sum(nil))
 	}
 
 	// Record plaintext size on the Part so CompleteMultipartUpload
@@ -401,111 +442,100 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 
 	// Multipart dedup: when the upload's policy enables
 	// intra-tenant dedup AND the gateway has a content_index store
-	// wired AND the upload landed as a single piece AND the
-	// encryption mode can produce convergent ciphertext, compute
-	// a content hash over the assembled bytes and run the
-	// content_index lookup/register flow so duplicate uploads
-	// dedup correctly.
+	// wired AND the encryption mode can produce convergent
+	// ciphertext, compute a content hash over the assembled bytes
+	// and run the content_index lookup/register flow so duplicate
+	// uploads dedup correctly.
 	//
-	// Two encryption modes are deliberately excluded:
+	// "managed" / "public_distribution" multipart uploads are
+	// excluded: CreateMultipartUpload generates a fresh random DEK
+	// per session (see the IsGatewayEncrypted branch above), so
+	// two clients uploading identical plaintext produce different
+	// ciphertext and the content_index Lookup would always miss.
+	// Single-PUT covers these modes via the convergent-DEK path
+	// in dedup.go (Pattern B).
 	//
-	//   - "managed" / "public_distribution" — multipart's
-	//     CreateMultipartUpload generates a fresh random DEK per
-	//     upload (see the IsGatewayEncrypted branch above), so
-	//     two clients uploading identical plaintext produce
-	//     different ciphertext and the content_index Lookup
-	//     would always miss. Single-PUT covers these modes via
-	//     the convergent-DEK path in dedup.go (Pattern B); the
-	//     multipart path can't take that route without
-	//     redesigning per-part DEK assignment.
-	//
-	//   - multi-piece uploads (len(pieces) > 1) — the current
-	//     content_index schema stores one PieceID per entry, so
-	//     multi-piece dedup would require a "manifest reference"
-	//     representation that is out of scope for the §3.14
-	//     object-level tier. Hashing for multi-piece would also
-	//     force an O(object size) backend read with no
-	//     content_index op the DELETE path can use.
-	dedupCandidate := h.dedupEnabled(upload.Policy) && len(pieces) == 1 &&
-		(upload.EncMode == string(encryption.StrictZK) || upload.EncMode == "")
+	// Multi-piece uploads (len(pieces) > 1) ARE supported via the
+	// content_index PieceIDs JSONB extension. The hash for an
+	// N-part upload is BLAKE3(hash1 || hash2 || ... || hashN) over
+	// per-part BLAKE3 digests sorted by PartNumber. Per-part
+	// digests are produced at UploadPart time via a TeeReader so
+	// CompleteMultipartUpload doesn't have to re-read pieces from
+	// the backend in the common case.
+	dedupCandidate := h.multipartDedupEligible(upload)
 	if dedupCandidate {
-		// deleteUploadedPart is the cleanup the early-return
-		// error paths run before the manifest is written. The
-		// multipart session has already been consumed by
-		// Complete and the client cannot retry; without this
-		// the just-uploaded part would orphan on the backend
-		// until GC.
-		deleteUploadedPart := func() {
-			if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
-				_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
-			}
-		}
-		contentHash, hashErr := h.hashAssembledPieces(r.Context(), pieces)
+		contentHash, hashErr := h.computeMultipartContentHash(r.Context(), upload, pieces, parts)
 		if hashErr != nil {
-			deleteUploadedPart()
+			h.deleteUploadedParts(r.Context(), parts)
 			writeError(w, http.StatusInternalServerError, "DedupHashFailed", hashErr.Error(), r.URL.Path)
 			return
 		}
 		manifest.ContentHash = contentHash
 		existing, lerr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
 		if lerr != nil && !errors.Is(lerr, content_index.ErrNotFound) {
-			deleteUploadedPart()
+			h.deleteUploadedParts(r.Context(), parts)
 			writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lerr.Error(), r.URL.Path)
 			return
 		}
 		if existing != nil {
 			if err := h.cfg.ContentIndex.IncrementRef(r.Context(), tenantID, contentHash); err != nil {
-				deleteUploadedPart()
+				h.deleteUploadedParts(r.Context(), parts)
 				writeError(w, http.StatusInternalServerError, "ContentIndexIncrementFailed", err.Error(), r.URL.Path)
 				return
 			}
-			// Drop the just-uploaded duplicate piece;
-			// the manifest will reference the canonical
-			// piece instead.
-			if provider, ok := h.cfg.Providers[parts[0].Backend]; ok {
-				_ = provider.DeletePiece(r.Context(), parts[0].PieceID)
+			// Drop ALL just-uploaded duplicate pieces; the
+			// manifest will reference the canonical piece(s)
+			// instead.
+			h.deleteUploadedParts(r.Context(), parts)
+			if err := h.redirectManifestToCanonical(manifest, existing); err != nil {
+				// IncrementRef has already fired — undo it
+				// so we don't permanently inflate the
+				// canonical refcount.
+				_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, contentHash)
+				writeError(w, http.StatusInternalServerError, "DedupRedirectFailed", err.Error(), r.URL.Path)
+				return
 			}
-			// Reuse the canonical ETag so the dedup-hit
-			// CompleteMultipartUpload response and any
-			// follow-up GET/HEAD return the same ETag the
-			// first uploader's PUT response carried.
-			manifest.Pieces[0].PieceID = existing.PieceID
-			manifest.Pieces[0].Backend = existing.Backend
-			manifest.Pieces[0].Hash = existing.ETag
-			manifest.Pieces[0].SizeBytes = existing.SizeBytes
-			manifest.MigrationState.PrimaryBackend = existing.Backend
 			h.emit(tenantID, bucket, billing.DedupHits, 1)
 			if existing.SizeBytes > 0 {
 				h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(existing.SizeBytes))
 			}
 		} else {
-			raceLost, regErr := h.registerDedupedPiece(r.Context(), content_index.ContentIndexEntry{
+			entry := content_index.ContentIndexEntry{
 				TenantID:    tenantID,
 				ContentHash: contentHash,
-				PieceID:     parts[0].PieceID,
-				Backend:     parts[0].Backend,
-				SizeBytes:   parts[0].SizeBytes,
-				ETag:        parts[0].ETag,
-			})
+				// Anchor PieceID/Backend/SizeBytes/ETag on the
+				// first part so single-piece reverse lookups
+				// (orphan GC, the piece_id index) keep working
+				// for both single- and multi-piece entries.
+				PieceID:   parts[0].PieceID,
+				Backend:   parts[0].Backend,
+				SizeBytes: parts[0].SizeBytes,
+				ETag:      parts[0].ETag,
+			}
+			if len(pieces) > 1 {
+				entry.PieceIDs = pieceRefsFromParts(parts)
+				// Record total assembled size on the
+				// canonical entry so dedup-hit billing
+				// reports the bytes-saved across the whole
+				// object rather than only the first part.
+				entry.SizeBytes = totalSize
+			}
+			raceLost, regErr := h.registerDedupedPiece(r.Context(), entry)
 			if regErr != nil {
-				// Best-effort cleanup of the orphaned piece
+				// Best-effort cleanup of the orphaned pieces
 				// so we don't leave billable storage behind.
-				if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
-					_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
-				}
+				h.deleteUploadedParts(r.Context(), parts)
 				writeError(w, http.StatusInternalServerError, "ContentIndexRegisterFailed", regErr.Error(), r.URL.Path)
 				return
 			}
 			if raceLost {
 				// A concurrent uploader registered first.
-				// Drop the duplicate piece and redirect the
+				// Drop the duplicate pieces and redirect the
 				// manifest at the canonical copy — mirrors
 				// the single-PUT race-recovery path in
 				// dedup.go so the on-disk and refcount
 				// views stay consistent.
-				if prov, ok := h.cfg.Providers[parts[0].Backend]; ok {
-					_ = prov.DeletePiece(r.Context(), parts[0].PieceID)
-				}
+				h.deleteUploadedParts(r.Context(), parts)
 				canonical, lookupErr := h.cfg.ContentIndex.Lookup(r.Context(), tenantID, contentHash)
 				if lookupErr != nil {
 					// Roll back the IncrementRef that
@@ -519,11 +549,11 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 					writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lookupErr.Error(), r.URL.Path)
 					return
 				}
-				manifest.Pieces[0].PieceID = canonical.PieceID
-				manifest.Pieces[0].Backend = canonical.Backend
-				manifest.Pieces[0].Hash = canonical.ETag
-				manifest.Pieces[0].SizeBytes = canonical.SizeBytes
-				manifest.MigrationState.PrimaryBackend = canonical.Backend
+				if err := h.redirectManifestToCanonical(manifest, canonical); err != nil {
+					_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, contentHash)
+					writeError(w, http.StatusInternalServerError, "DedupRedirectFailed", err.Error(), r.URL.Path)
+					return
+				}
 				h.emit(tenantID, bucket, billing.DedupHits, 1)
 				if canonical.SizeBytes > 0 {
 					h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(canonical.SizeBytes))
@@ -549,18 +579,20 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		if manifest.ContentHash != "" && h.cfg.ContentIndex != nil {
 			_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, manifest.ContentHash)
 		}
-		// Best-effort piece cleanup. Skip the piece that the
-		// content_index now references (manifest.Pieces[0] —
-		// that's either the just-registered canonical piece or
-		// the existing canonical piece on a hit / lost-race).
-		// In the dedup-disabled or multi-piece case manifest
-		// pieces line up with parts, so the skip is a no-op.
-		var keep string
-		if manifest.ContentHash != "" && len(manifest.Pieces) == 1 {
-			keep = manifest.Pieces[0].PieceID
+		// Best-effort piece cleanup. Skip every piece the
+		// content_index now references (the manifest's pieces
+		// — that's either the just-registered canonical pieces
+		// or the existing canonical pieces on a hit /
+		// lost-race). In the dedup-disabled case the manifest
+		// pieces line up with parts so we delete all of them.
+		keep := make(map[string]struct{})
+		if manifest.ContentHash != "" {
+			for _, mp := range manifest.Pieces {
+				keep[mp.PieceID] = struct{}{}
+			}
 		}
 		for _, p := range parts {
-			if p.PieceID == keep {
+			if _, kept := keep[p.PieceID]; kept {
 				continue
 			}
 			if provider, ok := h.cfg.Providers[p.Backend]; ok {
@@ -698,4 +730,135 @@ func firstPartSize(parts []multipart.Part) int64 {
 		return 0
 	}
 	return parts[0].SizeBytes
+}
+
+// computeMultipartContentHash returns the canonical content hash
+// for the multipart upload's pieces. For len(pieces) == 1 the
+// hash is the BLAKE3 of the piece bytes (matching
+// hashAssembledPieces and the single-piece dedup hash format that
+// shipped before multi-piece). For len(pieces) > 1 the hash is
+// BLAKE3(hash1 || hash2 || ... || hashN) over per-part BLAKE3
+// digests in ascending PartNumber order, so two uploads of the
+// same content with the same chunking land on the same canonical
+// row.
+//
+// When per-part hashes are recorded on the upload session (the
+// common case for dedup-eligible uploads), the function builds
+// the digest entirely in memory. Otherwise it falls back to
+// hashAssembledPieces, which streams every piece back from the
+// backend.
+func (h *Handler) computeMultipartContentHash(ctx context.Context, upload *multipart.Upload, pieces []metadata.Piece, parts []multipart.Part) (string, error) {
+	if len(pieces) == 0 {
+		return "", errors.New("s3compat: multipart content hash: no pieces")
+	}
+	// Build the per-part digest list. When any part is missing
+	// a recorded hash (e.g. UploadPart wasn't dedup-eligible at
+	// the time, or the in-memory store was restarted) we fall
+	// back to hashAssembledPieces for correctness.
+	partDigests := make([][]byte, 0, len(parts))
+	for _, p := range parts {
+		d, ok := upload.PartHash(p.PartNumber)
+		if !ok {
+			return h.hashAssembledPieces(ctx, pieces)
+		}
+		partDigests = append(partDigests, d)
+	}
+	if len(pieces) == 1 {
+		// Single-piece: contentHash = BLAKE3(piece bytes) ==
+		// the per-part digest. Return it verbatim so the
+		// hash format matches every other single-piece dedup
+		// caller.
+		return formatContentHash(fmt.Sprintf("%x", partDigests[0])), nil
+	}
+	// Multi-piece: contentHash = BLAKE3(hash1 || ... || hashN)
+	// in ascending PartNumber order (parts is already sorted by
+	// PartNumber when the multipart store returns it).
+	hasher := blake3.New()
+	for _, d := range partDigests {
+		hasher.Write(d)
+	}
+	return formatContentHash(fmt.Sprintf("%x", hasher.Sum(nil))), nil
+}
+
+// pieceRefsFromParts builds a content_index.PieceRef list from the
+// multipart parts in ascending PartNumber order. parts is assumed
+// sorted (the multipart store guarantees it).
+func pieceRefsFromParts(parts []multipart.Part) []content_index.PieceRef {
+	out := make([]content_index.PieceRef, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, content_index.PieceRef{
+			PieceID:    p.PieceID,
+			Backend:    p.Backend,
+			PartNumber: p.PartNumber,
+			SizeBytes:  p.SizeBytes,
+		})
+	}
+	return out
+}
+
+// deleteUploadedParts is the cleanup the multipart Complete
+// error paths run before the manifest is written. The multipart
+// session has already been consumed by Complete and the client
+// cannot retry; without this the just-uploaded parts would orphan
+// on the backend until orphan GC reclaims them. Best-effort:
+// errors are swallowed so a transient backend hiccup does not
+// shadow the underlying dedup / manifest error.
+func (h *Handler) deleteUploadedParts(ctx context.Context, parts []multipart.Part) {
+	for _, p := range parts {
+		if prov, ok := h.cfg.Providers[p.Backend]; ok {
+			_ = prov.DeletePiece(ctx, p.PieceID)
+		}
+	}
+}
+
+// redirectManifestToCanonical rewrites every piece on manifest to
+// point at the canonical piece list recorded on existing. For a
+// single-piece canonical (existing.PieceIDs == nil) the manifest
+// must already have exactly one piece and the redirect simply
+// copies the canonical PieceID/Backend/SizeBytes/ETag onto it. For
+// a multi-piece canonical, the manifest's Pieces are matched
+// against existing.PieceIDs by PartNumber so both uploads end up
+// with byte-identical Pieces[i] entries.
+//
+// Returns an error when the canonical piece set does not cover
+// every PartNumber on the manifest — this can only happen if a
+// caller registered a malformed canonical entry.
+func (h *Handler) redirectManifestToCanonical(manifest *metadata.ObjectManifest, existing *content_index.ContentIndexEntry) error {
+	if len(existing.PieceIDs) == 0 {
+		// Single-piece canonical. The manifest must also be
+		// single-piece for the hash to have matched.
+		if len(manifest.Pieces) != 1 {
+			return fmt.Errorf("s3compat: dedup redirect: manifest has %d pieces, canonical is single-piece", len(manifest.Pieces))
+		}
+		manifest.Pieces[0].PieceID = existing.PieceID
+		manifest.Pieces[0].Backend = existing.Backend
+		manifest.Pieces[0].Hash = existing.ETag
+		manifest.Pieces[0].SizeBytes = existing.SizeBytes
+		manifest.MigrationState.PrimaryBackend = existing.Backend
+		return nil
+	}
+	// Multi-piece canonical: match manifest pieces to canonical
+	// pieces by PartNumber.
+	byPart := make(map[int]content_index.PieceRef, len(existing.PieceIDs))
+	for _, ref := range existing.PieceIDs {
+		byPart[ref.PartNumber] = ref
+	}
+	for i := range manifest.Pieces {
+		ref, ok := byPart[manifest.Pieces[i].PartNumber]
+		if !ok {
+			return fmt.Errorf("s3compat: dedup redirect: canonical missing part %d", manifest.Pieces[i].PartNumber)
+		}
+		manifest.Pieces[i].PieceID = ref.PieceID
+		manifest.Pieces[i].Backend = ref.Backend
+		manifest.Pieces[i].SizeBytes = ref.SizeBytes
+		// Per-part canonical ETag is not recorded in the
+		// content_index PieceRef (the existing.ETag covers
+		// the assembled object). Leave the part Hash alone:
+		// the GET path does not surface per-part ETags, only
+		// the manifest's aggregate ETag.
+	}
+	if len(manifest.Pieces) > 0 {
+		manifest.MigrationState.PrimaryBackend = manifest.Pieces[0].Backend
+	}
+	return nil
 }

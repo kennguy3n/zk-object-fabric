@@ -837,6 +837,62 @@ CREATE INDEX content_index_piece_id ON content_index (piece_id);
 The `piece_id` index supports orphan GC and reverse lookups when the
 provider reports a missing piece.
 
+#### 3.14.3.1 Multipart upload dedup constraints
+
+Multipart uploads are deduped only when:
+
+1. The upload lands as a single piece (`len(pieces) == 1`).
+2. The encryption mode produces convergent ciphertext
+   (`client_side` with convergent DEK, or unencrypted).
+
+Two cases are excluded:
+
+- **`managed` / `public_distribution` multipart**:
+  `CreateMultipartUpload` generates a fresh random DEK per session,
+  so two uploads of identical plaintext produce different
+  ciphertext. Single-PUT covers these modes via Pattern B (the
+  gateway-convergent path above).
+- **Multi-piece multipart (`len(pieces) > 1`)**: supported for
+  `client_side` and unencrypted modes via the nullable `piece_ids`
+  JSONB column on `content_index`. The canonical hash is
+  `BLAKE3(hash1 || hash2 || ... || hashN)` over per-part BLAKE3
+  digests in ascending `PartNumber` order. Per-part digests are
+  computed at UploadPart time via a TeeReader and stored on the
+  in-memory `multipart.Upload`, so the common-case
+  CompleteMultipartUpload does not have to re-read pieces from the
+  backend. On dedup hit the manifest's `Pieces[i]` are redirected
+  to the canonical entry's `PieceIDs[i]` (matched by `PartNumber`)
+  and the duplicate parts are deleted in a single
+  `deleteUploadedParts` sweep. `managed` / `public_distribution`
+  multipart remains excluded for the random-DEK reason above.
+
+The current matrix:
+
+| Multipart shape                              | Dedup? |
+| -------------------------------------------- | ------ |
+| 1 part, `client_side` or `""`                | Yes    |
+| 1 part, `managed` / `public_distribution`    | No     |
+| N>1 parts, `client_side` or `""`             | Yes (`piece_ids` JSONB) |
+| N>1 parts, `managed` / `public_distribution` | No     |
+
+#### 3.14.3.2 CopyObject dedup
+
+`CopyObject` uses a dedup-aware fast path when the source manifest
+carries a `ContentHash`: the gateway calls
+`ContentIndex.IncrementRef` on `(tenant_id, content_hash)` and
+writes a new manifest pointing at the **same `piece_id`** as the
+source. No backend data movement occurs; the copy is a pure
+metadata operation.
+
+When the source has no `ContentHash` (or the `content_index` row
+has been GC'd out from under us), the copy falls back to the
+provider's server-side copy via `CopyPiece`, and from there to a
+GET+PUT through the gateway when the provider has no native copy
+path. EC and multipart sources are rejected with HTTP 501
+(`NotImplemented`): a multi-piece source has no single canonical
+`piece_id` to refcount, so neither the fast path nor the
+provider's `CopyPiece` is safe.
+
 #### 3.14.4 Block-level dedup (Ceph RGW only)
 
 Object-level dedup catches whole-file duplicates. For partial overlap

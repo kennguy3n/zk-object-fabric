@@ -40,6 +40,7 @@ func (s *MemoryStore) Lookup(_ context.Context, tenantID, contentHash string) (*
 		return nil, ErrNotFound
 	}
 	cp := e
+	cp.PieceIDs = clonePieceRefs(e.PieceIDs)
 	return &cp, nil
 }
 
@@ -59,6 +60,7 @@ func (s *MemoryStore) Register(_ context.Context, entry ContentIndexEntry) error
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = s.now()
 	}
+	entry.PieceIDs = clonePieceRefs(entry.PieceIDs)
 	s.entries[k] = entry
 	return nil
 }
@@ -124,9 +126,24 @@ func (s *MemoryStore) ScanAll(_ context.Context, tenantID string) ([]ContentInde
 		if k.TenantID != tenantID {
 			continue
 		}
-		out = append(out, e)
+		cp := e
+		cp.PieceIDs = clonePieceRefs(e.PieceIDs)
+		out = append(out, cp)
 	}
 	return out, nil
+}
+
+// clonePieceRefs returns an independent copy of refs so callers
+// that mutate the returned slice do not corrupt the store's
+// internal state. Returns nil for nil to preserve the
+// "single-piece entry" sentinel.
+func clonePieceRefs(refs []PieceRef) []PieceRef {
+	if refs == nil {
+		return nil
+	}
+	out := make([]PieceRef, len(refs))
+	copy(out, refs)
+	return out
 }
 
 // ListTenants returns the distinct tenant IDs that have at least

@@ -90,8 +90,34 @@ type ContentIndexEntry struct {
 	// Optional for entries written before this field existed.
 	ETag string
 
+	// PieceIDs is the multi-piece extension used by multi-part
+	// multipart dedup (see api/s3compat/multipart_handler.go and
+	// docs/PROPOSAL.md §3.14.3.1). When non-empty it lists every
+	// piece that makes up the canonical object, in ascending
+	// PartNumber order. PieceID and Backend continue to identify
+	// the *first* piece so single-piece reverse lookups still
+	// work; multi-piece dedup hits redirect every manifest piece
+	// at the corresponding canonical entry by PartNumber.
+	//
+	// PieceIDs is nil for single-piece entries (the common case)
+	// and for rows written before the multi-piece extension
+	// shipped.
+	PieceIDs []PieceRef `json:"piece_ids,omitempty"`
+
 	// CreatedAt is set by the store at first INSERT.
 	CreatedAt time.Time
+}
+
+// PieceRef describes one piece in a multi-piece canonical entry.
+// The combination (PieceID, Backend) uniquely identifies the piece
+// on a backend; PartNumber is the multipart upload's 1-indexed
+// part identifier so dedup-hit redirection can match by part
+// rather than relying on slice position.
+type PieceRef struct {
+	PieceID    string `json:"piece_id"`
+	Backend    string `json:"backend"`
+	PartNumber int    `json:"part_number"`
+	SizeBytes  int64  `json:"size_bytes"`
 }
 
 // Store is the persistence boundary for the content index. All

@@ -9,6 +9,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -50,19 +51,27 @@ func (s *Store) Lookup(ctx context.Context, tenantID, contentHash string) (*cont
 	}
 	// etag column may be NULL on rows written before Phase 3.5
 	// added the field; coalesce to empty string so the caller
-	// sees a uniform zero value.
+	// sees a uniform zero value. piece_ids is the multi-piece
+	// extension and is NULL for single-piece entries; we scan it
+	// into a []byte and unmarshal only when non-NULL.
 	q := fmt.Sprintf(`
-		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), created_at
+		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), piece_ids, created_at
 		FROM %s
 		WHERE tenant_id = $1 AND content_hash = $2
 	`, s.table)
 	row := s.db.QueryRowContext(ctx, q, tenantID, contentHash)
 	var e content_index.ContentIndexEntry
-	if err := row.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &e.CreatedAt); err != nil {
+	var pieceIDsRaw []byte
+	if err := row.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &pieceIDsRaw, &e.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, content_index.ErrNotFound
 		}
 		return nil, fmt.Errorf("postgres: content_index lookup: %w", err)
+	}
+	if len(pieceIDsRaw) > 0 {
+		if err := json.Unmarshal(pieceIDsRaw, &e.PieceIDs); err != nil {
+			return nil, fmt.Errorf("postgres: content_index lookup unmarshal piece_ids: %w", err)
+		}
 	}
 	return &e, nil
 }
@@ -81,12 +90,23 @@ func (s *Store) Register(ctx context.Context, entry content_index.ContentIndexEn
 	if entry.Backend == "" {
 		return errors.New("postgres: backend is required")
 	}
+	// Marshal piece_ids when present. Single-piece entries leave
+	// it nil; the column accepts a SQL NULL via a typed-nil
+	// []byte so we don't need a separate INSERT branch.
+	var pieceIDsJSON []byte
+	if len(entry.PieceIDs) > 0 {
+		var err error
+		pieceIDsJSON, err = json.Marshal(entry.PieceIDs)
+		if err != nil {
+			return fmt.Errorf("postgres: content_index register marshal piece_ids: %w", err)
+		}
+	}
 	q := fmt.Sprintf(`
-		INSERT INTO %s (tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, etag)
-		VALUES ($1, $2, $3, $4, 1, $5, NULLIF($6, ''))
+		INSERT INTO %s (tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, etag, piece_ids)
+		VALUES ($1, $2, $3, $4, 1, $5, NULLIF($6, ''), $7)
 		ON CONFLICT (tenant_id, content_hash) DO NOTHING
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes, entry.ETag)
+	res, err := s.db.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes, entry.ETag, nullableJSON(pieceIDsJSON))
 	if err != nil {
 		return fmt.Errorf("postgres: content_index register: %w", err)
 	}
@@ -204,7 +224,7 @@ func (s *Store) ScanAll(ctx context.Context, tenantID string) ([]content_index.C
 		return nil, errors.New("postgres: tenant_id is required")
 	}
 	q := fmt.Sprintf(`
-		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), created_at
+		SELECT tenant_id, content_hash, piece_id, backend, ref_count, size_bytes, COALESCE(etag, ''), piece_ids, created_at
 		FROM %s
 		WHERE tenant_id = $1
 	`, s.table)
@@ -216,8 +236,14 @@ func (s *Store) ScanAll(ctx context.Context, tenantID string) ([]content_index.C
 	out := make([]content_index.ContentIndexEntry, 0)
 	for rows.Next() {
 		var e content_index.ContentIndexEntry
-		if err := rows.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &e.CreatedAt); err != nil {
+		var pieceIDsRaw []byte
+		if err := rows.Scan(&e.TenantID, &e.ContentHash, &e.PieceID, &e.Backend, &e.RefCount, &e.SizeBytes, &e.ETag, &pieceIDsRaw, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("postgres: content_index scan row: %w", err)
+		}
+		if len(pieceIDsRaw) > 0 {
+			if err := json.Unmarshal(pieceIDsRaw, &e.PieceIDs); err != nil {
+				return nil, fmt.Errorf("postgres: content_index scan unmarshal piece_ids: %w", err)
+			}
 		}
 		out = append(out, e)
 	}
@@ -249,6 +275,18 @@ func (s *Store) ListTenants(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("postgres: content_index list tenants iter: %w", err)
 	}
 	return out, nil
+}
+
+// nullableJSON returns nil for an empty/nil byte slice so the
+// JSONB column receives a SQL NULL on INSERT. lib/pq treats a
+// typed-nil []byte as NULL but a non-nil empty slice as the
+// literal string "" which Postgres rejects for JSONB; this helper
+// makes the intent explicit.
+func nullableJSON(b []byte) interface{} {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // isCheckViolation reports whether err looks like a Postgres CHECK
