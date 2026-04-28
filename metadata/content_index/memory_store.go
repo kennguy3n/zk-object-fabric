@@ -44,6 +44,30 @@ func (s *MemoryStore) Lookup(_ context.Context, tenantID, contentHash string) (*
 	return &cp, nil
 }
 
+// LookupByPlaintextHash scans entries for one matching
+// (tenantID, plaintextHash). The in-memory store has no real
+// secondary index; the linear scan is acceptable for the dev /
+// test use-case the MemoryStore targets.
+func (s *MemoryStore) LookupByPlaintextHash(_ context.Context, tenantID, plaintextHash string) (*ContentIndexEntry, error) {
+	if plaintextHash == "" {
+		return nil, ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, e := range s.entries {
+		if k.TenantID != tenantID {
+			continue
+		}
+		if e.PlaintextHash != plaintextHash {
+			continue
+		}
+		cp := e
+		cp.PieceIDs = clonePieceRefs(e.PieceIDs)
+		return &cp, nil
+	}
+	return nil, ErrNotFound
+}
+
 // Register inserts a new entry with RefCount = 1. Returns an
 // error if a row already exists for the (tenantID, contentHash)
 // key — the caller should retry via IncrementRef.

@@ -108,6 +108,20 @@ type Upload struct {
 	// same durable channel as DEKMaterial — see the package doc.
 	PartHashes map[int][]byte
 
+	// PlaintextPartHashes accumulates per-part BLAKE3 digests of
+	// the *plaintext* (not the ciphertext) for managed /
+	// public_distribution multipart uploads when dedup is
+	// enabled. Keyed by PartNumber. Populated by UploadPart
+	// before the part is sealed with the session's random DEK,
+	// and consumed by CompleteMultipartUpload to compute the
+	// canonical plaintext hash used by the deferred convergent
+	// consolidation path.
+	//
+	// Stored separately from PartHashes (which holds ciphertext
+	// digests for client_side / unencrypted dedup) so the two
+	// dedup flows do not interfere.
+	PlaintextPartHashes map[int][]byte
+
 	mu    sync.Mutex
 	parts map[int]Part
 }
@@ -141,6 +155,44 @@ func (u *Upload) PartHash(partNumber int) ([]byte, bool) {
 	cp := make([]byte, len(h))
 	copy(cp, h)
 	return cp, true
+}
+
+// SetPlaintextPartHash records the BLAKE3 digest of the plaintext
+// for the given PartNumber under the upload's mutex. The slice is
+// copied so callers may reuse their hasher buffer.
+func (u *Upload) SetPlaintextPartHash(partNumber int, hash []byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.PlaintextPartHashes == nil {
+		u.PlaintextPartHashes = make(map[int][]byte)
+	}
+	cp := make([]byte, len(hash))
+	copy(cp, hash)
+	u.PlaintextPartHashes[partNumber] = cp
+}
+
+// PlaintextPartHash returns the BLAKE3 plaintext digest for
+// partNumber and a bool indicating whether one was recorded.
+func (u *Upload) PlaintextPartHash(partNumber int) ([]byte, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	h, ok := u.PlaintextPartHashes[partNumber]
+	if !ok {
+		return nil, false
+	}
+	cp := make([]byte, len(h))
+	copy(cp, h)
+	return cp, true
+}
+
+// PlaintextPartHashCount returns the number of recorded
+// per-part plaintext digests under the upload's mutex. Used by
+// CompleteMultipartUpload to confirm every part has a recorded
+// hash before triggering the consolidation path.
+func (u *Upload) PlaintextPartHashCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.PlaintextPartHashes)
 }
 
 // Parts returns a copy of the part set keyed by PartNumber. Callers

@@ -31,8 +31,24 @@ CREATE TABLE content_index (
     -- order, and piece_id holds the first element's id so existing
     -- single-piece queries (orphan GC reverse lookup) still work.
     piece_ids     JSONB       NULL,
+    -- plaintext_hash is the BLAKE3-derived plaintext digest used by
+    -- the multipart Pattern B dedup path (deferred convergent
+    -- consolidation). For single-piece Pattern B entries it is
+    -- BLAKE3(plaintext); for multipart-consolidated entries it is
+    -- BLAKE3(perPart1 || perPart2 || ... || perPartN) over the
+    -- per-part plaintext digests. NULL for Pattern C entries (the
+    -- gateway never sees plaintext) and for entries written before
+    -- this column existed.
+    plaintext_hash TEXT       NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, content_hash)
 );
 
 CREATE INDEX content_index_piece_id ON content_index (piece_id);
+
+-- Partial index supporting the multipart Pattern B lookup-by-plaintext-hash
+-- path. Pattern C and pre-Phase-3.5 rows skip the index by virtue of the
+-- WHERE clause.
+CREATE INDEX content_index_plaintext_hash
+    ON content_index (tenant_id, plaintext_hash)
+    WHERE plaintext_hash IS NOT NULL;

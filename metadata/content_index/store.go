@@ -104,6 +104,25 @@ type ContentIndexEntry struct {
 	// shipped.
 	PieceIDs []PieceRef `json:"piece_ids,omitempty"`
 
+	// PlaintextHash is the BLAKE3 hash of the plaintext, stored
+	// only for Pattern B (gateway convergent) entries. It enables
+	// multipart uploads to look up the content_index by plaintext
+	// hash before producing the convergent ciphertext (the
+	// "deferred convergent consolidation" path). Empty for
+	// Pattern C entries — the gateway never sees plaintext — and
+	// for entries written before this field existed.
+	//
+	// For single-piece Pattern B entries the value is
+	// formatContentHash(blake3Hex(plaintext)). For multipart
+	// consolidated Pattern B entries the value is
+	// formatContentHash(blake3Hex(BLAKE3(p1)||...||BLAKE3(pN)))
+	// where each p_i is one part's plaintext bytes. The two
+	// formats live in the same column but are produced and
+	// consumed exclusively within their respective code paths
+	// (single-PUT or multipart). See api/s3compat/dedup.go and
+	// api/s3compat/multipart_handler.go for the producer sites.
+	PlaintextHash string
+
 	// CreatedAt is set by the store at first INSERT.
 	CreatedAt time.Time
 }
@@ -133,6 +152,20 @@ type Store interface {
 	// ErrNotFound if no row exists. It does not mutate
 	// RefCount.
 	Lookup(ctx context.Context, tenantID, contentHash string) (*ContentIndexEntry, error)
+
+	// LookupByPlaintextHash returns the entry for (tenantID,
+	// plaintextHash) using the plaintext_hash secondary index.
+	// Returns ErrNotFound if no matching row exists. Used by the
+	// multipart Pattern B dedup path so a fresh multipart upload
+	// can detect that the same content was previously uploaded —
+	// without first having to consolidate and re-encrypt to
+	// produce the convergent ciphertext for a content_hash
+	// lookup. It does not mutate RefCount.
+	//
+	// Pattern C entries and rows written before plaintext_hash
+	// existed are excluded by virtue of the partial index
+	// covering only non-NULL plaintext_hash values.
+	LookupByPlaintextHash(ctx context.Context, tenantID, plaintextHash string) (*ContentIndexEntry, error)
 
 	// Register inserts a new entry with RefCount = 1. It is the
 	// "miss" path: the gateway has just written a new piece and

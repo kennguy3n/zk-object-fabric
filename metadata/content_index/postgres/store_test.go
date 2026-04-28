@@ -41,6 +41,7 @@ func requirePostgres(t *testing.T) *sql.DB {
 			size_bytes    BIGINT      NOT NULL DEFAULT 0,
 			etag          TEXT        NULL,
 			piece_ids     JSONB       NULL,
+			plaintext_hash TEXT       NULL,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (tenant_id, content_hash)
 		)`); err != nil {
@@ -133,5 +134,51 @@ func TestPostgresStore_TenantIsolation(t *testing.T) {
 	}
 	if b.PieceID != "pb" {
 		t.Fatalf("tenant isolation broken: got pieceID %q", b.PieceID)
+	}
+}
+
+func TestPostgresStore_LookupByPlaintextHash(t *testing.T) {
+	db := requirePostgres(t)
+	s, err := New(Config{DB: db, Table: "content_index_test"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	if _, err := s.LookupByPlaintextHash(ctx, "tnt", ""); !errors.Is(err, content_index.ErrNotFound) {
+		t.Fatalf("LookupByPlaintextHash empty: got %v want ErrNotFound", err)
+	}
+
+	// Legacy / Pattern C entry without plaintext_hash must not
+	// be reachable via LookupByPlaintextHash.
+	if err := s.Register(ctx, content_index.ContentIndexEntry{
+		TenantID: "tnt", ContentHash: "h-legacy", PieceID: "p-legacy", Backend: "wasabi",
+	}); err != nil {
+		t.Fatalf("Register legacy: %v", err)
+	}
+	if _, err := s.LookupByPlaintextHash(ctx, "tnt", ""); !errors.Is(err, content_index.ErrNotFound) {
+		t.Fatalf("LookupByPlaintextHash legacy short-circuit: got %v want ErrNotFound", err)
+	}
+
+	// Pattern B / consolidated entry carrying plaintext_hash is
+	// found; tenant isolation is enforced.
+	if err := s.Register(ctx, content_index.ContentIndexEntry{
+		TenantID: "tnt", ContentHash: "h-pb", PieceID: "p-pb", Backend: "wasabi",
+		SizeBytes: 1024, PlaintextHash: "blake3:abc123",
+	}); err != nil {
+		t.Fatalf("Register PB: %v", err)
+	}
+	got, err := s.LookupByPlaintextHash(ctx, "tnt", "blake3:abc123")
+	if err != nil {
+		t.Fatalf("LookupByPlaintextHash: %v", err)
+	}
+	if got.ContentHash != "h-pb" || got.PlaintextHash != "blake3:abc123" {
+		t.Fatalf("LookupByPlaintextHash unexpected entry: %+v", got)
+	}
+	if _, err := s.LookupByPlaintextHash(ctx, "other", "blake3:abc123"); !errors.Is(err, content_index.ErrNotFound) {
+		t.Fatalf("LookupByPlaintextHash cross-tenant: got %v want ErrNotFound", err)
+	}
+	if _, err := s.LookupByPlaintextHash(ctx, "tnt", "blake3:doesnotexist"); !errors.Is(err, content_index.ErrNotFound) {
+		t.Fatalf("LookupByPlaintextHash unknown: got %v want ErrNotFound", err)
 	}
 }

@@ -451,30 +451,80 @@ and is referenced from
 | Single `PutObject` | unencrypted (`""`) | No | Empty encryption mode excluded from dedup path |
 | Single `PutObject` + EC profile | Any | No | Erasure-coded objects dispatched before dedup check |
 | Multipart (1 part) | `client_side` or `""` | Yes | Single piece + convergent ciphertext |
-| Multipart (1 part) | `managed` / `public_distribution` | No | Random DEK per multipart session — ciphertext differs |
+| Multipart (1 part) | `managed` / `public_distribution` | Yes (Pattern B) | Deferred convergent consolidation (see below) |
 | Multipart (N parts, N>1) | `client_side` or `""` | Yes | Per-part BLAKE3 + `piece_ids` JSONB column on `content_index` |
-| Multipart (N parts, N>1) | `managed` / `public_distribution` | No | Random DEK per multipart session — ciphertext differs |
+| Multipart (N parts, N>1) | `managed` / `public_distribution` | Yes (Pattern B) | Deferred convergent consolidation (see below) |
 | `CopyObject` | Source has `ContentHash` | Yes | Refcount++ on existing piece, no data movement |
 | `CopyObject` | Source has no `ContentHash` | No | Fresh piece via server-side copy or GET+PUT |
 | `CopyObject` | Source is EC or multipart | Rejected (501) | Multi-piece sources cannot be safely refcounted |
 | `DeleteObject` | Manifest has `ContentHash` | Refcount-- | Piece removed only when refcount reaches 0 |
 | `DeleteObject` | No `ContentHash` | Direct delete | Legacy path, pieces deleted immediately |
 
-### Why multipart with `managed` / `public_distribution` doesn't dedup
+### Multipart `managed` / `public_distribution` — deferred convergent consolidation
 
-`CreateMultipartUpload` generates a **fresh random DEK per session**
-(see `multipart.Upload.DEKMaterial`), so two clients uploading the
-same plaintext under either of these modes encrypt under different
-keys and produce different ciphertext. The `content_index` lookup
-therefore always misses, and dedup cannot fire.
+`CreateMultipartUpload` still mints a **fresh random DEK per
+session** (`multipart.Upload.DEKMaterial`), so the parts streamed
+to the backend during `UploadPart` cannot themselves be convergent
+ciphertext. The gateway sidesteps that by consolidating the
+upload into a single convergent-encrypted piece at
+`CompleteMultipartUpload` time:
 
-Single-PUT covers these modes via the convergent-DEK path in
-`api/s3compat/dedup.go` (Pattern B), which derives
-`DEK = HKDF(BLAKE3(plaintext), salt=tenantID)` so identical
-plaintext yields identical ciphertext. The multipart path cannot
-take that route without redesigning per-part DEK assignment (the
-current model assigns one DEK per session at `CreateMultipartUpload`,
-not per-part).
+1. **At UploadPart**: when dedup is enabled on the upload's
+   policy, the handler hashes each part's plaintext with BLAKE3
+   *before* sealing it with the session's random DEK and stashes
+   the digest on the in-memory upload session
+   (`Upload.PlaintextPartHashes`). The plaintext is already in
+   memory — the hash is essentially free.
+2. **At CompleteMultipartUpload**: the per-part digests are
+   concatenated in ascending `PartNumber` order and BLAKE3'd to
+   produce the canonical plaintext hash:
+   `plaintext_hash = BLAKE3(BLAKE3(p1) || BLAKE3(p2) || ... || BLAKE3(pN))`.
+3. **Lookup**: the gateway calls
+   `LookupByPlaintextHash(tenant_id, plaintext_hash)` on the
+   `content_index`. If a row exists, the new upload's parts (all
+   sealed with the random DEK) are deleted from the backend and
+   the manifest is redirected at the canonical piece. The
+   convergent DEK is re-derived on-the-fly so the new manifest
+   carries an independently wrapped copy that decrypts the
+   canonical piece.
+4. **Miss**: the gateway reads every part back, decrypts with the
+   session's random DEK, re-encrypts the assembled plaintext under
+   `DEK = DeriveConvergentDEK(plaintext_hash, tenantID)` with
+   `Options{ConvergentNonce: true}`, writes a single consolidated
+   piece, deletes the per-part pieces, and registers a new
+   `content_index` row carrying both `content_hash`
+   (`BLAKE3(consolidated_ciphertext)`) and `plaintext_hash`. Any
+   subsequent multipart upload of the same content with the same
+   chunking matches on `plaintext_hash` and follows the hit
+   branch.
+
+**Cost.** The miss branch reads, decrypts, and re-encrypts every
+part. This is one-time per fresh content and bounded by the part
+size; subsequent uploads of the same content cost only a
+`LookupByPlaintextHash` and the deletion of the just-uploaded
+parts. The hit branch never reads parts back from the backend at
+all.
+
+**Cross-method dedup limits.** `plaintext_hash` is dual-format:
+single-PUT entries store `BLAKE3(plaintext)`, multipart entries
+store `BLAKE3(per-part-digests-concatenated)`. The two values
+differ even for the same logical content, so a single-PUT
+followed by a multipart upload (or vice versa) does not currently
+dedup across methods — only within the same method. Single-PUT
+after multipart still dedups when the consolidated ciphertext's
+`content_hash` matches a previously written single-PUT, but that
+is a coincidental match and not the primary path. A future Phase
+4+ task may add an eager backfill that recomputes
+`BLAKE3(plaintext)` for legacy single-PUT rows so cross-method
+dedup falls out automatically.
+
+**Re-chunking does not dedup.** Two multipart uploads of the same
+plaintext bytes split into different part sizes produce different
+per-part digest sequences and therefore different `plaintext_hash`
+values. This is intentional — eager whole-object hashing during
+multipart would require either holding the entire plaintext in
+memory or reading every part back at Complete time even for
+non-dedup uploads.
 
 ### Multi-part multipart uploads (N>1 parts) — supported for convergent modes
 
@@ -509,11 +559,13 @@ doesn't have to re-read every part from the backend at
    `piece_id` field is anchored on the first part so single-piece
    queries continue to work.
 
-`managed` / `public_distribution` multipart still cannot dedup —
-each `CreateMultipartUpload` mints a fresh random DEK so two
-clients sending the same plaintext produce different ciphertext.
-That row in the matrix above stays "No"; only the
-`client_side` / unencrypted rows lift to "Yes".
+`managed` / `public_distribution` multipart now also dedups via
+the deferred convergent consolidation flow described above. The
+two flows are mutually exclusive: `client_side` / unencrypted
+uploads run through the per-part ciphertext-hash + `piece_ids`
+path documented here, while gateway-encrypted uploads run through
+the plaintext-hash lookup + consolidation path. The encryption
+mode picks the branch.
 
 ### Why erasure-coded objects don't dedup
 

@@ -94,6 +94,20 @@ type dedupResult struct {
 	// DEK; for Pattern C it is the algorithm declared by the
 	// client header.
 	Encryption metadata.EncryptionConfig
+
+	// PlaintextHash is the formatted BLAKE3-of-plaintext digest
+	// recorded on the content_index row for Pattern B entries
+	// (lazy backfill so the multipart consolidation path can
+	// later look this content up via LookupByPlaintextHash).
+	// Empty for Pattern C — the gateway never sees plaintext,
+	// so there is nothing to record.
+	//
+	// TODO(phase4+): consider an eager backfill that walks every
+	// pre-existing Pattern B row, unwraps the manifest's DEK,
+	// decrypts the piece, and updates plaintext_hash so the
+	// first multipart upload of previously-single-PUT'd content
+	// can dedup without consolidating once.
+	PlaintextHash string
 }
 
 // blake3Hex computes BLAKE3-256(b) and returns the hex-encoded
@@ -186,6 +200,13 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 		return nil, fmt.Errorf("s3compat: wrap dek: %w", err)
 	}
 	contentHash := formatContentHash(blake3Hex(ciphertext))
+	// Lazy-backfill plaintext_hash so future multipart uploads of
+	// the same plaintext can dedup via LookupByPlaintextHash.
+	// Pre-existing rows from before this field shipped will keep
+	// PlaintextHash NULL; multipart of *those* contents pays the
+	// consolidation cost once and then registers a row that does
+	// carry plaintext_hash, after which subsequent uploads dedup.
+	plaintextHashFmt := formatContentHash(fmt.Sprintf("%x", plaintextHash[:]))
 	encCfg := metadata.EncryptionConfig{
 		Mode:          encMode,
 		Algorithm:     client_sdk.ContentAlgorithm,
@@ -206,6 +227,7 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 			Hit:           true,
 			Existing:      existing,
 			ContentHash:   contentHash,
+			PlaintextHash: plaintextHashFmt,
 			PlaintextSize: int64(len(plaintext)),
 			Encryption:    encCfg,
 		}, nil
@@ -213,6 +235,7 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 	return &dedupResult{
 		Hit:             false,
 		ContentHash:     contentHash,
+		PlaintextHash:   plaintextHashFmt,
 		CiphertextBytes: ciphertext,
 		PlaintextSize:   int64(len(plaintext)),
 		Encryption:      encCfg,
@@ -383,12 +406,13 @@ func (h *Handler) putDeduped(
 		// that case Register returns ErrAlreadyExists and we
 		// fall back to IncrementRef on the canonical entry.
 		raceLost, regErr := h.registerDedupedPiece(r.Context(), content_index.ContentIndexEntry{
-			TenantID:    tenantID,
-			ContentHash: res.ContentHash,
-			PieceID:     pieceID,
-			Backend:     pieceBackend,
-			SizeBytes:   sizeOnWire,
-			ETag:        pieceHash,
+			TenantID:      tenantID,
+			ContentHash:   res.ContentHash,
+			PieceID:       pieceID,
+			Backend:       pieceBackend,
+			SizeBytes:     sizeOnWire,
+			ETag:          pieceHash,
+			PlaintextHash: res.PlaintextHash,
 		})
 		if regErr != nil {
 			// Best-effort cleanup of the orphaned piece so we

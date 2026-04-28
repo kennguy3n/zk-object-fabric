@@ -254,6 +254,20 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		plaintextSize = int64(len(plaintext))
+
+		// When dedup is enabled on the upload's policy, capture
+		// BLAKE3(plaintext) for this part. CompleteMultipartUpload
+		// combines the per-part digests in PartNumber order to
+		// derive the canonical plaintext hash that drives the
+		// deferred convergent consolidation path. The hash adds
+		// negligible cost (the plaintext is already in memory)
+		// and records nothing irreversible: non-dedup uploads
+		// simply ignore the map.
+		if h.dedupEnabled(upload.Policy) {
+			ptDigest := blake3.Sum256(plaintext)
+			upload.SetPlaintextPartHash(partNumber, ptDigest[:])
+		}
+
 		ciphertext, eerr := h.encryptWithDEK(plaintext, upload.DEKMaterial)
 		if eerr != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", eerr.Error(), r.URL.Path)
@@ -440,28 +454,33 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		},
 	}
 
-	// Multipart dedup: when the upload's policy enables
-	// intra-tenant dedup AND the gateway has a content_index store
-	// wired AND the encryption mode can produce convergent
-	// ciphertext, compute a content hash over the assembled bytes
-	// and run the content_index lookup/register flow so duplicate
-	// uploads dedup correctly.
+	// Multipart dedup. Two flows feed the content_index, selected
+	// by the encryption mode of the upload:
 	//
-	// "managed" / "public_distribution" multipart uploads are
-	// excluded: CreateMultipartUpload generates a fresh random DEK
-	// per session (see the IsGatewayEncrypted branch above), so
-	// two clients uploading identical plaintext produce different
-	// ciphertext and the content_index Lookup would always miss.
-	// Single-PUT covers these modes via the convergent-DEK path
-	// in dedup.go (Pattern B).
+	//  1. client_side / unencrypted (multipartDedupEligible) —
+	//     ciphertext is already convergent (the client either
+	//     sent it that way or there is no encryption at all). The
+	//     content hash is BLAKE3 over the assembled ciphertext
+	//     bytes; per-part digests are produced at UploadPart time
+	//     via a TeeReader so CompleteMultipartUpload doesn't
+	//     re-read pieces from the backend. Multi-piece uploads
+	//     (len(pieces) > 1) are supported via the content_index
+	//     PieceIDs JSONB extension.
 	//
-	// Multi-piece uploads (len(pieces) > 1) ARE supported via the
-	// content_index PieceIDs JSONB extension. The hash for an
-	// N-part upload is BLAKE3(hash1 || hash2 || ... || hashN) over
-	// per-part BLAKE3 digests sorted by PartNumber. Per-part
-	// digests are produced at UploadPart time via a TeeReader so
-	// CompleteMultipartUpload doesn't have to re-read pieces from
-	// the backend in the common case.
+	//  2. managed / public_distribution — CreateMultipartUpload
+	//     generated a random per-session DEK so the parts on the
+	//     backend are NOT convergent. The handler instead hashes
+	//     plaintext per-part during UploadPart (see the managed/
+	//     public_distribution case there) and runs a "deferred
+	//     convergent consolidation" pass: it looks up the
+	//     content_index by plaintext hash, and on miss decrypts
+	//     every part with the random DEK and re-encrypts them
+	//     under a convergent DEK derived from the same plaintext
+	//     hash, producing a single consolidated piece that future
+	//     uploads of the same content can dedup against.
+	//
+	// The two flows are mutually exclusive: the encryption mode
+	// dictates which one fires.
 	dedupCandidate := h.multipartDedupEligible(upload)
 	if dedupCandidate {
 		contentHash, hashErr := h.computeMultipartContentHash(r.Context(), upload, pieces, parts)
@@ -559,6 +578,21 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 					h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(canonical.SizeBytes))
 				}
 			}
+		}
+	} else if h.dedupEnabled(upload.Policy) && IsGatewayEncrypted(upload.EncMode) && upload.PlaintextPartHashCount() == len(parts) {
+		// Deferred convergent consolidation for managed /
+		// public_distribution multipart uploads. The parts on the
+		// backend were sealed with the session's random DEK, so
+		// looking up by ciphertext hash would always miss. We
+		// instead derive the canonical plaintext hash from the
+		// per-part plaintext digests recorded at UploadPart time
+		// and dispatch through dedupManagedMultipart, which either
+		// redirects the manifest at an existing canonical piece
+		// (HIT) or consolidates the parts into a single
+		// convergent-encrypted piece and registers a fresh entry
+		// (MISS).
+		if !h.dedupManagedMultipart(w, r, tenantID, bucket, upload, parts, totalSize, manifest) {
+			return
 		}
 	}
 
@@ -861,4 +895,316 @@ func (h *Handler) redirectManifestToCanonical(manifest *metadata.ObjectManifest,
 		manifest.MigrationState.PrimaryBackend = manifest.Pieces[0].Backend
 	}
 	return nil
+}
+
+// dedupManagedMultipart runs the deferred convergent consolidation
+// dedup pass for a managed / public_distribution multipart upload.
+// On success it returns true with manifest mutated to reference
+// either an existing canonical piece (HIT) or a freshly written
+// consolidated piece (MISS). On any error it writes a structured
+// HTTP error response and returns false; the caller MUST return
+// without writing the manifest in that case.
+//
+// Preconditions enforced by the caller: dedup is enabled on
+// upload.Policy, upload.EncMode is gateway-encrypted, and every
+// part in parts has a recorded plaintext digest.
+func (h *Handler) dedupManagedMultipart(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID, bucket string,
+	upload *multipart.Upload,
+	parts []multipart.Part,
+	totalSize int64,
+	manifest *metadata.ObjectManifest,
+) bool {
+	ctx := r.Context()
+
+	// Combine per-part plaintext hashes in PartNumber order
+	// (parts is already sorted by the multipart store) to form
+	// the canonical plaintext hash. If any part is missing a
+	// digest the precondition was violated; bail out without
+	// touching the parts so the non-dedup write path below can
+	// still complete.
+	combined := blake3.New()
+	for _, p := range parts {
+		d, ok := upload.PlaintextPartHash(p.PartNumber)
+		if !ok {
+			return true
+		}
+		combined.Write(d)
+	}
+	combinedDigest := combined.Sum(nil)
+	plaintextHash := formatContentHash(fmt.Sprintf("%x", combinedDigest))
+
+	existing, lerr := h.cfg.ContentIndex.LookupByPlaintextHash(ctx, tenantID, plaintextHash)
+	if lerr != nil && !errors.Is(lerr, content_index.ErrNotFound) {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lerr.Error(), r.URL.Path)
+		return false
+	}
+
+	if existing != nil {
+		return h.dedupManagedMultipartHit(w, r, tenantID, bucket, upload, parts, combinedDigest, existing, manifest)
+	}
+	return h.dedupManagedMultipartMiss(w, r, tenantID, bucket, upload, parts, totalSize, combinedDigest, plaintextHash, manifest)
+}
+
+// dedupManagedMultipartHit is the HIT branch of
+// dedupManagedMultipart: an existing canonical piece is referenced
+// for the same plaintext, so we drop the just-uploaded random-DEK
+// parts and redirect the manifest at the canonical piece. The
+// convergent DEK is re-derived from the plaintext digest so this
+// upload's manifest carries a correctly-wrapped DEK that decrypts
+// the canonical piece.
+func (h *Handler) dedupManagedMultipartHit(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID, bucket string,
+	upload *multipart.Upload,
+	parts []multipart.Part,
+	combinedDigest []byte,
+	existing *content_index.ContentIndexEntry,
+	manifest *metadata.ObjectManifest,
+) bool {
+	ctx := r.Context()
+
+	if err := h.cfg.ContentIndex.IncrementRef(ctx, tenantID, existing.ContentHash); err != nil {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "ContentIndexIncrementFailed", err.Error(), r.URL.Path)
+		return false
+	}
+
+	convergentEnc, derr := h.deriveConvergentEncryptionConfig(combinedDigest, tenantID, upload.EncMode)
+	if derr != nil {
+		_, _ = h.cfg.ContentIndex.DecrementRef(ctx, tenantID, existing.ContentHash)
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "DedupConvergentDEKFailed", derr.Error(), r.URL.Path)
+		return false
+	}
+
+	// Drop ALL uploaded parts (encrypted with the session's random
+	// DEK). The canonical piece referenced below is the one GET
+	// will read.
+	h.deleteUploadedParts(ctx, parts)
+
+	manifest.Pieces = []metadata.Piece{{
+		PieceID:   existing.PieceID,
+		Backend:   existing.Backend,
+		Hash:      existing.ETag,
+		SizeBytes: existing.SizeBytes,
+		State:     "active",
+	}}
+	manifest.ContentHash = existing.ContentHash
+	manifest.ChunkSize = existing.SizeBytes
+	manifest.MigrationState.PrimaryBackend = existing.Backend
+	manifest.Encryption = convergentEnc
+
+	h.emit(tenantID, bucket, billing.DedupHits, 1)
+	if existing.SizeBytes > 0 {
+		h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(existing.SizeBytes))
+	}
+	return true
+}
+
+// dedupManagedMultipartMiss is the MISS branch: there is no
+// existing canonical piece, so we read every part back, decrypt
+// with the session's random DEK, re-encrypt the assembled
+// plaintext under a convergent DEK, and write a single
+// consolidated piece. The new piece is registered in the
+// content_index with both its ciphertext content_hash and the
+// plaintext_hash key future uploads will look up against. A
+// concurrent uploader winning the Register race triggers the
+// standard fall-back-to-canonical recovery.
+func (h *Handler) dedupManagedMultipartMiss(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID, bucket string,
+	upload *multipart.Upload,
+	parts []multipart.Part,
+	totalSize int64,
+	combinedDigest []byte,
+	plaintextHash string,
+	manifest *metadata.ObjectManifest,
+) bool {
+	ctx := r.Context()
+
+	plaintext, asmErr := h.assembleManagedMultipartPlaintext(ctx, upload, parts, totalSize)
+	if asmErr != nil {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "DedupConsolidateFailed", asmErr.Error(), r.URL.Path)
+		return false
+	}
+
+	convergentDEK, derr := client_sdk.DeriveConvergentDEK(combinedDigest, tenantID)
+	if derr != nil {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "DedupConvergentDEKFailed", derr.Error(), r.URL.Path)
+		return false
+	}
+	encReader, eerr := client_sdk.EncryptObject(bytes.NewReader(plaintext), convergentDEK, client_sdk.Options{ConvergentNonce: true})
+	if eerr != nil {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "DedupEncryptFailed", eerr.Error(), r.URL.Path)
+		return false
+	}
+	consolidatedCiphertext, rerr := io.ReadAll(encReader)
+	if rerr != nil {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "DedupReadCiphertextFailed", rerr.Error(), r.URL.Path)
+		return false
+	}
+
+	provider, ok := h.cfg.Providers[upload.Backend]
+	if !ok {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "BackendNotRegistered",
+			"backend "+upload.Backend+" is not in the provider registry", r.URL.Path)
+		return false
+	}
+	consolidatedPieceID := newPieceID(tenantID, upload.Bucket, upload.ObjectKey, h.cfg.Now())
+	putRes, perr := provider.PutPiece(ctx, consolidatedPieceID, bytes.NewReader(consolidatedCiphertext), providers.PutOptions{
+		ContentLength: int64(len(consolidatedCiphertext)),
+	})
+	if perr != nil {
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusBadGateway, "BackendPutFailed", perr.Error(), r.URL.Path)
+		return false
+	}
+
+	contentHash := formatContentHash(blake3Hex(consolidatedCiphertext))
+	wrapped, werr := h.cfg.Encryption.Wrapper.WrapDEK(convergentDEK, h.cfg.Encryption.CMK)
+	if werr != nil {
+		_ = provider.DeletePiece(ctx, putRes.PieceID)
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "DedupWrapDEKFailed", werr.Error(), r.URL.Path)
+		return false
+	}
+	convergentEnc := metadata.EncryptionConfig{
+		Mode:          upload.EncMode,
+		Algorithm:     client_sdk.ContentAlgorithm,
+		KeyID:         wrapped.KeyID,
+		WrappedDEK:    wrapped.WrappedKey,
+		WrapAlgorithm: wrapped.WrapAlgorithm,
+	}
+
+	raceLost, regErr := h.registerDedupedPiece(ctx, content_index.ContentIndexEntry{
+		TenantID:      tenantID,
+		ContentHash:   contentHash,
+		PlaintextHash: plaintextHash,
+		PieceID:       putRes.PieceID,
+		Backend:       upload.Backend,
+		SizeBytes:     putRes.SizeBytes,
+		ETag:          putRes.ETag,
+	})
+	if regErr != nil {
+		_ = provider.DeletePiece(ctx, putRes.PieceID)
+		h.deleteUploadedParts(ctx, parts)
+		writeError(w, http.StatusInternalServerError, "ContentIndexRegisterFailed", regErr.Error(), r.URL.Path)
+		return false
+	}
+
+	// The original per-part pieces are now unreferenced regardless
+	// of which branch we took. Delete them in a single pass.
+	h.deleteUploadedParts(ctx, parts)
+
+	if raceLost {
+		// A concurrent uploader registered the canonical first.
+		// Drop the just-written consolidated piece and redirect
+		// the manifest at the canonical row — mirroring the
+		// single-PUT race-recovery in dedup.go.
+		_ = provider.DeletePiece(ctx, putRes.PieceID)
+		canonical, lookupErr := h.cfg.ContentIndex.Lookup(ctx, tenantID, contentHash)
+		if lookupErr != nil {
+			_, _ = h.cfg.ContentIndex.DecrementRef(ctx, tenantID, contentHash)
+			writeError(w, http.StatusInternalServerError, "ContentIndexLookupFailed", lookupErr.Error(), r.URL.Path)
+			return false
+		}
+		manifest.Pieces = []metadata.Piece{{
+			PieceID:   canonical.PieceID,
+			Backend:   canonical.Backend,
+			Hash:      canonical.ETag,
+			SizeBytes: canonical.SizeBytes,
+			State:     "active",
+		}}
+		manifest.ContentHash = canonical.ContentHash
+		manifest.ChunkSize = canonical.SizeBytes
+		manifest.MigrationState.PrimaryBackend = canonical.Backend
+		manifest.Encryption = convergentEnc
+		h.emit(tenantID, bucket, billing.DedupHits, 1)
+		if canonical.SizeBytes > 0 {
+			h.emit(tenantID, bucket, billing.DedupBytesSaved, uint64(canonical.SizeBytes))
+		}
+		return true
+	}
+
+	manifest.Pieces = []metadata.Piece{{
+		PieceID:   putRes.PieceID,
+		Backend:   upload.Backend,
+		Hash:      putRes.ETag,
+		SizeBytes: putRes.SizeBytes,
+		State:     "active",
+	}}
+	manifest.ContentHash = contentHash
+	manifest.ChunkSize = putRes.SizeBytes
+	manifest.MigrationState.PrimaryBackend = upload.Backend
+	manifest.Encryption = convergentEnc
+	return true
+}
+
+// assembleManagedMultipartPlaintext reads every part back from its
+// backend, decrypts it with the session's random DEK, and returns
+// the concatenated plaintext. The decrypted bytes are held in
+// memory because the consolidation path needs to feed them into a
+// single convergent EncryptObject call. Used only by the MISS
+// branch of dedupManagedMultipart.
+func (h *Handler) assembleManagedMultipartPlaintext(ctx context.Context, upload *multipart.Upload, parts []multipart.Part, totalSize int64) ([]byte, error) {
+	out := make([]byte, 0, totalSize)
+	for _, p := range parts {
+		prov, ok := h.cfg.Providers[p.Backend]
+		if !ok {
+			return nil, fmt.Errorf("s3compat: consolidate: backend %q not registered", p.Backend)
+		}
+		rc, err := prov.GetPiece(ctx, p.PieceID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("s3compat: consolidate get piece %s: %w", p.PieceID, err)
+		}
+		ciphertext, rerr := io.ReadAll(rc)
+		_ = rc.Close()
+		if rerr != nil {
+			return nil, fmt.Errorf("s3compat: consolidate read piece %s: %w", p.PieceID, rerr)
+		}
+		pt, derr := h.decryptWithDEK(ciphertext, upload.DEKMaterial)
+		if derr != nil {
+			return nil, fmt.Errorf("s3compat: consolidate decrypt piece %s: %w", p.PieceID, derr)
+		}
+		out = append(out, pt...)
+	}
+	return out, nil
+}
+
+// deriveConvergentEncryptionConfig builds an EncryptionConfig
+// wrapping the convergent DEK derived from combinedDigest. Used by
+// the HIT branch of the managed multipart consolidation flow,
+// which does not need the unwrapped DEK itself (the canonical
+// piece is read at GET time, not now) but does need the wrapped
+// form on the manifest so future GETs can decrypt.
+func (h *Handler) deriveConvergentEncryptionConfig(combinedDigest []byte, tenantID, encMode string) (metadata.EncryptionConfig, error) {
+	if h.cfg.Encryption == nil {
+		return metadata.EncryptionConfig{}, errors.New("s3compat: gateway encryption is not configured")
+	}
+	dek, err := client_sdk.DeriveConvergentDEK(combinedDigest, tenantID)
+	if err != nil {
+		return metadata.EncryptionConfig{}, fmt.Errorf("s3compat: derive convergent dek: %w", err)
+	}
+	wrapped, err := h.cfg.Encryption.Wrapper.WrapDEK(dek, h.cfg.Encryption.CMK)
+	if err != nil {
+		return metadata.EncryptionConfig{}, fmt.Errorf("s3compat: wrap convergent dek: %w", err)
+	}
+	return metadata.EncryptionConfig{
+		Mode:          encMode,
+		Algorithm:     client_sdk.ContentAlgorithm,
+		KeyID:         wrapped.KeyID,
+		WrappedDEK:    wrapped.WrappedKey,
+		WrapAlgorithm: wrapped.WrapAlgorithm,
+	}, nil
 }
