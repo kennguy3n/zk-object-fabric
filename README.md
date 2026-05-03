@@ -409,7 +409,7 @@ cache in front of it.
 
 ## Project status
 
-- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant Deduplication (COMPLETE).
+- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production & Scale (IN PROGRESS).
 - **Tracker**: [docs/PROGRESS.md](docs/PROGRESS.md).
 - **Technical proposal**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
 
