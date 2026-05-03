@@ -3,9 +3,9 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
 > Status: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant
-> Deduplication (COMPLETE). Phase 4 — Production & Scale (NOT
-> STARTED). This document defines the target architecture, not the
-> current implementation. See [PROGRESS.md](PROGRESS.md) for build status.
+> Deduplication (COMPLETE). Phase 4 — Production & Scale (IN PROGRESS).
+> This document defines the target architecture. See
+> [PROGRESS.md](PROGRESS.md) for the live build tracker.
 
 ---
 
@@ -999,7 +999,7 @@ Applications that do not use MLS (`kmail` standard mode, `zk-drive`,
     `DeriveConvergentDEK(contentHash, tenantID)`.
   - **Other languages**: implement BLAKE3 + HKDF-SHA256 against the
     documented derivation (`DEK = HKDF(BLAKE3(plaintext),
-    salt=tenant_id, info="zkof-cdek-v1", L=32)`) and a deterministic
+    salt=tenant_id, info="zkof-convergent-dek-v1", L=32)`) and a deterministic
     nonce scheme (`nonce_i = HKDF(DEK, info="zkof-nonce-v1" ||
     chunk_index, L=24)`).
 

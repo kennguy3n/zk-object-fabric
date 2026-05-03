@@ -5,7 +5,7 @@ gateway's `/api/v1/` management API. It is a Vite + React + TypeScript
 scaffold; it is intentionally minimal and is expected to grow alongside
 the Phase 3 control-plane workstreams.
 
-## What the console does today (Phase 3 scaffold)
+## What the console does today (Phase 3+ scaffold)
 
 - **Login / signup**: B2C self-service onboarding. The form targets
   `POST /api/v1/auth/login` and `POST /api/v1/auth/signup`.
@@ -48,9 +48,11 @@ npm run test
 Before this SPA can go in front of real tenants it still needs:
 
 - A real auth flow backed by the Authenticator (OAuth2 PKCE is the
-  intended shape).
-- Server-sent events on `/api/v1/usage/stream` so the dashboard can
-  update without polling.
+  intended shape). _(B2C signup/login with Postgres-backed auth store
+  is shipped; OAuth2 PKCE is the production upgrade.)_
 - Role-based access so b2b_dedicated / sovereign tenants see the
   placement-hardware UI their operators need.
-- E2E tests under `tests/e2e/` driven by Playwright.
+
+Already shipped:
+- Server-sent events on `/api/v1/usage/stream` (Phase 3).
+- E2E tests under `tests/e2e/` driven by Playwright (Phase 3).

@@ -182,10 +182,11 @@ instead.
    different tenants produce *different* DEKs and hash to different
    ciphertext — this is the cryptographic enforcement of the
    intra-tenant boundary.
-4. Gateway encrypts with **deterministic per-chunk nonces**
-   (`nonce = BLAKE3(content_hash || chunk_index)[:24]`) so the
-   ciphertext is itself a deterministic function of the plaintext +
-   tenant.
+4. Gateway encrypts with **deterministic per-chunk nonces** derived
+   via HKDF: `nonce = HKDF-SHA256(secret = DEK, salt = nil,
+   info = "zkof-nonce-v1" || u64_BE(chunk_index))[:24]`, matching
+   the SDK's `ConvergentNonce` path, so the ciphertext is itself a
+   deterministic function of the plaintext + tenant.
 5. Gateway computes `ciphertext_hash = BLAKE3(ciphertext)`.
 6. Gateway looks up `ContentIndex(tenant_id, ciphertext_hash)`.
    - **Hit**: the new manifest's `Piece` points at the existing
@@ -256,8 +257,9 @@ off `BLAKE3(ciphertext)`.
    regardless of who derives it.
 2. Set `Options{ConvergentNonce: true}` so the SDK derives per-chunk
    nonces deterministically:
-   `nonce = BLAKE3(chunk || chunk_index)[:24]` instead of sampling
-   from `crypto/rand`.
+   `nonce = HKDF-SHA256(secret = DEK, salt = nil,
+   info = "zkof-nonce-v1" || u64_BE(chunk_index))[:24]` instead of
+   sampling from `crypto/rand`.
 
 With both options the SDK produces a **bit-identical ciphertext
 stream** for any (plaintext, tenant_id) pair. Two clients in the
