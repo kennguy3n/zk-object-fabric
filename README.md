@@ -88,6 +88,26 @@ Phase 3.5 adds intra-tenant deduplication — see
 [docs/INTEGRATION.md](docs/INTEGRATION.md) for the external app
 integration guide.
 
+## Running tests
+
+```bash
+# Unit and integration tests (uses in-memory backends)
+go test ./...
+
+# S3 compliance suite only
+go test ./tests/s3_compat/ -v
+
+# Benchmark suite
+go test ./tests/benchmark/ -v
+
+# Frontend e2e tests (requires running gateway)
+cd frontend && npx playwright test
+```
+
+Environment-gated tests (Ceph RGW, Wasabi, Storj, etc.) require
+provider credentials via environment variables. See
+`tests/s3_compat/suite_test.go` for the gating pattern.
+
 It serves two audiences:
 
 - **B2C / self-service** app developers who need cheap, zero-knowledge,
@@ -306,61 +326,79 @@ key mode.
   coding in Phase 2+, and any node-local agent where memory footprint
   and per-byte CPU cost matter.
 
-## Target repo structure
+## Repo structure
 
 ```
 zk-object-fabric/
-  Dockerfile             # Multi-stage build: Go gateway + React frontend
-  docker-compose.yml     # One-command demo: docker compose up --build
+  Dockerfile
+  docker-compose.yml
+  go.mod / go.sum
   .dockerignore
-  demo/
-    config.json          # Minimal gateway config (local_fs_dev, in-memory stores)
-    tenants.json         # Pre-loaded demo tenant with HMAC credentials
-    README.md            # Demo usage guide, downstream integration examples
-  api/s3_compat/
-    handler/          # S3 API request handlers (PUT, GET, HEAD, DELETE, LIST, multipart)
-    presigned/        # Presigned URL generation and validation
-    auth/             # S3 signature v4 verification
-    errors/           # S3-compatible error responses (XML)
-    middleware/       # Rate limiting, tenant resolution, request logging
+  cmd/
+    gateway/              # Gateway entry point (main.go)
+  api/
+    s3compat/             # S3 API handlers, multipart, dedup, erasure coding, encryption
+    console/              # Console API: tenant mgmt, auth, billing, placement, dedup policy
   encryption/
-    client_sdk/
-    envelope_keys/
-    chunk_crypto/
+    client_sdk/           # Client-side encryption SDK (XChaCha20-Poly1305, convergent DEK)
+    envelope.go           # Encryption envelope types
   metadata/
-    manifest_store/
-    object_versions/
-    placement_policy/
+    manifest_store/       # Manifest persistence (memory + Postgres)
+    placement_policy/     # Placement engine and policy DSL
+    erasure_coding/       # EC profiles, encoder, registry
+    content_index/        # Dedup ContentIndex (memory + Postgres)
+    tenant/               # Tenant schema, tier config
   providers/
-    s3_generic/
-    wasabi/
-    aws_s3/
-    backblaze_b2/
-    cloudflare_r2/
-    local_fs_dev/
+    s3_generic/           # Shared S3-compatible base adapter
+    wasabi/               # Wasabi adapter + fair-use guardrails
+    ceph_rgw/             # Ceph RGW adapter (Phase 2+)
+    aws_s3/               # AWS S3 adapter (BYOC / DR)
+    backblaze_b2/         # Backblaze B2 adapter
+    cloudflare_r2/        # Cloudflare R2 adapter
+    storj/                # Storj native uplink adapter
+    local_fs_dev/         # Filesystem loopback (dev/demo)
   cache/
-    hot_object_cache/
-    range_cache/
+    hot_object_cache/     # LRU memory cache, disk cache, promotion worker
   migration/
-    dual_write/
-    background_rebalancer/
-    lazy_read_repair/
-  billing/
-    storage_metering/
-    egress_metering/
-    request_metering/
+    dual_write/           # Dual-write provider wrapper
+    lazy_read_repair/     # Read-path migration
+    background_rebalancer/# Background object drain
+    cross_cell/           # Cross-cell async replicator
+  billing/                # Metering, ClickHouse sink, logger sink, forecasting, provider registry
+  internal/
+    auth/                 # SigV4 authenticator, rate limiter, abuse guard, DDoS shield, legal hold
+    cellops/              # Cell registry, provisioner
+    compliance/           # Audit trail, residency enforcer
+    config/               # Gateway configuration
+    health/               # Health/ready/drain endpoints
+    metrics/              # Prometheus text-format exporter
+    repair/               # Automated repair queue
+    tracing/              # Request tracing
+  frontend/               # React + Vite tenant console
+  deploy/
+    aws/                  # Terraform: RDS, IAM, KMS, CloudWatch
+    linode/               # Terraform: gateway fleet, NodeBalancer
+    wasabi/               # Bucket provisioner, IAM policy
+    local-dc/             # Ceph cephadm, Ansible, monitoring
+    cell-provisioner/     # Automated cell provisioning scripts
   tests/
-    s3_compat/
-      crud/           # PUT, GET, HEAD, DELETE, CopyObject
-      listing/        # ListObjectsV2, ListBuckets
-      multipart/      # Full multipart lifecycle
-      range/          # Range GET, conditional headers
-      presigned/      # Presigned URL generation and consumption
-      migration/      # S3 operations during active backend migration
-      cross_adapter/  # Same test suite run against each StorageProvider adapter
-    chaos/
-    migration/
-    cost_model/
+    s3_compat/            # S3 compliance suite, dedup, encryption, migration tests
+    benchmark/            # Performance benchmark runner
+    control_plane/        # Control-plane contract tests
+    providers/            # Provider-specific tests
+  demo/
+    config.json           # Dev gateway config (local_fs_dev, in-memory stores)
+    tenants.json.tmpl     # Demo tenant template
+    entrypoint.sh         # Docker entrypoint
+    README.md             # Demo usage guide
+  docs/
+    PROPOSAL.md           # Technical proposal (full architecture spec)
+    PROGRESS.md           # Phase-gated progress tracker
+    PHASES.md             # Phase summary and status (NEW)
+    ARCHITECTURE.md       # As-built architecture overview (NEW)
+    INTEGRATION.md        # Dedup integration guide for external apps
+    STORAGE_INFRA.md      # Deployment-model to storage mapping
+    runbooks/             # Operational runbooks
 ```
 
 ## Storage provider interface
@@ -409,9 +447,19 @@ cache in front of it.
 
 ## Project status
 
-- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production & Scale (IN PROGRESS).
+- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production & Scale (IN PROGRESS, ~75%).
 - **Tracker**: [docs/PROGRESS.md](docs/PROGRESS.md).
 - **Technical proposal**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
+
+## Documentation
+
+- [docs/PROPOSAL.md](docs/PROPOSAL.md) — Full technical proposal and architecture spec
+- [docs/PROGRESS.md](docs/PROGRESS.md) — Phase-gated progress tracker
+- [docs/PHASES.md](docs/PHASES.md) — Phase summary and status overview
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — As-built architecture overview
+- [docs/INTEGRATION.md](docs/INTEGRATION.md) — Dedup integration guide for external apps
+- [docs/STORAGE_INFRA.md](docs/STORAGE_INFRA.md) — Deployment-model to storage mapping
+- [docs/runbooks/](docs/runbooks/) — Operational runbooks (CMK rotation, tenant setup, beta onboarding, BYOC)
 
 ## License
 
