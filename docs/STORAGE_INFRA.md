@@ -218,8 +218,8 @@ for the complete (upload method × encryption mode) cross-product.
 | Upload method | Dedup supported? | Notes |
 | --- | --- | --- |
 | Single `PutObject` | Yes (Pattern B or C) | Primary dedup path |
-| Multipart (1 part) | Yes (`client_side` / unencrypted only) | `managed`/`public_distribution` excluded (random DEK per session) |
-| Multipart (N parts) | Yes (`client_side` / unencrypted only) | Per-part BLAKE3 + `piece_ids` JSONB column on `content_index` |
+| Multipart (1 part) | Yes (all convergent modes) | `managed` / `public_distribution` via deferred convergent consolidation at `CompleteMultipartUpload` (PR #54) |
+| Multipart (N parts) | Yes (all convergent modes) | `client_side` / unencrypted via per-part BLAKE3 + `piece_ids` JSONB column; `managed` / `public_distribution` via deferred convergent consolidation |
 | `CopyObject` | Yes (refcount fast path) | Source must be single-piece with `ContentHash` |
 | EC-coded `PutObject` | No (object-level) | Block-level dedup via Ceph RADOS tier covers this for B2B |
 
@@ -229,10 +229,15 @@ attachment via the SDK's multipart "chunked" path in StrictZK mode
 ciphertext (so each part hashes the same across uploads) and the
 chunking strategy is stable. Two uploads that chunk the same
 plaintext into the same N parts produce the same combined
-content-hash and share a single canonical piece set. Tenants on
-`managed` / `public_distribution` multipart still hit the
-random-DEK exclusion above and need to use single `PutObject` if
-they want dedup.
+content-hash and share a single canonical piece set. `managed` /
+`public_distribution` multipart uploads now also dedup via the
+deferred convergent consolidation flow at `CompleteMultipartUpload`
+time (the gateway hashes each part's plaintext at `UploadPart`,
+looks the combined hash up at Complete time, and either redirects
+the manifest to the canonical convergent piece on hit or
+re-encrypts under a convergent DEK on miss). See
+[INTEGRATION.md §8.5](INTEGRATION.md#85-complete-dedup-scenario-matrix)
+for the authoritative per-method × per-mode matrix.
 
 See [INTEGRATION.md](INTEGRATION.md) for the external app
 integration guide.
