@@ -29,7 +29,7 @@ Before integrating, you need:
 - A **bucket dedup policy** enabled via the console API at `:8081`.
   Without an enabled policy the gateway behaves exactly like a
   standard S3 backend — no content addressing, no refcount, no
-  shared pieces. See section 10 below for the API.
+  shared pieces. See section 9 below for the API.
 - For Pattern C (client-side convergent encryption) you also need
   the Go client SDK at `encryption/client_sdk/` or an equivalent
   reimplementation in your application's language.
@@ -232,7 +232,7 @@ s3.put_object(Bucket="company-docs", Key="bob/q1.pdf", Body=body)
 ```
 
 The dedup policy must be enabled on the bucket (`enabled: true`,
-`scope: "intra_tenant"`) — see section 10. Without it, both PUTs
+`scope: "intra_tenant"`) — see section 9. Without it, both PUTs
 write independent ciphertext with random DEKs and consume the full
 storage twice.
 

@@ -2,10 +2,9 @@
 
 The tenant console is the operator-facing SPA that sits in front of the
 gateway's `/api/v1/` management API. It is a Vite + React + TypeScript
-scaffold; it is intentionally minimal and is expected to grow alongside
-the Phase 3 control-plane workstreams.
+application.
 
-## What the console does today (Phase 3+ scaffold)
+## What the console does
 
 - **Login / signup**: B2C self-service onboarding. The form targets
   `POST /api/v1/auth/login` and `POST /api/v1/auth/signup`.
@@ -16,11 +15,13 @@ the Phase 3 control-plane workstreams.
 - **Buckets**: create / list / delete via `/api/v1/buckets`.
 - **API keys**: create / revoke / list via `/api/v1/api-keys`.
 - **Placement policy editor**: visual + YAML editor for the placement
-  policy schema from `docs/PROPOSAL.md` §3.6. Loads and persists
-  through `/api/v1/placement-policies`.
+  policy schema documented in [`docs/PROPOSAL.md`](../docs/PROPOSAL.md).
+  Loads and persists through `/api/v1/placement-policies`.
 - **B2B section**: the dedicated-cell provisioning workflow. Visible
   only for tenants whose `contract_type` is `b2b_dedicated` or
   `sovereign`.
+- **Tier comparison**: read-only public tier comparison at
+  `/api/v1/tiers`.
 
 ## API shape
 
@@ -31,11 +32,12 @@ means the gateway can enforce different auth headers, CORS policies,
 and rate limits on each.
 
 The API client lives in `src/api/` and is typed against the contracts
-defined in `docs/PROPOSAL.md` §3.6 and `metadata/tenant`.
+defined in [`docs/PROPOSAL.md`](../docs/PROPOSAL.md) and the
+`metadata/tenant` package.
 
 ## Development
 
-```
+```bash
 npm install
 npm run dev   # proxies /api/v1 → http://localhost:8080
 npm run build
@@ -43,16 +45,9 @@ npm run lint
 npm run test
 ```
 
-## Next steps
+## Roadmap
 
-Before this SPA can go in front of real tenants it still needs:
-
-- A real auth flow backed by the Authenticator (OAuth2 PKCE is the
-  intended shape). _(B2C signup/login with Postgres-backed auth store
-  is shipped; OAuth2 PKCE is the production upgrade.)_
-- Role-based access so b2b_dedicated / sovereign tenants see the
-  placement-hardware UI their operators need.
-
-Already shipped:
-- Server-sent events on `/api/v1/usage/stream` (Phase 3).
-- E2E tests under `tests/e2e/` driven by Playwright (Phase 3).
+- OAuth2 PKCE for browser-side authentication, layered on top of the
+  existing Postgres-backed authenticator.
+- Role-based access so `b2b_dedicated` and `sovereign` tenants see
+  the placement-hardware UI their operators need.

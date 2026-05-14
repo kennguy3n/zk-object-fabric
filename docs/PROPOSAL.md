@@ -1,4 +1,4 @@
-# ZK Object Fabric — Technical Proposal
+# ZK Object Fabric — Technical Design
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
@@ -47,11 +47,11 @@
 - **License**: Proprietary. AGPL-licensed bases are ruled out for
   production. Permissive / weak-copyleft bases (Ceph RGW LGPL-2.1,
   SeaweedFS Apache-2.0) are acceptable for Phase 2+ local DC storage.
-- **Key strategic insight**: Use public cloud first to prove the
-  product and the migration layer. Because data flows only through the
-  Linode data plane — never through AWS — bandwidth costs stay
-  predictable. Cost leadership is claimed only after moving to local
-  DC cells in Phase 3.
+- **Deployment trajectory**: Phase 1 runs on public cloud (AWS
+  control plane + Linode data plane + Wasabi storage) so the product
+  and the migration layer can be proven without owned infrastructure.
+  Phase 2 introduces hybrid local-DC cells. Phase 3 moves the primary
+  origin onto owned cells with cloud retained for DR and overflow.
 
 ### 1.1 Tech stack
 
@@ -71,87 +71,54 @@
 
 ---
 
-## 2. Market Analysis & Pricing
+## 2. Backend Economics & Cache Strategy
 
-### 2.1 Competitive landscape
+ZK Object Fabric is designed around a small set of cost properties
+that the rest of the architecture must respect. This section
+summarises those properties; commercial pricing is intentionally out
+of scope here.
 
-| Backend                       | Storage cost              | Egress model                                  | Strategic use                                                              |
-| ----------------------------- | ------------------------- | --------------------------------------------- | -------------------------------------------------------------------------- |
-| Wasabi                        | ~$6.99 / TB-mo            | Free, fair-use ≤ 1× stored                    | **Phase 1 primary storage backend.** Main price benchmark.                 |
-| Akamai / Linode Object Storage| ~$20 / TB-mo              | 1 TB / mo included, overage ~$5 / TB          | Data plane compute, not primary storage                                    |
-| AWS S3 Standard               | ~$23 / TB-mo              | Egress ~$0.09 / GB                            | Control plane only. **Never use for data path.**                           |
-| Cloudflare R2                 | ~$15 / TB-mo              | No egress charge, request fees                | Alternative hot egress layer                                               |
-| Backblaze B2                  | ~$6 / TB-mo               | Free egress up to 3× stored, then ~$0.01 / GB | Alternative storage backend                                                |
-| Storj                         | ~$6–$15 / TB-mo by tier   | 1× free egress included                       | ZK and distributed-design **benchmark only** — not usable as prod base     |
+### 2.1 Backend categories
+
+The storage backends below appear in the placement engine and
+determine where ciphertext physically lives.
+
+| Backend                       | Egress model                                  | Architectural role                                                         |
+| ----------------------------- | --------------------------------------------- | -------------------------------------------------------------------------- |
+| Wasabi                        | Free, fair-use ≤ 1× stored                    | Phase 1 primary durable origin                                             |
+| Linode Object Storage         | Monthly transfer allowance per node           | Data plane compute, hot cache                                              |
+| AWS S3 Standard               | Per-GB egress                                 | Control-plane storage only; never used for the customer data path         |
+| Cloudflare R2                 | No per-GB egress, request fees                | Optional hot-egress backend                                                |
+| Backblaze B2                  | Free egress up to 3× stored                   | Alternative durable backend                                                |
+| Storj                         | Per-tier egress allowance                     | BYOC / ZK reference; not used as a production base                         |
 
 ### 2.2 Phase 1 economics with AWS + Linode + Wasabi
 
 Why this stack works:
 
-- **Wasabi at ~$6.99 / TB-mo** is the cheapest S3-compatible storage
-  with included egress. It is the right place to put long-term
-  ciphertext in Phase 1.
-- **Linode** provides data-plane compute with predictable bandwidth.
+- Wasabi is the cheapest S3-compatible durable storage with included
+  egress and is the right place to put long-term ciphertext in
+  Phase 1.
+- Linode provides data-plane compute with predictable bandwidth.
   Each Linode instance includes a monthly transfer allowance that
   absorbs hot-read egress from the cache.
-- **AWS control-plane costs are minimal** — a modest RDS, IAM,
-  CloudWatch, and a small compute footprint — because **no customer
-  data** crosses AWS.
-- **Total Phase 1 COGS per TB** = Wasabi storage per TB-mo + amortized
-  Linode compute / bandwidth per TB served + amortized AWS control-
-  plane cost per tenant. This is significantly cheaper than putting
-  the data path on AWS S3 or Akamai Object Storage.
-- **Fair-use constraint**: Wasabi's included egress assumes monthly
-  egress ≤ active storage volume. The data plane must respect this.
-  The **Linode cache is the mechanism** — hot objects are pinned in
-  Linode NVMe / block storage so repeat reads do not hit Wasabi.
+- AWS control-plane costs are minimal because no customer data
+  crosses AWS — only metadata, auth tokens, billing counters, and
+  monitoring traffic.
+- Phase 1 COGS per TB combines Wasabi storage, amortised Linode
+  compute and bandwidth, and a small amortised AWS control-plane
+  share.
 
-### 2.3 Pricing conclusion
+### 2.3 Fair-use cache contract
 
-With Wasabi as the backend, Phase 1 retail pricing can be more
-competitive than previously estimated. The privacy premium over
-direct Wasabi is the value proposition: customers get ZK encryption,
-placement policy, provider neutrality, and migration-readiness on top
-of Wasabi-class storage economics. Storage cost and bandwidth cost
-must still be separated in all pricing; "unlimited egress" is
-disallowed.
+Wasabi's included egress assumes monthly egress ≤ active storage
+volume. The data plane must respect this constraint, and the Linode
+cache is the mechanism that enforces it. Hot objects are pinned in
+Linode NVMe / block storage so repeat reads do not hit Wasabi origin.
 
-### 2.4 Pricing by phase
-
-#### Phase 1 — AWS + Linode + Wasabi
-
-| Product               | Backend                     | Suggested retail          | Positioning                                              |
-| --------------------- | --------------------------- | ------------------------- | -------------------------------------------------------- |
-| ZK Beta               | Wasabi via Linode           | $9.99–$14.99 / TB-mo      | ZK + placement + portability premium over Wasabi direct  |
-| ZK Hot                | Wasabi + Linode cache       | $14.99–$19.99 / TB-mo     | High egress, frequent reads, cache-served                |
-| BYOC Control Plane    | Customer's own cloud        | SaaS fee + usage          | Enterprise, customer pays storage directly               |
-| Migration Layer       | Cloud → local DC            | Project or usage fee      | Builds future local storage demand                       |
-
-#### Phase 2 — Hybrid (local DC primary + Wasabi / cloud DR)
-
-| Product                  | Backend                        | Suggested retail       |
-| ------------------------ | ------------------------------ | ---------------------- |
-| ZK Standard              | Local primary + Wasabi DR      | $6.99–$8.99 / TB-mo    |
-| ZK Standard (Strict)     | Local EC + customer keys       | $7.99–$11.99 / TB-mo   |
-| ZK Hot                   | Local cache + CDN              | $9.99–$19.99 / TB-mo   |
-| Dedicated PB Cell        | Reserved local capacity        | Custom                 |
-
-#### Phase 3 — Local DC
-
-| Product         | Backend                                | Possible retail target |
-| --------------- | -------------------------------------- | ---------------------- |
-| ZK Archive      | Local HDD EC                           | $2.99–$4.99 / TB-mo    |
-| ZK Standard     | Local HDD EC + limited egress          | $4.99–$6.99 / TB-mo    |
-| ZK Hot          | Local EC + NVMe cache + replica        | $7.99–$12.99 / TB-mo   |
-| ZK Sovereign    | Reserved racks or nodes                | Contracted             |
-
-### 2.5 Key insight
-
-Storage cost and bandwidth cost must be separated. Do **not** advertise
-"unlimited egress." Wasabi's fair-use egress policy means **the Linode
-cache layer is critical** — it absorbs repeated reads so Wasabi origin
-egress stays within fair-use bounds. Cache hit ratio is a product
-metric, not an implementation detail.
+As a result, cache hit ratio is treated as a first-class product
+metric and storage cost and bandwidth cost are always reported
+separately.
 
 ---
 
@@ -193,7 +160,7 @@ and Wasabi is used purely as a durable-origin S3 endpoint.
 #### Wasabi (Storage Backend)
 
 - Durable encrypted object / chunk storage.
-- ~$6.99 / TB-mo with fair-use included egress.
+- Low-cost S3-compatible storage with fair-use included egress.
 - S3-compatible API — the Linode gateway speaks S3 to Wasabi.
 - **90-day minimum storage duration applies.** The data plane must
   **not** use Wasabi for ephemeral objects. Short-TTL cache objects
@@ -1296,7 +1263,7 @@ Phase 1 recommended stack:
 | ----------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
 | Control plane           | AWS (RDS, IAM, CloudWatch)                 | Enterprise trust; no data path needed                                |
 | Data plane / gateway    | Linode compute instances                   | Predictable bandwidth; good compute pricing                          |
-| Storage backend         | Wasabi                                     | ~$6.99 / TB-mo; cheapest S3-compatible; included egress              |
+| Storage backend         | Wasabi                                     | Low-cost S3-compatible storage with fair-use included egress         |
 | Hot cache               | Linode NVMe / block storage                | Absorbs hot reads; keeps Wasabi egress in fair-use                   |
 | CDN (optional)          | Cloudflare or Akamai                       | Additional edge caching for global distribution                      |
 | DR copy                 | AWS S3 Standard-IA or a 2nd Wasabi region  | Not hot serving; cold DR only                                        |
@@ -1355,10 +1322,8 @@ fine; production build on AGPL is not.
 | Bad move                                                           | Why                                                                                            |
 | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
 | Route customer data through AWS                                    | AWS egress costs destroy the economics. Data must stay on the Linode path.                     |
-| Promise cheaper-than-Wasabi pricing during Phase 1                 | ZK Object Fabric adds margin on top of Wasabi. Claim cost leadership only in Phase 3.          |
 | Ignore Wasabi's 90-day minimum storage duration                    | Ephemeral objects on Wasabi incur unnecessary minimum-storage charges. Keep short-TTL on Linode cache. |
 | Exceed Wasabi's fair-use egress                                    | Triggers throttling or account review. Cache hit ratio is a first-class product metric.        |
-| Advertise "unlimited egress"                                       | Forces cross-subsidization that breaks at PB+ scale; invites adverse-selection workloads.      |
 | Reconstruct EC shards on every hot GET                             | EC lowers storage overhead, not read bandwidth. Hot reads must come from L0 / L1.              |
 | Enable cross-tenant deduplication                                  | Permanently incompatible with ZK. Intra-tenant dedup only, via convergent encryption (§3.14). Cross-tenant dedup is never offered. |
 | Use AGPL bases (Storj, MinIO, Garage) as production bases          | Conflicts with the proprietary license. Permitted only as reference / study material.          |
@@ -1376,7 +1341,7 @@ fine; production build on AGPL is not.
 
 ```
 cost_per_TB_month_phase1 =
-    wasabi_storage_per_TB_month                                  (~$6.99)
+    wasabi_storage_per_TB_month
   + linode_compute_amortized_per_TB_served_per_month
   + linode_bandwidth_amortized_per_TB_served_per_month
   + aws_control_plane_amortized_per_tenant_per_month
@@ -1496,16 +1461,18 @@ Becomes an **infrastructure company problem**. Needs:
 
 ## 14. Product Tiers (Consolidated)
 
-| Tier          | Phase  | Storage price          | Included egress          | Backend                                        | Target                           |
-| ------------- | ------ | ---------------------- | ------------------------ | ---------------------------------------------- | -------------------------------- |
-| ZK Beta       | 1      | $9.99–$14.99 / TB-mo   | Capped, cache-shaped     | Wasabi via Linode                              | Privacy-premium early adopters   |
-| ZK Hot        | 1–3    | $7.99–$19.99 / TB-mo   | 2–5× if cacheable        | Wasabi + Linode cache → local + CDN            | SaaS assets, frequent reads      |
-| ZK Archive    | 3      | $2.99–$4.99 / TB-mo    | Low / retrieval-priced   | Local HDD EC (10+4)                            | Backup, compliance               |
-| ZK Standard   | 2–3    | $4.99–$8.99 / TB-mo    | 1× stored                | Local EC + Wasabi DR / local HDD EC            | Wasabi / B2 replacement          |
-| ZK Dedicated  | 2–3    | Custom                 | Committed bandwidth      | Dedicated cell                                 | PB+ customers                    |
-| ZK Sovereign  | 3      | Premium                | Contractual              | Country / DC / rack-constrained cell           | Regulated customers              |
+| Tier          | Phase  | Egress shape             | Backend                                        | Target                           |
+| ------------- | ------ | ------------------------ | ---------------------------------------------- | -------------------------------- |
+| ZK Beta       | 1      | Capped, cache-shaped     | Wasabi via Linode                              | Privacy-premium early adopters   |
+| ZK Hot        | 1–3    | 2–5× stored, cacheable   | Wasabi + Linode cache → local + CDN            | SaaS assets, frequent reads      |
+| ZK Archive    | 3      | Low / retrieval-priced   | Local HDD EC (10+4)                            | Backup, compliance               |
+| ZK Standard   | 2–3    | 1× stored                | Local EC + Wasabi DR / local HDD EC            | Wasabi / B2 replacement          |
+| ZK Dedicated  | 2–3    | Committed bandwidth      | Dedicated cell                                 | PB+ customers                    |
+| ZK Sovereign  | 3      | Contractual              | Country / DC / rack-constrained cell           | Regulated customers              |
 
 All tiers are zero-knowledge by default. All tiers are S3-compatible.
 All tiers expose placement policy; ZK Archive and ZK Standard use
 sensible defaults, ZK Hot and ZK Dedicated expect customer
-configuration, ZK Sovereign requires it.
+configuration, ZK Sovereign requires it. Storage and egress are
+priced separately; commercial pricing is intentionally not pinned
+in this document.

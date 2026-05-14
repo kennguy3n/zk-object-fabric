@@ -1,6 +1,6 @@
 # ZK Object Fabric — As-Built Architecture
 
-This document describes the system **as it actually ships today** —
+This document describes the system **as currently implemented** —
 the directory layout, the components in each layer, the deployment
 modes, and the wire-level contracts. It complements but does not
 replace:

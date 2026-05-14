@@ -52,5 +52,4 @@ passing a stubbed assertion.
 The specs do not seed fixture data in the gateway; most tests
 tolerate an empty tenant by asserting the UI surface and the
 outbound HTTP request, rather than expecting a specific response
-body. Exhaustive fixture-driven coverage is tracked in
-`docs/FRONTEND_PLAN.md` §6.
+body. Exhaustive fixture-driven coverage is a follow-up item.
