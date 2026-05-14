@@ -94,7 +94,7 @@ cdn_shielding:      true       # require requests via the SaaS CDN
 4. Issue one API key for the SaaS app's server-side writers,
    plus presigned-URL-only access for the SaaS app's clients.
 5. Confirm presigned GET / PUT works through the gateway's
-   `s3compat` v4 query-string presigning (PR #24 wired this).
+   `s3compat` v4 query-string presigning.
 
 ---
 

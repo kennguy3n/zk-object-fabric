@@ -159,7 +159,12 @@ host-level reweighting alerts).
   cell provisioning that drives `POST /api/tenants/{id}/dedicated-cells`.
 - [`docs/runbooks/beta-onboarding.md`](../../docs/runbooks/beta-onboarding.md).
 
-## Block-level deduplication (Phase 3.5 §3.14)
+## Block-level deduplication
+
+See [PROPOSAL.md](../../docs/PROPOSAL.md) for the intra-tenant
+deduplication design and [INTEGRATION.md](../../docs/INTEGRATION.md)
+for the external app integration patterns.
+
 
 The Ceph RGW build of zk-object-fabric supports an *opt-in*
 intra-tenant block-level dedup tier on top of the gateway's

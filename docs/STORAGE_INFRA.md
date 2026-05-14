@@ -22,14 +22,14 @@ It answers two questions:
 
 ### B2C — multi-tenant shared fabric
 
-- **Primary (Phase 1)**: Wasabi. See PROPOSAL.md §2.1 for why.
+- **Primary (Phase 1)**: Wasabi. See [PROPOSAL.md §2](PROPOSAL.md)
+  for the backend economics rationale.
 - **Primary (Phase 2+)**: Ceph RGW pooled cells. See PROPOSAL.md §4 for
   the Wasabi → local-DC migration playbook. Ceph RGW is the
   recommended production base: S3-compatible, LGPL-2.1, and mature at
   the 2–20 PB cell sizes the fabric targets.
-- **Alternatives**: Backblaze B2 ($6 / TB-month storage, cheaper than
-  Wasabi but with non-zero egress) and Cloudflare R2 (zero egress,
-  ideal for hot-read workloads).
+- **Alternatives**: Backblaze B2 (low storage price, non-zero egress)
+  and Cloudflare R2 (zero egress, ideal for hot-read workloads).
 - **Cache**: Linode NVMe at the edge (L0) and per-gateway (L1). The
   Wasabi fair-use guardrails (see
   [providers/wasabi/guardrails.go](../providers/wasabi/guardrails.go))
@@ -108,7 +108,7 @@ It answers two questions:
 | --- | --- | --- | --- | --- |
 | `wasabi`        | [`providers/wasabi`](../providers/wasabi)               | 1 | B2C primary (cold origin) | Wired on AWS SDK v2; registered as default provider in `cmd/gateway`; exercised by the S3 compliance suite via `s3_generic` fake. 90-day minimum-storage guardrails shipped. |
 | `local_fs_dev`  | [`providers/local_fs_dev`](../providers/local_fs_dev)   | 1 | Dev / conformance loopback | Wired; drives the Phase 2 S3 compliance suite (`tests/s3_compat`), the migration suite, and the benchmark runner. Also serves as the backend for the Docker demo container (`demo/config.json`). |
-| `s3_generic`    | [`providers/s3_generic`](../providers/s3_generic)       | 1 | Shared S3-compatible base | Wired on AWS SDK v2. ETag normalization (PR #6). |
+| `s3_generic`    | [`providers/s3_generic`](../providers/s3_generic)       | 1 | Shared S3-compatible base | Wired on AWS SDK v2 with S3-quoted ETag normalization. |
 | `ceph_rgw`      | [`providers/ceph_rgw`](../providers/ceph_rgw)           | 2 | B2B / sovereign primary | Scaffold — Config, constructor, Capabilities, CostModel, PlacementLabels. Passes conformance against a fake S3 backend; Phase 3 wires a real RGW cluster. |
 | `backblaze_b2`  | [`providers/backblaze_b2`](../providers/backblaze_b2)   | 2 | B2C alternative          | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.BackblazeB2.Endpoint` is set. |
 | `cloudflare_r2` | [`providers/cloudflare_r2`](../providers/cloudflare_r2) | 2 | B2C hot-egress backend   | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.CloudflareR2.AccountID` or `cfg.Providers.CloudflareR2.Endpoint` is set. |
@@ -218,7 +218,7 @@ for the complete (upload method × encryption mode) cross-product.
 | Upload method | Dedup supported? | Notes |
 | --- | --- | --- |
 | Single `PutObject` | Yes (Pattern B or C) | Primary dedup path |
-| Multipart (1 part) | Yes (all convergent modes) | `managed` / `public_distribution` via deferred convergent consolidation at `CompleteMultipartUpload` (PR #54) |
+| Multipart (1 part) | Yes (all convergent modes) | `managed` / `public_distribution` via deferred convergent consolidation at `CompleteMultipartUpload` |
 | Multipart (N parts) | Yes (all convergent modes) | `client_side` / unencrypted via per-part BLAKE3 + `piece_ids` JSONB column; `managed` / `public_distribution` via deferred convergent consolidation |
 | `CopyObject` | Yes (refcount fast path) | Source must be single-piece with `ContentHash` |
 | EC-coded `PutObject` | No (object-level) | Block-level dedup via Ceph RADOS tier covers this for B2B |

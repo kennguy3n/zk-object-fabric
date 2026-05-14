@@ -26,13 +26,12 @@ as the durable origin.
 | Adapter         | Tag                | Notes                                                                  |
 | --------------- | ------------------ | ---------------------------------------------------------------------- |
 | `aws_s3`        | `TestSuite_AWSS3`  | Native AWS SDK v2 client; supports KMS-encrypted buckets and SigV4.    |
-| `backblaze_b2`  | `TestSuite_BackblazeB2` | S3-compatible mode; uses the unsigned-payload middleware fix.     |
+| `backblaze_b2`  | `TestSuite_BackblazeB2` | S3-compatible mode; unsigned-payload PUTs supported.              |
 | `cloudflare_r2` | `TestSuite_CloudflareR2` | S3-compatible mode; Cloudflare account ID required.              |
 
-All three embed `providers/s3_generic.Provider` and inherit the
-PutPiece middleware fix from PR #25 so the AWS SDK v2 signer
-accepts non-seekable `io.Reader` bodies against non-AWS
-endpoints.
+All three embed `providers/s3_generic.Provider`, so the AWS SDK v2
+signer accepts non-seekable `io.Reader` bodies against non-AWS
+S3-compatible endpoints (Backblaze B2, Cloudflare R2).
 
 ## Step-by-step: AWS S3
 

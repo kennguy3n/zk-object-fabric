@@ -4,7 +4,7 @@
 > placement, provider-neutral durability, and cache-aware egress pricing.
 > Start on public cloud, migrate to dedicated storage cells.
 
-## What it is
+## Overview
 
 ZK Object Fabric is a multi-tenanted, portable encrypted object fabric
 that sits between customers and storage backends. It encrypts data
@@ -12,11 +12,11 @@ client-side by default, stores ciphertext across pluggable storage
 providers (Wasabi, Linode, AWS, local DC cells), and serves hot reads
 from a regional cache — all behind an S3-compatible API.
 
-The fabric is designed to **start on public cloud** and migrate to
-**owned infrastructure** without changing customer-facing APIs. The same
-SDK, bucket name, object key, and URL work across every phase.
+The fabric is designed to start on public cloud and migrate to owned
+infrastructure without changing customer-facing APIs. The same SDK,
+bucket name, object key, and URL work across every phase.
 
-## Quick start (Docker)
+## Quick Start (Docker)
 
 The gateway runs as a single container with **zero external
 dependencies** — no Postgres, no ClickHouse, no cloud credentials.
@@ -27,10 +27,10 @@ and the logger billing sink.
 docker compose up --build
 ```
 
-| Port   | Service         |
-| ------ | --------------- |
+| Port    | Service           |
+| ------- | ----------------- |
 | `:8080` | S3-compatible API |
-| `:8081` | Console API      |
+| `:8081` | Console API       |
 
 Demo tenant credentials (pre-loaded from `demo/tenants.json`):
 
@@ -48,47 +48,16 @@ aws --endpoint-url http://localhost:8080 s3 ls s3://mybucket/
 ```
 
 Any S3-compatible client (AWS SDK, MinIO client, boto3) works.
-Downstream services like **zk-drive**, **kmail**, and **Kapp
-Business Suite** (`kapp-fab`) point their S3 client at
-`http://localhost:8080` (or `http://zk-fabric:8080` when running
-inside the same Docker Compose network).
 
-### Downstream integrations
-
-The fabric currently has three reference downstream integrations,
-all using `managed` encryption mode so the gateway handles the DEK
-and the application code never sees plaintext keys:
-
-- **kmail** — Stalwart blob store backend; one tenant per kmail
-  install, credentials seeded in `demo/tenants.json`.
-- **zk-drive** — end-user file sync; per-end-user tenants, HMAC
-  pair handed out at signup.
-- **Kapp Business Suite** ([`kennguy3n/kapp-fab`](https://github.com/kennguy3n/kapp-fab))
-  — multi-tenant ERP-lite; the Kapp setup wizard provisions a
-  fabric tenant + HMAC pair + bucket via the console API at
-  `:8081` so each ERP tenant's file attachments inherit per-tenant
-  zero-knowledge encryption with no application-side key
-  management.
-- **KChat** — MLS-based encrypted messaging; uses `client_side`
-  encryption mode with convergent dedup (Pattern C from
-  [docs/INTEGRATION.md](docs/INTEGRATION.md)) for cross-group file
-  deduplication while preserving MLS forward secrecy on the message
-  channel.
+Reference integrations for mail, file sync, ERP, and messaging are
+included in the demo configuration; see
+[`demo/README.md`](demo/README.md).
 
 > **Note**: tenant and manifest state is in-memory and lost on
 > container restart. Object data persists in the `zk-data` Docker
 > volume. This mode is for development and demos only.
 
-The S3 API is the phase-invariant contract. The same `aws s3 cp`,
-`boto3`, or `@aws-sdk/client-s3` command works in Phase 1 (Wasabi),
-Phase 2 (Ceph RGW), and Phase 3 (owned DC) without any client-side
-changes. Backend migrations are invisible to the API consumer.
-
-Phase 3.5 adds intra-tenant deduplication — see
-[docs/INTEGRATION.md](docs/INTEGRATION.md) for the external app
-integration guide.
-
-## Running tests
+## Running Tests
 
 ```bash
 # Unit and integration tests (uses in-memory backends)
@@ -108,111 +77,35 @@ Environment-gated tests (Ceph RGW, Wasabi, Storj, etc.) require
 provider credentials via environment variables. See
 `tests/s3_compat/suite_test.go` for the gating pattern.
 
-It serves two audiences:
-
-- **B2C / self-service** app developers who need cheap, zero-knowledge,
-  S3-compatible storage they can onboard via an SDK and an API key.
-- **B2B / enterprise / sovereign** customers who need dedicated cells,
-  country / DC / rack-level placement control, committed bandwidth, and
-  SLA-backed durability.
-
-## Key differentiators
+## Key Features
 
 - **S3 API as the stable contract** — the S3-compatible API surface is
-  frozen across all phases. Backend storage, encryption, caching, and
-  erasure coding evolve underneath; the API never changes. Validated
-  by a compliance test suite that runs against every backend adapter.
+  frozen across phases. Backend storage, encryption, caching, and
+  erasure coding evolve underneath; the API never changes.
 - **Zero-knowledge by default** — client-side encryption, per-object
   DEKs, encrypted manifests. The service operator cannot read customer
-  data.
-- **Provider-neutral object manifests** — customer objects are
-  decoupled from backend provider objects.
+  data in Strict ZK mode.
+- **Provider-neutral object manifests** — customer object names are
+  decoupled from backend locators, enabling seamless migrations.
 - **Pluggable storage backends** — Wasabi, Backblaze B2, Cloudflare R2,
-  AWS S3, local DC cells.
-- **Built-in migration engine** — cloud → hybrid → local DC with zero
+  AWS S3, Storj, and local DC cells.
+- **Built-in migration engine** — cloud → hybrid → local DC with no
   customer-facing API changes.
 - **Customer-controlled placement** — provider, region, country; plus
   DC / rack / node when on owned infrastructure.
 - **Three-layer data plane** — L0 edge cache, L1 regional hot replica,
   L2 durable origin.
-- **Explicit bandwidth accounting** — no hidden "fair-use" policies;
-  egress is metered and priced transparently.
 - **Multi-tenant** — per-tenant encryption, placement policies, egress
   budgets, billing counters, and abuse controls.
-- **Intra-tenant deduplication** — object-level dedup across all backends
-  (gateway ContentIndex), plus block-level dedup on Ceph RGW cells.
-  Three integration patterns for external apps: single-upload/N-readers,
-  gateway-convergent (transparent), and client-side convergent (Strict ZK
-  compatible). See [docs/INTEGRATION.md](docs/INTEGRATION.md).
+- **Intra-tenant deduplication** — object-level dedup across all
+  backends plus block-level dedup on Ceph RGW cells. See
+  [docs/INTEGRATION.md](docs/INTEGRATION.md) for the external app
+  integration guide.
 - **Cell architecture for horizontal scale** — independent cells of
-  2–20 PB usable capacity in the local DC phase, each with its own
-  metadata, repair queues, and failure domains.
-- **Two deployment modes** — B2C self-service on pooled infrastructure
-  and B2B dedicated cells for sovereign / PB+ customers.
+  2–20 PB usable capacity, each with its own metadata, repair queues,
+  and failure domains.
 
-## Phase 1 Architecture — AWS + Linode + Wasabi
-
-Phase 1 splits the system into three clearly separated components so
-that customer data **never transits AWS** and therefore never incurs
-AWS egress fees.
-
-- **AWS (Control Plane)** — metadata DB (Postgres / RDS), auth / IAM,
-  billing counters, monitoring, alerting, operational dashboards.
-  **No customer data flows through AWS.**
-- **Linode (Data Plane)** — S3-compatible gateway fleet, hot object
-  cache, CDN integration. **All customer data flows through Linode
-  nodes only.**
-- **Wasabi (Storage Backend)** — durable object storage at
-  ~$6.99 / TB-mo with fair-use included egress. Primary durable origin
-  for encrypted chunks/objects in Phase 1.
-
-Data flow:
-
-```mermaid
-flowchart LR
-    Client["Client / SDK"]
-    Linode["Linode Data Plane<br/>(Gateway + Cache)"]
-    Wasabi["Wasabi<br/>(Storage Backend)"]
-    AWS["AWS Control Plane<br/>(Metadata, Auth, Billing)"]
-
-    Client <-->|"data path"| Linode
-    Linode <-->|"data path"| Wasabi
-    Linode <-->|"control signals only<br/>(no customer data)"| AWS
-    Client -->|"auth tokens"| AWS
-```
-
-Why this works:
-
-- Wasabi is the cheapest S3-compatible storage backend (~$6.99 / TB-mo)
-  with included egress under a fair-use policy (monthly egress
-  ≤ active storage volume).
-- Linode provides the data plane with predictable bandwidth pricing and
-  an included transfer allowance per node, which is ideal for
-  caching hot ciphertext in front of Wasabi.
-- AWS provides an enterprise-grade control plane (RDS, IAM, CloudWatch)
-  without incurring data egress costs — because no customer data
-  transits AWS.
-- The Linode cache layer absorbs repeated reads, keeping Wasabi origin
-  egress within fair-use bounds.
-
-## Phased strategy
-
-- **Phase 1 — Public Cloud Origin**: AWS control plane + Linode data
-  plane + Wasabi storage. Prove the ZK storage layer, S3 API, client
-  SDK, placement policy, billing, hot cache, migration engine, and
-  operational telemetry. *S3 API served by Linode gateway → Wasabi
-  backend.*
-- **Phase 2 — Hybrid Local Primary**: add local DC cells (Ceph RGW)
-  for new writes. Linode + Wasabi continue as backup and overflow.
-  Dual-write, lazy migration on read, background rebalancer. *Same S3
-  API, now served by gateway → Ceph RGW backend. Zero client changes.*
-- **Phase 3 — In-Country Storage Cells**: local erasure-coded HDD
-  origin, NVMe cache, DC / rack / node placement. Cloud only for DR,
-  migration, and burst. This is where ZK Object Fabric achieves cost
-  leadership. *Same S3 API, now served by gateway → owned DC backend.
-  Zero client changes.*
-
-## Architecture (full system view)
+## Architecture Overview
 
 ```mermaid
 flowchart TD
@@ -249,7 +142,11 @@ All layers below the ZK Gateway operate on ciphertext. Keys never leave
 the client boundary unless the customer explicitly opts into a managed
 key mode.
 
-## Zero-knowledge modes
+For the full as-built architecture (component diagrams, package map,
+data flow, deployment modes), see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Zero-Knowledge Modes
 
 | Mode                | Product name                | Who holds keys                              | Use case                              |
 | ------------------- | --------------------------- | ------------------------------------------- | ------------------------------------- |
@@ -257,204 +154,21 @@ key mode.
 | Managed Encrypted   | Managed Secure Storage      | Gateway or HSM-backed service               | Simpler B2C and SMB                   |
 | Public Distribution | Edge Object                 | Object may be public but origin encrypted   | Assets, media, downloads              |
 
-> **Note**: Managed encrypted mode is **not** strict zero-knowledge.
-> The gateway can access plaintext in memory during request handling.
-> This mode should be called **confidential managed storage**, not
-> zero-knowledge, in customer-facing documentation.
+Managed encrypted mode is not strict zero-knowledge — the gateway can
+access plaintext in memory during request handling.
 
-## Product tiers by phase
+## Project Status
 
-### Phase 1 — Public Cloud (AWS + Linode + Wasabi)
-
-| Product               | Backend                          | Suggested retail          | Positioning                                  |
-| --------------------- | -------------------------------- | ------------------------- | -------------------------------------------- |
-| ZK Beta               | Wasabi via Linode                | $9.99–$14.99 / TB-mo      | Privacy premium over Wasabi direct           |
-| ZK Hot                | Wasabi + Linode cache / CDN      | $14.99–$19.99 / TB-mo     | High egress, CDN, frequent reads             |
-| BYOC Control Plane    | Customer's own cloud account     | SaaS fee + usage          | Best for early enterprise                    |
-| Migration Layer       | Customer cloud → local DC        | Project or usage fee      | Builds future local storage demand           |
-
-### Phase 2 — Hybrid (local DC primary + Wasabi / cloud DR)
-
-| Product                  | Backend                         | Suggested retail       |
-| ------------------------ | ------------------------------- | ---------------------- |
-| ZK Standard              | Local primary + Wasabi DR       | $6.99–$8.99 / TB-mo    |
-| ZK Standard (Strict)     | Local EC + customer keys        | $7.99–$11.99 / TB-mo   |
-| ZK Hot                   | Local cache + CDN               | $9.99–$19.99 / TB-mo   |
-| Dedicated PB Cell        | Reserved local capacity         | Custom                 |
-
-### Phase 3 — Local DC
-
-| Product         | Backend                                  | Possible retail target |
-| --------------- | ---------------------------------------- | ---------------------- |
-| ZK Archive      | Local HDD EC                             | $2.99–$4.99 / TB-mo    |
-| ZK Standard     | Local HDD EC + limited egress            | $4.99–$6.99 / TB-mo    |
-| ZK Hot          | Local EC + NVMe cache + replica          | $7.99–$12.99 / TB-mo   |
-| ZK Sovereign    | Reserved racks or nodes                  | Contracted             |
-
-## Deployment modes
-
-### B2C / Self-service
-
-- Pooled infrastructure shared across many tenants.
-- Automated onboarding: sign up, create bucket, receive API keys.
-- SDK-driven encryption so tenants never ship plaintext keys to the
-  service.
-- Per-tenant egress budgets and anomaly detection.
-- Abuse controls (rate limits, reputation, optional CDN shielding).
-- Starts on public cloud (AWS control plane + Linode data plane +
-  Wasabi storage) and migrates to owned nodes as a tenant's footprint
-  grows.
-
-### B2B / Dedicated
-
-- Dedicated cells with isolated metadata, repair, and billing.
-- Sovereign placement (specific countries, DCs, racks, node classes).
-- Committed bandwidth contracts, not best-effort egress.
-- Custom erasure coding profiles per cell.
-- SLA-backed durability and availability.
-- Scales to owned high-density HDD storage nodes for PB+ footprints.
-
-## Tech stack
-
-- **Server-side**: **Go** for the ZK Gateway, control plane services,
-  storage provider adapters, migration engine, billing, and metadata
-  services.
-- **Frontend**: **React** for the tenant console, admin dashboards,
-  self-service onboarding, and operator UIs.
-- **Rust** is used **selectively** where it makes a large difference —
-  chunking and encryption hot paths, cache eviction loops, erasure
-  coding in Phase 2+, and any node-local agent where memory footprint
-  and per-byte CPU cost matter.
-
-## Repo structure
-
-```
-zk-object-fabric/
-  Dockerfile
-  docker-compose.yml
-  go.mod / go.sum
-  .dockerignore
-  cmd/
-    gateway/              # Gateway entry point (main.go)
-  api/
-    s3compat/             # S3 API handlers, multipart, dedup, erasure coding, encryption
-    console/              # Console API: tenant mgmt, auth, billing, placement, dedup policy
-  encryption/
-    client_sdk/           # Client-side encryption SDK (XChaCha20-Poly1305, convergent DEK)
-    envelope.go           # Encryption envelope types
-  metadata/
-    manifest_store/       # Manifest persistence (memory + Postgres)
-    placement_policy/     # Placement engine and policy DSL
-    erasure_coding/       # EC profiles, encoder, registry
-    content_index/        # Dedup ContentIndex (memory + Postgres)
-    tenant/               # Tenant schema, tier config
-  providers/
-    s3_generic/           # Shared S3-compatible base adapter
-    wasabi/               # Wasabi adapter + fair-use guardrails
-    ceph_rgw/             # Ceph RGW adapter (Phase 2+)
-    aws_s3/               # AWS S3 adapter (BYOC / DR)
-    backblaze_b2/         # Backblaze B2 adapter
-    cloudflare_r2/        # Cloudflare R2 adapter
-    storj/                # Storj native uplink adapter
-    local_fs_dev/         # Filesystem loopback (dev/demo)
-  cache/
-    hot_object_cache/     # LRU memory cache, disk cache, promotion worker
-  migration/
-    dual_write/           # Dual-write provider wrapper
-    lazy_read_repair/     # Read-path migration
-    background_rebalancer/# Background object drain
-    cross_cell/           # Cross-cell async replicator
-  billing/                # Metering, ClickHouse sink, logger sink, forecasting, provider registry
-  internal/
-    auth/                 # SigV4 authenticator, rate limiter, abuse guard, DDoS shield, legal hold
-    cellops/              # Cell registry, provisioner
-    compliance/           # Audit trail, residency enforcer
-    config/               # Gateway configuration
-    health/               # Health/ready/drain endpoints
-    metrics/              # Prometheus text-format exporter
-    repair/               # Automated repair queue
-    tracing/              # Request tracing
-  frontend/               # React + Vite tenant console
-  deploy/
-    aws/                  # Terraform: RDS, IAM, KMS, CloudWatch
-    linode/               # Terraform: gateway fleet, NodeBalancer
-    wasabi/               # Bucket provisioner, IAM policy
-    local-dc/             # Ceph cephadm, Ansible, monitoring
-    cell-provisioner/     # Automated cell provisioning scripts
-  tests/
-    s3_compat/            # S3 compliance suite, dedup, encryption, migration tests
-    benchmark/            # Performance benchmark runner
-    control_plane/        # Control-plane contract tests
-    providers/            # Provider-specific tests
-  demo/
-    config.json           # Dev gateway config (local_fs_dev, in-memory stores)
-    tenants.json.tmpl     # Demo tenant template
-    entrypoint.sh         # Docker entrypoint
-    README.md             # Demo usage guide
-  docs/
-    PROPOSAL.md           # Technical proposal (full architecture spec)
-    PROGRESS.md           # Phase-gated progress tracker
-    PHASES.md             # Phase summary and status (NEW)
-    ARCHITECTURE.md       # As-built architecture overview (NEW)
-    INTEGRATION.md        # Dedup integration guide for external apps
-    STORAGE_INFRA.md      # Deployment-model to storage mapping
-    runbooks/             # Operational runbooks
-```
-
-## Storage provider interface
-
-All backends (Wasabi, Backblaze B2, Cloudflare R2, AWS S3, local DC
-cell) implement the same interface so the fabric can add, remove, and
-migrate between backends without customer-visible changes.
-
-```typescript
-interface StorageProvider {
-  putPiece(pieceId: string, data: ReadableStream, opts: PutOptions): Promise<PutResult>;
-  getPiece(pieceId: string, range?: ByteRange): Promise<ReadableStream>;
-  headPiece(pieceId: string): Promise<PieceMetadata>;
-  deletePiece(pieceId: string): Promise<void>;
-  listPieces(prefix: string, cursor?: string): Promise<ListResult>;
-  capabilities(): ProviderCapabilities;
-  costModel(): ProviderCostModel;
-  placementLabels(): PlacementLabels;
-}
-```
-
-The Go implementation uses the equivalent interface; the TypeScript
-signature above is the canonical reference for documentation.
-
-Every adapter must pass the S3 compliance test suite
-(`tests/s3_compat/`). This guarantees that swapping `wasabi` for
-`ceph_rgw` or `local_dc` does not change S3 API behavior.
-
-## What NOT to build first
-
-The following items are explicitly **out of scope for Phase 1 and
-Phase 2**. They are tempting, but any of them will slow the product
-down without materially improving the value proposition.
-
-- Full decentralized node reputation system.
-- Storj-style satellite complexity.
-- Public token incentives.
-- Multi-cloud erasure coding.
-- Custom distributed filesystem.
-- Full Ceph fork.
-- Ceph on EC2 / EBS.
-
-The early fabric is: S3 API at the edge, ZK encryption, provider-
-neutral manifests, Wasabi as the primary durable backend, and a Linode
-cache in front of it.
-
-## Project status
-
-- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production & Scale (IN PROGRESS, ~75%).
+- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 —
+  Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production &
+  Scale (IN PROGRESS).
 - **Tracker**: [docs/PROGRESS.md](docs/PROGRESS.md).
-- **Technical proposal**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
+- **Technical design**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
 
 ## Documentation
 
-- [docs/PROPOSAL.md](docs/PROPOSAL.md) — Full technical proposal and architecture spec
-- [docs/PROGRESS.md](docs/PROGRESS.md) — Phase-gated progress tracker
+- [docs/PROPOSAL.md](docs/PROPOSAL.md) — Technical design and architecture spec
+- [docs/PROGRESS.md](docs/PROGRESS.md) — Phase-gated development progress
 - [docs/PHASES.md](docs/PHASES.md) — Phase summary and status overview
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — As-built architecture overview
 - [docs/INTEGRATION.md](docs/INTEGRATION.md) — Dedup integration guide for external apps

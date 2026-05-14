@@ -5,8 +5,8 @@ status. It exists so a reader can answer "what is shipped, what is
 in progress, and where is the detail?" without scrolling through the
 full progress tracker.
 
-- For the **detailed checklist**, per-PR notes, and Phase 4 changelog,
-  see [PROGRESS.md](PROGRESS.md).
+- For the **detailed phase checklist** and changelog, see
+  [PROGRESS.md](PROGRESS.md).
 - For the **technical design** (manifest format, encryption envelope,
   placement DSL, dedup, migration engine, cell architecture), see
   [PROPOSAL.md](PROPOSAL.md).
@@ -52,12 +52,12 @@ decisions.
 - Benchmark suite spec (PUT/GET p50/p95/p99, cache-hit ratio,
   Wasabi origin egress ratio, LIST scaling).
 
-**Decision gate**: Phase 2+ local-DC base → **Ceph RGW** (production
+**Design decision**: Phase 2+ local-DC base → **Ceph RGW** (production
 maturity, operational tooling, EC support). SeaweedFS retained as
 documented fallback. AGPL options ruled out by license; Garage ruled
 out by lack of EC.
 
-**Detail**: [PROGRESS.md §Phase 1](PROGRESS.md#phase-1-architecture-proof-weeks-13).
+See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
 ---
 
@@ -85,7 +85,7 @@ dry-run cut-over to a local DC cell.
   lazy read repair + background rebalancer.
 - S3 compliance test suite (`tests/s3_compat/`) running cross-adapter.
 
-**Detail**: [PROGRESS.md §Phase 2](PROGRESS.md#phase-2-prototype-weeks-49).
+See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
 ---
 
@@ -121,7 +121,7 @@ B2B paths, plus a first local DC cell for early hybrid customers.
 - Reference downstream integrations: kmail, zk-drive, Kapp Business
   Suite (all `managed`-mode), KChat (`client_side` convergent).
 
-**Detail**: [PROGRESS.md §Phase 3](PROGRESS.md#phase-3-beta-cell-weeks-1015).
+See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
 ---
 
@@ -150,7 +150,7 @@ permanently excluded.
 - Reference-counted DELETE (`api/s3compat/handler.go#Delete`).
 - Multipart dedup at `CompleteMultipartUpload` (single-piece +
   multi-piece via the `piece_ids` JSONB column; deferred convergent
-  consolidation for `managed` / `public_distribution` per PR #54).
+  consolidation for `managed` / `public_distribution`).
 - Console API at `/api/v1/tenants/{tid}/buckets/{bucket}/dedup-policy`
   with the `object+block` Ceph-RGW + dedicated-cell guardrail.
 - Ceph RGW block-level dedup operator guide.
@@ -162,7 +162,7 @@ permanently excluded.
 - External-app integration patterns documented in
   [INTEGRATION.md](INTEGRATION.md).
 
-**Detail**: [PROGRESS.md §Phase 3.5](PROGRESS.md#phase-35-intra-tenant-deduplication).
+See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
 ---
 
@@ -206,4 +206,4 @@ local DC cells become the primary origin.
 - DC and power strategy.
 - Global peering and transit.
 
-**Detail**: [PROGRESS.md §Phase 4](PROGRESS.md#phase-4-production--scale-post-beta).
+See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
