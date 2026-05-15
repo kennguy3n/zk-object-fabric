@@ -567,3 +567,80 @@ func TestRateLimiter_UnknownTenantPassesThrough(t *testing.T) {
 		t.Fatal("unknown tenant: want allow")
 	}
 }
+
+// ---- SigV4 canonical URI/query edge-case tests ----
+
+func TestCanonicalURI_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"empty", "", "/"},
+		{"root", "/", "/"},
+		{"simple", "/bucket/key", "/bucket/key"},
+		{"unreserved chars", "/bucket/key-name_v1.2~draft", "/bucket/key-name_v1.2~draft"},
+		{"space encoded", "/bucket/my key", "/bucket/my%20key"},
+		{"double slash", "/bucket//leading-slash", "/bucket//leading-slash"},
+		{"pre-encoded percent", "/bucket/100%done", "/bucket/100%25done"},
+		{"unicode bytes", "/bucket/日本語", "/bucket/%E6%97%A5%E6%9C%AC%E8%AA%9E"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := canonicalURI(tt.path)
+			if got != tt.want {
+				t.Errorf("canonicalURI(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalQuery_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"empty", "", ""},
+		{"single param", "key=value", "key=value"},
+		{"sorted", "b=2&a=1", "a=1&b=2"},
+		{"repeated keys sorted by value", "k=b&k=a", "k=a&k=b"},
+		{"empty value", "key=", "key="},
+		{"no equals", "key", "key="},
+		{"pre-encoded slash in value", "path=%2Ffoo%2Fbar", "path=%2Ffoo%2Fbar"},
+		{"space as plus", "msg=hello+world", "msg=hello%20world"},
+		{"mixed encoding", "a=%2B&b=+", "a=%2B&b=%20"},
+		{"trailing ampersand", "a=1&", "a=1"},
+		{"pre-encoded equals in value", "data=a%3Db", "data=a%3Db"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := canonicalQuery(tt.raw)
+			if got != tt.want {
+				t.Errorf("canonicalQuery(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSigV4PercentEncode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"abc", "abc"},
+		{"hello world", "hello%20world"},
+		{"/foo/bar", "%2Ffoo%2Fbar"},
+		{"a=b&c", "a%3Db%26c"},
+		{"file~name.txt", "file~name.txt"},
+		{"日本", "%E6%97%A5%E6%9C%AC"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got := sigV4PercentEncode(tt.in)
+			if got != tt.want {
+				t.Errorf("sigV4PercentEncode(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

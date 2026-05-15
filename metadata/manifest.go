@@ -90,6 +90,13 @@ type Piece struct {
 	Locator string `json:"locator"`
 	State   string `json:"state"`
 
+	// ProviderETag is the opaque ETag returned by the storage
+	// provider on PUT. It is preserved for S3-protocol
+	// compatibility (GET/HEAD return this to clients) but is NOT
+	// the canonical integrity hash. Use Hash for content
+	// integrity verification.
+	ProviderETag string `json:"provider_etag,omitempty"`
+
 	// PartNumber is the 1-based S3 multipart index. Zero means the
 	// piece was not uploaded via multipart.
 	PartNumber int `json:"part_number,omitempty"`

@@ -89,7 +89,11 @@ func (s *Store) Put(ctx context.Context, key manifest_store.ManifestKey, m *meta
 		return fmt.Errorf("postgres: marshal manifest: %w", err)
 	}
 	if s.encryptor != nil {
-		sealed, eerr := s.encryptor.Encrypt(body)
+		sealed, eerr := s.encryptor.Encrypt(body, BodyContext{
+			TenantID:      key.TenantID,
+			Bucket:        key.Bucket,
+			ObjectKeyHash: key.ObjectKeyHash,
+		})
 		if eerr != nil {
 			return fmt.Errorf("postgres: encrypt manifest body: %w", eerr)
 		}
@@ -139,7 +143,11 @@ func (s *Store) Get(ctx context.Context, key manifest_store.ManifestKey) (*metad
 		return nil, fmt.Errorf("postgres: get manifest: %w", err)
 	}
 	if s.encryptor != nil {
-		opened, derr := s.encryptor.Decrypt(body)
+		opened, derr := s.encryptor.Decrypt(body, BodyContext{
+			TenantID:      key.TenantID,
+			Bucket:        key.Bucket,
+			ObjectKeyHash: key.ObjectKeyHash,
+		})
 		if derr != nil {
 			return nil, fmt.Errorf("postgres: decrypt manifest body: %w", derr)
 		}
@@ -224,7 +232,11 @@ func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit
 			return manifest_store.ListResult{}, fmt.Errorf("postgres: scan manifest: %w", err)
 		}
 		if s.encryptor != nil {
-			opened, derr := s.encryptor.Decrypt(body)
+			opened, derr := s.encryptor.Decrypt(body, BodyContext{
+				TenantID:      tenantID,
+				Bucket:        bucket,
+				ObjectKeyHash: hash,
+			})
 			if derr != nil {
 				return manifest_store.ListResult{}, fmt.Errorf("postgres: decrypt manifest body: %w", derr)
 			}
@@ -277,19 +289,30 @@ func (s *Store) HasManifestWithPieceID(ctx context.Context, tenantID, pieceID st
 	}
 	// Encrypted body: scan + decrypt rows for the tenant. This
 	// is acceptable because orphan GC is rate-limited and the
-	// per-tenant row count is bounded by tenant policy.
-	q := fmt.Sprintf(`SELECT body FROM %s WHERE tenant_id = $1`, s.table)
+	// per-tenant row count is bounded by tenant policy. We
+	// select bucket and object_key_hash alongside body so the
+	// AAD-bound decrypt can use the manifest key the row was
+	// sealed under.
+	q := fmt.Sprintf(`SELECT bucket, object_key_hash, body FROM %s WHERE tenant_id = $1`, s.table)
 	rows, err := s.db.QueryContext(ctx, q, tenantID)
 	if err != nil {
 		return false, fmt.Errorf("postgres: has manifest with piece_id: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var body []byte
-		if err := rows.Scan(&body); err != nil {
+		var (
+			bucket string
+			hash   string
+			body   []byte
+		)
+		if err := rows.Scan(&bucket, &hash, &body); err != nil {
 			return false, fmt.Errorf("postgres: has manifest scan: %w", err)
 		}
-		opened, derr := s.encryptor.Decrypt(body)
+		opened, derr := s.encryptor.Decrypt(body, BodyContext{
+			TenantID:      tenantID,
+			Bucket:        bucket,
+			ObjectKeyHash: hash,
+		})
 		if derr != nil {
 			return false, fmt.Errorf("postgres: has manifest decrypt: %w", derr)
 		}
@@ -332,7 +355,11 @@ func (s *Store) ListVersions(ctx context.Context, tenantID, bucket, objectKeyHas
 			return nil, fmt.Errorf("postgres: list versions scan: %w", err)
 		}
 		if s.encryptor != nil {
-			opened, derr := s.encryptor.Decrypt(body)
+			opened, derr := s.encryptor.Decrypt(body, BodyContext{
+				TenantID:      tenantID,
+				Bucket:        bucket,
+				ObjectKeyHash: objectKeyHash,
+			})
 			if derr != nil {
 				return nil, fmt.Errorf("postgres: list versions decrypt: %w", derr)
 			}

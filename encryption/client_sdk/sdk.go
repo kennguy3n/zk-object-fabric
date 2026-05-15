@@ -16,6 +16,32 @@
 // plaintext. The last chunk may be shorter. Ciphertext chunks are
 // self-describing — the decryptor walks frames sequentially — so the
 // SDK does not need a separate manifest for framing metadata.
+//
+// # Additional Authenticated Data (AAD)
+//
+// Callers may bind per-chunk ciphertext to an object-level context
+// by populating Options.ChunkAAD. When non-empty the AEAD AAD for
+// every chunk is the concatenation
+//
+//	AAD = ChunkAAD || "|" || big-endian uint64(chunk_index)
+//
+// This prevents a frame from being lifted out of one object and
+// replayed inside another (same DEK) — the chunk_index suffix also
+// rejects within-object reordering. The recommended ChunkAAD
+// payload is the canonical, pipe-separated tuple
+//
+//	tenant_id|bucket|object_key_hash|version_id
+//
+// where `object_key_hash` is a content-derived SHA-256 over the
+// object key (so the binding survives a CompleteMultipartUpload
+// that may reorder bucket / key formatting). Other SDK
+// implementations MUST reproduce this format byte-for-byte to
+// interoperate.
+//
+// When ChunkAAD is empty (zero-length slice) the SDK falls back to
+// AAD = nil for both Seal and Open — this preserves ciphertext
+// compatibility with Phase 1 / Phase 2 objects that were sealed
+// before the AAD field existed.
 package client_sdk
 
 import (
@@ -59,6 +85,15 @@ type Options struct {
 	// docs/PROPOSAL.md §3.14. Trade-off: stored ciphertext loses
 	// forward secrecy. Default false (random nonces, FS preserved).
 	ConvergentNonce bool
+
+	// ChunkAAD, when non-empty, is mixed into every per-chunk AEAD
+	// AAD alongside the big-endian chunk index. See the package
+	// doc for the canonical format. When empty the SDK seals every
+	// chunk with AAD = nil so ciphertext stays compatible with
+	// pre-AAD objects. EncryptObject and DecryptObject MUST be
+	// invoked with the same ChunkAAD value or Open will return a
+	// MAC failure.
+	ChunkAAD []byte
 }
 
 func (o Options) chunkSize() int {
@@ -90,6 +125,7 @@ func EncryptObject(plaintext io.Reader, dek DataEncryptionKey, opts Options) (io
 		src:       plaintext,
 		aead:      aead,
 		chunkSize: opts.chunkSize(),
+		chunkAAD:  cloneNonEmpty(opts.ChunkAAD),
 	}
 	if opts.ConvergentNonce {
 		// Hold a copy of the DEK on the reader so nextFrame can
@@ -122,7 +158,37 @@ func DecryptObject(ciphertext io.Reader, dek DataEncryptionKey, opts Options) (i
 		src:       ciphertext,
 		aead:      aead,
 		chunkSize: opts.chunkSize(),
+		chunkAAD:  cloneNonEmpty(opts.ChunkAAD),
 	}, nil
+}
+
+// cloneNonEmpty returns nil when b is empty so the SDK's AAD logic
+// can branch cleanly on len(chunkAAD) == 0 without conflating a
+// caller-passed empty slice with a nil slice.
+func cloneNonEmpty(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return append([]byte(nil), b...)
+}
+
+// chunkAADBytes returns the AEAD AAD for the given chunkIndex. The
+// returned slice is nil when chunkAAD is empty (legacy compat
+// mode); otherwise it is the canonical pipe-separated form
+// documented in the package doc:
+//
+//	chunkAAD || "|" || big-endian uint64(chunkIndex)
+func chunkAADBytes(chunkAAD []byte, chunkIndex uint64) []byte {
+	if len(chunkAAD) == 0 {
+		return nil
+	}
+	aad := make([]byte, 0, len(chunkAAD)+1+8)
+	aad = append(aad, chunkAAD...)
+	aad = append(aad, '|')
+	var idx [8]byte
+	binary.BigEndian.PutUint64(idx[:], chunkIndex)
+	aad = append(aad, idx[:]...)
+	return aad
 }
 
 // deriveConvergentNonce returns the deterministic nonce used to
@@ -159,6 +225,7 @@ type encryptReader struct {
 	convergent bool
 	dek        DataEncryptionKey
 	chunkIndex uint64
+	chunkAAD   []byte
 }
 
 // cipherAEAD is the subset of cipher.AEAD the SDK needs; exposed as
@@ -211,8 +278,9 @@ func (r *encryptReader) nextFrame() error {
 			return fmt.Errorf("client_sdk: generate nonce: %w", err)
 		}
 	}
+	aad := chunkAADBytes(r.chunkAAD, r.chunkIndex)
 	r.chunkIndex++
-	sealed := r.aead.Seal(nil, nonce, buf[:n], nil)
+	sealed := r.aead.Seal(nil, nonce, buf[:n], aad)
 
 	var hdr [chunkHeaderSize]byte
 	copy(hdr[:nonceSize], nonce)
@@ -224,11 +292,13 @@ func (r *encryptReader) nextFrame() error {
 
 // decryptReader streams plaintext chunks on demand.
 type decryptReader struct {
-	src       io.Reader
-	aead      cipherAEAD
-	chunkSize int
-	pending   bytes.Buffer
-	eof       bool
+	src        io.Reader
+	aead       cipherAEAD
+	chunkSize  int
+	pending    bytes.Buffer
+	eof        bool
+	chunkAAD   []byte
+	chunkIndex uint64
 }
 
 func (r *decryptReader) Read(p []byte) (int, error) {
@@ -267,7 +337,9 @@ func (r *decryptReader) nextFrame() error {
 	if _, err := io.ReadFull(r.src, ct); err != nil {
 		return fmt.Errorf("client_sdk: read frame body: %w", err)
 	}
-	pt, err := r.aead.Open(nil, nonce, ct, nil)
+	aad := chunkAADBytes(r.chunkAAD, r.chunkIndex)
+	r.chunkIndex++
+	pt, err := r.aead.Open(nil, nonce, ct, aad)
 	if err != nil {
 		return fmt.Errorf("client_sdk: open frame: %w", err)
 	}

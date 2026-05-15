@@ -31,6 +31,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
+	"github.com/zeebo/blake3"
 )
 
 // Authenticator verifies the identity claimed by an S3 request and
@@ -438,7 +439,14 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pieceID := newPieceID(tenantID, bucket, key, h.cfg.Now())
-	putRes, err := provider.PutPiece(r.Context(), pieceID, body, providers.PutOptions{
+
+	// Tee the body through a BLAKE3 hasher so we record an
+	// independent content-integrity hash that does not rely on
+	// the storage provider's ETag.
+	blake3Hasher := blake3.New()
+	teeBody := io.TeeReader(body, blake3Hasher)
+
+	putRes, err := provider.PutPiece(r.Context(), pieceID, teeBody, providers.PutOptions{
 		ContentLength: contentLength,
 		ContentType:   r.Header.Get("Content-Type"),
 	})
@@ -446,6 +454,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
 		return
 	}
+	blake3Hash := "blake3:" + hex.EncodeToString(blake3Hasher.Sum(nil))
 
 	// ObjectSize must reflect what the client will read back, not
 	// the bytes we actually wrote to the backend. For managed /
@@ -468,11 +477,12 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		Encryption:      encCfg,
 		PlacementPolicy: policy,
 		Pieces: []metadata.Piece{{
-			PieceID: putRes.PieceID,
-			Backend: backendName,
-			Locator: putRes.Locator,
-			Hash:    putRes.ETag,
-			State:   "active",
+			PieceID:      putRes.PieceID,
+			Backend:      backendName,
+			Locator:      putRes.Locator,
+			Hash:         blake3Hash,
+			ProviderETag: putRes.ETag,
+			State:        "active",
 		}},
 		MigrationState: metadata.MigrationState{
 			Generation:     1,
@@ -619,8 +629,8 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		body = io.NopCloser(bytes.NewReader(plaintext))
 	}
 
-	if piece.Hash != "" {
-		w.Header().Set("ETag", quote(piece.Hash))
+	if etag := pieceETag(piece); etag != "" {
+		w.Header().Set("ETag", quote(etag))
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	status := http.StatusOK
@@ -804,8 +814,8 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 		writeResolveError(w, r, err)
 		return
 	}
-	if piece.Hash != "" {
-		w.Header().Set("ETag", quote(piece.Hash))
+	if etag := pieceETag(piece); etag != "" {
+		w.Header().Set("ETag", quote(etag))
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
@@ -1017,7 +1027,7 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 		}
 		c := content{Key: m.ObjectKey, Size: m.ObjectSize}
 		if len(m.Pieces) > 0 {
-			c.ETag = quote(m.Pieces[0].Hash)
+			c.ETag = quote(pieceETag(m.Pieces[0]))
 		}
 		resp.Contents = append(resp.Contents, c)
 	}
@@ -1212,4 +1222,17 @@ func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource s
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(httpCode)
 	_ = xml.NewEncoder(w).Encode(s3ErrorResponse{Code: s3Code, Message: message, Resource: resource})
+}
+
+// pieceETag returns the S3-protocol ETag for a piece. It prefers
+// ProviderETag (the opaque ETag the storage backend returned on PUT)
+// so clients see the same value they received in the PUT response.
+// Legacy manifests written before BLAKE3 hashing was added have
+// ProviderETag="" and Hash set to the provider ETag; this falls
+// through cleanly.
+func pieceETag(p metadata.Piece) string {
+	if p.ProviderETag != "" {
+		return p.ProviderETag
+	}
+	return p.Hash
 }
