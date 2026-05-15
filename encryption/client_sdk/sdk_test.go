@@ -281,3 +281,105 @@ func TestEncryptObject_ConvergentNonce_MatchesDeriveHelper(t *testing.T) {
 		t.Fatalf("first-chunk nonce mismatch: got %x want %x", got, want)
 	}
 }
+
+func TestEncryptDecrypt_RoundTrip_WithChunkAAD(t *testing.T) {
+	dek := make([]byte, chacha20poly1305.KeySize)
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		t.Fatalf("rand dek: %v", err)
+	}
+	plain := bytes.Repeat([]byte("xyz"), 2048) // forces multiple chunks at chunkSize=256
+	aad := []byte("tnt_a|bkt|0xabc|v1")
+
+	encR, err := EncryptObject(bytes.NewReader(plain), dek, Options{ChunkSize: 256, ChunkAAD: aad})
+	if err != nil {
+		t.Fatalf("EncryptObject: %v", err)
+	}
+	ct, err := io.ReadAll(encR)
+	if err != nil {
+		t.Fatalf("read ct: %v", err)
+	}
+
+	// Round-trip with matching AAD succeeds.
+	decR, err := DecryptObject(bytes.NewReader(ct), dek, Options{ChunkSize: 256, ChunkAAD: aad})
+	if err != nil {
+		t.Fatalf("DecryptObject: %v", err)
+	}
+	got, err := io.ReadAll(decR)
+	if err != nil {
+		t.Fatalf("read pt: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("AAD round-trip mismatch")
+	}
+
+	// Decrypt with mismatched AAD must fail (open returns auth error).
+	mismatched, err := DecryptObject(bytes.NewReader(ct), dek, Options{ChunkSize: 256, ChunkAAD: []byte("different-aad")})
+	if err != nil {
+		t.Fatalf("DecryptObject: %v", err)
+	}
+	if _, err := io.ReadAll(mismatched); err == nil {
+		t.Fatal("decrypt with mismatched AAD: want auth error, got nil")
+	}
+
+	// Decrypt with nil AAD against ciphertext sealed under non-nil AAD also fails.
+	nilAAD, err := DecryptObject(bytes.NewReader(ct), dek, Options{ChunkSize: 256})
+	if err != nil {
+		t.Fatalf("DecryptObject: %v", err)
+	}
+	if _, err := io.ReadAll(nilAAD); err == nil {
+		t.Fatal("decrypt with nil AAD against AAD-sealed ciphertext: want auth error, got nil")
+	}
+}
+
+func TestEncryptDecrypt_BackwardsCompat_NilAAD(t *testing.T) {
+	// Ciphertext sealed with the zero-value Options (no ChunkAAD)
+	// MUST decrypt cleanly with the zero-value Options, so existing
+	// objects keep working after the AAD field is added.
+	dek := make([]byte, chacha20poly1305.KeySize)
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		t.Fatalf("rand dek: %v", err)
+	}
+	plain := bytes.Repeat([]byte("legacy"), 1024)
+
+	encR, err := EncryptObject(bytes.NewReader(plain), dek, Options{ChunkSize: 256})
+	if err != nil {
+		t.Fatalf("EncryptObject: %v", err)
+	}
+	ct, err := io.ReadAll(encR)
+	if err != nil {
+		t.Fatalf("read ct: %v", err)
+	}
+	decR, err := DecryptObject(bytes.NewReader(ct), dek, Options{ChunkSize: 256})
+	if err != nil {
+		t.Fatalf("DecryptObject: %v", err)
+	}
+	got, err := io.ReadAll(decR)
+	if err != nil {
+		t.Fatalf("read pt: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("nil-AAD round-trip mismatch")
+	}
+}
+
+func TestChunkAADBytes_CanonicalFormat(t *testing.T) {
+	got := chunkAADBytes([]byte("tnt|bkt|h"), 42)
+	wantPrefix := []byte("tnt|bkt|h|")
+	if !bytes.HasPrefix(got, wantPrefix) {
+		t.Errorf("chunkAADBytes prefix = %q, want %q", got[:len(wantPrefix)], wantPrefix)
+	}
+	if len(got) != len(wantPrefix)+8 {
+		t.Errorf("chunkAADBytes len = %d, want %d", len(got), len(wantPrefix)+8)
+	}
+	// Suffix is big-endian uint64(42) = 0x00...002a.
+	wantSuffix := []byte{0, 0, 0, 0, 0, 0, 0, 42}
+	if !bytes.Equal(got[len(wantPrefix):], wantSuffix) {
+		t.Errorf("chunkAADBytes suffix = %x, want %x", got[len(wantPrefix):], wantSuffix)
+	}
+	if nilAAD := chunkAADBytes(nil, 7); nilAAD != nil {
+		t.Errorf("chunkAADBytes(nil) = %v, want nil", nilAAD)
+	}
+	if emptyAAD := chunkAADBytes([]byte{}, 7); emptyAAD != nil {
+		t.Errorf("chunkAADBytes([]) = %v, want nil", emptyAAD)
+	}
+}
