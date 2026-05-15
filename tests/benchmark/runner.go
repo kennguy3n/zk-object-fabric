@@ -19,7 +19,6 @@ import (
 	"io"
 	"math/rand/v2"
 	"sort"
-	"sync/atomic"
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
@@ -355,11 +354,3 @@ func (r *Report) ToJSON() ([]byte, error) {
 	return json.MarshalIndent(r, "", "  ")
 }
 
-// monotonicCounter is an atomic counter used internally by the
-// runner when concurrent drivers are added in a later phase. It is
-// exposed to the package so shared helpers can grow against a single
-// accounting primitive.
-type monotonicCounter struct{ n atomic.Int64 }
-
-func (c *monotonicCounter) Add(delta int64) int64 { return c.n.Add(delta) }
-func (c *monotonicCounter) Load() int64           { return c.n.Load() }

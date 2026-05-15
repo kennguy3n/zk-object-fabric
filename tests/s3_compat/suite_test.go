@@ -803,27 +803,6 @@ func testErasureRoundTrip(t *testing.T, setup Setup) {
 	}
 }
 
-// errorsAs is a tiny helper that forwards to errors.As. Using it
-// keeps the test file free of stringly-typed error inspection while
-// avoiding a bare `errors` import that would overlap with the
-// standard-library name in places.
-func errorsAs(err error, target any) bool {
-	for err != nil {
-		if u, ok := target.(**smithyhttp.ResponseError); ok {
-			if re, match := err.(*smithyhttp.ResponseError); match {
-				*u = re
-				return true
-			}
-		}
-		w, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = w.Unwrap()
-	}
-	return false
-}
-
 // TestSuite_LocalFSDev runs the full suite against the local_fs_dev
 // adapter. This is the canonical developer loopback target.
 func TestSuite_LocalFSDev(t *testing.T) {

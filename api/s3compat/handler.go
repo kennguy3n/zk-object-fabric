@@ -45,6 +45,32 @@ type Authenticator interface {
 // Authenticator in production.
 const AnonymousTenant = "anonymous"
 
+// MaxInMemoryObjectBytes caps the size of an object the handler is
+// willing to buffer into memory on the request goroutine. The two
+// non-streaming paths that have to honour this ceiling are:
+//
+//   - The gateway-encrypted GET path, which has to read the entire
+//     ciphertext before frame-decrypting it (the SDK's chunk format
+//     does not currently expose a streaming Open).
+//
+//   - The inline cache-warming path in fetchPiece, which buffers a
+//     piece into memory so it can hand the bytes both to the
+//     hot-object cache and to the client.
+//
+// Above the cap the gateway-encrypted GET returns 507
+// InsufficientStorage with a descriptive message, and the
+// cache-warming path skips inline warming and publishes a
+// PromotionSignal so the async worker can decide whether to warm
+// the piece. Both ceilings match the multipart in-memory pre-fetch
+// cap (maxMultipartInMemoryBytes) so operators have a single knob
+// to reason about.
+//
+// The constant lives here rather than in config so tests can
+// reference it without round-tripping through a Config field; a
+// follow-up commit can promote it to a tunable when streaming
+// decryption / streaming EC land.
+const MaxInMemoryObjectBytes int64 = 256 * 1024 * 1024
+
 // PlacementEngine chooses the storage backend for a new object. Phase
 // 2 supplies a concrete implementation; the handler treats the engine
 // as a black box that resolves (tenant, bucket, key) to a backend
@@ -553,6 +579,22 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	_ = served
 
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
+		// The gateway-encrypted GET path frame-decrypts the entire
+		// ciphertext before slicing the optional Range, so it has
+		// to buffer the whole piece in memory. Refuse objects
+		// above the in-memory ceiling so a single very large GET
+		// cannot OOM the gateway. Streaming frame-decryption is
+		// tracked as a Phase 4 workstream; until that lands
+		// operators should route very large gateway-encrypted
+		// objects through the EC path or use direct-to-backend
+		// presigned URLs.
+		if manifest.ObjectSize > MaxInMemoryObjectBytes {
+			writeError(w, http.StatusInsufficientStorage, "ObjectTooLargeForInMemoryDecrypt",
+				fmt.Sprintf("gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; streaming decryption is not yet implemented",
+					manifest.ObjectSize, MaxInMemoryObjectBytes),
+				r.URL.Path)
+			return
+		}
 		ciphertext, rerr := io.ReadAll(body)
 		if rerr != nil {
 			writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
@@ -646,6 +688,24 @@ func (h *Handler) fetchPiece(
 	}
 	if h.cfg.Cache != nil && byteRange == nil {
 		h.emit(tenantID, bucket, billing.CacheMisses, 1)
+
+		// Pieces above the in-memory ceiling skip inline warming
+		// to keep a single very large GET from buffering hundreds
+		// of MiB on the request goroutine. The async promotion
+		// worker decides whether to fetch the piece on its own
+		// schedule. piece.SizeBytes is populated for multipart
+		// and EC pieces; legacy single-piece manifests can fall
+		// back to ObjectSize, which equals the piece size for
+		// non-multipart, non-EC objects.
+		pieceSize := piece.SizeBytes
+		if pieceSize <= 0 {
+			pieceSize = objectSize
+		}
+		if pieceSize > MaxInMemoryObjectBytes {
+			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
+			return body, false, nil
+		}
+
 		buf, rerr := io.ReadAll(body)
 		_ = body.Close()
 		if rerr != nil {
@@ -655,9 +715,10 @@ func (h *Handler) fetchPiece(
 		// re-trigger the backend GET (or a redundant read-repair
 		// round-trip during migration). The promotion worker
 		// handles signals for pieces that were not cached here
-		// (e.g. range reads) so we do not publish one from this
-		// path — doing so would cause a redundant origin fetch
-		// since the piece is already resident.
+		// (e.g. range reads, oversize pieces) so we do not
+		// publish one from this path — doing so would cause a
+		// redundant origin fetch since the piece is already
+		// resident.
 		_ = h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,

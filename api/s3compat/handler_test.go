@@ -584,9 +584,7 @@ func (f *fakeProviderWithCountry) PlacementLabels() providers.PlacementLabels {
 }
 
 // fakeResidencyChecker implements ResidencyChecker for tests.
-type fakeResidencyChecker struct {
-	allowed map[string]bool
-}
+type fakeResidencyChecker struct{}
 
 func (f *fakeResidencyChecker) Check(tenantID, backendCountry string, policyResidency []string) error {
 	for _, c := range policyResidency {
@@ -854,11 +852,7 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 		bytes.Repeat([]byte("part-1-"), 1024),
 		bytes.Repeat([]byte("part-2-"), 1024),
 	}
-	type completedPart struct {
-		PartNumber int
-		ETag       string
-	}
-	completed := make([]completedPart, 0, len(parts))
+	completed := make([]completeUploadEntry, 0, len(parts))
 	for i, body := range parts {
 		partNum := i + 1
 		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
@@ -873,16 +867,10 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 		if etag == "" {
 			t.Fatalf("UploadPart %d returned empty ETag", partNum)
 		}
-		completed = append(completed, completedPart{PartNumber: partNum, ETag: etag})
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
 	}
 
-	completeBody := completeMultipartUploadRequest{}
-	for _, p := range completed {
-		completeBody.Parts = append(completeBody.Parts, completeUploadEntry{
-			PartNumber: p.PartNumber,
-			ETag:       p.ETag,
-		})
-	}
+	completeBody := completeMultipartUploadRequest{Parts: completed}
 	completeXML, err := xml.Marshal(completeBody)
 	if err != nil {
 		t.Fatalf("marshal complete body: %v", err)

@@ -17,7 +17,6 @@ package cross_cell
 import (
 	"context"
 	"errors"
-	"io"
 	"log"
 	"sync/atomic"
 	"time"
@@ -232,13 +231,6 @@ func (r *Replicator) copyPiece(ctx context.Context, p metadata.Piece) error {
 	defer rc.Close()
 	_, err = r.Dest.Provider.PutPiece(ctx, p.PieceID, rc, providers.PutOptions{})
 	return err
-}
-
-// drainPiece is the io-helper used by tests so they can verify
-// the body that landed in the dest provider.
-func drainPiece(rc io.ReadCloser) ([]byte, error) {
-	defer rc.Close()
-	return io.ReadAll(rc)
 }
 
 func (r *Replicator) logf(format string, args ...interface{}) {

@@ -167,11 +167,14 @@ func main() {
 
 	healthMon := startHealthMonitor(workerCtx, cfg.Health, cache)
 
-	multipartStore := multipart.NewMemoryStore()
 	erasureRegistry := erasure_coding.DefaultRegistry()
 	repairDone := startRepairQueue(workerCtx, cfg.Repair, store, registry, erasureRegistry)
 
 	gatewayEnc := buildGatewayEncryption(cfg.Encryption)
+	multipartStore, multipartCloser := buildMultipartStore(metadataDB, gatewayEnc, registry)
+	if multipartCloser != nil {
+		defer multipartCloser()
+	}
 
 	mux := http.NewServeMux()
 	if cfg.Metrics.Enabled {
@@ -539,6 +542,61 @@ func buildGatewayEncryption(cfg config.EncryptionConfig) *s3compat.GatewayEncryp
 			HolderClass: holderClass,
 		},
 	}
+}
+
+// buildMultipartStore returns the multipart-session Store the S3
+// handler consumes. When metadata_dsn is configured the gateway
+// uses the Postgres-backed store so in-flight uploads survive
+// restart and let a client complete an upload against a different
+// node than the one that handled CreateMultipartUpload. Without a
+// metadata DSN the gateway falls back to the in-memory store
+// (intended for `go run` / dev use only).
+//
+// The expiry sweeper's cleanup callback fans DeletePiece out to
+// every part's backend so abandoned ciphertext does not accumulate
+// when a client never calls CompleteMultipartUpload or
+// AbortMultipartUpload. A nil registry entry for a part's backend
+// is logged but does not stop the sweep — the alternative would
+// be the sweeper getting stuck on a single ill-formed upload.
+//
+// The returned closer must be called at gateway shutdown to stop
+// the sweeper goroutine; it is nil for the in-memory store.
+func buildMultipartStore(
+	db *sql.DB,
+	enc *s3compat.GatewayEncryption,
+	registry map[string]providers.StorageProvider,
+) (multipart.Store, func()) {
+	if db == nil {
+		log.Printf("gateway: no control_plane.metadata_dsn; using in-memory multipart store (dev only — in-flight uploads do NOT survive restart)")
+		return multipart.NewMemoryStore(), nil
+	}
+	pgCfg := multipart.PostgresConfig{
+		DB:     db,
+		Logger: log.New(os.Stdout, "multipart_pg ", log.LstdFlags),
+		Cleanup: func(ctx context.Context, _ *multipart.Upload, parts []multipart.Part) {
+			for _, p := range parts {
+				provider, ok := registry[p.Backend]
+				if !ok {
+					log.Printf("gateway: multipart expiry: backend %q not registered; skipping piece %s", p.Backend, p.PieceID)
+					continue
+				}
+				if err := provider.DeletePiece(ctx, p.PieceID); err != nil {
+					log.Printf("gateway: multipart expiry: delete piece %s on %s: %v", p.PieceID, p.Backend, err)
+				}
+			}
+		},
+	}
+	if enc != nil {
+		pgCfg.Wrapper = enc.Wrapper
+		pgCfg.CMK = enc.CMK
+	}
+	store, err := multipart.NewPostgresStore(pgCfg)
+	if err != nil {
+		log.Fatalf("gateway: build postgres multipart store: %v", err)
+	}
+	log.Printf("gateway: postgres multipart store enabled (upload_ttl=%s sweep_interval=%s)",
+		multipart.DefaultUploadTTL, multipart.DefaultExpirySweepInterval)
+	return store, func() { _ = store.Close() }
 }
 
 // selectGatewayWrapper returns the client_sdk.Wrapper bound to uri
