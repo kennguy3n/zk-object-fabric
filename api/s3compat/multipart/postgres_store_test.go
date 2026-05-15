@@ -249,3 +249,79 @@ func TestPostgresStore_ExpirySweeper(t *testing.T) {
 		t.Errorf("post-sweep Get err = %v, want ErrNotFound", err)
 	}
 }
+
+// TestPostgresStore_ExpirySweeper_DeletesStuckRowOnLoadFailure
+// is a regression test for a bug Devin Review caught: when
+// loadUpload (or loadParts) returned an error, expireOne returned
+// early WITHOUT deleting the row. The sweep query
+//
+//	SELECT upload_id FROM ... ORDER BY created_at LIMIT 1000
+//
+// would then re-select the same broken row every sweep interval,
+// and once 1000 such rows accumulated, newer expired uploads
+// stopped being processed at all.
+//
+// We simulate the load failure by writing the row directly with
+// invalid JSON in the policy column so loadUpload's
+// json.Unmarshal fails. The fix guarantees:
+//
+//  1. The row is deleted anyway (so the sweeper never gets stuck).
+//  2. The cleanup callback is NOT fired (we don't have a valid
+//     upload to hand it).
+//  3. sweepExpired returns nil rather than surfacing the
+//     individual load error to the goroutine wrapper.
+func TestPostgresStore_ExpirySweeper_DeletesStuckRowOnLoadFailure(t *testing.T) {
+	db := requireMultipartPostgres(t)
+	var sweeperCalls int
+	store, err := NewPostgresStore(PostgresConfig{
+		DB:                  db,
+		UploadsTable:        "multipart_uploads_test",
+		PartsTable:          "multipart_parts_test",
+		UploadTTL:           1 * time.Millisecond,
+		ExpirySweepInterval: 1 * time.Hour,
+		Cleanup: func(ctx context.Context, _ *Upload, _ []Part) {
+			sweeperCalls++
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPostgresStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Insert a row directly with bogus policy JSON so loadUpload
+	// fails inside json.Unmarshal. created_at is set to an hour ago
+	// so the sweep cutoff includes it.
+	ctx := context.Background()
+	_, ierr := db.ExecContext(ctx, `
+		INSERT INTO multipart_uploads_test
+		(upload_id, tenant_id, bucket, object_key, policy, created_at)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+	`, "u-stuck", "t", "b", "k", `"this-is-not-a-policy-object"`,
+		time.Now().Add(-1*time.Hour))
+	if ierr != nil {
+		t.Fatalf("seed stuck row: %v", ierr)
+	}
+
+	if err := store.sweepExpired(); err != nil {
+		t.Fatalf("sweepExpired returned error on broken row: %v", err)
+	}
+
+	// The cleanup callback must NOT fire — we never had a valid
+	// upload to hand it.
+	if sweeperCalls != 0 {
+		t.Errorf("cleanup callback fired %d times on a row that failed to load, want 0", sweeperCalls)
+	}
+
+	// The row MUST be gone — this is the bug fix. Before the
+	// fix, the row would still be present and sweepExpired
+	// would re-select it forever.
+	var remaining int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM multipart_uploads_test WHERE upload_id = $1
+	`, "u-stuck").Scan(&remaining); err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("stuck row was not deleted; %d copies still present", remaining)
+	}
+}

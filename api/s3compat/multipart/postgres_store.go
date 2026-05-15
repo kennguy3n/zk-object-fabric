@@ -520,9 +520,18 @@ func (s *PostgresStore) PutPart(uploadID string, part Part) error {
 // Complete finalises the upload. It validates that tenantID,
 // bucket, and objectKey match the recorded upload, that every
 // PartReference names a known part with a matching ETag, and then
-// deletes the upload row (cascading the parts) within a single
-// transaction so a Complete that races an Abort cannot leak a
-// half-deleted record.
+// issues a single DELETE on the upload row (the ON DELETE CASCADE
+// on multipart_parts removes the part records atomically with the
+// parent row).
+//
+// Atomicity scope: the DELETE itself is atomic, but Complete does
+// not open an explicit transaction around the validate-then-delete
+// sequence — two concurrent Complete (or Complete+Abort) calls
+// for the same upload could both pass the validation step before
+// either DELETE wins. S3 clients do not issue concurrent
+// Complete/Abort for the same upload, so this matches the
+// observed protocol; callers that need cross-Complete ordering
+// should serialise externally.
 func (s *PostgresStore) Complete(uploadID, tenantID, bucket, objectKey string, expected []PartReference) ([]Part, *Upload, error) {
 	upload, err := s.Get(uploadID)
 	if err != nil {
@@ -710,20 +719,49 @@ func (s *PostgresStore) sweepExpired() error {
 
 // expireOne loads the upload + parts (so the cleanup callback can
 // fan out to providers), invokes the callback, then deletes the
-// upload row. Failures in cleanup are logged but do not block the
-// row deletion — the alternative would be an infinitely retrying
-// sweep on a single broken upload.
+// upload row.
+//
+// Crucially, a failure in loadUpload (e.g. DEK-unwrap error after a
+// CMK rotation) or loadParts MUST NOT prevent the DELETE — Devin
+// Review caught a bug here: if either load returned early, the row
+// was never removed and sweepExpired's `ORDER BY created_at LIMIT
+// 1000` would keep re-selecting the same broken row every sweep
+// interval. Once 1000 such rows accumulate, NEWER expired uploads
+// stop being processed entirely.
+//
+// To prevent that we now log the load failure and still issue the
+// DELETE. The cleanup callback (which would fan out DeletePiece to
+// providers) is skipped when we don't have a loaded upload — the
+// trade-off is intentional: leaving abandoned backend pieces is
+// recoverable through provider lifecycle policies or a manual
+// sweep, but a permanently stuck sweeper is operationally far
+// worse and corrodes the storage gateway's correctness guarantees.
+//
+// Failures in the cleanup callback itself are similarly logged but
+// do not block the DELETE — the alternative would be an
+// infinitely-retrying sweep on a single misbehaving provider.
 func (s *PostgresStore) expireOne(uploadID string) {
-	upload, err := s.loadUpload(uploadID)
-	if err != nil {
-		s.logf("expire load upload %s: %v", uploadID, err)
-		return
+	var (
+		upload      *Upload
+		canCleanup  bool
+		createdAt   time.Time
+		loadFailErr error
+	)
+	if u, err := s.loadUpload(uploadID); err != nil {
+		loadFailErr = err
+	} else {
+		upload = u
+		createdAt = u.CreatedAt
+		if err := s.loadParts(uploadID, u); err != nil {
+			loadFailErr = err
+		} else {
+			canCleanup = true
+		}
 	}
-	if err := s.loadParts(uploadID, upload); err != nil {
-		s.logf("expire load parts %s: %v", uploadID, err)
-		return
+	if loadFailErr != nil {
+		s.logf("expire load %s: %v (deleting row anyway to prevent sweeper from getting stuck; backend pieces may need manual cleanup)", uploadID, loadFailErr)
 	}
-	if s.cleanup != nil {
+	if canCleanup && s.cleanup != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		parts := make([]Part, 0, len(upload.parts))
 		for _, p := range upload.parts {
@@ -746,7 +784,11 @@ func (s *PostgresStore) expireOne(uploadID string) {
 		return
 	}
 	s.sessions.Delete(uploadID)
-	s.logf("expired multipart upload %s (created %s)", uploadID, upload.CreatedAt.Format(time.RFC3339))
+	if canCleanup {
+		s.logf("expired multipart upload %s (created %s)", uploadID, createdAt.Format(time.RFC3339))
+	} else {
+		s.logf("expired multipart upload %s (load failed; cleanup skipped)", uploadID)
+	}
 }
 
 func (s *PostgresStore) logf(format string, args ...any) {
