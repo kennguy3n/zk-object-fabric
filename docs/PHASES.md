@@ -21,9 +21,9 @@ full progress tracker.
 | --- | --- | --- |
 | 1 | Architecture Proof | COMPLETE |
 | 2 | Prototype | COMPLETE |
-| 3 | Beta Cell | COMPLETE |
-| 3.5 | Intra-Tenant Deduplication | COMPLETE |
-| 4 | Production & Scale | IN PROGRESS (~75%) |
+| 3 | Beta Cell | IMPLEMENTATION COMPLETE (production validation pending) |
+| 3.5 | Intra-Tenant Deduplication | IMPLEMENTATION COMPLETE (production validation pending) |
+| 4 | Production & Scale | ~75% implementation scaffold complete |
 
 ---
 
@@ -91,7 +91,9 @@ See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
 ## Phase 3: Beta Cell
 
-**Status**: COMPLETE
+**Status**: IMPLEMENTATION COMPLETE — production validation pending
+(see the **Production Readiness** section in
+[PROGRESS.md](PROGRESS.md#production-readiness)).
 
 **Goal**: stand up a real beta deployment on the AWS + Linode +
 Wasabi stack with paying / design-partner customers on both B2C and
@@ -127,7 +129,9 @@ See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
 ## Phase 3.5: Intra-Tenant Deduplication
 
-**Status**: COMPLETE
+**Status**: IMPLEMENTATION COMPLETE — production validation pending
+(see the **Production Readiness** section in
+[PROGRESS.md](PROGRESS.md#production-readiness)).
 
 **Goal**: add object-level and block-level intra-tenant deduplication
 to reduce storage costs for B2C community (viral / shared files) and
@@ -168,7 +172,10 @@ See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
 ## Phase 4: Production & Scale
 
-**Status**: IN PROGRESS — **~75% (9 of 12 checklist items complete)**
+**Status**: IN PROGRESS — **~75% implementation scaffold complete**
+(9 of 12 checklist items implemented; none yet production-validated —
+see the **Production Readiness** section in
+[PROGRESS.md](PROGRESS.md#production-readiness))
 
 **Goal**: move from a single beta deployment to a production,
 multi-cell fabric with published product tiers and operational

@@ -2,7 +2,7 @@
 
 - **Project**: ZK Object Fabric
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production & Scale (IN PROGRESS).
+- **Status**: Phase 3 — Beta Cell (IMPLEMENTATION COMPLETE — production validation pending). Phase 3.5 — Intra-Tenant Deduplication (IMPLEMENTATION COMPLETE — production validation pending). Phase 4 — Production & Scale (~75% implementation scaffold complete; not yet production-validated).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -155,7 +155,10 @@ Checklist:
 
 ## Phase 3: Beta Cell
 
-**Status**: `COMPLETE`
+**Status**: `IMPLEMENTATION COMPLETE` — production validation pending
+(load testing, chaos testing, security review, and DR exercises have
+not yet been performed against this codebase). See the **Production
+Readiness** section below for the full not-yet-validated list.
 
 **Goal**: stand up a real beta deployment on the AWS + Linode +
 Wasabi stack with paying / design-partner customers on both B2C and
@@ -332,7 +335,8 @@ Checklist:
 
 ## Phase 3.5: Intra-Tenant Deduplication
 
-**Status**: `COMPLETE`
+**Status**: `IMPLEMENTATION COMPLETE` — production validation pending
+(see **Production Readiness** below).
 
 **Goal**: add object-level and block-level intra-tenant deduplication
 to reduce storage costs for B2C community (viral / shared files) and
@@ -432,7 +436,9 @@ Checklist:
 
 ## Phase 4: Production & Scale
 
-**Status**: `IN PROGRESS | ~75%` (9 of 12 checklist items complete)
+**Status**: `IN PROGRESS | ~75% implementation scaffold complete`
+(9 of 12 checklist items implemented; none yet production-validated —
+see **Production Readiness** below)
 
 **Goal**: move from a single beta deployment to a production,
 multi-cell fabric with published product tiers and operational
@@ -517,6 +523,41 @@ Checklist:
   `public_distribution` multipart uploads at
   `CompleteMultipartUpload` time; see
   [INTEGRATION.md §8.5](INTEGRATION.md#85-complete-dedup-scenario-matrix).
+
+---
+
+## Production Readiness
+
+The phase status labels above reflect **code-implementation completeness**,
+not production validation. The following items are explicitly **not yet
+validated** against this codebase and should be completed before any
+external load is run on it:
+
+- **Load testing** — sustained PUT/GET throughput at target tenant
+  counts, p99 latency under sustained load, and degradation behaviour at
+  cache eviction / repair pressure.
+- **Chaos / failure-injection testing** — single-node loss, zone loss,
+  metadata-DB failover, provider-side outages, cache partition.
+- **External security review** — independent review of the auth path
+  (HMAC, presigned URLs, IAM-style policies), the encryption envelope,
+  manifest sealing, and DEK handling.
+- **External cryptography review** — review of the AEAD bindings
+  (per-chunk AAD, manifest body AAD), the KEK / CMK hierarchy, and the
+  HMAC SigV4 implementation.
+- **S3 conformance report** — a published conformance matrix against
+  the AWS S3 API surface (PUT, GET, HEAD, DELETE, LIST, multipart,
+  range, ACL, versioning, lifecycle) using an external conformance
+  harness, not only the in-repo `tests/s3_compat` suite.
+- **Disaster-recovery exercises** — restore-from-backup runbooks
+  exercised end-to-end, cross-cell replication failover, manifest-DB
+  restore-and-resume, and customer-visible RPO / RTO measurement.
+- **Multi-tenant abuse / quota validation** — abuse-control trip
+  thresholds tested under adversarial workloads (slowloris, key-space
+  flood, egress-budget exhaustion).
+
+This list will shrink as items are exercised against the codebase. When
+an item is completed, move it from this section into the relevant
+phase's checklist with a link to the report or runbook.
 
 ---
 

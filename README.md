@@ -1,8 +1,9 @@
 # ZK Object Fabric
 
-> Zero-knowledge, S3-compatible object storage with customer-controlled
-> placement, provider-neutral durability, and cache-aware egress pricing.
-> Start on public cloud, migrate to dedicated storage cells.
+> S3-compatible encrypted object storage with client-side zero-knowledge
+> mode, customer-controlled placement, provider-neutral durability, and
+> cache-aware egress pricing. Start on public cloud, migrate to
+> dedicated storage cells.
 
 ## Overview
 
@@ -82,9 +83,16 @@ provider credentials via environment variables. See
 - **S3 API as the stable contract** — the S3-compatible API surface is
   frozen across phases. Backend storage, encryption, caching, and
   erasure coding evolve underneath; the API never changes.
-- **Zero-knowledge by default** — client-side encryption, per-object
-  DEKs, encrypted manifests. The service operator cannot read customer
-  data in Strict ZK mode.
+- **Client-side encryption available (Strict ZK mode)** — when the SDK
+  performs client-side encryption with a customer-held KEK, the service
+  operator cannot read customer object bodies. Note that metadata
+  (object keys, sizes, content-type, access patterns) is visible to the
+  gateway in all modes unless the client transforms keys before upload.
+  See the metadata-visibility matrix below.
+- **Manifest encryption available when configured** — manifest bodies
+  can be sealed with a CMK (see `EncryptionConfig.ManifestBodyKeyPath`).
+  Without manifest body encryption, manifest JSON is stored in plaintext
+  JSONB in Postgres.
 - **Provider-neutral object manifests** — customer object names are
   decoupled from backend locators, enabling seamless migrations.
 - **Pluggable storage backends** — Wasabi, Backblaze B2, Cloudflare R2,
@@ -104,6 +112,34 @@ provider credentials via environment variables. See
 - **Cell architecture for horizontal scale** — independent cells of
   2–20 PB usable capacity, each with its own metadata, repair queues,
   and failure domains.
+
+## Metadata Visibility Matrix
+
+What the service operator can see in each encryption mode. "Visible"
+here means the gateway has technical access to the value, not that any
+operator routinely inspects it.
+
+| Item                          | Strict ZK (client-side enc.) | Managed (gateway-side enc.) | Public Distribution         |
+| ----------------------------- | ---------------------------- | --------------------------- | --------------------------- |
+| Object body (plaintext)       | Not visible                  | Visible at GET/PUT time     | Visible                     |
+| Object key                    | Visible¹                     | Visible                     | Visible                     |
+| Bucket name                   | Visible                      | Visible                     | Visible                     |
+| Object size                   | Visible                      | Visible                     | Visible                     |
+| Content-Type / S3 headers     | Visible                      | Visible                     | Visible                     |
+| Access patterns / request log | Visible                      | Visible                     | Visible                     |
+| Tenant identity (HMAC binding)| Visible                      | Visible                     | Visible                     |
+| Per-object DEK                | Not visible (wrapped only)   | Held by gateway CMK         | Held by gateway CMK         |
+| Manifest body (JSON contents) | Visible² unless CMK-sealed   | Visible² unless CMK-sealed  | Visible² unless CMK-sealed  |
+
+¹ Clients can transform object keys before upload (e.g. hash them) to
+reduce gateway visibility into the key namespace. The gateway will then
+store and return the transformed key verbatim.
+
+² Manifest bodies are stored encrypted with the manifest CMK if
+`EncryptionConfig.ManifestBodyKeyPath` is set; otherwise they are
+stored as plaintext JSONB in Postgres. Manifests contain object key,
+size, piece locators, and the wrapped DEK — they do **not** contain
+object bodies.
 
 ## Architecture Overview
 
@@ -159,9 +195,12 @@ access plaintext in memory during request handling.
 
 ## Project Status
 
-- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 —
-  Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production &
-  Scale (IN PROGRESS).
+- **Current phase**: Phase 3 — Beta Cell (IMPLEMENTATION COMPLETE —
+  production validation pending). Phase 3.5 — Intra-Tenant
+  Deduplication (IMPLEMENTATION COMPLETE — production validation
+  pending). Phase 4 — Production & Scale (~75% implementation
+  scaffold complete). See [Production Readiness](docs/PROGRESS.md#production-readiness)
+  for what is and isn't yet validated.
 - **Tracker**: [docs/PROGRESS.md](docs/PROGRESS.md).
 - **Technical design**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
 
