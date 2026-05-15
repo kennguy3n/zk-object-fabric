@@ -195,9 +195,12 @@ access plaintext in memory during request handling.
 
 ## Project Status
 
-- **Current phase**: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 —
-  Intra-Tenant Deduplication (COMPLETE). Phase 4 — Production &
-  Scale (IN PROGRESS).
+- **Current phase**: Phase 3 — Beta Cell (IMPLEMENTATION COMPLETE —
+  production validation pending). Phase 3.5 — Intra-Tenant
+  Deduplication (IMPLEMENTATION COMPLETE — production validation
+  pending). Phase 4 — Production & Scale (~75% implementation
+  scaffold complete). See [Production Readiness](docs/PROGRESS.md#production-readiness)
+  for what is and isn't yet validated.
 - **Tracker**: [docs/PROGRESS.md](docs/PROGRESS.md).
 - **Technical design**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
 
