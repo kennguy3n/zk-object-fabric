@@ -7,11 +7,63 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// sigV4UnreservedChar reports whether c is an RFC 3986 unreserved
+// character (ALPHA / DIGIT / '-' / '_' / '.' / '~'). AWS SigV4
+// requires every other byte in a URI path or query parameter to be
+// percent-encoded as upper-case hex.
+func sigV4UnreservedChar(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	case c == '-' || c == '_' || c == '.' || c == '~':
+		return true
+	}
+	return false
+}
+
+// sigV4PercentEncode returns s with every byte that is not in the
+// SigV4 unreserved set percent-encoded as upper-case hex. It does
+// NOT preserve forward slashes; callers that want slash-preservation
+// (the path canonicaliser) must split on '/' first.
+func sigV4PercentEncode(s string) string {
+	// Fast path: scan once; if every byte is unreserved we can
+	// return s as-is and skip the buffer entirely.
+	allUnreserved := true
+	for i := 0; i < len(s); i++ {
+		if !sigV4UnreservedChar(s[i]) {
+			allUnreserved = false
+			break
+		}
+	}
+	if allUnreserved {
+		return s
+	}
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if sigV4UnreservedChar(c) {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0x0F])
+	}
+	return b.String()
+}
 
 // HMACAuthenticator verifies AWS Signature V4 (SigV4) on incoming
 // requests and returns the tenant bound to the signing access key.
@@ -596,23 +648,97 @@ func buildCanonicalHeaders(r *http.Request, signedHeaders []string, host string)
 	return b.String(), nil
 }
 
+// canonicalURI returns the SigV4-canonical URI for path. Per the
+// SigV4 spec each path segment is percent-encoded with the RFC 3986
+// unreserved alphabet (ALPHA / DIGIT / '-' / '_' / '.' / '~');
+// forward slashes that separate segments are preserved verbatim;
+// and "normalize URI paths according to RFC 3986" is intentionally
+// skipped for S3-compatible services (S3's own SigV4 docs explicitly
+// require unmodified paths so that object keys with '..' or '//'
+// round-trip cleanly).
+//
+// Bytes already in their percent-encoded form (e.g. a client that
+// pre-encoded "%2F") get a second pass of encoding so the literal
+// '%' itself is escaped, producing "%252F". This is the
+// double-encoding the SigV4 spec calls out for path components.
 func canonicalURI(path string) string {
 	if path == "" {
 		return "/"
 	}
-	return path
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		segments[i] = sigV4PercentEncode(seg)
+	}
+	return strings.Join(segments, "/")
 }
 
-// canonicalQuery sorts query parameters lexicographically and
-// re-joins them in the form required by SigV4. The empty query
-// string produces an empty canonical form.
+// canonicalQuery returns the SigV4-canonical query string for raw.
+// The empty query string produces an empty canonical form.
+//
+// The function parses raw into (key, value) pairs by splitting on
+// '&' and then on the first '='. Each side is URL-decoded back to
+// its underlying byte value, then re-encoded with sigV4PercentEncode
+// so the canonical string matches what the AWS SDK signer would
+// produce when signing the same logical parameters. Sorting is by
+// (encoded key, encoded value), which is the SigV4 spec's rule.
+//
+// Splitting on the FIRST '=' is important: query values are
+// allowed to contain '=' verbatim (e.g. base64 padding), so they
+// must round-trip through this canonicaliser unchanged. Keys with
+// no '=' sentinel render as "key=" so SigV4's mandatory '=' is
+// always present.
 func canonicalQuery(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	parts := strings.Split(raw, "&")
-	sort.Strings(parts)
-	return strings.Join(parts, "&")
+	pairs := strings.Split(raw, "&")
+	type kv struct{ k, v string }
+	encoded := make([]kv, 0, len(pairs))
+	for _, p := range pairs {
+		if p == "" {
+			continue
+		}
+		eq := strings.IndexByte(p, '=')
+		var kRaw, vRaw string
+		if eq < 0 {
+			kRaw = p
+		} else {
+			kRaw, vRaw = p[:eq], p[eq+1:]
+		}
+		// Decode whatever the URL carries (so a pre-encoded value
+		// like "%2F" round-trips to '/'); fall back to the raw
+		// bytes when QueryUnescape rejects malformed sequences, so
+		// we never reject a request just because the client used
+		// non-canonical (but still URL-shaped) input.
+		kDecoded, err := url.QueryUnescape(kRaw)
+		if err != nil {
+			kDecoded = kRaw
+		}
+		vDecoded, err := url.QueryUnescape(vRaw)
+		if err != nil {
+			vDecoded = vRaw
+		}
+		encoded = append(encoded, kv{
+			k: sigV4PercentEncode(kDecoded),
+			v: sigV4PercentEncode(vDecoded),
+		})
+	}
+	sort.SliceStable(encoded, func(i, j int) bool {
+		if encoded[i].k != encoded[j].k {
+			return encoded[i].k < encoded[j].k
+		}
+		return encoded[i].v < encoded[j].v
+	})
+	var b strings.Builder
+	for i, kv := range encoded {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(kv.k)
+		b.WriteByte('=')
+		b.WriteString(kv.v)
+	}
+	return b.String()
 }
 
 func hmacSHA256(key []byte, data string) []byte {
