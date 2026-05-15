@@ -293,7 +293,7 @@ func (h *Handler) writeCopyManifest(
 	h.audit(r, "COPY", tenantID, dstBucket, dstKey, piece.PieceID, backend, copyCountry)
 
 	res := CopyObjectResult{
-		ETag:         quote(piece.Hash),
+		ETag:         quote(pieceETag(piece)),
 		LastModified: h.cfg.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 	w.Header().Set("Content-Type", "application/xml")
@@ -384,7 +384,7 @@ func (h *Handler) ListObjectVersions(w http.ResponseWriter, r *http.Request, buc
 		for i, v := range versions {
 			etag := ""
 			if len(v.Pieces) > 0 {
-				etag = quote(v.Pieces[0].Hash)
+				etag = quote(pieceETag(v.Pieces[0]))
 			}
 			out.Versions = append(out.Versions, ListVersionEntry{
 				Key:          v.ObjectKey,
