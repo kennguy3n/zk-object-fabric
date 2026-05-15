@@ -30,6 +30,18 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
+// maxECObjectSize caps the size of an object the EC PUT path is
+// willing to buffer into memory before encoding. The path reads the
+// entire request body before handing it to the reed-solomon
+// encoder; until streaming EC lands (docs/PROPOSAL.md §6) operators
+// must keep individual objects below this ceiling or route them
+// through a non-EC backend.
+//
+// Matches MaxInMemoryObjectBytes (handler.go) so operators have a
+// single ceiling to reason about across the gateway-encrypted GET,
+// multipart pre-fetch, cache-warming, and EC PUT paths.
+const maxECObjectSize int64 = MaxInMemoryObjectBytes
+
 // putErasureCoded is called by Put when the resolved placement policy
 // names an ErasureProfile. It encodes the body into k + m shards per
 // stripe and writes each shard as its own piece.
@@ -52,9 +64,33 @@ func (h *Handler) putErasureCoded(
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	// The EC PUT path buffers the entire request body in memory
+	// before encoding into k+m shards; the klauspost/reedsolomon
+	// codec supports streaming but the wiring is a Phase 4
+	// workstream (docs/PROPOSAL.md §6). Until streaming EC lands,
+	// reject requests whose Content-Length advertises a body above
+	// the in-memory ceiling so a single client cannot OOM the
+	// gateway. The check matches MaxInMemoryObjectBytes so
+	// operators have a single knob for both the EC and the
+	// gateway-encrypted GET paths.
+	if r.ContentLength > maxECObjectSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "ECObjectTooLarge",
+			fmt.Sprintf("erasure-coded object of %d bytes exceeds in-memory encode ceiling of %d bytes; streaming EC is not yet implemented",
+				r.ContentLength, maxECObjectSize),
+			r.URL.Path)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxECObjectSize+1))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
+		return
+	}
+	if int64(len(body)) > maxECObjectSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "ECObjectTooLarge",
+			fmt.Sprintf("erasure-coded object exceeds in-memory encode ceiling of %d bytes; streaming EC is not yet implemented",
+				maxECObjectSize),
+			r.URL.Path)
 		return
 	}
 	plaintextSize := int64(len(body))

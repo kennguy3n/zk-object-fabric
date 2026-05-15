@@ -27,15 +27,6 @@ func (s *fakeSink) Emit(e billing.UsageEvent) {
 	s.events = append(s.events, e)
 }
 
-func (s *fakeSink) drain() []billing.UsageEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]billing.UsageEvent, len(s.events))
-	copy(out, s.events)
-	s.events = s.events[:0]
-	return out
-}
-
 func (s *fakeSink) dimensionCount(dim billing.Dimension) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

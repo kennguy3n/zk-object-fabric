@@ -18,8 +18,7 @@ import (
 //
 // Schema: see api/console/schema.sql.
 type PostgresDedicatedCellStore struct {
-	db  *sql.DB
-	ctx context.Context
+	db *sql.DB
 }
 
 // NewPostgresDedicatedCellStore wraps db. Callers must register a
@@ -30,13 +29,6 @@ func NewPostgresDedicatedCellStore(db *sql.DB) (*PostgresDedicatedCellStore, err
 		return nil, errors.New("console: postgres dedicated cell store requires a non-nil *sql.DB")
 	}
 	return &PostgresDedicatedCellStore{db: db}, nil
-}
-
-func (s *PostgresDedicatedCellStore) cx() context.Context {
-	if s.ctx != nil {
-		return s.ctx
-	}
-	return context.Background()
 }
 
 // ListDedicatedCells implements DedicatedCellStore.

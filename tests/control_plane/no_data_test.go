@@ -159,7 +159,7 @@ func fieldViolates(ft reflect.Type) (bool, string) {
 			if ft.Kind() == reflect.Interface && ft.Implements(banned) {
 				return true, "field is " + ft.String() + " (implements " + banned.String() + ")"
 			}
-			if ft.Kind() != reflect.Interface && reflect.PtrTo(ft).Implements(banned) {
+			if ft.Kind() != reflect.Interface && reflect.PointerTo(ft).Implements(banned) {
 				return true, "field is " + ft.String() + " (satisfies " + banned.String() + ")"
 			}
 		} else if ft == banned {
