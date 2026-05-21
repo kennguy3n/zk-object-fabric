@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -143,6 +144,55 @@ func TestHandler_HeadReturnsHeadersOnly(t *testing.T) {
 	}
 	if got := rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
 		t.Errorf("HEAD Content-Type = %q", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=60" {
+		t.Errorf("HEAD Cache-Control = %q", got)
+	}
+}
+
+// TestHandler_HeadAndGetReturnSameContentLength is the RFC 9110
+// §9.3.2 compliance guard: a HEAD response's Content-Length MUST
+// equal what a GET response would deliver. Monitoring tooling
+// that uses HEAD to compute payload size (AWS ALB target-group
+// health checks, ngrok inspector, Prometheus blackbox_exporter's
+// probe_http_content_length metric on HEAD) depends on this
+// invariant.
+//
+// Pre-fix the handler used json.NewEncoder(w).Encode directly,
+// which writes the body before Content-Length can be set. HEAD
+// responses therefore omitted Content-Length entirely, and GET
+// responses left it to Go's net/http chunked-transfer fallback.
+// Post-fix the handler buffers the body so both GET and HEAD
+// carry an identical, deterministic Content-Length.
+func TestHandler_HeadAndGetReturnSameContentLength(t *testing.T) {
+	getRec := httptest.NewRecorder()
+	Handler().ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, Path, nil))
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status=%d, want 200; body=%s", getRec.Code, getRec.Body)
+	}
+	getCL := getRec.Header().Get("Content-Length")
+	if getCL == "" {
+		t.Fatal("GET response missing Content-Length header")
+	}
+	// Sanity: declared length matches actual body length.
+	if got, want := getCL, strconv.Itoa(getRec.Body.Len()); got != want {
+		t.Errorf("GET Content-Length = %q, want %q (the actual body length)", got, want)
+	}
+
+	headRec := httptest.NewRecorder()
+	Handler().ServeHTTP(headRec, httptest.NewRequest(http.MethodHead, Path, nil))
+	if headRec.Code != http.StatusOK {
+		t.Fatalf("HEAD status=%d, want 200", headRec.Code)
+	}
+	headCL := headRec.Header().Get("Content-Length")
+	if headCL == "" {
+		t.Fatal("HEAD response missing Content-Length header — RFC 9110 §9.3.2 violation")
+	}
+	if headCL != getCL {
+		t.Errorf("HEAD Content-Length = %q, GET Content-Length = %q; RFC 9110 §9.3.2 requires equality", headCL, getCL)
+	}
+	if headRec.Body.Len() != 0 {
+		t.Errorf("HEAD body length = %d, want 0; Content-Length header is correct but body must be empty on HEAD", headRec.Body.Len())
 	}
 }
 

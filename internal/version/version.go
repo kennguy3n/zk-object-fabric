@@ -15,9 +15,11 @@
 package version
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"runtime"
+	"strconv"
 )
 
 // Defaults the Dockerfile overrides via -ldflags -X. Keep the
@@ -65,23 +67,44 @@ func Current() Info {
 // Handler returns an http.Handler that serves Current() as a
 // JSON document. The handler accepts every HTTP method so a
 // `curl -I` HEAD probe also gets the response shape and
-// content-length without a 405; a HEAD request returns the same
-// headers but an empty body, matching the net/http convention.
+// Content-Length without a 405. A HEAD request returns the same
+// headers (including the same Content-Length as GET) but an
+// empty body, matching RFC 9110 §9.3.2 — the Content-Length
+// reported on HEAD MUST equal what a GET would deliver so
+// monitoring tooling that uses HEAD to compute payload size
+// (e.g. AWS ALB target-group health checks, ngrok inspector)
+// gets the right number without an extra GET round-trip.
 //
 // The response is cached for 60s in shared caches so a noisy
 // readiness probe does not stampede the handler on every poll.
 // The body is small (~200 bytes) and JSON-encodes in microseconds,
 // so the cache header is a polite gesture rather than a
 // performance requirement.
+//
+// Encoding strategy: we materialise the JSON into a buffer
+// before writing headers so the same byte stream backs both the
+// Content-Length header and the body. Using
+// `json.NewEncoder(w).Encode(...)` directly would write the body
+// before Content-Length could be set, which is exactly what
+// caused the pre-fix HEAD response to be missing Content-Length.
+// The buffer is small enough that this is essentially free
+// allocation-wise — Info encodes to ~200 bytes — and the
+// strconv.Itoa avoids fmt.Sprintf's reflection overhead.
 func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(Current()); err != nil {
+			http.Error(w, "encode version info: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(Current())
+		_, _ = w.Write(buf.Bytes())
 	})
 }
 
