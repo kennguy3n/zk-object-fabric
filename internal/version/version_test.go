@@ -9,6 +9,27 @@ import (
 	"testing"
 )
 
+// PARALLELISM WARNING — DO NOT ADD t.Parallel() TO THESE TESTS.
+//
+// TestCurrent_ReturnsLdflagsStampedFields and TestHandler_ServesJSON
+// mutate the package-level vars Version, GitCommit, and BuildDate
+// before calling Current() / Handler(). They restore the originals
+// via t.Cleanup so the package-level state is invariant across the
+// suite, but the mutations themselves are not goroutine-safe — if
+// a future contributor adds t.Parallel() to any test in this file,
+// the mutations will race against concurrent reads from Current()
+// and HTTP requests served by Handler().
+//
+// The right fix if parallelism is needed is NOT a sync.Mutex
+// around the vars (it would slow every Current() call in production
+// for a test-only concern). Instead, refactor Current/Handler to
+// accept the Info as a parameter (or read from a context-scoped
+// override) and have the tests construct the Info locally. Only
+// then is it safe to add t.Parallel() back.
+//
+// As of this writing every test in this file runs sequentially,
+// which is why the global mutation pattern is acceptable.
+
 func TestCurrent_ReturnsLdflagsStampedFields(t *testing.T) {
 	old := struct{ v, c, b string }{Version, GitCommit, BuildDate}
 	t.Cleanup(func() {

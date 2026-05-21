@@ -90,7 +90,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # fetch-depth: 0 pulls the full commit history AND all
+      # tags. Without it actions/checkout@v4 defaults to a shallow
+      # depth=1 clone with no tags, so `git describe --tags` below
+      # silently falls back to the bare commit SHA on every CI run
+      # — defeating the version-stamp's "follow the latest
+      # annotated tag" contract. The --always flag still keeps the
+      # command from erroring on a brand-new repo with zero tags,
+      # but with the full clone the tag-derived semver wins
+      # whenever a tag is reachable.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v3
 
