@@ -16,6 +16,7 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -247,6 +248,90 @@ func TestGet_OpenEndedRange(t *testing.T) {
 	}
 	if rec.Body.String() != "56789" {
 		t.Errorf("open-ended range body = %q, want %q", rec.Body.String(), "56789")
+	}
+}
+
+// recordingHotCache is a minimal HotObjectCache implementation that
+// tracks Put calls so tests can assert when fetchPiece warms the
+// cache. Get is intentionally a permanent miss: every test that
+// uses this cache wants to exercise the cache-miss path so it can
+// observe whether the warm happened.
+type recordingHotCache struct {
+	mu  sync.Mutex
+	put map[string]int
+}
+
+func (c *recordingHotCache) Get(_ context.Context, _ string) (io.ReadCloser, hot_object_cache.CachedPieceMetadata, error) {
+	return nil, hot_object_cache.CachedPieceMetadata{}, hot_object_cache.ErrCacheMiss
+}
+
+func (c *recordingHotCache) Put(_ context.Context, pieceID string, r io.Reader, _ hot_object_cache.PutOptions) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.put == nil {
+		c.put = map[string]int{}
+	}
+	c.put[pieceID]++
+	_, _ = io.Copy(io.Discard, r)
+	return nil
+}
+
+func (c *recordingHotCache) Evict(_ context.Context, _ string) error {
+	return nil
+}
+
+func (c *recordingHotCache) Stats() hot_object_cache.Stats {
+	return hot_object_cache.Stats{}
+}
+
+func (c *recordingHotCache) putCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, v := range c.put {
+		n += v
+	}
+	return n
+}
+
+// TestGet_RangeRequestWarmsCacheInline pins the optimisation
+// added after the integrity branch: when a range request triggers
+// a full-piece fetch (so the verifier can hash the whole piece),
+// the verified buffer is already in memory and the cache is keyed
+// by piece — so we warm it immediately instead of publishing a
+// promotion signal that would cause the async worker to re-fetch.
+// Without this test, a future refactor could re-gate the cache
+// put on `byteRange == nil` without anything catching it.
+func TestGet_RangeRequestWarmsCacheInline(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	cache := &recordingHotCache{}
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Cache:     cache,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("GET range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if rec.Body.String() != "2345" {
+		t.Fatalf("GET range body = %q, want %q", rec.Body.String(), "2345")
+	}
+	if got := cache.putCount(); got != 1 {
+		t.Fatalf("recordingHotCache.Put calls = %d, want 1 (range cache miss must warm the verified full piece)", got)
 	}
 }
 

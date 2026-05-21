@@ -870,14 +870,21 @@ func (h *Handler) fetchPiece(
 		}
 	}
 
-	if h.cfg.Cache != nil && byteRange == nil {
-		// Warm the cache inline so a concurrent request doesn't
-		// re-trigger the backend GET (or a redundant read-repair
-		// round-trip during migration). The promotion worker
-		// handles signals for pieces that were not cached here
-		// (e.g. oversize pieces) so we do not publish one from
-		// this path — doing so would cause a redundant origin
-		// fetch since the piece is already resident.
+	if h.cfg.Cache != nil {
+		// Warm the cache inline regardless of whether this is a
+		// full-piece or range request: when the integrity branch
+		// fetched the full piece (wantFullPiece == true above),
+		// the verified buffer is already in memory and the cache
+		// is keyed by piece, not by byte range. Caching it costs
+		// one memcpy and skips a backend round-trip on the next
+		// request — full OR range — for the same piece. The
+		// previous code gated this on byteRange == nil and then
+		// published a promotion signal in the range branch,
+		// which forced the async worker to re-fetch a piece we
+		// already had verified bytes for. Oversize pieces (the
+		// short-circuit above) and read-repair-supplied bodies
+		// (preVerified == true, body served raw) still flow
+		// through signalPromotion / the worker as before.
 		_ = h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,
@@ -886,12 +893,12 @@ func (h *Handler) fetchPiece(
 
 	if byteRange != nil {
 		// We fetched the full piece for the integrity check;
-		// slice it down to the requested range and publish a
-		// promotion signal so the async worker can decide
-		// whether to warm the full piece. The slice is bounded
-		// by the buffered length, not ObjectSize, because EC /
-		// multipart pieces may be smaller than the object as a
-		// whole.
+		// slice it down to the requested range. The slice is
+		// bounded by the buffered length, not ObjectSize,
+		// because EC / multipart pieces may be smaller than the
+		// object as a whole. No signalPromotion here: the cache
+		// put above already warmed the full piece, so the async
+		// worker would only cause a redundant origin fetch.
 		end := byteRange.End
 		if end < 0 || end >= int64(len(buf)) {
 			end = int64(len(buf)) - 1
@@ -900,7 +907,6 @@ func (h *Handler) fetchPiece(
 			return nil, false, fmt.Errorf("s3compat: range %d-%d out of bounds for piece %s (%d bytes)", byteRange.Start, byteRange.End, piece.PieceID, len(buf))
 		}
 		sliced := buf[byteRange.Start : end+1]
-		h.signalPromotion(piece, tenantID, int64(len(sliced)), objectSize)
 		return io.NopCloser(bytes.NewReader(sliced)), false, nil
 	}
 
