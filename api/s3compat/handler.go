@@ -840,29 +840,75 @@ func (h *Handler) streamGatewayDecryptedGet(
 	// failure.
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
 	w.WriteHeader(http.StatusOK)
-	n, copyErr := io.Copy(w, plaintext)
+	// Wrap the response writer so we can distinguish read-side
+	// errors (decryptor / chunk-AEAD reject — a real corruption
+	// signal) from write-side errors (client RST, broken pipe — a
+	// transport hiccup). io.Copy returns whichever error happened
+	// first, but only the wrapper sees write failures directly.
+	// The branching below uses this to decide whether to call
+	// verifyFn at all: on a write-side failure the TeeReader has
+	// only hashed a partial ciphertext prefix, so calling verifyFn
+	// would always mismatch and produce a false-positive
+	// zkof_integrity_failure_total tick that trains operators to
+	// ignore the counter.
+	ew := &writeErrCapturingWriter{w: w}
+	n, copyErr := io.Copy(ew, plaintext)
 
-	// Verify integrity after the body has been drained: the
-	// TeeReader inside openCiphertextStream observed every byte
-	// the decryptor consumed, so the hasher's Sum() reflects the
-	// ciphertext we actually fed downstream. A nil verifyFn means
-	// either a cache hit (already verified at put time) or a
-	// read-repair body (ReadRepair already verified).
-	if verifyFn != nil {
-		if verr := verifyFn(); verr != nil {
-			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
-				h.recordIntegrityUnrecognized(piece, verr)
-			} else {
-				// Mismatch on the streaming path is a
-				// detection (we cannot un-send the bytes the
-				// client already has), but we still:
-				//   (a) emit the Prometheus counter so
-				//       operators see it on dashboards;
-				//   (b) log at ERROR with piece + backend +
-				//       expected/got so on-call can pivot.
-				h.recordIntegrityFailure(piece, verr)
+	// Three terminal states; each chooses how to interact with the
+	// integrity counter so the metric stays a high-fidelity signal
+	// for actual content corruption:
+	//
+	//   1. copyErr == nil — full stream landed cleanly. Run the
+	//      post-EOF BLAKE3 check on the ciphertext the TeeReader
+	//      observed and record the appropriate counter on a
+	//      mismatch (or unrecognised legacy claim).
+	//
+	//   2. ew.writeErr != nil — client side aborted before we
+	//      finished writing. The TeeReader has only hashed a
+	//      ciphertext prefix; calling verifyFn would always
+	//      mismatch. Skip the integrity check entirely; the WARN
+	//      log below still surfaces the truncation. This is the
+	//      false-positive case Devin Review flagged.
+	//
+	//   3. copyErr != nil && ew.writeErr == nil — decryptor /
+	//      chunk-AEAD rejected a frame. The error itself is the
+	//      integrity signal (Poly1305 said the bytes are wrong),
+	//      so we record an integrity failure with the underlying
+	//      error rather than re-deriving the same conclusion via
+	//      a partial-hash mismatch. This preserves the
+	//      tamper-detection contract pinned by
+	//      TestManagedEncryption_StreamingGet_TamperedPieceDetected.
+	switch {
+	case copyErr == nil:
+		if verifyFn != nil {
+			if verr := verifyFn(); verr != nil {
+				if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+					h.recordIntegrityUnrecognized(piece, verr)
+				} else {
+					// Mismatch on the streaming path is a
+					// detection (we cannot un-send the bytes the
+					// client already has), but we still:
+					//   (a) emit the Prometheus counter so
+					//       operators see it on dashboards;
+					//   (b) log at ERROR with piece + backend +
+					//       expected/got so on-call can pivot.
+					h.recordIntegrityFailure(piece, verr)
+				}
 			}
 		}
+	case ew.writeErr != nil:
+		// Client disconnect / broken pipe. Don't ring the
+		// integrity bell — partial hash would lie. WARN log
+		// below carries the bytes-sent + cause.
+	default:
+		// Read-side error: decryptor or chunk-AEAD reject. The
+		// error itself is the integrity signal. Skip the
+		// post-EOF BLAKE3 check (it would either mismatch on
+		// the same partial-hash basis or be redundant with this
+		// stronger signal) and record the counter directly so
+		// the failure shows up on dashboards with the
+		// underlying error for diagnosis.
+		h.recordIntegrityFailure(piece, copyErr)
 	}
 
 	if copyErr != nil {
@@ -873,9 +919,13 @@ func (h *Handler) streamGatewayDecryptedGet(
 		// client sees a truncated stream and the gateway has
 		// burned real egress. Surface it at WARN with piece +
 		// backend + bytes-sent so on-call can correlate the
-		// billing emission below against the failure mode.
-		log.Printf("s3compat: WARN streaming_get_truncated: piece=%s backend=%s bytes_sent=%d err=%v",
-			piece.PieceID, piece.Backend, n, copyErr)
+		// billing emission below against the failure mode. The
+		// write_err field distinguishes client disconnects
+		// (writeErr != nil) from read-side decrypt failures
+		// (writeErr == nil) so on-call doesn't need to grep
+		// chunk-AEAD error strings to triage.
+		log.Printf("s3compat: WARN streaming_get_truncated: piece=%s backend=%s bytes_sent=%d write_err=%v err=%v",
+			piece.PieceID, piece.Backend, n, ew.writeErr, copyErr)
 	}
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	// Bill on bytes actually written to the response, regardless
@@ -1698,6 +1748,38 @@ func formatContentRange(r *providers.ByteRange, total int64) string {
 		end = total - 1
 	}
 	return fmt.Sprintf("bytes %d-%d/%d", r.Start, end, total)
+}
+
+// writeErrCapturingWriter wraps an io.Writer and remembers the first
+// Write error it sees. streamGatewayDecryptedGet uses this to tell
+// whether an io.Copy failure came from the downstream
+// http.ResponseWriter (client disconnect / broken pipe — transport
+// hiccup) or from the upstream decryptor (chunk-AEAD reject — real
+// corruption). The two cases need different integrity-counter
+// behaviour:
+//
+//   - Write failure ⇒ TeeReader hashed only a ciphertext prefix, so a
+//     post-EOF BLAKE3 check would always mismatch. Suppress the
+//     integrity counter to avoid false positives.
+//   - Read failure with no write failure ⇒ the read-side error is the
+//     integrity signal; record an integrity failure directly.
+//
+// We intentionally do not implement http.Flusher / http.Hijacker /
+// http.Pusher here: streamGatewayDecryptedGet never relies on those
+// optional interfaces, and forwarding them would only widen the
+// blast radius if a future handler accidentally took a dependency on
+// them through this wrapper.
+type writeErrCapturingWriter struct {
+	w        io.Writer
+	writeErr error
+}
+
+func (e *writeErrCapturingWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err != nil && e.writeErr == nil {
+		e.writeErr = err
+	}
+	return n, err
 }
 
 func quote(s string) string {

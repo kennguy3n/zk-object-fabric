@@ -91,6 +91,13 @@ type encryptionServer struct {
 	cmkMaterial []byte
 	cmkPath     string
 	integrity   *integritySinkRecorder
+	// handler is the in-process *s3compat.Handler driving the
+	// httptest server. Streaming-GET regression tests that need to
+	// inject a custom http.ResponseWriter (for example to simulate a
+	// client disconnect mid-stream) call h.Get directly instead of
+	// going through the AWS SDK + httptest stack, so timing is
+	// deterministic.
+	handler *s3compat.Handler
 }
 
 // integritySinkRecorder mirrors api/s3compat.IntegrityFailureSink
@@ -169,7 +176,7 @@ func newEncryptionServer(t *testing.T, placement encryptionPlacement, cmk []byte
 	manifests := memory.New()
 	sink := &integritySinkRecorder{}
 	mux := http.NewServeMux()
-	s3compat.New(s3compat.Config{
+	handler := s3compat.New(s3compat.Config{
 		Manifests:         manifests,
 		Providers:         map[string]providers.StorageProvider{placement.backend: backend},
 		Placement:         placement,
@@ -178,7 +185,8 @@ func newEncryptionServer(t *testing.T, placement encryptionPlacement, cmk []byte
 		Encryption:        gatewayEnc,
 		IntegrityFailures: sink,
 		Now:               time.Now,
-	}).Register(mux)
+	})
+	handler.Register(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
@@ -205,6 +213,7 @@ func newEncryptionServer(t *testing.T, placement encryptionPlacement, cmk []byte
 		cmkMaterial: cmkMaterial,
 		cmkPath:     cmkPath,
 		integrity:   sink,
+		handler:     handler,
 	}
 }
 
@@ -1114,8 +1123,116 @@ func TestManagedEncryption_StreamingGet_TamperedPieceDetected(t *testing.T) {
 	}
 }
 
+// disconnectingResponseWriter is an http.ResponseWriter that succeeds
+// for the first writeBudget bytes and then returns io.ErrClosedPipe on
+// every subsequent Write. It simulates a client that resets / closes
+// its end of the connection mid-stream, which is the case Devin Review
+// flagged on PR #63: the post-EOF BLAKE3 TeeReader has only hashed a
+// partial ciphertext prefix, and calling verifyFn on that partial
+// hash will always mismatch, producing a false-positive
+// zkof_integrity_failure_total tick.
+//
+// We deliberately do NOT implement http.Flusher / Hijacker / Pusher —
+// the production code path does not depend on those, and the matching
+// writeErrCapturingWriter in handler.go also abstains, so this
+// keeps the test surface identical to the real call site.
+type disconnectingResponseWriter struct {
+	header      http.Header
+	body        bytes.Buffer
+	writeBudget int
+	status      int
+}
+
+func (w *disconnectingResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = http.Header{}
+	}
+	return w.header
+}
+
+func (w *disconnectingResponseWriter) WriteHeader(status int) { w.status = status }
+
+func (w *disconnectingResponseWriter) Write(p []byte) (int, error) {
+	if w.writeBudget <= 0 {
+		return 0, io.ErrClosedPipe
+	}
+	if len(p) > w.writeBudget {
+		// Write what we still have budget for so the test can
+		// assert n > 0 was actually committed before the error
+		// (mirroring the streaming path's egress-billing
+		// behaviour) and then refuse the rest.
+		n, _ := w.body.Write(p[:w.writeBudget])
+		w.writeBudget = 0
+		return n, io.ErrClosedPipe
+	}
+	n, _ := w.body.Write(p)
+	w.writeBudget -= n
+	return n, nil
+}
+
 // ---------------------------------------------------------------
-// Test 15: Streaming decryption — concurrent GETs on the same
+// Test 15: Streaming decryption — a mid-stream client disconnect
+// (Write fails with broken pipe / closed pipe / RST) MUST NOT
+// increment the integrity failure counter. Pre-fix, the
+// streamGatewayDecryptedGet path called verifyFn() unconditionally
+// after io.Copy returned, regardless of whether copyErr came from
+// the write side (transport hiccup, partial hash → false mismatch)
+// or the read side (chunk-AEAD reject, real corruption). The fix
+// wraps the ResponseWriter in a writeErrCapturingWriter so the
+// handler can tell the two cases apart; this test pins that
+// behaviour by feeding the handler a writer that fails after 16 KiB
+// and asserting the counter stays at zero.
+//
+// The tamper test (TestManagedEncryption_StreamingGet_TamperedPieceDetected)
+// still asserts the counter ticks on a true corruption signal, so
+// the two tests together pin both sides of the contract.
+// ---------------------------------------------------------------
+func TestManagedEncryption_StreamingGet_ClientDisconnectDoesNotFalsifyIntegrity(t *testing.T) {
+	s := newEncryptionServer(t, encryptionPlacement{
+		backend:        "local_fs_dev",
+		encryptionMode: "managed",
+	}, nil)
+
+	// 2 MiB plaintext: large enough that 16 KiB of write budget
+	// hits an io.ErrClosedPipe well before the decryptor finishes
+	// consuming the ciphertext, so the TeeReader's hash is
+	// guaranteed to be a strict prefix of the recorded BLAKE3.
+	plaintext := make([]byte, 2*1024*1024)
+	if _, err := rand.Read(plaintext); err != nil {
+		t.Fatalf("rand plaintext: %v", err)
+	}
+	key := "disconnect.bin"
+	if _, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(plaintext),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// Call h.Get directly with the failing writer; this skips the
+	// AWS SDK + httptest stack entirely so write-error timing is
+	// deterministic.
+	req := httptest.NewRequest(http.MethodGet, "/"+s.bucket+"/"+key, nil)
+	rec := &disconnectingResponseWriter{writeBudget: 16 * 1024}
+	s.handler.Get(rec, req)
+
+	if rec.status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (headers were committed before the write failure)", rec.status)
+	}
+	if rec.body.Len() == 0 {
+		t.Fatalf("body length = 0, want some bytes written before the simulated disconnect (test setup is not exercising the streaming path)")
+	}
+	if rec.body.Len() >= len(plaintext) {
+		t.Fatalf("body length = %d but plaintext is %d bytes; the simulated disconnect must abort before EOF for this test to exercise the partial-hash branch", rec.body.Len(), len(plaintext))
+	}
+	if got := s.integrity.failures("local_fs_dev"); got != 0 {
+		t.Fatalf("integrity failure counter = %d, want 0 (write-side failure must not falsify the integrity signal; verifyFn would mismatch on the partial ciphertext prefix and that mismatch is NOT corruption)", got)
+	}
+}
+
+// ---------------------------------------------------------------
+// Test 16: Streaming decryption — concurrent GETs on the same
 // large object do not interfere. This is a smoke check that the
 // stream chain (cache lookup → TeeReader → DecryptObject → response)
 // is safe across goroutines and does not share buffers.
