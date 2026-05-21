@@ -48,6 +48,14 @@ type Authenticator interface {
 // Authenticator in production.
 const AnonymousTenant = "anonymous"
 
+// ErrAuthMisconfigured is the sentinel authenticate returns when
+// RequireAuth is true and the handler has no Authenticator wired.
+// Call sites translate it into a 500 InternalAuthMisconfigured S3
+// error via writeAuthError so the production-mode safety net
+// surfaces as an operator-visible failure instead of a silent
+// anonymous-tenant fallthrough.
+var ErrAuthMisconfigured = errors.New("s3compat: authenticator not configured but RequireAuth=true")
+
 // MaxInMemoryObjectBytes caps the size of an object the handler is
 // willing to buffer into memory on the request goroutine. The
 // remaining non-streaming paths that have to honour this ceiling are:
@@ -192,6 +200,15 @@ type Config struct {
 
 	// NodeID identifies the gateway node emitting billing events.
 	NodeID string
+
+	// RequireAuth, when true, makes the handler refuse every
+	// request with 500 InternalAuthMisconfigured if Auth is
+	// nil — instead of silently serving every request under
+	// AnonymousTenant. cmd/gateway sets this whenever the
+	// deployment env is "production" so a misconfiguration that
+	// drops the authenticator can never silently grant
+	// world-write to the anonymous tenant.
+	RequireAuth bool
 
 	// ContentIndex is the intra-tenant deduplication content
 	// index. When non-nil and the resolved placement policy has
@@ -381,7 +398,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 // it to enumerate bucket names.
 func (h *Handler) PutBucket(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.authenticate(r); err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	bucket, _ := parseBucketKey(r.URL.Path)
@@ -397,7 +414,7 @@ func (h *Handler) PutBucket(w http.ResponseWriter, r *http.Request) {
 // implicit, an authenticated HEAD always returns 200 OK.
 func (h *Handler) HeadBucket(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.authenticate(r); err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -414,7 +431,7 @@ func (h *Handler) HeadBucket(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	if h.cfg.VerifiedCheck != nil {
@@ -1398,7 +1415,7 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
@@ -1544,7 +1561,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	if bucket == "" {
@@ -1613,7 +1630,18 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.StorageProvider, metadata.Piece, string, string, error) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusForbidden, s3code: "AccessDenied", msg: err.Error()}
+		// Map auth errors to typed *httpError at the boundary so
+		// writeResolveError can dispatch uniformly. The wrapped
+		// err field carries the original sentinel through the
+		// error chain — errors.Is(returnedErr, ErrAuthMisconfigured)
+		// still works for any downstream caller that wants to
+		// special-case the misconfiguration signal (today only the
+		// HTTP status code rendering needs that, but the chain is
+		// preserved for forward-compat).
+		if errors.Is(err, ErrAuthMisconfigured) {
+			return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusInternalServerError, s3code: "InternalAuthMisconfigured", msg: err.Error(), err: err}
+		}
+		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusForbidden, s3code: "AccessDenied", msg: err.Error(), err: err}
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
 	if bucket == "" || key == "" {
@@ -1649,9 +1677,31 @@ func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.
 
 func (h *Handler) authenticate(r *http.Request) (string, error) {
 	if h.cfg.Auth == nil {
+		// Production-mode safety net: when an operator
+		// configures RequireAuth=true (cmd/gateway does this
+		// automatically when env="production") but forgets
+		// to wire an Authenticator, refuse every request
+		// instead of silently dropping into AnonymousTenant.
+		if h.cfg.RequireAuth {
+			return "", ErrAuthMisconfigured
+		}
 		return AnonymousTenant, nil
 	}
 	return h.cfg.Auth.Authenticate(r)
+}
+
+// writeAuthError translates an authenticate() error into the
+// right HTTP response. Auth-misconfiguration (operator forgot to
+// wire an Authenticator under RequireAuth=true) is a 500
+// InternalAuthMisconfigured because the server is the broken
+// party; everything else is a 403 AccessDenied (the request
+// itself is malformed or signed with bad credentials).
+func writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, ErrAuthMisconfigured) {
+		writeError(w, http.StatusInternalServerError, "InternalAuthMisconfigured", err.Error(), r.URL.Path)
+		return
+	}
+	writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
 }
 
 func (h *Handler) emit(tenantID, bucket string, dim billing.Dimension, delta uint64) {
@@ -1793,14 +1843,30 @@ func quote(s string) string {
 }
 
 // httpError is the internal error type returned by resolve so the
-// handler method can choose the right HTTP status code.
+// handler method can choose the right HTTP status code. The
+// optional err field carries the underlying error chain so
+// errors.Is / errors.As work through wrapped httpErrors —
+// previously, resolve() and writeResolveError each had to
+// errors.Is(err, ErrAuthMisconfigured) before falling through
+// to the httpError dispatch. Wrapping the sentinel into the
+// httpError at the boundary (resolve) means writeResolveError
+// can dispatch uniformly via *httpError and the sentinel-check
+// duplication goes away.
 type httpError struct {
 	code   int
 	s3code string
 	msg    string
+	err    error
 }
 
 func (e *httpError) Error() string { return e.msg }
+
+// Unwrap exposes the underlying error so errors.Is and errors.As
+// can match sentinels (e.g. ErrAuthMisconfigured) carried through
+// a typed *httpError. Returns nil when no underlying error is
+// attached, which is the common case for synthesised errors like
+// "path must be /{bucket}/{key...}".
+func (e *httpError) Unwrap() error { return e.err }
 
 func writeResolveError(w http.ResponseWriter, r *http.Request, err error) {
 	var he *httpError
