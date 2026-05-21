@@ -10,7 +10,6 @@
 package background_rebalancer
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -20,9 +19,40 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/migration"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
+
+// IntegrityFailureSink is the optional metrics surface the
+// rebalancer uses to report a streamed-piece content-hash
+// mismatch. The contract mirrors api/s3compat's sink so the same
+// internal/metrics adapter can drive both the cache-miss GET
+// path and the rebalance path with one type. A nil sink in
+// Config disables the counters but keeps the structured log
+// line, which is enough for operators in dev / test contexts.
+//
+// Inc fires on a verified content mismatch (cf.
+// pieceintegrity.ErrIntegrityCheckFailed) — i.e. the recorded
+// hash and the streamed bytes disagree. Operators page on this:
+// either the source backend's bytes have rotted / been tampered,
+// or the manifest recorded the wrong hash on PUT. Either way the
+// rebalancer refuses to leave the bad bytes on the destination
+// (it deletes them) and aborts the manifest.
+//
+// IncUnrecognized fires when piece.Hash is non-empty but does
+// not parse as blake3:<hex> or as a 64-char SHA-256 hex (cf.
+// pieceintegrity.ErrIntegrityClaimUnrecognized). This is the
+// legacy-manifest path: copy/dedup/multipart manifests written
+// before the BLAKE3 cut-over stamped a backend ETag into Hash.
+// The bytes are not known to be wrong; the rebalancer leaves
+// them in place and surfaces the counter so operators can plan
+// a one-shot rewrite migration that moves the legacy ETag into
+// ProviderETag and clears Hash.
+type IntegrityFailureSink interface {
+	Inc(backend string)
+	IncUnrecognized(backend string)
+}
 
 // TenantTarget names a single migration target inside the
 // rebalancer's scan set. A manifest is eligible for rebalance when
@@ -49,7 +79,10 @@ type Config struct {
 	Targets []TenantTarget
 
 	// BytesPerSecond caps the steady-state copy bandwidth. Zero
-	// means no cap.
+	// means no cap. The cap is enforced inline per Read on the
+	// streaming copy path (see throttledReader) so a slow rate
+	// does not force the gateway to buffer the entire piece in
+	// memory before dispatching the destination PUT.
 	BytesPerSecond int64
 
 	// PageSize is the ManifestStore list page size. Zero defaults
@@ -62,6 +95,14 @@ type Config struct {
 
 	// Logger receives per-piece outcomes. Nil disables logging.
 	Logger *log.Logger
+
+	// IntegrityFailures, if set, receives metric increments when a
+	// streamed piece's recomputed content hash does not match the
+	// manifest's recorded Hash (or when the recorded hash format
+	// is unrecognised). The rebalancer also logs the event
+	// structurally either way; the sink is optional so tests that
+	// do not wire a metrics registry still build.
+	IntegrityFailures IntegrityFailureSink
 }
 
 // Rebalancer owns a single migration workflow. Its Run method walks
@@ -214,31 +255,16 @@ func (r *Rebalancer) rebalanceManifest(
 		if piece.Backend != target.SourceBackend {
 			continue
 		}
-		rc, err := source.GetPiece(ctx, piece.PieceID, nil)
-		if err != nil {
-			return copied, bytesCopied, fmt.Errorf("get piece %s from %s: %w", piece.PieceID, target.SourceBackend, err)
-		}
-		body, err := io.ReadAll(rc)
-		_ = rc.Close()
-		if err != nil {
-			return copied, bytesCopied, fmt.Errorf("drain piece %s: %w", piece.PieceID, err)
-		}
-		if err := r.throttle(ctx, int64(len(body))); err != nil {
-			return copied, bytesCopied, err
-		}
-
-		put, err := primary.PutPiece(ctx, piece.PieceID, bytes.NewReader(body), providers.PutOptions{
-			ContentLength: int64(len(body)),
-		})
-		if err != nil {
-			return copied, bytesCopied, fmt.Errorf("put piece %s to %s: %w", piece.PieceID, target.PrimaryBackend, err)
+		copyBytes, newLocator, copyErr := r.copyPieceStreaming(ctx, piece, target, source, primary)
+		bytesCopied += copyBytes
+		if copyErr != nil {
+			return copied, bytesCopied, copyErr
 		}
 		m.Pieces[i].Backend = target.PrimaryBackend
-		if put.Locator != "" {
-			m.Pieces[i].Locator = put.Locator
+		if newLocator != "" {
+			m.Pieces[i].Locator = newLocator
 		}
 		copied++
-		bytesCopied += int64(len(body))
 		dirty = true
 	}
 	if dirty {
@@ -322,26 +348,160 @@ func applyPhase(m *metadata.ObjectManifest, next migration.MigrationPhase) {
 	}
 }
 
-// throttle pauses the worker to honour BytesPerSecond. It uses a
-// simple token-bucket model: one call per copy reserves `bytes` of
-// budget and sleeps the shortfall. The sleep respects ctx so a
-// SIGTERM-driven cancel unwinds the rebalancer promptly instead of
-// blocking for up to piece_size / BytesPerSecond seconds.
-func (r *Rebalancer) throttle(ctx context.Context, bytes int64) error {
-	if r.cfg.BytesPerSecond <= 0 {
-		return nil
+// copyPieceStreaming pipes a single piece source→primary as a
+// continuous io.Copy: GetPiece's body flows through a per-Read
+// rate-limited throttledReader, then a TeeReader that feeds a
+// pieceintegrity.Hasher tracking the on-wire bytes for content
+// verification, and finally a countingReader that records the
+// exact number of bytes that landed on the destination. The
+// pipeline never materialises the full piece in the gateway's
+// heap, which was the previous bottleneck — io.ReadAll on the
+// source forced piece_size bytes of allocation and stalled the
+// destination PUT until the source had fully drained.
+//
+// Integrity verification fires after the destination accepts the
+// upload. A pieceintegrity.ErrIntegrityCheckFailed means the
+// recomputed hash and the recorded Hash disagree (backend
+// bit-rot, a tampered backend, or a manifest written with the
+// wrong hash). The rebalancer treats that as fail-closed: the
+// destination piece is deleted so a future pass can retry the
+// copy (potentially from a different replica) and the caller's
+// stats reflect the bytes that moved but not a successful
+// copy. pieceintegrity.ErrIntegrityClaimUnrecognized means the
+// manifest's Hash is non-empty but in a legacy format the
+// verifier does not parse (e.g. a copy/dedup manifest that
+// stamped a backend ETag into Hash); the bytes are not known to
+// be wrong so the destination is left alone and the
+// observability counter is incremented instead.
+func (r *Rebalancer) copyPieceStreaming(
+	ctx context.Context,
+	piece metadata.Piece,
+	target TenantTarget,
+	source providers.StorageProvider,
+	primary providers.StorageProvider,
+) (bytesCopied int64, newLocator string, err error) {
+	rc, err := source.GetPiece(ctx, piece.PieceID, nil)
+	if err != nil {
+		return 0, "", fmt.Errorf("get piece %s from %s: %w", piece.PieceID, target.SourceBackend, err)
 	}
-	d := time.Duration(float64(bytes) / float64(r.cfg.BytesPerSecond) * float64(time.Second))
-	if d <= 0 {
-		return nil
+	defer rc.Close()
+
+	contentLength, err := r.resolveContentLength(ctx, piece, target, source)
+	if err != nil {
+		return 0, "", err
 	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+
+	hashWriter, checkHash := pieceintegrity.Hasher(piece)
+	throttled := newThrottledReader(ctx, rc, r.cfg.BytesPerSecond)
+	teed := io.TeeReader(throttled, hashWriter)
+	counting := &countingReader{r: teed}
+
+	put, err := primary.PutPiece(ctx, piece.PieceID, counting, providers.PutOptions{
+		ContentLength: contentLength,
+	})
+	if err != nil {
+		return counting.n, "", fmt.Errorf("put piece %s to %s: %w", piece.PieceID, target.PrimaryBackend, err)
+	}
+
+	if hashErr := checkHash(); hashErr != nil {
+		switch {
+		case errors.Is(hashErr, pieceintegrity.ErrIntegrityCheckFailed):
+			r.recordIntegrityFailure(piece, target, hashErr)
+			if delErr := primary.DeletePiece(ctx, piece.PieceID); delErr != nil {
+				r.logf("background_rebalancer: failed to delete corrupted dest piece %s on %s: %v",
+					piece.PieceID, target.PrimaryBackend, delErr)
+			}
+			return counting.n, "", fmt.Errorf("rebalance integrity check failed for piece %s: %w",
+				piece.PieceID, hashErr)
+		case errors.Is(hashErr, pieceintegrity.ErrIntegrityClaimUnrecognized):
+			r.recordIntegrityClaimUnrecognized(piece, target, hashErr)
+			// Fall through: keep the destination bytes because
+			// we cannot prove they are wrong.
+		default:
+			// Defensive: an unexpected hash-check error should
+			// still surface so the rebalancer does not silently
+			// claim success.
+			return counting.n, "", fmt.Errorf("rebalance hash check error for piece %s: %w",
+				piece.PieceID, hashErr)
+		}
+	}
+	return counting.n, put.Locator, nil
+}
+
+// resolveContentLength returns the byte count to advertise on the
+// destination PutPiece. Manifests written by the Phase 4+ PUT
+// path carry per-piece SizeBytes, so the common case is a
+// constant-time lookup. Legacy manifests (multipart/copy/dedup
+// flows that pre-date the SizeBytes stamp) may carry a zero,
+// in which case we HEAD the source to learn the true size — S3
+// backends require a known Content-Length on the upload and we
+// would rather pay a single round trip than fall back to a
+// chunked upload that some providers reject.
+func (r *Rebalancer) resolveContentLength(
+	ctx context.Context,
+	piece metadata.Piece,
+	target TenantTarget,
+	source providers.StorageProvider,
+) (int64, error) {
+	if piece.SizeBytes > 0 {
+		return piece.SizeBytes, nil
+	}
+	head, headErr := source.HeadPiece(ctx, piece.PieceID)
+	if headErr != nil {
+		return 0, fmt.Errorf("head piece %s on %s: %w", piece.PieceID, target.SourceBackend, headErr)
+	}
+	if head.SizeBytes <= 0 {
+		// HEAD returned 0 — the source does not know either.
+		// Defer to the destination's streaming-length contract
+		// (some providers, like local_fs_dev, accept -1).
+		return -1, nil
+	}
+	return head.SizeBytes, nil
+}
+
+// countingReader is a thin io.Reader middlebox that records the
+// total bytes observed. It exists because the streaming-copy
+// path's piece body never sits in a single buffer the caller can
+// len() — the source's Read calls drive the count instead, and
+// the destination's PutPiece result does not surface the byte
+// count.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// recordIntegrityFailure logs a structured ERROR line and
+// increments the optional metric sink for a verified content
+// mismatch on a streamed piece. The log line carries every label
+// an on-call needs to scope the investigation (which backend
+// served the bad bytes, which destination the rebalancer was
+// moving them to, what hash was recorded) without forcing the
+// gateway to depend on internal/metrics from this package.
+func (r *Rebalancer) recordIntegrityFailure(piece metadata.Piece, target TenantTarget, hashErr error) {
+	r.logf("background_rebalancer: ERROR integrity_check_failed piece=%s source=%s primary=%s recorded_hash=%q err=%v",
+		piece.PieceID, target.SourceBackend, target.PrimaryBackend, piece.Hash, hashErr)
+	if r.cfg.IntegrityFailures != nil {
+		r.cfg.IntegrityFailures.Inc(target.SourceBackend)
+	}
+}
+
+// recordIntegrityClaimUnrecognized logs a structured WARN line
+// and increments the observability sink for a streamed piece
+// whose recorded Hash is non-empty but not in any recognised
+// format. The rebalancer keeps the destination bytes (there is
+// no proof they are wrong) and the counter lets operators see
+// the population of legacy manifests that still need a rewrite.
+func (r *Rebalancer) recordIntegrityClaimUnrecognized(piece metadata.Piece, target TenantTarget, hashErr error) {
+	r.logf("background_rebalancer: WARN integrity_claim_unrecognized piece=%s source=%s primary=%s recorded_hash=%q detail=%v",
+		piece.PieceID, target.SourceBackend, target.PrimaryBackend, piece.Hash, hashErr)
+	if r.cfg.IntegrityFailures != nil {
+		r.cfg.IntegrityFailures.IncUnrecognized(target.SourceBackend)
 	}
 }
 

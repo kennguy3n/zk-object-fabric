@@ -167,7 +167,7 @@ func main() {
 	// any unrecognised-claim count discovered during repair.
 	readRepair.IntegrityFailures = integrityFailureSink{r: metricsRegistry}
 
-	rebalancerDone := startRebalancer(workerCtx, cfg.Rebalancer, store, registry)
+	rebalancerDone := startRebalancer(workerCtx, cfg.Rebalancer, store, registry, metricsRegistry)
 	orphanGCDone := startOrphanGC(workerCtx, cfg.Dedup, contentIndex, store, registry)
 	crossCellDone := startCrossCellReplicator(workerCtx, cfg.CrossCell, store, registry)
 
@@ -366,6 +366,7 @@ func startRebalancer(
 	rb config.RebalancerConfig,
 	store manifest_store.ManifestStore,
 	registry map[string]providers.StorageProvider,
+	metricsReg *metrics.Registry,
 ) <-chan struct{} {
 	if !rb.Enabled || len(rb.Targets) == 0 {
 		return nil
@@ -389,6 +390,13 @@ func startRebalancer(
 		Targets:        targets,
 		BytesPerSecond: rb.BytesPerSecond,
 		Logger:         log.New(os.Stdout, "rebalancer ", log.LstdFlags),
+		// Reuse the GET-path integrity sink so streaming-rebalance
+		// hash mismatches feed the same zkof_integrity_failure_total
+		// counter operators already alert on. The source backend
+		// label is set by the rebalancer (it is the same backend
+		// label semantics: "this backend served bytes that did not
+		// match the recorded hash").
+		IntegrityFailures: integrityFailureSink{r: metricsReg},
 	})
 	done := make(chan struct{})
 	go func() {
