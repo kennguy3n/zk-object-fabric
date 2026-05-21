@@ -79,6 +79,15 @@ func (h *Handler) encryptWithDEK(plaintext []byte, dek client_sdk.DataEncryption
 // decryptFromStorage unwraps the DEK recorded on the manifest and
 // returns the plaintext for ciphertext. It is the mirror of
 // encryptForStorage and encryptWithDEK.
+//
+// Read-path callers should prefer streamDecryptFromStorage so a
+// multi-GiB GET does not balloon the gateway's heap by 2x the
+// object size. decryptFromStorage remains in use only on paths
+// that genuinely need the full plaintext buffer in memory — the
+// gateway-encrypted Range GET path (slices an arbitrary byte
+// range out of the materialised plaintext) and the multipart /
+// EC GET paths (assemble per-part plaintext blobs before stitching
+// them together).
 func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionConfig) ([]byte, error) {
 	if h.cfg.Encryption == nil {
 		return nil, fmt.Errorf("s3compat: gateway encryption is not configured")
@@ -109,6 +118,46 @@ func (h *Handler) decryptWithDEK(ciphertext []byte, dek client_sdk.DataEncryptio
 		return nil, fmt.Errorf("s3compat: read plaintext: %w", err)
 	}
 	return plaintext, nil
+}
+
+// streamDecryptFromStorage is the streaming mirror of
+// decryptFromStorage: it unwraps the DEK and returns the SDK's
+// decrypt reader so the caller can io.Copy plaintext straight to
+// the client without ever buffering the full object in memory.
+//
+// The SDK's DecryptObject already streams chunk-by-chunk
+// (encryption/client_sdk/sdk.go), so the gateway gains nothing from
+// the legacy decryptFromStorage's io.ReadAll except a hard ceiling
+// at MaxInMemoryObjectBytes and a fat memory spike per concurrent
+// request. The non-range GET path uses this helper to lift that
+// ceiling; the range-request path keeps decryptFromStorage because
+// it needs the full plaintext in memory to slice arbitrary byte
+// ranges (chunk-level range seek lands in v0.2.0).
+//
+// The returned reader takes ownership of ciphertext: callers must
+// not read from ciphertext after this returns. Decrypt errors
+// surface on the first Read call, not on this returning function,
+// so the caller MUST drain to EOF (or close) to learn whether the
+// stream was valid.
+func (h *Handler) streamDecryptFromStorage(ciphertext io.Reader, enc metadata.EncryptionConfig) (io.Reader, error) {
+	if h.cfg.Encryption == nil {
+		return nil, fmt.Errorf("s3compat: gateway encryption is not configured")
+	}
+	wrapped := encryption.DataEncryptionKey{
+		KeyID:         enc.KeyID,
+		Algorithm:     enc.Algorithm,
+		WrappedKey:    enc.WrappedDEK,
+		WrapAlgorithm: enc.WrapAlgorithm,
+	}
+	dek, err := h.cfg.Encryption.Wrapper.UnwrapDEK(wrapped, h.cfg.Encryption.CMK)
+	if err != nil {
+		return nil, fmt.Errorf("s3compat: unwrap dek: %w", err)
+	}
+	decReader, err := client_sdk.DecryptObject(ciphertext, dek, client_sdk.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("s3compat: decrypt object: %w", err)
+	}
+	return decReader, nil
 }
 
 // prepareSinglePieceEncryption consumes r.Body, applies the

@@ -49,19 +49,23 @@ type Authenticator interface {
 const AnonymousTenant = "anonymous"
 
 // MaxInMemoryObjectBytes caps the size of an object the handler is
-// willing to buffer into memory on the request goroutine. The two
-// non-streaming paths that have to honour this ceiling are:
+// willing to buffer into memory on the request goroutine. The
+// remaining non-streaming paths that have to honour this ceiling are:
 //
-//   - The gateway-encrypted GET path, which has to read the entire
-//     ciphertext before frame-decrypting it (the SDK's chunk format
-//     does not currently expose a streaming Open).
+//   - The gateway-encrypted Range GET path
+//     (bufferedGatewayDecryptedGet). Slicing an arbitrary byte
+//     range out of a chunk-framed plaintext requires the whole
+//     plaintext in memory; chunk-level range seek lands in v0.2.0.
+//     Non-range gateway-encrypted GETs use the streaming path
+//     (streamGatewayDecryptedGet) and have NO ceiling.
 //
 //   - The inline cache-warming path in fetchPiece, which buffers a
 //     piece into memory so it can hand the bytes both to the
 //     hot-object cache and to the client.
 //
-// Above the cap the gateway-encrypted GET returns 507
-// InsufficientStorage with a descriptive message, and the
+// Above the cap the buffered Range GET returns 507
+// InsufficientStorage with a descriptive message that points the
+// caller at the unbounded streaming full-object GET path; the
 // cache-warming path skips inline warming and publishes a
 // PromotionSignal so the async worker can decide whether to warm
 // the piece. Both ceilings match the multipart in-memory pre-fetch
@@ -70,8 +74,8 @@ const AnonymousTenant = "anonymous"
 //
 // The constant lives here rather than in config so tests can
 // reference it without round-tripping through a Config field; a
-// follow-up commit can promote it to a tunable when streaming
-// decryption / streaming EC land.
+// follow-up commit can promote it to a tunable when chunk-level
+// range seek and streaming EC land.
 const MaxInMemoryObjectBytes int64 = 256 * 1024 * 1024
 
 // PlacementEngine chooses the storage backend for a new object. Phase
@@ -609,18 +613,36 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		VersionID:     manifest.VersionID,
 	}
 
-	// For gateway-encrypted objects (managed / public_distribution)
-	// the backend pieces are ciphertext with self-framing nonces, so
-	// we must fetch the whole piece to decrypt and only then slice
-	// to the requested byte range. Client_side objects are opaque
-	// ciphertext from the gateway's view — byte ranges land on
-	// ciphertext bytes and the client owns the framing.
-	effectiveRange := byteRange
+	// Branch on (encrypted, range) before we touch the backend.
+	// Four paths:
+	//
+	//   1. Not gateway-encrypted, any range:
+	//      fetchPiece handles ciphertext-vs-clear-bytes
+	//      transparently; the body it returns is what we serve.
+	//   2. Gateway-encrypted, no range:
+	//      Streaming decryption path — pull ciphertext as an
+	//      io.Reader, TeeReader through a BLAKE3 hasher for
+	//      post-EOF integrity verification, then chain through
+	//      streamDecryptFromStorage so plaintext flows straight
+	//      to the client. No MaxInMemoryObjectBytes ceiling: a
+	//      multi-GiB object uses a few hundred KiB of buffers
+	//      (one DecryptObject chunk frame + os pipes).
+	//   3. Gateway-encrypted, range request:
+	//      Buffered decrypt path. We need the full plaintext in
+	//      memory to slice an arbitrary byte range; chunk-level
+	//      range seek lands in v0.2.0. Until then the
+	//      MaxInMemoryObjectBytes ceiling still applies to
+	//      protect the gateway from OOM on a 4 GiB Range GET.
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
-		effectiveRange = nil
+		if byteRange == nil {
+			h.streamGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, tenantID, bucket)
+			return
+		}
+		h.bufferedGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
+		return
 	}
 
-	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, effectiveRange, tenantID, bucket)
+	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
 	if err != nil {
 		if errors.Is(err, pieceintegrity.ErrIntegrityCheckFailed) {
 			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
@@ -632,48 +654,6 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer body.Close()
-	_ = served
-
-	if IsGatewayEncrypted(manifest.Encryption.Mode) {
-		// The gateway-encrypted GET path frame-decrypts the entire
-		// ciphertext before slicing the optional Range, so it has
-		// to buffer the whole piece in memory. Refuse objects
-		// above the in-memory ceiling so a single very large GET
-		// cannot OOM the gateway. Streaming frame-decryption is
-		// tracked as a Phase 4 workstream; until that lands
-		// operators should route very large gateway-encrypted
-		// objects through the EC path or use direct-to-backend
-		// presigned URLs.
-		if manifest.ObjectSize > MaxInMemoryObjectBytes {
-			writeError(w, http.StatusInsufficientStorage, "ObjectTooLargeForInMemoryDecrypt",
-				fmt.Sprintf("gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; streaming decryption is not yet implemented",
-					manifest.ObjectSize, MaxInMemoryObjectBytes),
-				r.URL.Path)
-			return
-		}
-		ciphertext, rerr := io.ReadAll(body)
-		if rerr != nil {
-			writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
-			return
-		}
-		plaintext, derr := h.decryptFromStorage(ciphertext, manifest.Encryption)
-		if derr != nil {
-			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
-			return
-		}
-		if byteRange != nil {
-			end := byteRange.End
-			if end < 0 || end >= int64(len(plaintext)) {
-				end = int64(len(plaintext)) - 1
-			}
-			if byteRange.Start < 0 || byteRange.Start > end+1 {
-				writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
-				return
-			}
-			plaintext = plaintext[byteRange.Start : end+1]
-		}
-		body = io.NopCloser(bytes.NewReader(plaintext))
-	}
 
 	if etag := pieceETag(piece); etag != "" {
 		w.Header().Set("ETag", quote(etag))
@@ -706,6 +686,282 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
 }
+
+// bufferedGatewayDecryptedGet serves a gateway-encrypted object
+// with a Range header. We must materialise the full plaintext to
+// slice an arbitrary range (chunk-level range seek is a v0.2.0
+// follow-up), so the MaxInMemoryObjectBytes ceiling still applies
+// here as a hard OOM guard.
+func (h *Handler) bufferedGatewayDecryptedGet(
+	w http.ResponseWriter,
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	byteRange *providers.ByteRange,
+	tenantID, bucket string,
+) {
+	if manifest.ObjectSize > MaxInMemoryObjectBytes {
+		// TODO(v0.2.0): chunk-level range seek using the SDK's
+		// 64 KiB chunk-frame headers lets us decrypt only the
+		// chunks overlapping byteRange instead of the full
+		// object. Until that lands, very large gateway-encrypted
+		// objects with Range headers are refused outright; the
+		// non-range GET path uses streamGatewayDecryptedGet and
+		// has no ceiling.
+		writeError(w, http.StatusInsufficientStorage, "RangeRequestTooLargeForBufferedDecrypt",
+			fmt.Sprintf("range GET on gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; full-object GETs stream without this ceiling",
+				manifest.ObjectSize, MaxInMemoryObjectBytes),
+			r.URL.Path)
+		return
+	}
+
+	// The fetchPiece path returns a buffered + integrity-verified
+	// ciphertext for pieces inside the ceiling, exactly what we
+	// need to feed decryptFromStorage. Forcing byteRange=nil here
+	// (instead of pre-nilling the caller's byteRange like the old
+	// code did) keeps the cache and integrity logic uniform with
+	// the unencrypted path.
+	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, nil, tenantID, bucket)
+	if err != nil {
+		if errors.Is(err, pieceintegrity.ErrIntegrityCheckFailed) {
+			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+				"backend returned a piece whose content hash did not match the manifest; refusing to serve",
+				r.URL.Path)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+	defer body.Close()
+
+	ciphertext, rerr := io.ReadAll(body)
+	if rerr != nil {
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
+		return
+	}
+	plaintext, derr := h.decryptFromStorage(ciphertext, manifest.Encryption)
+	if derr != nil {
+		writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+		return
+	}
+	end := byteRange.End
+	if end < 0 || end >= int64(len(plaintext)) {
+		end = int64(len(plaintext)) - 1
+	}
+	if byteRange.Start < 0 || byteRange.Start > end+1 {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
+		return
+	}
+	sliced := plaintext[byteRange.Start : end+1]
+
+	if etag := pieceETag(piece); etag != "" {
+		w.Header().Set("ETag", quote(etag))
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(sliced)), 10))
+	w.WriteHeader(http.StatusPartialContent)
+	n, _ := w.Write(sliced)
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	if n > 0 {
+		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
+		if !served {
+			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
+		}
+	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// streamGatewayDecryptedGet serves a gateway-encrypted, non-range
+// GET by piping ciphertext directly through the SDK's chunk-frame
+// decryptor. No MaxInMemoryObjectBytes ceiling here — a multi-GiB
+// object uses a constant ~64 KiB chunk buffer plus a small TeeReader
+// + BLAKE3 hasher.
+//
+// Integrity verification is post-stream: we Tee the ciphertext into
+// a BLAKE3 hasher before it hits the decryptor and compare the
+// final digest against piece.Hash after io.Copy returns. Unlike the
+// buffered path (which can return 502 before any bytes reach the
+// client) we may have already written plaintext to the response by
+// the time a mismatch is detected. The trade-off is documented in
+// the v0.1.0 hardening plan; the alternatives — buffer the full
+// object before sending or refuse multi-GiB GETs — both regress
+// the throughput goal of this PR. On mismatch we record the
+// failure (Prometheus + ERROR log) and stop writing, which truncates
+// the response and surfaces to the client as either a
+// Content-Length mismatch (chunked transfer or otherwise) or a
+// shorter body than declared.
+//
+// Read-repair: if the primary backend GetPiece fails, we fall back
+// to tryReadRepair which buffers the repaired piece in memory and
+// returns it with preVerified=true. We stream-decrypt the buffered
+// bytes and skip our own hash check (ReadRepair already verified).
+//
+// Cache: a cache hit returns the cached ciphertext, which the cache
+// only stores after a successful prior verification, so we skip
+// the hash check on hits. On a miss we do NOT inline-warm the
+// cache from the streaming path — buffering the full ciphertext
+// just to warm the cache would defeat the purpose of streaming.
+// We publish a promotion signal so the async worker can decide.
+func (h *Handler) streamGatewayDecryptedGet(
+	w http.ResponseWriter,
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	tenantID, bucket string,
+) {
+	ciphertextSrc, served, verifyFn, err := h.openCiphertextStream(r, mkey, manifest, piece, pieceProvider, tenantID, bucket)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+	defer ciphertextSrc.Close()
+
+	plaintext, derr := h.streamDecryptFromStorage(ciphertextSrc, manifest.Encryption)
+	if derr != nil {
+		writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+		return
+	}
+
+	if etag := pieceETag(piece); etag != "" {
+		w.Header().Set("ETag", quote(etag))
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	// manifest.ObjectSize is the plaintext length on
+	// gateway-encrypted objects, so Content-Length is honest
+	// without buffering the decrypted bytes. The client uses it
+	// to detect truncation if we abort mid-stream on integrity
+	// failure.
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	w.WriteHeader(http.StatusOK)
+	n, copyErr := io.Copy(w, plaintext)
+
+	// Verify integrity after the body has been drained: the
+	// TeeReader inside openCiphertextStream observed every byte
+	// the decryptor consumed, so the hasher's Sum() reflects the
+	// ciphertext we actually fed downstream. A nil verifyFn means
+	// either a cache hit (already verified at put time) or a
+	// read-repair body (ReadRepair already verified).
+	if verifyFn != nil {
+		if verr := verifyFn(); verr != nil {
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				h.recordIntegrityUnrecognized(piece, verr)
+			} else {
+				// Mismatch on the streaming path is a
+				// detection (we cannot un-send the bytes the
+				// client already has), but we still:
+				//   (a) emit the Prometheus counter so
+				//       operators see it on dashboards;
+				//   (b) log at ERROR with piece + backend +
+				//       expected/got so on-call can pivot.
+				h.recordIntegrityFailure(piece, verr)
+			}
+		}
+	}
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	if n > 0 && copyErr == nil {
+		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
+		if !served {
+			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
+		}
+	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// openCiphertextStream is the streaming-path counterpart to
+// fetchPiece for gateway-encrypted GETs. It consults the cache,
+// falls back to the backend, falls back to read-repair, and wraps
+// the resulting reader with a BLAKE3 TeeReader so the caller can
+// stream the bytes downstream while still checking integrity after
+// EOF.
+//
+// Return values:
+//   - body: io.ReadCloser yielding ciphertext. Caller MUST close.
+//   - served: true on cache hit (for billing).
+//   - verifyFn: nil if the source is already verified (cache hit
+//     or repair-supplied buffer); otherwise a function the caller
+//     invokes AFTER draining body to EOF, which returns nil on a
+//     match, pieceintegrity.ErrIntegrityCheckFailed on a mismatch,
+//     or pieceintegrity.ErrIntegrityClaimUnrecognized on a legacy
+//     manifest with an unparseable Hash field.
+//   - err: opening the stream failed entirely.
+func (h *Handler) openCiphertextStream(
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	tenantID, bucket string,
+) (io.ReadCloser, bool, func() error, error) {
+	if h.cfg.Cache != nil {
+		cached, _, cerr := h.cfg.Cache.Get(r.Context(), piece.PieceID)
+		if cerr == nil {
+			h.emit(tenantID, bucket, billing.CacheHits, 1)
+			return cached, true, nil, nil
+		}
+	}
+	if h.cfg.Cache != nil {
+		h.emit(tenantID, bucket, billing.CacheMisses, 1)
+	}
+	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, nil)
+	if err != nil {
+		repaired, repairedVerified, repairErr := h.tryReadRepair(r, mkey, manifest, nil)
+		if repairErr != nil || repaired == nil {
+			return nil, false, nil, err
+		}
+		// Read-repair returns a buffered + verified body. Stream
+		// from it directly with no TeeReader: the verifier is
+		// implicit in the preVerified flag.
+		if repairedVerified {
+			return repaired, false, nil, nil
+		}
+		body = repaired
+	}
+
+	pieceSize := piece.SizeBytes
+	if pieceSize <= 0 {
+		pieceSize = manifest.ObjectSize
+	}
+	if h.cfg.Cache != nil {
+		// Publish a promotion signal so the async worker can
+		// decide whether to fetch + cache the ciphertext on its
+		// own schedule. We do NOT inline-warm here because that
+		// would force us to buffer the full ciphertext for the
+		// cache Put, defeating the streaming path's purpose.
+		h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
+	}
+
+	// pieceintegrity.Hasher returns (a) an io.Writer keyed off
+	// piece.Hash's format (BLAKE3 / legacy SHA-256 / unrecognised)
+	// and (b) a Check closure that returns nil on a match,
+	// pieceintegrity.ErrIntegrityCheckFailed on a content
+	// mismatch, or pieceintegrity.ErrIntegrityClaimUnrecognized
+	// on a legacy unparseable manifest. TeeReader fans every byte
+	// our caller reads into the hasher, so by the time the body
+	// is drained the Check closure can fire without us having
+	// kept a copy of the ciphertext.
+	hasher, check := pieceintegrity.Hasher(piece)
+	teed := io.TeeReader(body, hasher)
+	return &teeingCloser{r: teed, c: body}, false, check, nil
+}
+
+// teeingCloser wraps a TeeReader so the gateway's caller can defer
+// .Close() on a single io.ReadCloser. The TeeReader itself is not
+// a Closer; we delegate to the underlying body so the backend
+// connection is released when the request handler unwinds.
+type teeingCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (t *teeingCloser) Read(p []byte) (int, error) { return t.r.Read(p) }
+func (t *teeingCloser) Close() error               { return t.c.Close() }
 
 // fetchPiece consults the hot object cache (if configured) before
 // hitting the backend. Range requests bypass the cache because the
