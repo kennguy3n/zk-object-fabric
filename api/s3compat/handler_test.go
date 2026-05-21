@@ -335,6 +335,71 @@ func TestGet_RangeRequestWarmsCacheInline(t *testing.T) {
 	}
 }
 
+// TestGet_RangeRequestServedFromCache pins the cache-hit path for
+// range requests. The pre-fix fetchPiece gated cache.Get on
+// byteRange == nil, so every range request paid a backend
+// round-trip even when the piece was already hot in the cache.
+// After the fix the cache is consulted for any request shape; on
+// a hit the cached body is sliced down to the requested range
+// without touching the backend at all. The test enforces this by
+// (1) seeding the cache with the full piece, (2) deleting the
+// backing piece from the provider so any backend GET would fail,
+// and (3) issuing a range GET that must still succeed.
+func TestGet_RangeRequestServedFromCache(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	hotCache, err := hot_object_cache.NewMemoryCache(hot_object_cache.EvictionPolicy{
+		Kind:     hot_object_cache.EvictionLRU,
+		MaxBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryCache: %v", err)
+	}
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Cache:     hotCache,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("0123456789ABCDEF")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	// Warm the cache with a full-piece GET; the fetchPiece path
+	// puts the verified full piece into the cache on this call.
+	warmReq := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	warmRec := httptest.NewRecorder()
+	h.Get(warmRec, warmReq)
+	if warmRec.Code != http.StatusOK {
+		t.Fatalf("warm GET status = %d, want 200", warmRec.Code)
+	}
+
+	// Wipe the backend. If the range GET below still hits the
+	// provider the request fails. The MemoryCache copy must be
+	// the only source of truth.
+	fake.mu.Lock()
+	fake.pieces = map[string][]byte{}
+	fake.mu.Unlock()
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	rangeReq.Header.Set("Range", "bytes=4-9")
+	rangeRec := httptest.NewRecorder()
+	h.Get(rangeRec, rangeReq)
+	if rangeRec.Code != http.StatusPartialContent {
+		t.Fatalf("range GET status = %d, want 206; body=%s", rangeRec.Code, rangeRec.Body)
+	}
+	if rangeRec.Body.String() != "456789" {
+		t.Fatalf("range GET body = %q, want %q (cache slice must respect the requested byte range)", rangeRec.Body.String(), "456789")
+	}
+	if got, want := rangeRec.Header().Get("Content-Range"), "bytes 4-9/16"; got != want {
+		t.Fatalf("range GET Content-Range = %q, want %q", got, want)
+	}
+}
+
 func TestHashObjectKey_DistinguishesSlashVariants(t *testing.T) {
 	a := hashObjectKey("a//b")
 	b := hashObjectKey("a/b")

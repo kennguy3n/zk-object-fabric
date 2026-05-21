@@ -526,6 +526,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			Locator:      putRes.Locator,
 			Hash:         blake3Hash,
 			ProviderETag: putRes.ETag,
+			SizeBytes:    putRes.SizeBytes,
 			State:        "active",
 		}},
 		MigrationState: metadata.MigrationState{
@@ -864,8 +865,27 @@ func (h *Handler) streamGatewayDecryptedGet(
 		}
 	}
 
+	if copyErr != nil {
+		// Mid-stream failure: chunk-AEAD reject, client RST,
+		// broken pipe, etc. The status line and any headers
+		// already went out, and n bytes of plaintext were
+		// committed to the wire before the failure, so the
+		// client sees a truncated stream and the gateway has
+		// burned real egress. Surface it at WARN with piece +
+		// backend + bytes-sent so on-call can correlate the
+		// billing emission below against the failure mode.
+		log.Printf("s3compat: WARN streaming_get_truncated: piece=%s backend=%s bytes_sent=%d err=%v",
+			piece.PieceID, piece.Backend, n, copyErr)
+	}
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
-	if n > 0 && copyErr == nil {
+	// Bill on bytes actually written to the response, regardless
+	// of whether io.Copy returned an error. A mid-stream failure
+	// still committed n bytes of plaintext to the wire —
+	// gating on copyErr == nil here would silently undercount
+	// egress on flaky clients or tampered ciphertext. Every
+	// other GET path (fetchPiece-backed, EC, multipart) bills on
+	// n > 0 unconditionally; this matches that invariant.
+	if n > 0 {
 		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
 		if !served {
 			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
@@ -1007,12 +1027,51 @@ func (h *Handler) fetchPiece(
 	tenantID, bucket string,
 ) (io.ReadCloser, bool, error) {
 	objectSize := manifest.ObjectSize
-	if h.cfg.Cache != nil && byteRange == nil {
+	if h.cfg.Cache != nil {
 		cached, _, err := h.cfg.Cache.Get(r.Context(), piece.PieceID)
 		if err == nil {
 			h.emit(tenantID, bucket, billing.CacheHits, 1)
-			return cached, true, nil
+			if byteRange == nil {
+				return cached, true, nil
+			}
+			// Range request on a cache hit. The cache only
+			// ever stores fully-verified pieces (the cache
+			// put below gates on a successful Verify), so
+			// no second integrity check is needed. Read the
+			// cached body once and slice the requested
+			// range out of it; the slice is bounded by the
+			// per-piece cache ceiling (== MaxInMemoryObject
+			// Bytes), so this cannot OOM. Without this hit
+			// path every range request paid a backend
+			// round-trip even when the bytes were already
+			// hot — which was the pre-fix behaviour the
+			// integrity rework inadvertently locked in
+			// (fetchPiece now buffers full pieces for any
+			// request that goes upstream, so the cache hit
+			// pays off on the first range request after a
+			// full-piece warm).
+			buf, rerr := io.ReadAll(cached)
+			_ = cached.Close()
+			if rerr != nil {
+				return nil, false, rerr
+			}
+			end := byteRange.End
+			if end < 0 || end >= int64(len(buf)) {
+				end = int64(len(buf)) - 1
+			}
+			if byteRange.Start < 0 || byteRange.Start > end+1 {
+				return nil, false, fmt.Errorf("s3compat: range %d-%d out of bounds for piece %s (%d bytes)", byteRange.Start, byteRange.End, piece.PieceID, len(buf))
+			}
+			sliced := buf[byteRange.Start : end+1]
+			return io.NopCloser(bytes.NewReader(sliced)), true, nil
 		}
+		// Cache miss: emit the counter once here for both
+		// range and non-range. The legacy duplicate emission
+		// below the wantFullPiece branch only fired on
+		// byteRange == nil, which let range cache misses go
+		// uncounted; consolidating it here fixes both gaps
+		// without double-counting.
+		h.emit(tenantID, bucket, billing.CacheMisses, 1)
 	}
 
 	pieceSize := piece.SizeBytes
@@ -1075,10 +1134,6 @@ func (h *Handler) fetchPiece(
 			h.signalPromotion(piece, tenantID, end-byteRange.Start+1, objectSize)
 		}
 		return body, false, nil
-	}
-
-	if h.cfg.Cache != nil && byteRange == nil {
-		h.emit(tenantID, bucket, billing.CacheMisses, 1)
 	}
 
 	// Pieces above the in-memory ceiling skip buffer-and-verify to
