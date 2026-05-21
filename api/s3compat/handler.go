@@ -1630,13 +1630,18 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.StorageProvider, metadata.Piece, string, string, error) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		// Preserve the typed misconfiguration signal so
-		// writeResolveError can render it as 500
-		// InternalAuthMisconfigured rather than 403 AccessDenied.
+		// Map auth errors to typed *httpError at the boundary so
+		// writeResolveError can dispatch uniformly. The wrapped
+		// err field carries the original sentinel through the
+		// error chain — errors.Is(returnedErr, ErrAuthMisconfigured)
+		// still works for any downstream caller that wants to
+		// special-case the misconfiguration signal (today only the
+		// HTTP status code rendering needs that, but the chain is
+		// preserved for forward-compat).
 		if errors.Is(err, ErrAuthMisconfigured) {
-			return nil, nil, metadata.Piece{}, "", "", err
+			return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusInternalServerError, s3code: "InternalAuthMisconfigured", msg: err.Error(), err: err}
 		}
-		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusForbidden, s3code: "AccessDenied", msg: err.Error()}
+		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusForbidden, s3code: "AccessDenied", msg: err.Error(), err: err}
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
 	if bucket == "" || key == "" {
@@ -1838,20 +1843,32 @@ func quote(s string) string {
 }
 
 // httpError is the internal error type returned by resolve so the
-// handler method can choose the right HTTP status code.
+// handler method can choose the right HTTP status code. The
+// optional err field carries the underlying error chain so
+// errors.Is / errors.As work through wrapped httpErrors —
+// previously, resolve() and writeResolveError each had to
+// errors.Is(err, ErrAuthMisconfigured) before falling through
+// to the httpError dispatch. Wrapping the sentinel into the
+// httpError at the boundary (resolve) means writeResolveError
+// can dispatch uniformly via *httpError and the sentinel-check
+// duplication goes away.
 type httpError struct {
 	code   int
 	s3code string
 	msg    string
+	err    error
 }
 
 func (e *httpError) Error() string { return e.msg }
 
+// Unwrap exposes the underlying error so errors.Is and errors.As
+// can match sentinels (e.g. ErrAuthMisconfigured) carried through
+// a typed *httpError. Returns nil when no underlying error is
+// attached, which is the common case for synthesised errors like
+// "path must be /{bucket}/{key...}".
+func (e *httpError) Unwrap() error { return e.err }
+
 func writeResolveError(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, ErrAuthMisconfigured) {
-		writeError(w, http.StatusInternalServerError, "InternalAuthMisconfigured", err.Error(), r.URL.Path)
-		return
-	}
 	var he *httpError
 	if errors.As(err, &he) {
 		writeError(w, he.code, he.s3code, he.msg, r.URL.Path)
