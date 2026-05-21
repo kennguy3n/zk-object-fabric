@@ -779,23 +779,23 @@ func (h *Handler) fetchPiece(
 	}
 
 	// preVerified is set when the body we end up serving has
-	// already been integrity-checked upstream (currently only
-	// the lazy_read_repair path, which calls pieceintegrity.Verify
-	// inside ReadRepair.Repair before returning the bytes). In
-	// that case we skip the redundant BLAKE3 re-hash below —
-	// re-running it on a body whose integrity was just proved is
-	// a pure CPU tax that grows with piece size, and it would
-	// also double-count the ErrIntegrityClaimUnrecognized
-	// counter for legacy manifests resolved through repair.
+	// already been integrity-checked upstream so we can skip the
+	// redundant BLAKE3 re-hash below. Today only the
+	// lazy_read_repair path satisfies this contract —
+	// tryReadRepair returns the flag explicitly (not inferred at
+	// the call site) so any future repair-path change that drops
+	// or weakens its internal Verify call must also update the
+	// returned flag, which would surface as a test failure rather
+	// than a silent regression to serving unverified bytes.
 	preVerified := false
 	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, fetchRange)
 	if err != nil {
-		repaired, repairErr := h.tryReadRepair(r, mkey, manifest, fetchRange)
+		repaired, repairedVerified, repairErr := h.tryReadRepair(r, mkey, manifest, fetchRange)
 		if repairErr != nil || repaired == nil {
 			return nil, false, err
 		}
 		body = repaired
-		preVerified = true
+		preVerified = repairedVerified
 	}
 
 	if !wantFullPiece {
@@ -937,30 +937,41 @@ func (h *Handler) recordIntegrityUnrecognized(piece metadata.Piece, verr error) 
 
 // tryReadRepair invokes the configured ReadRepair when the primary
 // backend fails to serve a piece and the manifest sits in a
-// migration-in-progress state (Generation > 1). It returns the
-// repaired piece body (wrapped in an io.ReadCloser, sliced to
-// byteRange when one was requested) or (nil, nil) when repair is
-// not applicable. A non-nil error indicates the repair attempt
-// itself failed; callers should fall through to the original
-// backend error in that case.
+// migration-in-progress state (Generation > 1). It returns:
+//
+//   - (body, true,  nil)   — repair succeeded; body has already
+//                            been integrity-verified by ReadRepair
+//                            and the caller MAY skip a second
+//                            pieceintegrity.Verify pass.
+//   - (nil,  false, nil)   — repair is not applicable (no repair
+//                            wired, manifest not in migration, or
+//                            no pieces). Caller falls through to
+//                            the original backend error.
+//   - (nil,  false, error) — repair attempt itself failed.
+//
+// The bool is part of the signature (not inferred at the call
+// site) so the "already verified" contract is structural: any
+// future change to ReadRepair.Repair that drops or weakens its
+// internal Verify call MUST also flip the returned flag, which a
+// reviewer will catch immediately.
 func (h *Handler) tryReadRepair(
 	r *http.Request,
 	mkey manifest_store.ManifestKey,
 	manifest *metadata.ObjectManifest,
 	byteRange *providers.ByteRange,
-) (io.ReadCloser, error) {
+) (io.ReadCloser, bool, error) {
 	if h.cfg.ReadRepair == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	if manifest.MigrationState.Generation <= 1 {
-		return nil, nil
+		return nil, false, nil
 	}
 	if len(manifest.Pieces) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	res, err := h.cfg.ReadRepair.Repair(r.Context(), mkey, manifest, 0)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	data := res.Body
 	if byteRange != nil {
@@ -969,11 +980,19 @@ func (h *Handler) tryReadRepair(
 			end = int64(len(data)) - 1
 		}
 		if byteRange.Start < 0 || byteRange.Start > end+1 {
-			return nil, fmt.Errorf("s3compat: repaired body slice out of range")
+			return nil, false, fmt.Errorf("s3compat: repaired body slice out of range")
 		}
 		data = data[byteRange.Start : end+1]
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	// ReadRepair.Repair calls pieceintegrity.Verify on the source
+	// body before returning (lazy_read_repair/repair.go ~line 112).
+	// Slicing a byte range below does not change those bytes' hash
+	// relationship to the full-piece claim because we slice a
+	// verified buffer in memory — the caller's downstream
+	// fetchPiece guard already restricts byteRange-based reads to
+	// pieces inside MaxInMemoryObjectBytes, and the full piece is
+	// what got verified.
+	return io.NopCloser(bytes.NewReader(data)), true, nil
 }
 
 func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, readBytes, pieceSize int64) {

@@ -1159,17 +1159,22 @@ func (h *Handler) dedupManagedMultipartMiss(
 		return true
 	}
 
-	// The consolidated piece's blake3 was computed inline above
-	// (combinedDigest), but combinedDigest is the BLAKE3 of the
-	// concatenated plaintext digests, not BLAKE3 of the
-	// ciphertext-on-the-wire that the GET verifier re-hashes.
-	// Until the canonical-PUT path is extended to capture the
-	// ciphertext digest, leave Hash empty so the verifier treats
-	// the dedup-consolidated piece as "no integrity claim".
+	// contentHash (computed at line 1094) is
+	// formatContentHash(blake3Hex(consolidatedCiphertext)) —
+	// the BLAKE3 of the exact ciphertext bytes PUT to the backend
+	// above. That is precisely what pieceintegrity.Verify
+	// re-computes on the cache-miss GET path: hex of
+	// blake3.Sum256(ciphertext_returned_by_backend). Stamping it
+	// into Piece.Hash gives dedup-consolidated multipart
+	// manifests full GET-path integrity coverage, closing the
+	// observability gap the comment block above used to
+	// describe. combinedDigest is a separate variable that
+	// hashes plaintext digests — unsuitable for the verifier and
+	// not used here.
 	manifest.Pieces = []metadata.Piece{{
 		PieceID:      putRes.PieceID,
 		Backend:      upload.Backend,
-		Hash:         "",
+		Hash:         contentHash,
 		ProviderETag: putRes.ETag,
 		SizeBytes:    putRes.SizeBytes,
 		State:        "active",
