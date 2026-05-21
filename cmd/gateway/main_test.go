@@ -230,6 +230,68 @@ func TestStartListener_TLS_InvalidMinVersion(t *testing.T) {
 	}
 }
 
+// TestStartListener_TLS_PartialConfigRejected verifies that a
+// partial TLS config (exactly one of cert_path or key_path set) is
+// rejected as a startup error instead of silently falling through
+// to plain HTTP. This is the load-bearing safety check against the
+// "operator typoed key_path and lost TLS entirely" failure mode.
+func TestStartListener_TLS_PartialConfigRejected(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath, _ := generateSelfSignedCert(t, dir)
+	cases := []struct {
+		name      string
+		tls       config.TLSConfig
+		wantMatch string
+	}{
+		{
+			"cert_path set, key_path empty",
+			config.TLSConfig{CertPath: certPath},
+			"cert_path is set but key_path is empty",
+		},
+		{
+			"key_path set, cert_path empty",
+			config.TLSConfig{KeyPath: keyPath},
+			"key_path is set but cert_path is empty",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &http.Server{Handler: http.NewServeMux(), Addr: "127.0.0.1:0"}
+			err := startListener(srv, tc.tls, "production", "gateway-test")
+			if err == nil {
+				t.Fatalf("startListener: want error for partial TLS config, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantMatch) {
+				t.Fatalf("error = %q, want to contain %q", err.Error(), tc.wantMatch)
+			}
+			// The server must NOT have started — TLSConfig
+			// is unset, no listener was opened, so a follow-up
+			// startListener call on the same struct cannot
+			// race with a leaked goroutine.
+			if srv.TLSConfig != nil {
+				t.Errorf("srv.TLSConfig was set even though Validate rejected the config; want nil")
+			}
+		})
+	}
+}
+
+// TestTLSVersionLabel verifies the log helper renders known
+// versions correctly and the default "0x%04x" branch fires for an
+// unrecognised version constant — so a future MinTLSVersion
+// extension that forgets to update tlsVersionLabel surfaces the
+// raw constant in log lines instead of misreporting "1.2".
+func TestTLSVersionLabel(t *testing.T) {
+	if got := tlsVersionLabel(tls.VersionTLS13); got != "1.3" {
+		t.Errorf("tlsVersionLabel(VersionTLS13) = %q, want 1.3", got)
+	}
+	if got := tlsVersionLabel(tls.VersionTLS12); got != "1.2" {
+		t.Errorf("tlsVersionLabel(VersionTLS12) = %q, want 1.2", got)
+	}
+	if got := tlsVersionLabel(0x9999); got != "0x9999" {
+		t.Errorf("tlsVersionLabel(unknown) = %q, want 0x9999", got)
+	}
+}
+
 // loadedTenantStore builds a MemoryTenantStore pre-loaded with a
 // single binding so enforceProductionAuth tests can simulate
 // "--tenants file provided with at least one binding".

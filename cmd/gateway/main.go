@@ -327,13 +327,38 @@ func main() {
 	}
 }
 
+// tlsVersionLabel renders a crypto/tls version constant as the
+// "1.2" / "1.3" string the log line advertises. Centralised so the
+// log display stays correct when config.TLSConfig adds support
+// for a new TLS version: extending MinTLSVersion's switch is then
+// paired with one extra case here, instead of leaving the log
+// line silently misreporting the previous default. An unknown
+// constant renders as "0x%04x" rather than misleadingly defaulting
+// to the lowest supported version.
+func tlsVersionLabel(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "1.3"
+	case tls.VersionTLS12:
+		return "1.2"
+	default:
+		return fmt.Sprintf("0x%04x", v)
+	}
+}
+
 // startListener picks ListenAndServeTLS vs ListenAndServe based on
-// the supplied TLS config. When TLS is enabled it parses the
-// MinVersion from cfg and applies it to srv.TLSConfig before
-// handing the cert / key paths to ListenAndServeTLS. When TLS is
-// disabled and env == "production" it logs a WARNING so operators
-// terminating TLS at an upstream load balancer can ignore the
-// signal while deployments serving clients directly notice it.
+// the supplied TLS config. It first runs t.Validate so a partial
+// config (exactly one of cert_path or key_path set) surfaces as a
+// startup error instead of silently downgrading to plain HTTP —
+// the wrong failure mode for a production deployment that
+// configured TLS but typoed one of the paths.
+//
+// When TLS is enabled it parses the MinVersion from cfg and
+// applies it to srv.TLSConfig before handing the cert / key paths
+// to ListenAndServeTLS. When TLS is disabled and env ==
+// "production" it logs a WARNING so operators terminating TLS at
+// an upstream load balancer can ignore the signal while
+// deployments serving clients directly notice it.
 //
 // name labels the listener in log lines ("gateway", "console",
 // "health") so operators with multiple listeners on the same
@@ -342,17 +367,16 @@ func main() {
 // (where %s is the per-listener name) so log scrapers can match
 // every gateway-process line with one regex.
 func startListener(srv *http.Server, t config.TLSConfig, env, name string) error {
+	if err := t.Validate(name); err != nil {
+		return err
+	}
 	if t.Enabled() {
 		gotls, err := t.BuildGoTLSConfig()
 		if err != nil {
 			return fmt.Errorf("%s: build tls config: %w", name, err)
 		}
 		srv.TLSConfig = gotls
-		minVer := "1.2"
-		if gotls.MinVersion == tls.VersionTLS13 {
-			minVer = "1.3"
-		}
-		log.Printf("gateway: %s TLS enabled (cert=%s min_version=%s)", name, t.CertPath, minVer)
+		log.Printf("gateway: %s TLS enabled (cert=%s min_version=%s)", name, t.CertPath, tlsVersionLabel(gotls.MinVersion))
 		return srv.ListenAndServeTLS(t.CertPath, t.KeyPath)
 	}
 	if env == "production" {

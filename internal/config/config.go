@@ -377,8 +377,44 @@ type TLSConfig struct {
 
 // Enabled reports whether the TLS config has the minimum fields
 // needed to start an HTTPS listener (cert + key path both set).
+//
+// A partially-populated TLSConfig (exactly one of CertPath or
+// KeyPath set) is NOT enabled. Operators should use Validate()
+// to detect that misconfiguration explicitly; Enabled() alone
+// will silently report false and cause startListener to fall
+// through to plain HTTP, which is the wrong failure mode for a
+// production deployment.
 func (t TLSConfig) Enabled() bool {
 	return t.CertPath != "" && t.KeyPath != ""
+}
+
+// Validate returns an error when the TLSConfig is partially
+// populated — exactly one of CertPath or KeyPath set. Either both
+// must be empty (plain HTTP) or both must be non-empty (HTTPS);
+// any other shape is an operator typo that would otherwise
+// silently downgrade to unencrypted traffic.
+//
+// Validate also exercises MinTLSVersion so an unrecognised value
+// surfaces at startup rather than at the moment a client tries to
+// handshake.
+//
+// Callers should invoke Validate before startListener picks a
+// branch on Enabled(); the gateway entrypoint does this for every
+// listener (gateway, console, health) at boot.
+func (t TLSConfig) Validate(name string) error {
+	hasCert := t.CertPath != ""
+	hasKey := t.KeyPath != ""
+	if hasCert != hasKey {
+		set, missing := "cert_path", "key_path"
+		if hasKey {
+			set, missing = "key_path", "cert_path"
+		}
+		return fmt.Errorf("config: %s.tls.%s is set but %s is empty; both must be set for HTTPS or both must be empty for plain HTTP", name, set, missing)
+	}
+	if _, err := t.MinTLSVersion(); err != nil {
+		return fmt.Errorf("config: %s.tls: %w", name, err)
+	}
+	return nil
 }
 
 // MinTLSVersion parses the configured MinVersion string and returns

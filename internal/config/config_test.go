@@ -214,6 +214,39 @@ func TestTLSConfig_MinTLSVersion(t *testing.T) {
 	}
 }
 
+func TestTLSConfig_Validate(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        TLSConfig
+		wantErr   bool
+		wantMatch string // substring the error must contain
+	}{
+		{"both empty is valid (plain HTTP)", TLSConfig{}, false, ""},
+		{"both set is valid (HTTPS)", TLSConfig{CertPath: "/etc/tls/cert.pem", KeyPath: "/etc/tls/key.pem"}, false, ""},
+		{"both set with 1.3 is valid", TLSConfig{CertPath: "/etc/tls/cert.pem", KeyPath: "/etc/tls/key.pem", MinVersion: "1.3"}, false, ""},
+		{"cert only is invalid", TLSConfig{CertPath: "/etc/tls/cert.pem"}, true, "cert_path is set but key_path is empty"},
+		{"key only is invalid", TLSConfig{KeyPath: "/etc/tls/key.pem"}, true, "key_path is set but cert_path is empty"},
+		{"unrecognised min_version is invalid", TLSConfig{CertPath: "/etc/tls/cert.pem", KeyPath: "/etc/tls/key.pem", MinVersion: "1.0"}, true, "min_version"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.in.Validate("gateway")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Validate: want error, got nil")
+				}
+				if tc.wantMatch != "" && !strings.Contains(err.Error(), tc.wantMatch) {
+					t.Fatalf("Validate error = %q; want substring %q", err.Error(), tc.wantMatch)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Validate: unexpected error %v", err)
+			}
+		})
+	}
+}
+
 func TestTLSConfig_BuildGoTLSConfig(t *testing.T) {
 	t.Run("default min version is 1.2", func(t *testing.T) {
 		c := TLSConfig{}
