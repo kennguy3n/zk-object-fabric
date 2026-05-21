@@ -172,3 +172,123 @@ func TestRepair_NoopWhenAlreadyOnPrimary(t *testing.T) {
 // metadata/pieceintegrity/integrity_test.go. The repair tests
 // above exercise the integration path — Repair() refusing to
 // hand back tampered bytes — via TestRepair_RejectsHashMismatch.
+
+type integritySinkRecorder struct {
+	failures     map[string]int
+	unrecognised map[string]int
+}
+
+func (s *integritySinkRecorder) Inc(backend string) {
+	if s.failures == nil {
+		s.failures = map[string]int{}
+	}
+	s.failures[backend]++
+}
+
+func (s *integritySinkRecorder) IncUnrecognized(backend string) {
+	if s.unrecognised == nil {
+		s.unrecognised = map[string]int{}
+	}
+	s.unrecognised[backend]++
+}
+
+// TestRepair_UnrecognizedHashFiresObservabilitySink covers the
+// observability hook added for the cache-miss + repair path. A
+// legacy manifest with an opaque-ETag Hash should: (1) still
+// repair (no proof the bytes are wrong); (2) report the
+// unrecognised-format event to the wired sink so the
+// zkof_integrity_claim_unrecognized_total Prometheus counter
+// observes the same event the cache-miss GET path observes.
+// Without the sink hook, the metric would undercount because
+// fetchPiece treats repair-supplied bodies as pre-verified.
+func TestRepair_UnrecognizedHashFiresObservabilitySink(t *testing.T) {
+	ctx := context.Background()
+	old := newMem("wasabi")
+	newP := newMem("ceph")
+	payload := []byte("zk-piece-bytes")
+	old.store["piece-1"] = payload
+	registry := map[string]providers.StorageProvider{"wasabi": old, "ceph": newP}
+
+	store := memory.New()
+	key := manifest_store.ManifestKey{TenantID: "t", Bucket: "b", ObjectKeyHash: "h", VersionID: "v"}
+	manifest := &metadata.ObjectManifest{
+		TenantID:      "t",
+		Bucket:        "b",
+		ObjectKeyHash: "h",
+		VersionID:     "v",
+		ObjectSize:    int64(len(payload)),
+		ChunkSize:     int64(len(payload)),
+		Pieces: []metadata.Piece{{
+			PieceID: "piece-1",
+			Hash:    "d41d8cd98f00b204e9800998ecf8427e",
+			Backend: "wasabi",
+			Locator: "wasabi://piece-1",
+			State:   "active",
+		}},
+		MigrationState: metadata.MigrationState{Generation: 2, PrimaryBackend: "ceph"},
+	}
+	if err := store.Put(ctx, key, manifest); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	sink := &integritySinkRecorder{}
+	rr := New(registry, store)
+	rr.IntegrityFailures = sink
+
+	res, err := rr.Repair(ctx, key, manifest, 0)
+	if err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	if string(res.Body) != string(payload) {
+		t.Fatalf("Body = %q, want %q", res.Body, payload)
+	}
+	if got := sink.unrecognised["wasabi"]; got != 1 {
+		t.Fatalf("unrecognised counter for wasabi = %d, want 1", got)
+	}
+	if got := sink.failures["wasabi"]; got != 0 {
+		t.Fatalf("failure counter for wasabi = %d, want 0 (unrecognised is not a mismatch)", got)
+	}
+}
+
+// TestRepair_HashMismatchFiresFailureSink confirms the symmetric
+// case: a real content mismatch refuses the repair AND fires the
+// per-backend failure counter, so operators see the bit-rot
+// signal even when the repair path catches it first.
+func TestRepair_HashMismatchFiresFailureSink(t *testing.T) {
+	ctx := context.Background()
+	old := newMem("wasabi")
+	newP := newMem("ceph")
+	old.store["piece-1"] = []byte("tampered")
+	registry := map[string]providers.StorageProvider{"wasabi": old, "ceph": newP}
+	store := memory.New()
+	key := manifest_store.ManifestKey{TenantID: "t", Bucket: "b", ObjectKeyHash: "h", VersionID: "v"}
+	manifest := &metadata.ObjectManifest{
+		TenantID:      "t",
+		Bucket:        "b",
+		ObjectKeyHash: "h",
+		VersionID:     "v",
+		ObjectSize:    5,
+		ChunkSize:     5,
+		Pieces: []metadata.Piece{{
+			PieceID: "piece-1",
+			Hash:    hashOf([]byte("hello")),
+			Backend: "wasabi",
+		}},
+		MigrationState: metadata.MigrationState{Generation: 2, PrimaryBackend: "ceph"},
+	}
+	_ = store.Put(ctx, key, manifest)
+
+	sink := &integritySinkRecorder{}
+	rr := New(registry, store)
+	rr.IntegrityFailures = sink
+
+	if _, err := rr.Repair(ctx, key, manifest, 0); err == nil {
+		t.Fatal("Repair: want hash mismatch error, got nil")
+	}
+	if got := sink.failures["wasabi"]; got != 1 {
+		t.Fatalf("failure counter for wasabi = %d, want 1", got)
+	}
+	if got := sink.unrecognised["wasabi"]; got != 0 {
+		t.Fatalf("unrecognised counter for wasabi = %d, want 0", got)
+	}
+}

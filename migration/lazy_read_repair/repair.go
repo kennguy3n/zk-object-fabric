@@ -31,6 +31,21 @@ import (
 // original not-found to the user.
 var ErrRepairUnavailable = errors.New("lazy_read_repair: no backend has the piece")
 
+// IntegrityFailureSink is the minimal interface ReadRepair uses to
+// emit per-backend integrity observability when it detects a
+// content hash mismatch or an unrecognised hash claim during
+// repair. It mirrors the same-named interface in api/s3compat so
+// the cmd/gateway adapter can be reused without lazy_read_repair
+// importing internal/metrics (which would pull the metrics
+// package into the migration import graph).
+//
+// A nil sink is a valid no-op: the previous Logger-only signal is
+// preserved so tests that don't wire a sink continue to function.
+type IntegrityFailureSink interface {
+	Inc(backend string)
+	IncUnrecognized(backend string)
+}
+
 // ReadRepair coordinates the lazy read-repair path. It holds the
 // providers registry so it can pick primary/secondary by backend
 // name, and the ManifestStore so it can persist piece locator
@@ -42,6 +57,17 @@ type ReadRepair struct {
 	// Logger is optional; errors on the slow path are best surfaced
 	// through it so repair failures don't get lost.
 	Logger *log.Logger
+
+	// IntegrityFailures, when non-nil, receives a per-backend
+	// counter increment every time Verify detects a content
+	// mismatch (Inc) or an unrecognised hash claim
+	// (IncUnrecognized). Wired by cmd/gateway so legacy
+	// manifests resolved through repair show up on the same
+	// Prometheus counter as cache-miss GET observations — without
+	// this hook the metric would undercount because fetchPiece
+	// treats repair-supplied bodies as pre-verified and skips the
+	// in-handler counter.
+	IntegrityFailures IntegrityFailureSink
 }
 
 // New builds a ReadRepair given a provider registry and manifest
@@ -119,8 +145,21 @@ func (r *ReadRepair) Repair(ctx context.Context, key manifest_store.ManifestKey,
 		// proceeds. The structured log surfaces the count so
 		// operators can plan a rewrite that fills ProviderETag
 		// and clears Hash.
+		//
+		// In both cases we also fire the per-backend integrity
+		// counter through the optional sink so the repair path
+		// shows up on the same Prometheus series as cache-miss
+		// GET observations. Without the sink call,
+		// fetchPiece's preVerified shortcut would cause repair
+		// findings to be invisible to the metrics pipeline.
 		if !errors.Is(err, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+			if r.IntegrityFailures != nil {
+				r.IntegrityFailures.Inc(piece.Backend)
+			}
 			return RepairResult{}, fmt.Errorf("lazy_read_repair: %w", err)
+		}
+		if r.IntegrityFailures != nil {
+			r.IntegrityFailures.IncUnrecognized(piece.Backend)
 		}
 		r.logf("lazy_read_repair: integrity_claim_unrecognized: piece=%s backend=%s recorded_hash=%q detail=%v",
 			piece.PieceID, piece.Backend, piece.Hash, err)

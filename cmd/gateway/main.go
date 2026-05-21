@@ -160,6 +160,12 @@ func main() {
 
 	readRepair := lazy_read_repair.New(registry, store)
 	readRepair.Logger = log.New(os.Stdout, "read_repair ", log.LstdFlags)
+	// Share the same adapter as the HTTP handler so repair-path
+	// integrity observations land on the same Prometheus series
+	// (zkof_integrity_failure_total / zkof_integrity_claim_unrecognized_total).
+	// Without this, fetchPiece's preVerified shortcut would hide
+	// any unrecognised-claim count discovered during repair.
+	readRepair.IntegrityFailures = integrityFailureSink{r: metricsRegistry}
 
 	rebalancerDone := startRebalancer(workerCtx, cfg.Rebalancer, store, registry)
 	orphanGCDone := startOrphanGC(workerCtx, cfg.Dedup, contentIndex, store, registry)
