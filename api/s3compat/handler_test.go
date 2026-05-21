@@ -1075,7 +1075,6 @@ func TestHandler_RequireAuth_NoAuthenticator_Returns500(t *testing.T) {
 		Providers:   map[string]providers.StorageProvider{"test": fake},
 		Placement:   fixedPlacement{backend: "test"},
 		Billing:     bill,
-		Env:         "production",
 		RequireAuth: true,
 		// Auth intentionally nil to simulate the
 		// misconfiguration we want this safety net to catch.

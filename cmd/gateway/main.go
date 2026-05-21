@@ -220,7 +220,6 @@ func main() {
 		Compliance:        complianceHooks,
 		NodeID:            cfg.Env,
 		IntegrityFailures: integrityFailureSink{r: metricsRegistry},
-		Env:               cfg.Env,
 		// RequireAuth gates the handler's AnonymousTenant
 		// fallback: in production any misconfiguration that
 		// drops the authenticator returns 500
@@ -338,7 +337,10 @@ func main() {
 //
 // name labels the listener in log lines ("gateway", "console",
 // "health") so operators with multiple listeners on the same
-// process can tell them apart.
+// process can tell them apart. Both the TLS-enabled and the
+// production-warning log lines share the "gateway: %s …" prefix
+// (where %s is the per-listener name) so log scrapers can match
+// every gateway-process line with one regex.
 func startListener(srv *http.Server, t config.TLSConfig, env, name string) error {
 	if t.Enabled() {
 		gotls, err := t.BuildGoTLSConfig()
@@ -354,12 +356,19 @@ func startListener(srv *http.Server, t config.TLSConfig, env, name string) error
 		return srv.ListenAndServeTLS(t.CertPath, t.KeyPath)
 	}
 	if env == "production" {
-		log.Printf("WARNING: %s running without TLS in production mode (%s.tls.cert_path / key_path are empty); only safe when an upstream load balancer terminates TLS", name, name)
+		log.Printf("gateway: %s WARNING running without TLS in production mode (%s.tls.cert_path / key_path are empty); only safe when an upstream load balancer terminates TLS", name, name)
 	}
 	return srv.ListenAndServe()
 }
 
-// enforceProductionAuth refuses to start the gateway when
+// errProductionAuthRequired is returned by checkProductionAuth
+// when the gateway is started with env=production but no tenant
+// bindings of any kind (no Postgres DSN AND no --tenants file).
+// Exposed as a sentinel so cmd/gateway can log a friendly
+// message and main_test.go can errors.Is against it.
+var errProductionAuthRequired = errors.New("gateway: env=production but no tenant bindings are configured (no control_plane.metadata_dsn AND no --tenants file with bindings); refusing to start with an effectively-unauthenticated handler")
+
+// checkProductionAuth refuses to start the gateway when
 // cfg.Env == "production" and the tenant store is the dev /
 // scaffolding configuration (in-memory store with zero bindings).
 // The intent is to make it impossible to ship a production
@@ -371,24 +380,40 @@ func startListener(srv *http.Server, t config.TLSConfig, env, name string) error
 // rows are added by the console signup flow. metadataDB == nil
 // with a non-empty store means the operator loaded bindings via
 // --tenants, which is also a supported production config (static
-// HMAC keys). The fatal path only triggers when both are missing:
+// HMAC keys). The error path only triggers when both are missing:
 // no Postgres connection AND no static bindings.
 //
 // This guard is layered alongside the s3compat handler's
 // RequireAuth check: even if the operator zeroes out Auth on the
 // handler config, every request returns 500 instead of writing
 // data under AnonymousTenant.
-func enforceProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.TenantStore) {
+//
+// The function returns an error rather than calling log.Fatalf so
+// tests can exercise both branches in-process (no subprocess
+// re-exec gymnastics) and the production-startup wrapper
+// enforceProductionAuth below handles the fatal transition.
+func checkProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.TenantStore) error {
 	if env != "production" {
-		return
+		return nil
 	}
 	if metadataDB != nil {
-		return
+		return nil
 	}
 	if tenantStore != nil && tenantStore.Size() > 0 {
-		return
+		return nil
 	}
-	log.Fatalf("gateway: env=production but no tenant bindings are configured (no control_plane.metadata_dsn AND no --tenants file with bindings); refusing to start with an effectively-unauthenticated handler")
+	return errProductionAuthRequired
+}
+
+// enforceProductionAuth wraps checkProductionAuth at the startup
+// callsite: a non-nil error is fatal (the gateway must not boot
+// without a tenant store in production). Tests should call
+// checkProductionAuth directly so they can errors.Is against the
+// sentinel without forking the test binary.
+func enforceProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.TenantStore) {
+	if err := checkProductionAuth(env, metadataDB, tenantStore); err != nil {
+		log.Fatalf("%s", err)
+	}
 }
 
 // warnProductionLocalCMK emits a critical warning when the gateway

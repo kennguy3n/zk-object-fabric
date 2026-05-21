@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"database/sql"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -248,51 +249,52 @@ func loadedTenantStore(t *testing.T) *auth.MemoryTenantStore {
 	return s
 }
 
-// TestEnforceProductionAuth_NonProductionNoFatal: in development
-// mode the guard must not fire even with no metadata DB and no
-// bindings.
-func TestEnforceProductionAuth_NonProductionNoFatal(t *testing.T) {
-	// log.Fatalf would call os.Exit; if this returns, the
-	// guard correctly skipped the fatal path.
-	enforceProductionAuth("development", nil, auth.NewMemoryTenantStore())
-	enforceProductionAuth("", nil, auth.NewMemoryTenantStore())
-	enforceProductionAuth("staging", nil, auth.NewMemoryTenantStore())
-}
-
-// TestEnforceProductionAuth_ProductionWithBindingsNoFatal: in
-// production with --tenants-loaded bindings the guard must not fire.
-func TestEnforceProductionAuth_ProductionWithBindingsNoFatal(t *testing.T) {
-	enforceProductionAuth("production", nil, loadedTenantStore(t))
-}
-
-// TestEnforceProductionAuth_ProductionWithMetadataDBNoFatal: in
-// production with a Postgres-backed tenant store (even with zero
-// bindings — a fresh deploy waiting for the console signup flow)
-// the guard must not fire. We can't easily construct a real
-// *sql.DB here, but a non-nil pointer is enough: the guard short-
-// circuits on metadataDB != nil before touching the store.
-func TestEnforceProductionAuth_ProductionWithMetadataDBNoFatal(t *testing.T) {
-	enforceProductionAuth("production", &sql.DB{}, auth.NewMemoryTenantStore())
-}
-
-// TestEnforceProductionAuth_ProductionFails verifies the fatal
-// path. Because log.Fatalf calls os.Exit, we re-execute the test
-// binary with a sentinel env var and assert non-zero exit status.
-func TestEnforceProductionAuth_ProductionFails(t *testing.T) {
-	if os.Getenv("ZKOF_TEST_ENFORCE_PROD_AUTH") == "1" {
-		// log.Fatalf must terminate the process here.
-		enforceProductionAuth("production", nil, auth.NewMemoryTenantStore())
-		// If we ever reach here, the guard failed to fire.
-		os.Exit(0)
+// TestCheckProductionAuth_NonProduction: in development mode the
+// guard must not fire even with no metadata DB and no bindings.
+func TestCheckProductionAuth_NonProduction(t *testing.T) {
+	for _, env := range []string{"development", "", "staging"} {
+		if err := checkProductionAuth(env, nil, auth.NewMemoryTenantStore()); err != nil {
+			t.Errorf("checkProductionAuth(%q, nil, empty store) = %v; want nil", env, err)
+		}
 	}
-	cmd := newSelfExecCmd(t, "TestEnforceProductionAuth_ProductionFails")
-	cmd.Env = append(os.Environ(), "ZKOF_TEST_ENFORCE_PROD_AUTH=1")
-	out, err := cmd.CombinedOutput()
+}
+
+// TestCheckProductionAuth_ProductionWithBindings: in production
+// with --tenants-loaded bindings the guard must not fire.
+func TestCheckProductionAuth_ProductionWithBindings(t *testing.T) {
+	if err := checkProductionAuth("production", nil, loadedTenantStore(t)); err != nil {
+		t.Errorf("checkProductionAuth(production, nil, loaded store) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionAuth_ProductionWithMetadataDB: in production
+// with a Postgres-backed tenant store (even with zero bindings —
+// a fresh deploy waiting for the console signup flow) the guard
+// must not fire. We can't easily construct a real *sql.DB here,
+// but a non-nil pointer is enough: the guard short-circuits on
+// metadataDB != nil before touching the store.
+func TestCheckProductionAuth_ProductionWithMetadataDB(t *testing.T) {
+	if err := checkProductionAuth("production", &sql.DB{}, auth.NewMemoryTenantStore()); err != nil {
+		t.Errorf("checkProductionAuth(production, db, empty store) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionAuth_ProductionFails verifies the error
+// path: production with no metadata DB and an empty tenant store
+// must return errProductionAuthRequired so the startup wrapper
+// can refuse to boot. No subprocess re-exec needed because the
+// underlying check returns an error instead of calling
+// log.Fatalf.
+func TestCheckProductionAuth_ProductionFails(t *testing.T) {
+	err := checkProductionAuth("production", nil, auth.NewMemoryTenantStore())
 	if err == nil {
-		t.Fatalf("child exited with status 0; want non-zero (out=%s)", out)
+		t.Fatalf("checkProductionAuth(production, nil, empty store) = nil; want errProductionAuthRequired")
 	}
-	if !strings.Contains(string(out), "no tenant bindings are configured") {
-		t.Fatalf("child output = %s\nwant to mention 'no tenant bindings are configured'", out)
+	if !errors.Is(err, errProductionAuthRequired) {
+		t.Fatalf("checkProductionAuth returned %v; want errors.Is(_, errProductionAuthRequired)", err)
+	}
+	if !strings.Contains(err.Error(), "no tenant bindings are configured") {
+		t.Errorf("error message = %q; want to mention 'no tenant bindings are configured'", err.Error())
 	}
 }
 

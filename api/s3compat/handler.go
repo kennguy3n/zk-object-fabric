@@ -201,21 +201,13 @@ type Config struct {
 	// NodeID identifies the gateway node emitting billing events.
 	NodeID string
 
-	// Env is the deployment environment ("development",
-	// "staging", "production", …). The handler currently uses
-	// it for one thing: gating the production-mode safety net
-	// that refuses anonymous requests when Auth is nil. Empty
-	// or unrecognised values are treated as non-production so
-	// dev / test deploys do not change behaviour.
-	Env string
-
 	// RequireAuth, when true, makes the handler refuse every
 	// request with 500 InternalAuthMisconfigured if Auth is
 	// nil — instead of silently serving every request under
-	// AnonymousTenant. cmd/gateway sets this whenever Env is
-	// "production" so a misconfiguration that drops the
-	// authenticator can never silently grant world-write to
-	// the anonymous tenant.
+	// AnonymousTenant. cmd/gateway sets this whenever the
+	// deployment env is "production" so a misconfiguration that
+	// drops the authenticator can never silently grant
+	// world-write to the anonymous tenant.
 	RequireAuth bool
 
 	// ContentIndex is the intra-tenant deduplication content
