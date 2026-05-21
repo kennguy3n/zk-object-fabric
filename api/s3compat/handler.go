@@ -778,6 +778,16 @@ func (h *Handler) fetchPiece(
 		fetchRange = nil
 	}
 
+	// preVerified is set when the body we end up serving has
+	// already been integrity-checked upstream (currently only
+	// the lazy_read_repair path, which calls pieceintegrity.Verify
+	// inside ReadRepair.Repair before returning the bytes). In
+	// that case we skip the redundant BLAKE3 re-hash below —
+	// re-running it on a body whose integrity was just proved is
+	// a pure CPU tax that grows with piece size, and it would
+	// also double-count the ErrIntegrityClaimUnrecognized
+	// counter for legacy manifests resolved through repair.
+	preVerified := false
 	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, fetchRange)
 	if err != nil {
 		repaired, repairErr := h.tryReadRepair(r, mkey, manifest, fetchRange)
@@ -785,6 +795,7 @@ func (h *Handler) fetchPiece(
 			return nil, false, err
 		}
 		body = repaired
+		preVerified = true
 	}
 
 	if !wantFullPiece {
@@ -841,18 +852,21 @@ func (h *Handler) fetchPiece(
 		return nil, false, rerr
 	}
 
-	if verr := pieceintegrity.Verify(buf, piece); verr != nil {
-		if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
-			// Legacy manifest with no recognised integrity
-			// claim. We cannot prove the bytes are wrong, so we
-			// serve them and surface the count for operators
-			// via the dedicated observability channel. A
-			// follow-up rewrite migration is expected to fix
-			// the manifests so this channel goes back to zero.
-			h.recordIntegrityUnrecognized(piece, verr)
-		} else {
-			h.recordIntegrityFailure(piece, verr)
-			return nil, false, verr
+	if !preVerified {
+		if verr := pieceintegrity.Verify(buf, piece); verr != nil {
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				// Legacy manifest with no recognised
+				// integrity claim. We cannot prove the bytes
+				// are wrong, so we serve them and surface the
+				// count for operators via the dedicated
+				// observability channel. A follow-up rewrite
+				// migration is expected to fix the manifests
+				// so this channel goes back to zero.
+				h.recordIntegrityUnrecognized(piece, verr)
+			} else {
+				h.recordIntegrityFailure(piece, verr)
+				return nil, false, verr
+			}
 		}
 	}
 
