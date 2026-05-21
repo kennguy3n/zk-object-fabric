@@ -17,10 +17,13 @@ package s3compat
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+
+	"github.com/zeebo/blake3"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/encryption"
@@ -132,16 +135,24 @@ func (h *Handler) putErasureCoded(
 		if shard.Kind == erasure_coding.ShardKindParity {
 			kind = metadata.ShardKindParity
 		}
+		// Hash is the BLAKE3 of the shard bytes — what the GET
+		// integrity check re-computes from the shard payload.
+		// ProviderETag holds the backend's opaque ETag for the
+		// upload (some backends return a multipart-style
+		// concatenated MD5 that has no relationship to the
+		// bytes; we cannot use it for verification).
+		shardHash := blake3.Sum256(shard.Bytes)
 		pieces = append(pieces, metadata.Piece{
-			PieceID:     res.PieceID,
-			Hash:        res.ETag,
-			Backend:     backendName,
-			Locator:     res.Locator,
-			State:       "active",
-			SizeBytes:   int64(len(shard.Bytes)),
-			StripeIndex: shard.StripeIndex,
-			ShardIndex:  shard.ShardIndex,
-			ShardKind:   kind,
+			PieceID:      res.PieceID,
+			Hash:         "blake3:" + hex.EncodeToString(shardHash[:]),
+			ProviderETag: res.ETag,
+			Backend:      backendName,
+			Locator:      res.Locator,
+			State:        "active",
+			SizeBytes:    int64(len(shard.Bytes)),
+			StripeIndex:  shard.StripeIndex,
+			ShardIndex:   shard.ShardIndex,
+			ShardKind:    kind,
 		})
 	}
 

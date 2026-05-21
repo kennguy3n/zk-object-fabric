@@ -357,8 +357,18 @@ func (h *Handler) putDeduped(
 		return
 	}
 
-	var pieceID, pieceBackend, pieceHash, pieceLocator string
+	var pieceID, pieceBackend, pieceETag, pieceLocator string
 	var sizeOnWire int64
+	// pieceHash is the BLAKE3-of-ciphertext digest the GET path
+	// re-computes from the bytes returned by the backend. For
+	// every code path below it is res.ContentHash, which the
+	// dedup pipeline computed from the same ciphertext bytes the
+	// backend stored (Pattern B: blake3 of gateway-encrypted
+	// ciphertext; Pattern C: blake3 of client-supplied
+	// ciphertext). Before this rule landed the field carried the
+	// backend's opaque ETag, which made the cache-miss integrity
+	// check (PR-2) refuse to serve every dedup-PUT manifest.
+	pieceHash := res.ContentHash
 	// dedupHitEffective is true when this PUT did not actually
 	// store new bytes on the backend — either because the
 	// content_index Lookup hit (res.Hit) OR because the Register
@@ -377,7 +387,7 @@ func (h *Handler) putDeduped(
 		// Locator is left empty: the manifest's PieceID +
 		// Backend are sufficient to round-trip GETs through
 		// the provider, and the locator is opaque to clients.
-		pieceHash = res.Existing.ETag
+		pieceETag = res.Existing.ETag
 		sizeOnWire = res.Existing.SizeBytes
 		// Emit dedup-hit billing dimensions so operators can
 		// reconcile bytes-saved vs. bytes-written.
@@ -397,7 +407,7 @@ func (h *Handler) putDeduped(
 		}
 		pieceID = putRes.PieceID
 		pieceBackend = backendName
-		pieceHash = putRes.ETag
+		pieceETag = putRes.ETag
 		pieceLocator = putRes.Locator
 		sizeOnWire = putRes.SizeBytes
 
@@ -411,7 +421,7 @@ func (h *Handler) putDeduped(
 			PieceID:       pieceID,
 			Backend:       pieceBackend,
 			SizeBytes:     sizeOnWire,
-			ETag:          pieceHash,
+			ETag:          pieceETag,
 			PlaintextHash: res.PlaintextHash,
 		})
 		if regErr != nil {
@@ -439,7 +449,7 @@ func (h *Handler) putDeduped(
 			}
 			pieceID = canonical.PieceID
 			pieceBackend = canonical.Backend
-			pieceHash = canonical.ETag
+			pieceETag = canonical.ETag
 			pieceLocator = ""
 			sizeOnWire = canonical.SizeBytes
 			dedupHitEffective = true
@@ -472,12 +482,13 @@ func (h *Handler) putDeduped(
 		Encryption:      res.Encryption,
 		PlacementPolicy: policy,
 		Pieces: []metadata.Piece{{
-			PieceID:   pieceID,
-			Backend:   pieceBackend,
-			Locator:   pieceLocator,
-			Hash:      pieceHash,
-			SizeBytes: sizeOnWire,
-			State:     "active",
+			PieceID:      pieceID,
+			Backend:      pieceBackend,
+			Locator:      pieceLocator,
+			Hash:         pieceHash,
+			ProviderETag: pieceETag,
+			SizeBytes:    sizeOnWire,
+			State:        "active",
 		}},
 		MigrationState: metadata.MigrationState{
 			Generation:     1,
@@ -524,8 +535,12 @@ func (h *Handler) putDeduped(
 	}
 	h.audit(r, "PUT", tenantID, bucket, key, pieceID, pieceBackend, country)
 
-	if pieceHash != "" {
-		w.Header().Set("ETag", quote(pieceHash))
+	// Return the backend's ETag to the client so dedup-hit and
+	// non-dedup PUTs of the same content remain ETag-stable. The
+	// internal Piece.Hash is BLAKE3, which clients should not see -
+	// it is a server-side integrity primitive, not an external API.
+	if pieceETag != "" {
+		w.Header().Set("ETag", quote(pieceETag))
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.WriteHeader(http.StatusOK)

@@ -186,21 +186,22 @@ func main() {
 	}
 	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB)
 	s3compat.New(s3compat.Config{
-		Manifests:      store,
-		Providers:      registry,
-		Placement:      placement,
-		Auth:           authenticator,
-		VerifiedCheck:  verifiedCheck,
-		Billing:        billingSink,
-		Multipart:      multipartStore,
-		ErasureCoding:  erasureRegistry,
-		Cache:          cache,
-		CachePublisher: signalBus,
-		ReadRepair:     readRepair,
-		Encryption:     gatewayEnc,
-		ContentIndex:   contentIndex,
-		Compliance:     complianceHooks,
-		NodeID:         cfg.Env,
+		Manifests:         store,
+		Providers:         registry,
+		Placement:         placement,
+		Auth:              authenticator,
+		VerifiedCheck:     verifiedCheck,
+		Billing:           billingSink,
+		Multipart:         multipartStore,
+		ErasureCoding:     erasureRegistry,
+		Cache:             cache,
+		CachePublisher:    signalBus,
+		ReadRepair:        readRepair,
+		Encryption:        gatewayEnc,
+		ContentIndex:      contentIndex,
+		Compliance:        complianceHooks,
+		NodeID:            cfg.Env,
+		IntegrityFailures: integrityFailureSink{r: metricsRegistry},
 	}).Register(mux)
 
 	handler := http.Handler(mux)
@@ -1332,6 +1333,22 @@ func buildTracer(cfg config.TracingConfig) *tracing.Tracer {
 	// keep dependency footprint small. Operators wiring a real
 	// backend can add an Exporter implementation in a build tag.
 	return tracing.New(name, tracing.NoopExporter{})
+}
+
+// integrityFailureSink adapts metrics.Registry to the
+// s3compat.IntegrityFailureSink interface so the HTTP handler
+// can emit zkof_integrity_failure_total without importing
+// internal/metrics. A zero-value sink (nil registry) is a no-op
+// — useful for tests that wire the handler without a registry.
+type integrityFailureSink struct {
+	r *metrics.Registry
+}
+
+func (s integrityFailureSink) Inc(backend string) {
+	if s.r == nil {
+		return
+	}
+	s.r.IncIntegrityFailure(backend)
 }
 
 // metricsMiddleware wraps next with request-duration and

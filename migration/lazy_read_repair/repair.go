@@ -15,18 +15,14 @@ package lazy_read_repair
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"strings"
-
-	"github.com/zeebo/blake3"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
@@ -113,8 +109,8 @@ func (r *ReadRepair) Repair(ctx context.Context, key manifest_store.ManifestKey,
 		return RepairResult{}, fmt.Errorf("lazy_read_repair: drain piece: %w", err)
 	}
 
-	if err := verifyPiece(body, piece); err != nil {
-		return RepairResult{}, err
+	if err := pieceintegrity.Verify(body, piece); err != nil {
+		return RepairResult{}, fmt.Errorf("lazy_read_repair: %w", err)
 	}
 
 	putRes, err := target.PutPiece(ctx, piece.PieceID, bytes.NewReader(body), providers.PutOptions{ContentLength: int64(len(body))})
@@ -141,44 +137,6 @@ func (r *ReadRepair) Repair(ctx context.Context, key manifest_store.ManifestKey,
 		RepairedBackend: targetBackend,
 		SourceBackend:   piece.Backend,
 	}, nil
-}
-
-// verifyPiece checks body against piece.Hash. It recognises three
-// hash forms the gateway has written over time:
-//
-//  1. "blake3:<hex>" — the canonical Phase 4 content-derived hash
-//     written by api/s3compat/handler.go's PUT path after the
-//     BLAKE3 piece-integrity work landed.
-//  2. raw SHA-256 hex — the legacy Phase 2 form (no prefix). Kept
-//     so manifests written before the BLAKE3 cut-over still verify.
-//  3. an S3-style quoted ETag — also legacy; the surrounding
-//     quotes are stripped before the SHA-256 comparison.
-//
-// Empty piece.Hash skips the check. The matching algorithm is
-// selected by the prefix so a body never round-trips through two
-// hashers when the format is known.
-func verifyPiece(body []byte, piece metadata.Piece) error {
-	if piece.Hash == "" {
-		return nil
-	}
-	if strings.HasPrefix(piece.Hash, "blake3:") {
-		expected := piece.Hash[len("blake3:"):]
-		h := blake3.New()
-		_, _ = h.Write(body)
-		if hex.EncodeToString(h.Sum(nil)) == expected {
-			return nil
-		}
-		return fmt.Errorf("lazy_read_repair: piece %s blake3 mismatch: expected %q", piece.PieceID, expected)
-	}
-	expected := piece.Hash
-	if len(expected) >= 2 && expected[0] == '"' && expected[len(expected)-1] == '"' {
-		expected = expected[1 : len(expected)-1]
-	}
-	sum := sha256.Sum256(body)
-	if expected == hex.EncodeToString(sum[:]) {
-		return nil
-	}
-	return fmt.Errorf("lazy_read_repair: piece %s hash mismatch: expected %q", piece.PieceID, expected)
 }
 
 func (r *ReadRepair) logf(format string, args ...any) {

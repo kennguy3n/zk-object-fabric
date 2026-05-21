@@ -910,3 +910,105 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 		t.Errorf("multipart GET audit PieceID is empty; want first piece ID")
 	}
 }
+
+// integritySinkRecorder is an IntegrityFailureSink used by tests to
+// verify the GET path emits a metric when a piece body is tampered
+// with on the backend. Concurrent-safe so the tests can run in
+// parallel with the rest of the suite if a future maintainer adds
+// t.Parallel().
+type integritySinkRecorder struct {
+	mu   sync.Mutex
+	hits map[string]int
+}
+
+func (s *integritySinkRecorder) Inc(backend string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hits == nil {
+		s.hits = make(map[string]int)
+	}
+	s.hits[backend]++
+}
+
+func (s *integritySinkRecorder) count(backend string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hits[backend]
+}
+
+// TestGet_TamperedPiece_FailsClosed exercises PR-2: a backend piece
+// that has been mutated since PUT must be rejected with HTTP 502
+// IntegrityCheckFailed, the bytes must NOT reach the client, and a
+// per-backend zkof_integrity_failure_total metric must be emitted.
+func TestGet_TamperedPiece_FailsClosed(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	bill := &recordingBilling{}
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		Billing:           bill,
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("zkof piece integrity end-to-end")
+
+	// PUT through the handler so the manifest carries a real
+	// blake3 hash. This is the only writer of "well-formed"
+	// pieces in this test.
+	req := httptest.NewRequest(http.MethodPut, "/bucket/integrity.txt", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Sanity: the unmodified GET works.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/integrity.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("baseline GET status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Fatalf("baseline GET body = %q, want %q", got, body)
+	}
+	if hits := sink.count("test"); hits != 0 {
+		t.Fatalf("integrity hits on clean GET = %d, want 0", hits)
+	}
+
+	// Mutate the on-backend bytes behind the manifest's back.
+	// This is what bit-rot, a buggy backend, or an attacker who
+	// can write to the backend looks like to the gateway.
+	fake.mu.Lock()
+	if len(fake.pieces) == 0 {
+		fake.mu.Unlock()
+		t.Fatalf("fake backend has no pieces after PUT")
+	}
+	for k := range fake.pieces {
+		fake.pieces[k] = []byte("tampered bytes that do not match the manifest hash")
+	}
+	fake.mu.Unlock()
+
+	// GET must now fail closed, with no client bytes, an explicit
+	// IntegrityCheckFailed code, and a metric sample.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/integrity.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("tampered GET status = %d, want 502", rec.Code)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "IntegrityCheckFailed") {
+		t.Fatalf("tampered GET body missing IntegrityCheckFailed code: %q", got)
+	}
+	if got := rec.Body.String(); strings.Contains(got, "tampered bytes") {
+		t.Fatalf("tampered GET leaked backend bytes to the client: %q", got)
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered GET = %d, want 1", hits)
+	}
+}

@@ -9,8 +9,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/zeebo/blake3"
-
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
@@ -170,54 +168,7 @@ func TestRepair_NoopWhenAlreadyOnPrimary(t *testing.T) {
 	}
 }
 
-func TestVerifyPiece_AllHashForms(t *testing.T) {
-	payload := []byte("zk-piece-bytes")
-
-	t.Run("blake3 prefix matches body", func(t *testing.T) {
-		// Reproduce the exact hash the gateway stamps onto Piece.Hash
-		// in api/s3compat/handler.go's PUT path. The verifier MUST
-		// recognise this format — finding from Devin Review: before
-		// this fix, verifyPiece always returned mismatch because it
-		// only knew about SHA-256.
-		h := blake3Sum(payload)
-		piece := metadata.Piece{PieceID: "p1", Hash: "blake3:" + h}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(blake3 prefix): %v", err)
-		}
-	})
-
-	t.Run("blake3 prefix rejects tampered body", func(t *testing.T) {
-		h := blake3Sum([]byte("expected"))
-		piece := metadata.Piece{PieceID: "p1", Hash: "blake3:" + h}
-		if err := verifyPiece([]byte("tampered"), piece); err == nil {
-			t.Fatal("verifyPiece(blake3 prefix, tampered): want error, got nil")
-		}
-	})
-
-	t.Run("legacy raw sha256 hex matches body", func(t *testing.T) {
-		piece := metadata.Piece{PieceID: "p1", Hash: hashOf(payload)}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(legacy sha256): %v", err)
-		}
-	})
-
-	t.Run("legacy quoted etag strips quotes", func(t *testing.T) {
-		piece := metadata.Piece{PieceID: "p1", Hash: "\"" + hashOf(payload) + "\""}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(legacy quoted): %v", err)
-		}
-	})
-
-	t.Run("empty hash skips verification", func(t *testing.T) {
-		piece := metadata.Piece{PieceID: "p1", Hash: ""}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(empty hash): %v", err)
-		}
-	})
-}
-
-func blake3Sum(b []byte) string {
-	h := blake3.New()
-	_, _ = h.Write(b)
-	return hex.EncodeToString(h.Sum(nil))
-}
+// Hash-form coverage for the shared verifier lives in
+// metadata/pieceintegrity/integrity_test.go. The repair tests
+// above exercise the integration path — Repair() refusing to
+// hand back tampered bytes — via TestRepair_RejectsHashMismatch.

@@ -13,6 +13,7 @@
 //   - zkof_dedup_hit_total          (counter)
 //   - zkof_dedup_bytes_saved_total  (counter)
 //   - zkof_provider_errors_total    (counter, by provider, operation)
+//   - zkof_integrity_failure_total  (counter, by backend)
 //   - zkof_active_requests          (gauge)
 //
 // The exporter is goroutine-safe.
@@ -54,6 +55,7 @@ type Registry struct {
 	dedupBytesSaved   atomic.Int64
 	activeRequests    atomic.Int64
 	providerErrors    *labeledCounter
+	integrityFailures *labeledCounter
 }
 
 // NewRegistry returns a registry initialised with the default
@@ -66,6 +68,12 @@ func NewRegistry() *Registry {
 		providerErrors: newLabeledCounter("zkof_provider_errors_total",
 			"Number of provider-side errors observed by the gateway.",
 			[]string{"provider", "operation"}),
+		integrityFailures: newLabeledCounter("zkof_integrity_failure_total",
+			"Pieces whose content hash did not match the manifest "+
+				"on a read path. A non-zero value indicates either "+
+				"backend bit-rot, a tampered backend, or a manifest "+
+				"recorded with the wrong hash.",
+			[]string{"backend"}),
 	}
 }
 
@@ -89,6 +97,16 @@ func (r *Registry) AddDedupBytesSaved(delta uint64) { r.dedupBytesSaved.Add(int6
 // counter.
 func (r *Registry) IncProviderError(provider, operation string) {
 	r.providerErrors.Inc([]string{provider, operation})
+}
+
+// IncIntegrityFailure increments the per-backend integrity-failure
+// counter. Operators page on a non-zero rate because it can only
+// be one of: backend bit-rot, a tampered backend, or a manifest
+// that recorded the wrong hash on PUT. The label captures which
+// backend served the bad piece so the on-call can scope the
+// investigation.
+func (r *Registry) IncIntegrityFailure(backend string) {
+	r.integrityFailures.Inc([]string{backend})
 }
 
 // IncActive / DecActive update the active-requests gauge. Pair
@@ -116,6 +134,7 @@ func (r *Registry) write(w io.Writer) error {
 	emitCounter(w, "zkof_dedup_bytes_saved_total", "Bytes that did not have to be uploaded thanks to dedup.", r.dedupBytesSaved.Load())
 	emitGauge(w, "zkof_active_requests", "Currently in-flight S3 requests.", r.activeRequests.Load())
 	r.providerErrors.write(w)
+	r.integrityFailures.write(w)
 	r.requestDuration.write(w)
 	return nil
 }
