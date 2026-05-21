@@ -7,15 +7,17 @@
 //
 // The set of metrics defined here mirrors the observability brief:
 //
-//   - zkof_request_duration_seconds (histogram, by method, status)
-//   - zkof_cache_hit_total          (counter)
-//   - zkof_cache_miss_total         (counter)
-//   - zkof_dedup_hit_total          (counter)
-//   - zkof_dedup_bytes_saved_total  (counter)
-//   - zkof_provider_errors_total    (counter, by provider, operation)
-//   - zkof_integrity_failure_total              (counter, by backend)
-//   - zkof_integrity_claim_unrecognized_total   (counter, by backend)
-//   - zkof_active_requests                      (gauge)
+//   - zkof_request_duration_seconds              (histogram, by method, status)
+//   - zkof_cache_hit_total                       (counter)
+//   - zkof_cache_miss_total                      (counter)
+//   - zkof_dedup_hit_total                       (counter)
+//   - zkof_dedup_bytes_saved_total               (counter)
+//   - zkof_provider_errors_total                 (counter, by provider, operation)
+//   - zkof_integrity_failure_total               (counter, by backend)
+//   - zkof_integrity_claim_unrecognized_total    (counter, by backend)
+//   - zkof_cache_warming_budget_exhausted_total  (counter)
+//   - zkof_cache_warming_budget_exhausted_bytes  (counter)
+//   - zkof_active_requests                       (gauge)
 //
 // The exporter is goroutine-safe.
 package metrics
@@ -50,14 +52,16 @@ type Registry struct {
 	requestDuration *Histogram
 
 	// Counters keyed by sorted-label string for fast incrementing.
-	cacheHits         atomic.Int64
-	cacheMisses       atomic.Int64
-	dedupHits         atomic.Int64
-	dedupBytesSaved   atomic.Int64
-	activeRequests    atomic.Int64
-	providerErrors              *labeledCounter
-	integrityFailures           *labeledCounter
-	integrityClaimUnrecognized  *labeledCounter
+	cacheHits                    atomic.Int64
+	cacheMisses                  atomic.Int64
+	dedupHits                    atomic.Int64
+	dedupBytesSaved              atomic.Int64
+	activeRequests               atomic.Int64
+	cacheWarmBudgetExhaustedHits atomic.Int64
+	cacheWarmBudgetExhaustedSize atomic.Int64
+	providerErrors               *labeledCounter
+	integrityFailures            *labeledCounter
+	integrityClaimUnrecognized   *labeledCounter
 }
 
 // NewRegistry returns a registry initialised with the default
@@ -134,6 +138,20 @@ func (r *Registry) IncIntegrityClaimUnrecognized(backend string) {
 	r.integrityClaimUnrecognized.Inc([]string{backend})
 }
 
+// IncCacheWarmingBudgetExhausted records that fetchPiece would
+// have warmed the hot-object cache inline but the
+// CacheWarmingMemoryBudget semaphore rejected the acquire. The
+// pieceSize argument is the size of the piece that did not get
+// warmed; the size counter is the sum across all rejected
+// warmings and gives operators a sense of how much
+// would-have-been-cached data is going via the async path.
+func (r *Registry) IncCacheWarmingBudgetExhausted(pieceSize int64) {
+	r.cacheWarmBudgetExhaustedHits.Add(1)
+	if pieceSize > 0 {
+		r.cacheWarmBudgetExhaustedSize.Add(pieceSize)
+	}
+}
+
 // IncActive / DecActive update the active-requests gauge. Pair
 // each Inc with exactly one Dec on the request goroutine.
 func (r *Registry) IncActive() { r.activeRequests.Add(1) }
@@ -157,6 +175,8 @@ func (r *Registry) write(w io.Writer) error {
 	emitCounter(w, "zkof_cache_miss_total", "Cache misses that fell through to the origin.", r.cacheMisses.Load())
 	emitCounter(w, "zkof_dedup_hit_total", "Dedup-aware PUTs that reused an existing piece.", r.dedupHits.Load())
 	emitCounter(w, "zkof_dedup_bytes_saved_total", "Bytes that did not have to be uploaded thanks to dedup.", r.dedupBytesSaved.Load())
+	emitCounter(w, "zkof_cache_warming_budget_exhausted_total", "Pieces that skipped inline cache warming because the memory budget was exhausted.", r.cacheWarmBudgetExhaustedHits.Load())
+	emitCounter(w, "zkof_cache_warming_budget_exhausted_bytes", "Total piece bytes that skipped inline cache warming because the memory budget was exhausted.", r.cacheWarmBudgetExhaustedSize.Load())
 	emitGauge(w, "zkof_active_requests", "Currently in-flight S3 requests.", r.activeRequests.Load())
 	r.providerErrors.write(w)
 	r.integrityFailures.write(w)

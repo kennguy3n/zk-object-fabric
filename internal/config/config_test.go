@@ -370,3 +370,35 @@ func TestDefault_ControlPlanePoolDefaults(t *testing.T) {
 		t.Errorf("ConnMaxIdleTime = %v, want 2m", got)
 	}
 }
+
+func TestGatewayConfig_CacheWarmingMemoryBudget_DefaultApplied(t *testing.T) {
+	cfg := Default()
+	if got := cfg.Gateway.CacheWarmingMemoryBudget; got != 512*1024*1024 {
+		t.Fatalf("Default CacheWarmingMemoryBudget = %d, want 512 MiB", got)
+	}
+}
+
+func TestGatewayConfig_CacheWarmingMemoryBudget_OverrideFromJSON(t *testing.T) {
+	in := []byte(`{"gateway": {"cache_warming_memory_budget": 1073741824}}`)
+	var cfg Config
+	if err := json.Unmarshal(in, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got := cfg.Gateway.CacheWarmingMemoryBudget; got != 1024*1024*1024 {
+		t.Fatalf("CacheWarmingMemoryBudget = %d, want 1 GiB", got)
+	}
+}
+
+func TestGatewayConfig_CacheWarmingMemoryBudget_NegativeDisablesGuard(t *testing.T) {
+	// A negative budget is the documented opt-out for the budget
+	// guard; the field is honoured verbatim so the s3compat
+	// Handler can detect "disabled" via budget < 0.
+	in := []byte(`{"gateway": {"cache_warming_memory_budget": -1}}`)
+	var cfg Config
+	if err := json.Unmarshal(in, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got := cfg.Gateway.CacheWarmingMemoryBudget; got != -1 {
+		t.Fatalf("CacheWarmingMemoryBudget = %d, want -1 (disabled)", got)
+	}
+}

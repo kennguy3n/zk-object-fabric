@@ -35,6 +35,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 	"github.com/zeebo/blake3"
+	"golang.org/x/sync/semaphore"
 )
 
 // Authenticator verifies the identity claimed by an S3 request and
@@ -252,7 +253,33 @@ type Config struct {
 	// Now, if set, returns the current time. Tests override it to
 	// make manifests deterministic.
 	Now func() time.Time
+
+	// CacheWarmingMemoryBudget caps total bytes the handler will
+	// buffer simultaneously across all in-flight cache-warming
+	// operations. Zero (default) applies DefaultCacheWarmingBudget;
+	// a negative value disables the budget guard (the pre-PR-7
+	// behaviour, intended only for regression tests). See the
+	// matching field on internal/config.GatewayConfig for the
+	// operator-facing tunable.
+	CacheWarmingMemoryBudget int64
+
+	// OnCacheWarmingBudgetExhausted, when non-nil, is invoked
+	// with the piece size every time fetchPiece would have warmed
+	// the cache inline but the budget guard rejected the acquire.
+	// Production wires this into a Prometheus counter so operators
+	// can tell when the budget is too tight and bursts are
+	// degrading hit rate. The hook runs on the request goroutine
+	// and must be cheap (atomic Add, no blocking calls).
+	OnCacheWarmingBudgetExhausted func(pieceSize int64)
 }
+
+// DefaultCacheWarmingBudget is the default total memory budget
+// the handler allocates to in-flight cache-warming buffers when
+// Config.CacheWarmingMemoryBudget is zero. 512 MiB is a balance
+// between letting bursty cache-miss traffic warm the cache
+// effectively and bounding the resident-set growth on a small
+// fleet of gateway pods.
+const DefaultCacheWarmingBudget int64 = 512 * 1024 * 1024
 
 // ComplianceHooks is the optional residency / audit surface
 // supplied by cmd/gateway. The handler depends only on minimal
@@ -315,6 +342,21 @@ type AuditEntry struct {
 // pipeline.
 type Handler struct {
 	cfg Config
+
+	// cacheWarmSem bounds the total bytes the handler is willing
+	// to buffer simultaneously across all in-flight
+	// fetchPiece-warming operations. The semaphore is initialised
+	// to cfg.CacheWarmingMemoryBudget (or DefaultCacheWarmingBudget
+	// when that field is zero). A negative budget leaves the
+	// field nil — the pre-PR-7 unbounded behaviour, used only by
+	// regression tests that exercise the old code path.
+	cacheWarmSem *semaphore.Weighted
+
+	// cacheWarmBudget remembers the resolved budget so fetchPiece
+	// can short-circuit pieces larger than the entire budget
+	// (which would never succeed at TryAcquire) and skip straight
+	// to the promotion signal path.
+	cacheWarmBudget int64
 }
 
 // New returns a Handler ready to be wired into an HTTP mux.
@@ -322,7 +364,18 @@ func New(cfg Config) *Handler {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Handler{cfg: cfg}
+	h := &Handler{cfg: cfg}
+	budget := cfg.CacheWarmingMemoryBudget
+	switch {
+	case budget == 0:
+		budget = DefaultCacheWarmingBudget
+		fallthrough
+	case budget > 0:
+		h.cacheWarmSem = semaphore.NewWeighted(budget)
+		h.cacheWarmBudget = budget
+		// budget < 0 leaves cacheWarmSem == nil → unbounded path.
+	}
+	return h
 }
 
 // Register attaches the S3-compatible routes to mux. Route parsing
@@ -1301,9 +1354,49 @@ func (h *Handler) fetchPiece(
 		return body, false, nil
 	}
 
+	// The cache-warming memory-budget semaphore caps the total
+	// bytes the gateway will buffer at once across every
+	// concurrent fetchPiece-warming pass. The oversize-piece
+	// short-circuit above caught pieces larger than the
+	// in-memory ceiling; this guard handles pieces that fit the
+	// per-piece ceiling but would push the aggregate budget
+	// over. Two cases short-circuit to the promotion-signal
+	// path:
+	//
+	//   1. The piece by itself is larger than the entire budget
+	//      — TryAcquire would never succeed, so we skip without
+	//      contending for the semaphore.
+	//   2. The semaphore is fully consumed by other in-flight
+	//      warmers — we fall back to the async-promotion path
+	//      instead of blocking the request goroutine.
+	//
+	// A negative cfg.CacheWarmingMemoryBudget leaves
+	// cacheWarmSem nil so the unbounded pre-PR-7 behaviour is
+	// preserved for regression tests.
+	acquired := false
+	if h.cacheWarmSem != nil {
+		if pieceSize > h.cacheWarmBudget {
+			h.notifyCacheWarmingExhausted(pieceSize)
+			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
+			return body, false, nil
+		}
+		if !h.cacheWarmSem.TryAcquire(pieceSize) {
+			h.notifyCacheWarmingExhausted(pieceSize)
+			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
+			return body, false, nil
+		}
+		acquired = true
+	}
+
 	buf, rerr := io.ReadAll(body)
 	_ = body.Close()
 	if rerr != nil {
+		// Release the cache-warming budget on the read-error
+		// exit so a long-lived gateway cannot leak budget over
+		// time when backends start returning truncated bodies.
+		if acquired {
+			h.cacheWarmSem.Release(pieceSize)
+		}
 		return nil, false, rerr
 	}
 
@@ -1320,6 +1413,12 @@ func (h *Handler) fetchPiece(
 				h.recordIntegrityUnrecognized(piece, verr)
 			} else {
 				h.recordIntegrityFailure(piece, verr)
+				// Release the budget on the integrity-failure
+				// exit too — we never reach Cache.Put for bad
+				// bytes, so the budget must be returned here.
+				if acquired {
+					h.cacheWarmSem.Release(pieceSize)
+				}
 				return nil, false, verr
 			}
 		}
@@ -1344,6 +1443,14 @@ func (h *Handler) fetchPiece(
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,
 		})
+		// Release the budget AFTER Cache.Put completes so the
+		// next warmer cannot dogpile the same eviction window.
+		// The post-Put release means the in-flight semaphore
+		// accurately reflects bytes held by the request
+		// goroutine plus the bytes the cache is about to admit.
+		if acquired {
+			h.cacheWarmSem.Release(pieceSize)
+		}
 	}
 
 	if byteRange != nil {
@@ -1469,6 +1576,20 @@ func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, readByt
 		ObservedAt:     h.cfg.Now(),
 		OriginBackend:  piece.Backend,
 	})
+}
+
+// notifyCacheWarmingExhausted calls the operator-supplied
+// OnCacheWarmingBudgetExhausted hook when fetchPiece would have
+// warmed the cache inline but the budget guard rejected the
+// acquire. Production wires this into a Prometheus counter so a
+// chronically-undersized budget shows up as a metric, not a
+// silent degradation. Tests use the hook to assert the budget
+// guard fired.
+func (h *Handler) notifyCacheWarmingExhausted(pieceSize int64) {
+	if h.cfg.OnCacheWarmingBudgetExhausted == nil {
+		return
+	}
+	h.cfg.OnCacheWarmingBudgetExhausted(pieceSize)
 }
 
 // Head handles S3 HEAD object.
