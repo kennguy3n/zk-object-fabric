@@ -3,6 +3,7 @@ package s3compat
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -351,34 +352,70 @@ func TestCacheWarming_NegativeBudgetDisablesGuard(t *testing.T) {
 	}
 }
 
-// TestCacheWarming_RangeRequestRespectsBudget verifies that
-// range GETs respect the cache-warming budget the same way full
-// GETs do. The integrity-verification PR (the one that landed
-// alongside this budget guard) buffers the full piece in memory
-// to verify the BLAKE3 hash before serving a range slice; once
-// we have the verified buffer it would be wasteful to throw it
-// away, so the merged Cache.Put path warms the cache for both
-// range and full GETs. Because range requests now warm the
-// cache, they correctly account for the budget. When the budget
-// is tighter than the piece (this test uses 16 B vs 64 KiB), the
-// budget guard rejects the inline warm and the request falls
-// back to publishing a promotion signal — the same shape as a
-// full-piece GET that exhausts the budget.
-func TestCacheWarming_RangeRequestRespectsBudget(t *testing.T) {
+// TestCacheWarming_RangeRequestContendsForBudget verifies that
+// range GETs DO contend for the cache-warming budget when the
+// piece carries an integrity hash. Range cache-misses on hashed
+// pieces buffer the full piece for verification (and warm the
+// cache in the process), so the budget guard applies to range
+// paths the same way it applies to non-range paths. When the
+// budget cannot be acquired the gateway falls back to streaming
+// the raw body and publishes a promotion signal so the async
+// worker can warm the cache off the request goroutine.
+//
+// Correctness fence: the request asks for a non-zero range
+// window AND the test asserts on the response body content
+// (not just status code, headers, and counters). Earlier this
+// test used bytes=0-3 which happened to coincide with the first
+// bytes of the piece, masking a bug where the budget-exhausted
+// path returned the FULL piece body to the caller while Get()
+// wrote a Content-Range / Content-Length sized for the slice.
+// The fix (close the full body and re-fetch the actual range
+// from the provider) is gated by this assertion.
+//
+// This also pins the post-merge semantics: pre-PR-7 PR #7 was
+// designed before piece integrity verification landed, when
+// range paths did not buffer at all. Once verification on the
+// GET path landed, range paths joined non-range paths in the
+// "buffer-then-verify-then-warm" pipeline and the budget guard
+// must cover both equally — otherwise a pathological client
+// could issue concurrent range GETs on distinct pieces and
+// blow past the memory budget the operator configured.
+func TestCacheWarming_RangeRequestContendsForBudget(t *testing.T) {
 	const (
 		pieceSize = 64 * 1024
-		budget    = 16 // 16 bytes — far smaller than the piece, so the guard MUST reject
+		budget    = 16 // 16 bytes — too small to admit any piece
+		// Deliberately non-zero range start: a regression that
+		// returns the full piece body would emit the first
+		// bytes of the piece instead of bytes [start, end],
+		// which the body-content assertion below would catch.
+		rangeStart = 100
+		rangeEnd   = 199 // inclusive — 100 bytes
 	)
 	h, cache, pub, _, rejected := newCacheBudgetHandler(t, budget)
-	body := bytes.Repeat([]byte("R"), pieceSize)
+	// Body is filled with a position-encoded byte pattern so a
+	// wrong slice is immediately obvious in the assertion message.
+	body := make([]byte, pieceSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
 	putObject(t, h, "obj", body)
 
 	req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
-	req.Header.Set("Range", "bytes=0-3")
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd))
 	rec := httptest.NewRecorder()
 	h.Get(rec, req)
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("range GET status=%d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	want := body[rangeStart : rangeEnd+1]
+	got := rec.Body.Bytes()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("range GET served wrong bytes: budget-exhausted path must re-fetch with the actual range. got len=%d first=%v last=%v; want len=%d first=%v last=%v",
+			len(got), got[:min(8, len(got))], got[max(0, len(got)-8):],
+			len(want), want[:min(8, len(want))], want[max(0, len(want)-8):])
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != fmt.Sprintf("%d", rangeEnd-rangeStart+1) {
+		t.Errorf("Content-Length=%q must match the requested range size %d (not the full piece size)", cl, rangeEnd-rangeStart+1)
 	}
 	if rejected.Load() != 1 {
 		t.Errorf("range request larger than budget must be rejected by the guard; rejected=%d, want 1", rejected.Load())

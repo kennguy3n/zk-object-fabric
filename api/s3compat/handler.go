@@ -1373,16 +1373,67 @@ func (h *Handler) fetchPiece(
 	// A negative cfg.CacheWarmingMemoryBudget leaves
 	// cacheWarmSem nil so the unbounded pre-PR-7 behaviour is
 	// preserved for regression tests.
+	//
+	// Correctness for range cache misses: when the wantFullPiece
+	// branch fired above (piece.Hash != "" AND pieceSize fits in
+	// MaxInMemoryObjectBytes), GetPiece was called with
+	// fetchRange == nil — the body in scope here is the FULL
+	// piece, not the requested slice. If the budget rejects we
+	// cannot just hand that full body back to Get(); the caller
+	// already wrote Content-Range / Content-Length for the
+	// range slice, so io.Copy(w, body) would emit the wrong
+	// bytes and overrun Content-Length. The budget-rejected
+	// branches below close the full-piece body and re-fetch
+	// with the actual byteRange so the caller's stream-and-copy
+	// path serves the correct slice. The extra round-trip is
+	// the price of maintaining the budget invariant strictly;
+	// the alternative (waive the budget for hashed-and-ranged
+	// pieces) is rejected because a pathological client could
+	// then DoS the gateway by issuing concurrent range GETs
+	// on N distinct hashed pieces and blow past the operator's
+	// configured memory ceiling.
 	acquired := false
 	if h.cacheWarmSem != nil {
-		if pieceSize > h.cacheWarmBudget {
+		tooBig := pieceSize > h.cacheWarmBudget
+		if tooBig || !h.cacheWarmSem.TryAcquire(pieceSize) {
+			if piece.Hash != "" {
+				if tooBig {
+					log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=cache_warm_budget_too_small size_bytes=%d budget=%d",
+						piece.PieceID, piece.Backend, pieceSize, h.cacheWarmBudget)
+				} else {
+					log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=cache_warm_budget_exhausted size_bytes=%d",
+						piece.PieceID, piece.Backend, pieceSize)
+				}
+			}
 			h.notifyCacheWarmingExhausted(pieceSize)
+			// Publish promotion regardless of byteRange so the
+			// async worker can warm the cache off the request
+			// goroutine even when this request cannot. The
+			// signalPromotion implementation is a no-op when
+			// CachePublisher is nil, so it's safe to call
+			// unconditionally.
 			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
-			return body, false, nil
-		}
-		if !h.cacheWarmSem.TryAcquire(pieceSize) {
-			h.notifyCacheWarmingExhausted(pieceSize)
-			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
+			// Critical: if the caller asked for a byteRange we
+			// MUST NOT return the full-piece body — Get() will
+			// emit a Content-Length sized for the slice and
+			// the client would consume a truncated/wrong
+			// payload (the data-corruption bug fixed by
+			// d94e15e). Close the full body we just got and
+			// re-query the provider with the actual range so
+			// the returned reader is already trimmed.
+			// tryReadRepair is NOT invoked on this fallback:
+			// read-repair is a recovery path for upstream
+			// fetch errors, and here the first GetPiece
+			// returned a valid body we chose to discard for
+			// memory reasons.
+			if byteRange != nil {
+				_ = body.Close()
+				ranged, rerr := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
+				if rerr != nil {
+					return nil, false, rerr
+				}
+				return ranged, false, nil
+			}
 			return body, false, nil
 		}
 		acquired = true
