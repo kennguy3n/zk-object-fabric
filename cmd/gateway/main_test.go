@@ -360,6 +360,171 @@ func TestCheckProductionAuth_ProductionFails(t *testing.T) {
 	}
 }
 
+// TestCheckAllTLSConfigs_AllValid_NoError pins the happy path:
+// every listener TLS block validates clean. Covers the
+// gateway-only, gateway+console, gateway+console+health
+// combinations operators actually deploy.
+func TestCheckAllTLSConfigs_AllValid_NoError(t *testing.T) {
+	cases := []struct {
+		name string
+		in   config.Config
+	}{
+		{
+			"only gateway listener configured",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+			},
+		},
+		{
+			"gateway + console listeners (TLS off)",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Console: config.ConsoleConfig{ListenAddr: ":9090", TLS: config.TLSConfig{}},
+			},
+		},
+		{
+			"gateway + console + health (TLS off)",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Console: config.ConsoleConfig{ListenAddr: ":9090", TLS: config.TLSConfig{}},
+				Health:  config.HealthConfig{ListenAddr: ":9091", TLS: config.TLSConfig{}},
+			},
+		},
+		{
+			"gateway TLS enabled, console+health plain",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{CertPath: "/etc/tls/cert.pem", KeyPath: "/etc/tls/key.pem"}},
+				Console: config.ConsoleConfig{ListenAddr: ":9090", TLS: config.TLSConfig{}},
+				Health:  config.HealthConfig{ListenAddr: ":9091", TLS: config.TLSConfig{}},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkAllTLSConfigs(tc.in); err != nil {
+				t.Fatalf("checkAllTLSConfigs: unexpected error %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckAllTLSConfigs_PartialPerListener is the regression
+// guard for the soft-failure bug: when the console or health
+// listener has a partial TLS config (exactly one of cert_path /
+// key_path set), checkAllTLSConfigs MUST return an error that
+// names the offending listener. Without this pre-flight check
+// the startup would proceed and the partial-TLS console/health
+// listener would silently fail in its goroutine — log.Printf
+// only, not log.Fatalf — leaving the gateway running with the
+// listener mysteriously absent.
+//
+// The matrix covers every listener × every "exactly one path set"
+// shape because the wrong listener name in the wrapped error would
+// be invisible from a passing test that only checks one listener.
+func TestCheckAllTLSConfigs_PartialPerListener(t *testing.T) {
+	cases := []struct {
+		name         string
+		in           config.Config
+		wantListener string // substring the error MUST contain
+	}{
+		{
+			"gateway cert_path only is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{CertPath: "/etc/tls/cert.pem"}},
+			},
+			"gateway.tls",
+		},
+		{
+			"gateway key_path only is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{KeyPath: "/etc/tls/key.pem"}},
+			},
+			"gateway.tls",
+		},
+		{
+			"console cert_path only is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Console: config.ConsoleConfig{ListenAddr: ":9090", TLS: config.TLSConfig{CertPath: "/etc/tls/cert.pem"}},
+			},
+			"console.tls",
+		},
+		{
+			"console key_path only is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Console: config.ConsoleConfig{ListenAddr: ":9090", TLS: config.TLSConfig{KeyPath: "/etc/tls/key.pem"}},
+			},
+			"console.tls",
+		},
+		{
+			"health cert_path only is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Health:  config.HealthConfig{ListenAddr: ":9091", TLS: config.TLSConfig{CertPath: "/etc/tls/cert.pem"}},
+			},
+			"health.tls",
+		},
+		{
+			"health key_path only is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Health:  config.HealthConfig{ListenAddr: ":9091", TLS: config.TLSConfig{KeyPath: "/etc/tls/key.pem"}},
+			},
+			"health.tls",
+		},
+		{
+			"console bad min_version is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Console: config.ConsoleConfig{ListenAddr: ":9090", TLS: config.TLSConfig{CertPath: "/etc/tls/cert.pem", KeyPath: "/etc/tls/key.pem", MinVersion: "1.0"}},
+			},
+			"console.tls",
+		},
+		{
+			"health bad min_version is rejected",
+			config.Config{
+				Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+				Health:  config.HealthConfig{ListenAddr: ":9091", TLS: config.TLSConfig{CertPath: "/etc/tls/cert.pem", KeyPath: "/etc/tls/key.pem", MinVersion: "1.0"}},
+			},
+			"health.tls",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkAllTLSConfigs(tc.in)
+			if err == nil {
+				t.Fatalf("checkAllTLSConfigs: want error containing %q, got nil", tc.wantListener)
+			}
+			if !strings.Contains(err.Error(), tc.wantListener) {
+				t.Errorf("checkAllTLSConfigs error = %q; want substring %q (so operators see which listener is misconfigured)", err.Error(), tc.wantListener)
+			}
+		})
+	}
+}
+
+// TestCheckAllTLSConfigs_SkipsDisabledListeners covers the
+// branch where Console.ListenAddr == "" (or Health.ListenAddr
+// == "") — those listeners are not started at all, so their TLS
+// blocks must not be validated (a leftover stub TLS config in a
+// config file with the listener disabled is not an error). The
+// gateway data-plane listener always exists so its TLS block is
+// always validated.
+func TestCheckAllTLSConfigs_SkipsDisabledListeners(t *testing.T) {
+	cfg := config.Config{
+		Gateway: config.GatewayConfig{TLS: config.TLSConfig{}},
+		// Console disabled (empty ListenAddr) but with a
+		// partial TLS config that WOULD fail validation if
+		// the listener were active.
+		Console: config.ConsoleConfig{ListenAddr: "", TLS: config.TLSConfig{CertPath: "/etc/tls/cert.pem"}},
+		// Same for health.
+		Health: config.HealthConfig{ListenAddr: "", TLS: config.TLSConfig{KeyPath: "/etc/tls/key.pem"}},
+	}
+	if err := checkAllTLSConfigs(cfg); err != nil {
+		t.Fatalf("checkAllTLSConfigs with disabled console/health: unexpected error %v (validation should be skipped for listeners with empty ListenAddr)", err)
+	}
+}
+
 // TestIsLocalFileCMK pins the (uri, holder) detection used by the
 // production-mode CMK warning.
 func TestIsLocalFileCMK(t *testing.T) {

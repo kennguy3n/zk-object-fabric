@@ -94,6 +94,20 @@ func main() {
 		defer func() { _ = metadataDB.Close() }()
 	}
 
+	// Pre-flight TLS validation for every configured listener
+	// BEFORE any goroutines spawn. startListener also calls
+	// t.Validate inside as a defence-in-depth, but the console
+	// and health listeners run their startListener call inside
+	// a goroutine — a validation error there would only
+	// log.Printf and silently disable the listener instead of
+	// failing the process. Doing the validation here means a
+	// partial TLS config (cert_path set but key_path empty, or
+	// an unsupported min_version) on ANY listener fails the
+	// startup synchronously with log.Fatalf, which is the right
+	// failure mode for a production deployment that intended
+	// TLS but typoed one of the paths.
+	validateAllTLSConfigs(cfg)
+
 	store := buildManifestStore(cfg, metadataDB)
 	contentIndex := buildContentIndex(cfg, metadataDB)
 	registry := buildProviderRegistry(context.Background(), cfg)
@@ -461,6 +475,50 @@ func checkProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.Tenant
 func enforceProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.TenantStore) {
 	if err := checkProductionAuth(env, metadataDB, tenantStore); err != nil {
 		log.Fatalf("%s", err)
+	}
+}
+
+// checkAllTLSConfigs validates the TLS config for every listener
+// the gateway can start (gateway data-plane, console, health) and
+// returns the first non-nil validation error. The returned error
+// names the offending listener so the operator can immediately
+// see which block is misconfigured. Tests call this directly so
+// they can assert per-listener error wrapping without forking
+// the test binary; main calls validateAllTLSConfigs which fatals.
+func checkAllTLSConfigs(cfg config.Config) error {
+	if err := cfg.Gateway.TLS.Validate("gateway"); err != nil {
+		return err
+	}
+	if cfg.Console.ListenAddr != "" {
+		if err := cfg.Console.TLS.Validate("console"); err != nil {
+			return err
+		}
+	}
+	if cfg.Health.ListenAddr != "" {
+		if err := cfg.Health.TLS.Validate("health"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAllTLSConfigs is the startup-time wrapper: any
+// validation failure on any listener's TLS block is a fatal
+// startup error, full stop. The console and health listeners
+// run startListener inside goroutines that only log.Printf on
+// error, which would otherwise leave a partial TLS config as a
+// silent soft failure — exactly the wrong failure mode for a
+// production deploy that intended TLS but typoed a path. Doing
+// the validation here means the process refuses to boot rather
+// than running with a listener mysteriously absent.
+//
+// startListener also runs t.Validate internally so a future call
+// site that forgets to pre-validate still surfaces the error;
+// the pre-flight check is the architectural correctness fix and
+// the in-listener check is defence-in-depth.
+func validateAllTLSConfigs(cfg config.Config) {
+	if err := checkAllTLSConfigs(cfg); err != nil {
+		log.Fatalf("gateway: %v", err)
 	}
 }
 
