@@ -24,8 +24,26 @@ COPY . .
 
 # Build a statically linked gateway binary so stage 3's minimal
 # Alpine runtime does not need the Go toolchain or libc shims.
+#
+# Version metadata is stamped into the binary via -ldflags -X.
+# Callers (CI, Makefile, manual `docker build`) pass three build
+# args; sensible defaults keep dev builds working without an
+# explicit `--build-arg`. `git rev-parse` runs against the local
+# .git directory if .dockerignore lets it through; otherwise CI
+# is expected to pass GIT_COMMIT explicitly. BUILD_DATE is
+# normalised to RFC 3339 UTC at the Dockerfile layer so two
+# builds at the same wall-clock second from different time
+# zones still produce identical ldflags.
+ARG VERSION=0.0.0-dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
 ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
+RUN go build -trimpath \
+    -ldflags="-s -w \
+      -X github.com/kennguy3n/zk-object-fabric/internal/version.Version=${VERSION} \
+      -X github.com/kennguy3n/zk-object-fabric/internal/version.GitCommit=${GIT_COMMIT} \
+      -X github.com/kennguy3n/zk-object-fabric/internal/version.BuildDate=${BUILD_DATE}" \
+    -o /out/gateway ./cmd/gateway
 
 # ---------------------------------------------------------------
 # Stage 2 — Frontend build

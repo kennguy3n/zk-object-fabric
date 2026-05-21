@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -41,6 +42,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
 	"github.com/kennguy3n/zk-object-fabric/internal/metrics"
 	"github.com/kennguy3n/zk-object-fabric/internal/tracing"
+	"github.com/kennguy3n/zk-object-fabric/internal/version"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	cipostgres "github.com/kennguy3n/zk-object-fabric/metadata/content_index/postgres"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
@@ -184,6 +186,16 @@ func main() {
 		}
 		mux.Handle(path, metricsRegistry.Handler())
 	}
+	// /internal/version surfaces the ldflags-stamped build
+	// metadata so an orchestrator can match a running pod to a
+	// git SHA without shelling into the container. The handler
+	// has no auth requirement on the same rationale as
+	// /internal/metrics: operators are expected to keep the
+	// /internal/* prefix behind their cluster ingress and not
+	// expose it to tenants.
+	mux.Handle(version.Path, version.Handler())
+	log.Printf("gateway: build version=%s commit=%s built=%s go=%s/%s",
+		version.Version, version.GitCommit, version.BuildDate, runtime.GOOS, runtime.GOARCH)
 	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB)
 	s3compat.New(s3compat.Config{
 		Manifests:      store,
