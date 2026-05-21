@@ -9,8 +9,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/zeebo/blake3"
-
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
@@ -170,54 +168,127 @@ func TestRepair_NoopWhenAlreadyOnPrimary(t *testing.T) {
 	}
 }
 
-func TestVerifyPiece_AllHashForms(t *testing.T) {
-	payload := []byte("zk-piece-bytes")
+// Hash-form coverage for the shared verifier lives in
+// metadata/pieceintegrity/integrity_test.go. The repair tests
+// above exercise the integration path — Repair() refusing to
+// hand back tampered bytes — via TestRepair_RejectsHashMismatch.
 
-	t.Run("blake3 prefix matches body", func(t *testing.T) {
-		// Reproduce the exact hash the gateway stamps onto Piece.Hash
-		// in api/s3compat/handler.go's PUT path. The verifier MUST
-		// recognise this format — finding from Devin Review: before
-		// this fix, verifyPiece always returned mismatch because it
-		// only knew about SHA-256.
-		h := blake3Sum(payload)
-		piece := metadata.Piece{PieceID: "p1", Hash: "blake3:" + h}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(blake3 prefix): %v", err)
-		}
-	})
-
-	t.Run("blake3 prefix rejects tampered body", func(t *testing.T) {
-		h := blake3Sum([]byte("expected"))
-		piece := metadata.Piece{PieceID: "p1", Hash: "blake3:" + h}
-		if err := verifyPiece([]byte("tampered"), piece); err == nil {
-			t.Fatal("verifyPiece(blake3 prefix, tampered): want error, got nil")
-		}
-	})
-
-	t.Run("legacy raw sha256 hex matches body", func(t *testing.T) {
-		piece := metadata.Piece{PieceID: "p1", Hash: hashOf(payload)}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(legacy sha256): %v", err)
-		}
-	})
-
-	t.Run("legacy quoted etag strips quotes", func(t *testing.T) {
-		piece := metadata.Piece{PieceID: "p1", Hash: "\"" + hashOf(payload) + "\""}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(legacy quoted): %v", err)
-		}
-	})
-
-	t.Run("empty hash skips verification", func(t *testing.T) {
-		piece := metadata.Piece{PieceID: "p1", Hash: ""}
-		if err := verifyPiece(payload, piece); err != nil {
-			t.Fatalf("verifyPiece(empty hash): %v", err)
-		}
-	})
+type integritySinkRecorder struct {
+	failures     map[string]int
+	unrecognised map[string]int
 }
 
-func blake3Sum(b []byte) string {
-	h := blake3.New()
-	_, _ = h.Write(b)
-	return hex.EncodeToString(h.Sum(nil))
+func (s *integritySinkRecorder) Inc(backend string) {
+	if s.failures == nil {
+		s.failures = map[string]int{}
+	}
+	s.failures[backend]++
+}
+
+func (s *integritySinkRecorder) IncUnrecognized(backend string) {
+	if s.unrecognised == nil {
+		s.unrecognised = map[string]int{}
+	}
+	s.unrecognised[backend]++
+}
+
+// TestRepair_UnrecognizedHashFiresObservabilitySink covers the
+// observability hook added for the cache-miss + repair path. A
+// legacy manifest with an opaque-ETag Hash should: (1) still
+// repair (no proof the bytes are wrong); (2) report the
+// unrecognised-format event to the wired sink so the
+// zkof_integrity_claim_unrecognized_total Prometheus counter
+// observes the same event the cache-miss GET path observes.
+// Without the sink hook, the metric would undercount because
+// fetchPiece treats repair-supplied bodies as pre-verified.
+func TestRepair_UnrecognizedHashFiresObservabilitySink(t *testing.T) {
+	ctx := context.Background()
+	old := newMem("wasabi")
+	newP := newMem("ceph")
+	payload := []byte("zk-piece-bytes")
+	old.store["piece-1"] = payload
+	registry := map[string]providers.StorageProvider{"wasabi": old, "ceph": newP}
+
+	store := memory.New()
+	key := manifest_store.ManifestKey{TenantID: "t", Bucket: "b", ObjectKeyHash: "h", VersionID: "v"}
+	manifest := &metadata.ObjectManifest{
+		TenantID:      "t",
+		Bucket:        "b",
+		ObjectKeyHash: "h",
+		VersionID:     "v",
+		ObjectSize:    int64(len(payload)),
+		ChunkSize:     int64(len(payload)),
+		Pieces: []metadata.Piece{{
+			PieceID: "piece-1",
+			Hash:    "d41d8cd98f00b204e9800998ecf8427e",
+			Backend: "wasabi",
+			Locator: "wasabi://piece-1",
+			State:   "active",
+		}},
+		MigrationState: metadata.MigrationState{Generation: 2, PrimaryBackend: "ceph"},
+	}
+	if err := store.Put(ctx, key, manifest); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	sink := &integritySinkRecorder{}
+	rr := New(registry, store)
+	rr.IntegrityFailures = sink
+
+	res, err := rr.Repair(ctx, key, manifest, 0)
+	if err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	if string(res.Body) != string(payload) {
+		t.Fatalf("Body = %q, want %q", res.Body, payload)
+	}
+	if got := sink.unrecognised["wasabi"]; got != 1 {
+		t.Fatalf("unrecognised counter for wasabi = %d, want 1", got)
+	}
+	if got := sink.failures["wasabi"]; got != 0 {
+		t.Fatalf("failure counter for wasabi = %d, want 0 (unrecognised is not a mismatch)", got)
+	}
+}
+
+// TestRepair_HashMismatchFiresFailureSink confirms the symmetric
+// case: a real content mismatch refuses the repair AND fires the
+// per-backend failure counter, so operators see the bit-rot
+// signal even when the repair path catches it first.
+func TestRepair_HashMismatchFiresFailureSink(t *testing.T) {
+	ctx := context.Background()
+	old := newMem("wasabi")
+	newP := newMem("ceph")
+	old.store["piece-1"] = []byte("tampered")
+	registry := map[string]providers.StorageProvider{"wasabi": old, "ceph": newP}
+	store := memory.New()
+	key := manifest_store.ManifestKey{TenantID: "t", Bucket: "b", ObjectKeyHash: "h", VersionID: "v"}
+	manifest := &metadata.ObjectManifest{
+		TenantID:      "t",
+		Bucket:        "b",
+		ObjectKeyHash: "h",
+		VersionID:     "v",
+		ObjectSize:    5,
+		ChunkSize:     5,
+		Pieces: []metadata.Piece{{
+			PieceID: "piece-1",
+			Hash:    hashOf([]byte("hello")),
+			Backend: "wasabi",
+		}},
+		MigrationState: metadata.MigrationState{Generation: 2, PrimaryBackend: "ceph"},
+	}
+	_ = store.Put(ctx, key, manifest)
+
+	sink := &integritySinkRecorder{}
+	rr := New(registry, store)
+	rr.IntegrityFailures = sink
+
+	if _, err := rr.Repair(ctx, key, manifest, 0); err == nil {
+		t.Fatal("Repair: want hash mismatch error, got nil")
+	}
+	if got := sink.failures["wasabi"]; got != 1 {
+		t.Fatalf("failure counter for wasabi = %d, want 1", got)
+	}
+	if got := sink.unrecognised["wasabi"]; got != 0 {
+		t.Fatalf("unrecognised counter for wasabi = %d, want 0", got)
+	}
 }

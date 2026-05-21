@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 	"github.com/zeebo/blake3"
@@ -85,6 +87,35 @@ type PlacementEngine interface {
 // disables metering (used in tests).
 type BillingSink interface {
 	Emit(event billing.UsageEvent)
+}
+
+// IntegrityFailureSink receives observability events from the
+// piece-integrity verifier. cmd/gateway wires this to
+// internal/metrics so operators can alert on either channel
+// without api/s3compat importing internal/metrics directly.
+//
+// Two channels — semantically distinct — both fire from
+// fetchPiece / getMultipart / getErasureCoded:
+//
+//   - Inc(backend) fires when the bytes the backend returned
+//     failed to match a recognised integrity claim. This is a
+//     hard-fail signal: the gateway has refused to serve the
+//     piece, returned 502 IntegrityCheckFailed, and is shouting
+//     for an operator. Any sustained non-zero rate here is a
+//     bit-rot / tampering / wrong-hash bug.
+//
+//   - IncUnrecognized(backend) fires when the manifest's hash is
+//     present but not in any recognised format (e.g. a legacy
+//     multipart / copy / dedup manifest still has the backend's
+//     opaque ETag in Hash). The bytes were served because we
+//     cannot prove anything about them, but the verifier wants
+//     operators to see the count so they can plan / drive a
+//     one-shot rewrite to populate ProviderETag + clear Hash.
+//     A steady non-zero rate here is a migration TODO, not an
+//     incident.
+type IntegrityFailureSink interface {
+	Inc(backend string)
+	IncUnrecognized(backend string)
 }
 
 // Config collects the dependencies Handler needs.
@@ -173,6 +204,15 @@ type Config struct {
 	// pre-flight check and audit trail. Both fields are optional;
 	// when nil the gateway behaves as it did before Phase 4.
 	Compliance ComplianceHooks
+
+	// IntegrityFailures, when non-nil, is invoked once per piece
+	// the handler observed with a mismatched content hash. The
+	// handler also logs the failure at ERROR level and refuses to
+	// cache or serve the bad bytes regardless of whether a sink
+	// is wired. Hooked from cmd/gateway/main.go to
+	// internal/metrics's IncIntegrityFailure so operators can
+	// alert on the rate. Optional.
+	IntegrityFailures IntegrityFailureSink
 
 	// Now, if set, returns the current time. Tests override it to
 	// make manifests deterministic.
@@ -582,6 +622,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 
 	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, effectiveRange, tenantID, bucket)
 	if err != nil {
+		if errors.Is(err, pieceintegrity.ErrIntegrityCheckFailed) {
+			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+				"backend returned a piece whose content hash did not match the manifest; refusing to serve",
+				r.URL.Path)
+			return
+		}
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
 		return
 	}
@@ -671,6 +717,30 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // back to the configured ReadRepair to fetch the piece from the
 // secondary backend, copy it to the new primary, and serve the
 // repaired body to the caller.
+//
+// Integrity verification: on a cache miss the handler re-hashes
+// the piece body and compares it against piece.Hash before
+// caching or serving. On a mismatch fetchPiece returns an error
+// wrapping pieceintegrity.ErrIntegrityCheckFailed so Get() can
+// map it to 502 IntegrityCheckFailed — the bad bytes are NEVER
+// cached and NEVER served. The handler also emits the
+// zkof_integrity_failure_total{backend="..."} counter and logs
+// the failure at ERROR level with piece id, backend, expected
+// hash, and computed hash so an on-call can correlate.
+//
+// Range requests on a cache miss fetch the full piece, verify
+// it, then slice the range out of the verified buffer. This
+// keeps the integrity guarantee end-to-end at the cost of
+// reading the whole piece on a range cache miss; the cost is
+// reclaimed on the next hit because the verified piece is also
+// promoted into the cache (subject to the same
+// MaxInMemoryObjectBytes ceiling as the cache-warming path).
+// When the piece exceeds the ceiling we cannot verify in place
+// without a streaming hasher — fall back to the legacy
+// range-forward behaviour, publish a promotion signal, and
+// surface a structured warning so operators can spot the
+// unverified path in their logs. Streaming verify is delivered
+// in the streaming-decryption PR.
 func (h *Handler) fetchPiece(
 	r *http.Request,
 	mkey manifest_store.ManifestKey,
@@ -688,95 +758,226 @@ func (h *Handler) fetchPiece(
 			return cached, true, nil
 		}
 	}
-	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
+
+	pieceSize := piece.SizeBytes
+	if pieceSize <= 0 {
+		pieceSize = objectSize
+	}
+
+	// Decide up front whether we will buffer + verify or stream
+	// raw. The cache-warming branch already wanted the full
+	// piece, and the integrity branch on a range cache miss
+	// likewise needs the whole piece so it can re-hash before
+	// slicing. Both paths converge on the same
+	// MaxInMemoryObjectBytes ceiling so a single very large GET
+	// cannot OOM the gateway.
+	wantFullPiece := byteRange == nil || (piece.Hash != "" && pieceSize <= MaxInMemoryObjectBytes)
+
+	fetchRange := byteRange
+	if wantFullPiece {
+		fetchRange = nil
+	}
+
+	// preVerified is set when the body we end up serving has
+	// already been integrity-checked upstream so we can skip the
+	// redundant BLAKE3 re-hash below. Today only the
+	// lazy_read_repair path satisfies this contract —
+	// tryReadRepair returns the flag explicitly (not inferred at
+	// the call site) so any future repair-path change that drops
+	// or weakens its internal Verify call must also update the
+	// returned flag, which would surface as a test failure rather
+	// than a silent regression to serving unverified bytes.
+	preVerified := false
+	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, fetchRange)
 	if err != nil {
-		repaired, repairErr := h.tryReadRepair(r, mkey, manifest, byteRange)
+		repaired, repairedVerified, repairErr := h.tryReadRepair(r, mkey, manifest, fetchRange)
 		if repairErr != nil || repaired == nil {
 			return nil, false, err
 		}
 		body = repaired
+		preVerified = repairedVerified
 	}
+
+	if !wantFullPiece {
+		// Range cache-miss path for pieces too large to buffer:
+		// fall back to the legacy stream-the-range behaviour. We
+		// cannot verify the slice against a full-piece hash
+		// without the streaming hasher (delivered in the
+		// streaming-decryption PR), so log a structured warning
+		// and proceed. Open-ended ranges (End == -1) resolve
+		// against the object size so the published ReadBytes is
+		// never negative.
+		if piece.Hash != "" {
+			log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=oversize_range size_bytes=%d ceiling=%d",
+				piece.PieceID, piece.Backend, pieceSize, MaxInMemoryObjectBytes)
+		}
+		if byteRange != nil {
+			end := byteRange.End
+			if end < 0 {
+				end = objectSize - 1
+			}
+			h.signalPromotion(piece, tenantID, end-byteRange.Start+1, objectSize)
+		}
+		return body, false, nil
+	}
+
 	if h.cfg.Cache != nil && byteRange == nil {
 		h.emit(tenantID, bucket, billing.CacheMisses, 1)
+	}
 
-		// Pieces above the in-memory ceiling skip inline warming
-		// to keep a single very large GET from buffering hundreds
-		// of MiB on the request goroutine. The async promotion
-		// worker decides whether to fetch the piece on its own
-		// schedule. piece.SizeBytes is populated for multipart
-		// and EC pieces; legacy single-piece manifests can fall
-		// back to ObjectSize, which equals the piece size for
-		// non-multipart, non-EC objects.
-		pieceSize := piece.SizeBytes
-		if pieceSize <= 0 {
-			pieceSize = objectSize
+	// Pieces above the in-memory ceiling skip buffer-and-verify to
+	// keep a single very large GET from OOMing the request
+	// goroutine. We fall back to streaming the raw body straight to
+	// the client (the pre-PR behaviour). This guard fires whether
+	// or not a hot cache is configured: the OOM risk is identical,
+	// and the cache only changes whether we also emit a promotion
+	// signal once the piece is back in budget. piece.SizeBytes is
+	// populated for multipart and EC pieces; legacy single-piece
+	// manifests fall back to ObjectSize, which equals the piece
+	// size for non-multipart, non-EC objects.
+	if pieceSize > MaxInMemoryObjectBytes {
+		if piece.Hash != "" {
+			log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=oversize_full_piece size_bytes=%d ceiling=%d",
+				piece.PieceID, piece.Backend, pieceSize, MaxInMemoryObjectBytes)
 		}
-		if pieceSize > MaxInMemoryObjectBytes {
+		if h.cfg.Cache != nil && byteRange == nil {
 			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
-			return body, false, nil
 		}
+		return body, false, nil
+	}
 
-		buf, rerr := io.ReadAll(body)
-		_ = body.Close()
-		if rerr != nil {
-			return nil, false, rerr
+	buf, rerr := io.ReadAll(body)
+	_ = body.Close()
+	if rerr != nil {
+		return nil, false, rerr
+	}
+
+	if !preVerified {
+		if verr := pieceintegrity.Verify(buf, piece); verr != nil {
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				// Legacy manifest with no recognised
+				// integrity claim. We cannot prove the bytes
+				// are wrong, so we serve them and surface the
+				// count for operators via the dedicated
+				// observability channel. A follow-up rewrite
+				// migration is expected to fix the manifests
+				// so this channel goes back to zero.
+				h.recordIntegrityUnrecognized(piece, verr)
+			} else {
+				h.recordIntegrityFailure(piece, verr)
+				return nil, false, verr
+			}
 		}
-		// Warm the cache inline so a concurrent request doesn't
-		// re-trigger the backend GET (or a redundant read-repair
-		// round-trip during migration). The promotion worker
-		// handles signals for pieces that were not cached here
-		// (e.g. range reads, oversize pieces) so we do not
-		// publish one from this path — doing so would cause a
-		// redundant origin fetch since the piece is already
-		// resident.
+	}
+
+	if h.cfg.Cache != nil {
+		// Warm the cache inline regardless of whether this is a
+		// full-piece or range request: when the integrity branch
+		// fetched the full piece (wantFullPiece == true above),
+		// the verified buffer is already in memory and the cache
+		// is keyed by piece, not by byte range. Caching it costs
+		// one memcpy and skips a backend round-trip on the next
+		// request — full OR range — for the same piece. The
+		// previous code gated this on byteRange == nil and then
+		// published a promotion signal in the range branch,
+		// which forced the async worker to re-fetch a piece we
+		// already had verified bytes for. Oversize pieces (the
+		// short-circuit above) and read-repair-supplied bodies
+		// (preVerified == true, body served raw) still flow
+		// through signalPromotion / the worker as before.
 		_ = h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,
 		})
-		return io.NopCloser(bytes.NewReader(buf)), false, nil
 	}
+
 	if byteRange != nil {
-		// Range reads skip the inline cache warm because the cache
-		// is keyed by piece, not by byte range. Publish a signal so
-		// the promotion worker can decide whether to fetch the
-		// whole piece asynchronously. Open-ended ranges (End == -1)
-		// resolve against the object size so the published
-		// ReadBytes is never negative.
+		// We fetched the full piece for the integrity check;
+		// slice it down to the requested range. The slice is
+		// bounded by the buffered length, not ObjectSize,
+		// because EC / multipart pieces may be smaller than the
+		// object as a whole. No signalPromotion here: the cache
+		// put above already warmed the full piece, so the async
+		// worker would only cause a redundant origin fetch.
 		end := byteRange.End
-		if end < 0 {
-			end = objectSize - 1
+		if end < 0 || end >= int64(len(buf)) {
+			end = int64(len(buf)) - 1
 		}
-		h.signalPromotion(piece, tenantID, end-byteRange.Start+1, objectSize)
+		if byteRange.Start < 0 || byteRange.Start > end+1 {
+			return nil, false, fmt.Errorf("s3compat: range %d-%d out of bounds for piece %s (%d bytes)", byteRange.Start, byteRange.End, piece.PieceID, len(buf))
+		}
+		sliced := buf[byteRange.Start : end+1]
+		return io.NopCloser(bytes.NewReader(sliced)), false, nil
 	}
-	return body, false, nil
+
+	return io.NopCloser(bytes.NewReader(buf)), false, nil
+}
+
+// recordIntegrityFailure emits the structured error log and
+// optional metric increment that an integrity-mismatched piece
+// triggers. Centralised so every read path (fetchPiece today,
+// the streaming-decrypt path in the follow-up PR) reports
+// failures consistently.
+func (h *Handler) recordIntegrityFailure(piece metadata.Piece, verr error) {
+	log.Printf("s3compat: ERROR integrity_check_failed: piece=%s backend=%s expected_hash=%q err=%v",
+		piece.PieceID, piece.Backend, piece.Hash, verr)
+	if h.cfg.IntegrityFailures != nil {
+		h.cfg.IntegrityFailures.Inc(piece.Backend)
+	}
+}
+
+// recordIntegrityUnrecognized emits the WARN-level log and the
+// dedicated observability counter for a manifest whose Hash is
+// non-empty but not in any recognised format. The handler still
+// serves the piece — there is no proof the bytes are wrong, only
+// that we cannot check them — but operators get a count of
+// unverifiable manifests so they can plan a one-shot rewrite
+// that populates ProviderETag and clears the legacy Hash field.
+func (h *Handler) recordIntegrityUnrecognized(piece metadata.Piece, verr error) {
+	log.Printf("s3compat: WARN integrity_claim_unrecognized: piece=%s backend=%s recorded_hash=%q detail=%v",
+		piece.PieceID, piece.Backend, piece.Hash, verr)
+	if h.cfg.IntegrityFailures != nil {
+		h.cfg.IntegrityFailures.IncUnrecognized(piece.Backend)
+	}
 }
 
 // tryReadRepair invokes the configured ReadRepair when the primary
 // backend fails to serve a piece and the manifest sits in a
-// migration-in-progress state (Generation > 1). It returns the
-// repaired piece body (wrapped in an io.ReadCloser, sliced to
-// byteRange when one was requested) or (nil, nil) when repair is
-// not applicable. A non-nil error indicates the repair attempt
-// itself failed; callers should fall through to the original
-// backend error in that case.
+// migration-in-progress state (Generation > 1). It returns:
+//
+//   - (body, true,  nil)   — repair succeeded; body has already
+//                            been integrity-verified by ReadRepair
+//                            and the caller MAY skip a second
+//                            pieceintegrity.Verify pass.
+//   - (nil,  false, nil)   — repair is not applicable (no repair
+//                            wired, manifest not in migration, or
+//                            no pieces). Caller falls through to
+//                            the original backend error.
+//   - (nil,  false, error) — repair attempt itself failed.
+//
+// The bool is part of the signature (not inferred at the call
+// site) so the "already verified" contract is structural: any
+// future change to ReadRepair.Repair that drops or weakens its
+// internal Verify call MUST also flip the returned flag, which a
+// reviewer will catch immediately.
 func (h *Handler) tryReadRepair(
 	r *http.Request,
 	mkey manifest_store.ManifestKey,
 	manifest *metadata.ObjectManifest,
 	byteRange *providers.ByteRange,
-) (io.ReadCloser, error) {
+) (io.ReadCloser, bool, error) {
 	if h.cfg.ReadRepair == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	if manifest.MigrationState.Generation <= 1 {
-		return nil, nil
+		return nil, false, nil
 	}
 	if len(manifest.Pieces) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	res, err := h.cfg.ReadRepair.Repair(r.Context(), mkey, manifest, 0)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	data := res.Body
 	if byteRange != nil {
@@ -785,11 +986,19 @@ func (h *Handler) tryReadRepair(
 			end = int64(len(data)) - 1
 		}
 		if byteRange.Start < 0 || byteRange.Start > end+1 {
-			return nil, fmt.Errorf("s3compat: repaired body slice out of range")
+			return nil, false, fmt.Errorf("s3compat: repaired body slice out of range")
 		}
 		data = data[byteRange.Start : end+1]
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	// ReadRepair.Repair calls pieceintegrity.Verify on the source
+	// body before returning (lazy_read_repair/repair.go ~line 112).
+	// Slicing a byte range below does not change those bytes' hash
+	// relationship to the full-piece claim because we slice a
+	// verified buffer in memory — the caller's downstream
+	// fetchPiece guard already restricts byteRange-based reads to
+	// pieces inside MaxInMemoryObjectBytes, and the full piece is
+	// what got verified.
+	return io.NopCloser(bytes.NewReader(data)), true, nil
 }
 
 func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, readBytes, pieceSize int64) {
@@ -1230,9 +1439,20 @@ func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource s
 // Legacy manifests written before BLAKE3 hashing was added have
 // ProviderETag="" and Hash set to the provider ETag; this falls
 // through cleanly.
+//
+// Defence in depth: the fallback explicitly refuses to leak a
+// "blake3:<hex>" hash to the client. Today no write-path produces
+// a Piece with Hash set to a blake3-prefixed value and ProviderETag
+// empty, but if a future migration regresses that invariant we want
+// the client to see an empty ETag (which the S3 SDK treats as a
+// missing header) instead of a non-standard blake3 value that
+// would confuse strict ETag-matching clients.
 func pieceETag(p metadata.Piece) string {
 	if p.ProviderETag != "" {
 		return p.ProviderETag
+	}
+	if strings.HasPrefix(p.Hash, "blake3:") {
+		return ""
 	}
 	return p.Hash
 }

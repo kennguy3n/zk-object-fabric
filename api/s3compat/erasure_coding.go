@@ -17,16 +17,21 @@ package s3compat
 
 import (
 	"bytes"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+
+	"github.com/zeebo/blake3"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/encryption"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
@@ -132,16 +137,24 @@ func (h *Handler) putErasureCoded(
 		if shard.Kind == erasure_coding.ShardKindParity {
 			kind = metadata.ShardKindParity
 		}
+		// Hash is the BLAKE3 of the shard bytes — what the GET
+		// integrity check re-computes from the shard payload.
+		// ProviderETag holds the backend's opaque ETag for the
+		// upload (some backends return a multipart-style
+		// concatenated MD5 that has no relationship to the
+		// bytes; we cannot use it for verification).
+		shardHash := blake3.Sum256(shard.Bytes)
 		pieces = append(pieces, metadata.Piece{
-			PieceID:     res.PieceID,
-			Hash:        res.ETag,
-			Backend:     backendName,
-			Locator:     res.Locator,
-			State:       "active",
-			SizeBytes:   int64(len(shard.Bytes)),
-			StripeIndex: shard.StripeIndex,
-			ShardIndex:  shard.ShardIndex,
-			ShardKind:   kind,
+			PieceID:      res.PieceID,
+			Hash:         "blake3:" + hex.EncodeToString(shardHash[:]),
+			ProviderETag: res.ETag,
+			Backend:      backendName,
+			Locator:      res.Locator,
+			State:        "active",
+			SizeBytes:    int64(len(shard.Bytes)),
+			StripeIndex:  shard.StripeIndex,
+			ShardIndex:   shard.ShardIndex,
+			ShardKind:    kind,
 		})
 	}
 
@@ -287,6 +300,43 @@ func (h *Handler) getErasureCoded(
 			writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
 			return
 		}
+
+		// Verify the shard bytes match the manifest's per-shard
+		// BLAKE3 hash before handing them to the EC decoder. A
+		// silent corruption that preserves the shard length
+		// would otherwise feed bad bytes into Reed-Solomon, and
+		// the decoder cannot tell tampered data from good data
+		// when it has enough shards to "reconstruct" without
+		// rebuilding from parity. Treat a content mismatch like a
+		// missing shard: count it as a loss, emit the per-backend
+		// metric so operators see the bit-rot signal even when
+		// parity recovers, and let the parity-tolerance gate
+		// below decide whether the stripe is still recoverable.
+		// An unrecognised hash format (legacy manifest with an
+		// opaque ETag in Hash) is reported on the dedicated
+		// observability channel; the shard's bytes are still fed
+		// to the decoder because we cannot prove they're wrong.
+		if verr := pieceintegrity.Verify(buf, p); verr != nil {
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				h.recordIntegrityUnrecognized(p, verr)
+			} else {
+				h.recordIntegrityFailure(p, verr)
+				losses[p.StripeIndex]++
+				shards = append(shards, erasure_coding.Shard{
+					StripeIndex: p.StripeIndex,
+					ShardIndex:  p.ShardIndex,
+					Kind:        shardKindFromManifest(p.ShardKind),
+				})
+				if losses[p.StripeIndex] > tolerance {
+					writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+						fmt.Sprintf("stripe %d exceeded parity tolerance after shard integrity failure: %v", p.StripeIndex, verr),
+						r.URL.Path)
+					return
+				}
+				continue
+			}
+		}
+
 		shards = append(shards, erasure_coding.Shard{
 			StripeIndex: p.StripeIndex,
 			ShardIndex:  p.ShardIndex,
@@ -456,6 +506,29 @@ func (h *Handler) getMultipart(
 				fmt.Sprintf("part %d piece %q: read: %v", p.PartNumber, p.PieceID, rerr),
 				r.URL.Path)
 			return
+		}
+
+		// Verify the per-part BLAKE3 hash before decryption /
+		// concatenation. UploadPart hashes the ciphertext as it
+		// streams to the backend (PR-2), so a mismatch here
+		// means the backend either lost or tampered with the
+		// part. Fail closed on a content mismatch: we have
+		// already read the part into memory but have not
+		// committed the response status line, so a 502 cleanly
+		// aborts the GET before any bytes reach the client. A
+		// legacy manifest with an unrecognised hash format gets
+		// the observability counter but still serves — there is
+		// no proof the bytes are wrong.
+		if verr := pieceintegrity.Verify(buf, p); verr != nil {
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				h.recordIntegrityUnrecognized(p, verr)
+			} else {
+				h.recordIntegrityFailure(p, verr)
+				writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+					fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, verr),
+					r.URL.Path)
+				return
+			}
 		}
 		bodies[i] = buf
 	}
