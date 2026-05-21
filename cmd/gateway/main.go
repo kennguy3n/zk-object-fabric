@@ -50,6 +50,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 	"github.com/kennguy3n/zk-object-fabric/internal/repair"
+	"github.com/kennguy3n/zk-object-fabric/migration"
 	"github.com/kennguy3n/zk-object-fabric/migration/background_rebalancer"
 	"github.com/kennguy3n/zk-object-fabric/migration/cross_cell"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
@@ -239,12 +240,23 @@ func main() {
 		WriteTimeout: cfg.Gateway.WriteTimeout.ToDuration(),
 	}
 
+	// fleetOrchestrator coordinates large multi-tenant
+	// migrations across many gateway nodes. Its JobStore is
+	// PgJobStore when a metadata DSN is configured (so two
+	// gateways serialise their claims through Postgres) and
+	// InMemoryJobStore otherwise (single-node / dev). The
+	// orchestrator surface is currently consumed only by the
+	// management console's /api/v1/migrations endpoints;
+	// future PRs add the enqueue and RunOnce-ticker wiring so
+	// pending jobs are actually drained by the rebalancer.
+	fleetOrchestrator := buildFleetOrchestrator(cfg, metadataDB)
+
 	// Console API: separate HTTP surface for the tenant console
 	// (react frontend in frontend/). It runs on its own listener
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, authHooks, billingSink, billingProvider)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -405,6 +417,119 @@ func startRebalancer(
 		}
 	}()
 	return done
+}
+
+// buildFleetOrchestrator constructs the FleetOrchestrator used
+// for distributed migration-job coordination. The JobStore is
+// PgJobStore-backed when a metadata DB is available so two
+// gateways sharing the same Postgres serialise their claims
+// through the migration_jobs table; otherwise an
+// InMemoryJobStore keeps single-node and dev deployments
+// working without a DB dependency.
+//
+// NodeID resolution: explicit cfg.Rebalancer.NodeID wins;
+// otherwise os.Hostname is used (the typical pod or VM
+// identifier). A last-resort fallback to "gateway-unknown" only
+// fires when Hostname errors, which is rare enough that we log
+// loudly so an operator can see it.
+//
+// The orchestrator's per-cell CellLimits are sourced from the
+// Rebalancer.Targets list — every target's destination cell
+// gets a default cap of 1 unless the operator overrides it
+// elsewhere. The cap is a global guarantee across the fleet
+// because ListActiveJobs is the source of truth.
+//
+// The returned orchestrator's RunOnce ticker is NOT started
+// here; PRs in this hardening series add the enqueue path
+// (and a dispatch loop) when the production scheduler is
+// finalised. For now the orchestrator exists so the
+// management console's /api/v1/migrations endpoints have a
+// real store to introspect.
+func buildFleetOrchestrator(cfg config.Config, metadataDB *sql.DB) *migration.FleetOrchestrator {
+	store := buildJobStore(metadataDB)
+	nodeID := resolveRebalancerNodeID(cfg.Rebalancer)
+	ttl := time.Duration(cfg.Rebalancer.ClaimTTL)
+	limits := make([]migration.CellLimits, 0, len(cfg.Rebalancer.Targets))
+	seen := map[string]bool{}
+	for _, t := range cfg.Rebalancer.Targets {
+		cell := t.PrimaryBackend
+		if cell == "" || seen[cell] {
+			continue
+		}
+		seen[cell] = true
+		// Default to 1 because the orchestrator's per-cell
+		// concurrency cap is the only thing preventing a hot
+		// dest from being overrun by the rebalancer. Operators
+		// who want higher fan-out can override the cap in a
+		// follow-up config field.
+		limits = append(limits, migration.CellLimits{CellID: cell, MaxConcurrentJobs: 1})
+	}
+	o, err := migration.NewFleetOrchestratorWithStore(migration.FleetOrchestratorConfig{
+		Store:    store,
+		NodeID:   nodeID,
+		Limits:   limits,
+		ClaimTTL: ttl,
+		Logger:   log.New(os.Stdout, "orchestrator ", log.LstdFlags),
+	})
+	if err != nil {
+		// Construction can only fail when Store or NodeID
+		// are missing; both are populated above. Fatal here
+		// rather than silently return nil so a regression
+		// surfaces at startup.
+		log.Fatalf("gateway: build fleet orchestrator: %v", err)
+	}
+	log.Printf("gateway: fleet orchestrator node_id=%s store=%s", nodeID, jobStoreLabel(store))
+	return o
+}
+
+// buildJobStore returns a Postgres-backed JobStore when the
+// metadata DB is configured, falling back to InMemoryJobStore
+// for single-node / dev deployments. The fall-back is logged
+// loudly because an in-memory store loses every claim on
+// gateway restart — fine for dev but not for any deployment
+// where the rebalancer is expected to make sustained progress.
+func buildJobStore(metadataDB *sql.DB) migration.JobStore {
+	if metadataDB == nil {
+		return migration.NewInMemoryJobStore(nil)
+	}
+	store, err := migration.NewPgJobStore(migration.PgConfig{DB: metadataDB})
+	if err != nil {
+		log.Printf("gateway: build PgJobStore: %v; falling back to in-memory", err)
+		return migration.NewInMemoryJobStore(nil)
+	}
+	return store
+}
+
+// jobStoreLabel returns a short type tag used in the startup
+// log line so operators can confirm which JobStore the gateway
+// resolved without reading the source.
+func jobStoreLabel(s migration.JobStore) string {
+	switch s.(type) {
+	case *migration.PgJobStore:
+		return "postgres"
+	case *migration.InMemoryJobStore:
+		return "in-memory"
+	default:
+		return "unknown"
+	}
+}
+
+// resolveRebalancerNodeID picks the identifier the JobStore
+// uses to attribute claim ownership. Explicit cfg wins;
+// otherwise os.Hostname is the usual container / pod name;
+// a fallback of "gateway-unknown" only fires when Hostname
+// errors (rare in practice but defended against because the
+// orchestrator constructor refuses an empty NodeID).
+func resolveRebalancerNodeID(cfg config.RebalancerConfig) string {
+	if cfg.NodeID != "" {
+		return cfg.NodeID
+	}
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		log.Printf("gateway: os.Hostname() failed (%v); falling back to gateway-unknown — set rebalancer.node_id explicitly", err)
+		return "gateway-unknown"
+	}
+	return host
 }
 
 // applyDBConnectionPool applies the gateway's RDS / Postgres
@@ -999,6 +1124,7 @@ func startConsoleAPI(
 	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
 	billingProvider billing.BillingProvider,
+	orchestrator *migration.FleetOrchestrator,
 ) *http.Server {
 	if cfg.Console.ListenAddr == "" {
 		return nil
@@ -1036,6 +1162,7 @@ func startConsoleAPI(
 		Cells:           cellStore,
 		CellProvisioner: cellProvisioner,
 		DedupPolicies:   console.NewMemoryDedupPolicyStore(),
+		Orchestrator:    orchestrator,
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)

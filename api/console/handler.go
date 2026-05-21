@@ -44,6 +44,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
+	"github.com/kennguy3n/zk-object-fabric/migration"
 )
 
 // TenantStore is the read surface the console needs to answer
@@ -259,6 +260,16 @@ type Config struct {
 	// /usage request does not specify start/end query parameters.
 	// Defaults to 30 days.
 	DefaultUsageWindow time.Duration
+
+	// Orchestrator is the FleetOrchestrator the management
+	// console introspects via GET /api/v1/migrations and
+	// /api/v1/migrations/{job_id}. When nil the migration
+	// routes return an empty list / 404 (matching the
+	// MigrationHandler's nil-Orchestrator branch). Production
+	// wires the orchestrator from cmd/gateway against a
+	// PgJobStore so the routes reflect the distributed
+	// coordination view of pending and running migrations.
+	Orchestrator *migration.FleetOrchestrator
 }
 
 // Handler routes console-API requests. Use New to construct, then
@@ -346,6 +357,16 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		h.sseHandler = sse
 	}
 	h.registerDedupRoutes(mux)
+	if h.cfg.Orchestrator != nil {
+		// MigrationHandler exposes GET /api/v1/migrations and
+		// /api/v1/migrations/{job_id} so operators can see the
+		// current fleet-migration queue. Nil-Orchestrator
+		// deployments (single-node, no metadata DB) skip the
+		// routes entirely; the handler also tolerates a nil
+		// pointer internally for tests but checking here keeps
+		// the route table small in the common case.
+		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator}).Register(mux)
+	}
 }
 
 // usageStreamWindowEffective returns UsageStreamWindow, falling back
