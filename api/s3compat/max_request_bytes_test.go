@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -185,6 +186,102 @@ func TestDispatch_MaxRequestBytes_StreamingPutRejectsMidStream(t *testing.T) {
 type lyingReader struct{ r *bytes.Reader }
 
 func (l *lyingReader) Read(p []byte) (int, error) { return l.r.Read(p) }
+
+// TestDispatch_MaxRequestBytes_DeleteWrapInstalled verifies the
+// per-request body cap is method-agnostic. The dispatch wrap is
+// applied to DELETE requests with a non-empty body even though
+// the current Delete handler does not read r.Body — defence in
+// depth for any future handler that starts consuming the body.
+//
+// Why a behavioural 413 assertion is NOT the right test here:
+// http.MaxBytesReader only delivers 413 when the wrapped reader
+// is actually Read(); since the current Delete handler returns
+// 204 without touching r.Body, the cap is inert at the response
+// layer. The test instead verifies the structural invariant —
+// after dispatch's wrap step, r.Body has been replaced with a
+// MaxBytesReader (different from the body the test installed) —
+// which is the load-bearing property that future body-reading
+// DELETE handlers depend on.
+func TestDispatch_MaxRequestBytes_DeleteWrapInstalled(t *testing.T) {
+	const limit int64 = 1024
+	body := bytes.Repeat([]byte("A"), 4*1024)
+
+	fake := newFakeProvider("test")
+	store := memory.New()
+	h := New(Config{
+		Manifests:       store,
+		Providers:       map[string]providers.StorageProvider{"test": fake},
+		Placement:       fixedPlacement{backend: "test"},
+		MaxRequestBytes: limit,
+	})
+
+	// Install a known-identity body so we can verify the wrap
+	// replaced it. capRequestBody (factored out of dispatch for
+	// testability) is the structural seam where the wrap is
+	// applied; running it directly avoids the false-promise
+	// issue of asserting 413 against a handler that doesn't
+	// read r.Body.
+	originalBody := bytes.NewReader(body)
+	req := httptest.NewRequest(http.MethodDelete, "/bucket/key", io.NopCloser(originalBody))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+
+	wrapped := h.capRequestBody(rec, req)
+	if !wrapped {
+		t.Fatal("capRequestBody returned false on DELETE with non-empty body; the wrap was skipped")
+	}
+	// After the wrap, reading from r.Body past the limit must
+	// surface the cap as an error — the proof that the wrap is
+	// MaxBytesReader, not the original body. We discard up to
+	// limit+1 bytes; the read past the limit must fail.
+	n, err := io.Copy(io.Discard, io.LimitReader(req.Body, limit+1))
+	if err == nil {
+		t.Fatalf("DELETE body read past the cap returned nil error; copied %d bytes — wrap was not installed", n)
+	}
+	var mb *http.MaxBytesError
+	if !errors.As(err, &mb) {
+		t.Fatalf("DELETE body read error was %T %v; want *http.MaxBytesError (proves the wrap is MaxBytesReader, not the raw body)", err, err)
+	}
+	if mb.Limit != limit {
+		t.Errorf("MaxBytesError.Limit = %d, want %d", mb.Limit, limit)
+	}
+}
+
+// TestDispatch_MaxRequestBytes_DeleteWithoutBodyStillWorks
+// confirms the method-agnostic wrap does not regress the
+// no-body DELETE path (the only legitimate S3 DeleteObject
+// shape). net/http leaves r.Body == http.NoBody on a DELETE
+// without a body, and the outer dispatch guard
+// (r.Body != http.NoBody) short-circuits the wrap entirely.
+func TestDispatch_MaxRequestBytes_DeleteWithoutBodyStillWorks(t *testing.T) {
+	const limit int64 = 16
+	fake := newFakeProvider("test")
+	store := memory.New()
+	h := New(Config{
+		Manifests:       store,
+		Providers:       map[string]providers.StorageProvider{"test": fake},
+		Placement:       fixedPlacement{backend: "test"},
+		MaxRequestBytes: limit,
+	})
+
+	// Seed an object so DELETE has something to remove.
+	putReq := httptest.NewRequest(http.MethodPut, "/bucket/k", bytes.NewReader([]byte("ok")))
+	putReq.ContentLength = 2
+	putRec := httptest.NewRecorder()
+	h.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("setup PUT = %d, want 200; body=%s", putRec.Code, putRec.Body)
+	}
+
+	// DELETE with no body (the standard S3 DeleteObject shape)
+	// must not surface 413 even with a tiny cap.
+	delReq := httptest.NewRequest(http.MethodDelete, "/bucket/k", nil)
+	delRec := httptest.NewRecorder()
+	h.ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusNoContent && delRec.Code != http.StatusOK {
+		t.Fatalf("DELETE without body = %d, want 204 or 200; body=%s", delRec.Code, delRec.Body)
+	}
+}
 
 // TestDispatch_MaxRequestBytes_DefaultDoesNotBreakRoundtrip is a
 // regression test against the cap accidentally tripping on a

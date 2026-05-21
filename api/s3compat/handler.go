@@ -330,25 +330,56 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/", h.dispatch)
 }
 
+// capRequestBody installs the MaxRequestBytes cap on r.Body when
+// the request carries a body and the handler has been configured
+// with a non-zero cap. Returns true when the wrap was applied,
+// false when it was skipped (cap disabled, or r.Body is nil /
+// http.NoBody).
+//
+// The wrap is method-agnostic: GET and HEAD never have a body
+// (net/http guarantees r.Body == http.NoBody for them, which the
+// guard below filters out), so the wrap only fires on methods
+// that actually carry bytes. DELETE in well-behaved S3 clients
+// carries no body, but a misbehaving client that sends one will
+// have its body capped instead of silently consumed by an
+// unsuspecting future handler — defence in depth.
+//
+// Method-specific allowlists were tempting (just PUT/POST,
+// because those are the only methods that legitimately read the
+// body today) but they create a future trap: any handler that
+// starts consuming the body on a method outside the allowlist
+// would silently bypass the cap and reintroduce the
+// OOM/truncation hazard MaxRequestBytes exists to prevent.
+// Wrapping every non-empty body means a future contributor
+// adding (say) a DELETE-with-XML extension does not have to
+// remember to update this dispatch.
+//
+// CopyObject is a PUT with `x-amz-copy-source` set and no client
+// body — the source bytes are streamed from the source backend.
+// The wrap is a no-op for those requests because r.Body is
+// http.NoBody when no Content-Length / Transfer-Encoding was
+// sent.
+//
+// The function is factored out of dispatch so tests can verify
+// the wrap is installed without going through the full handler
+// chain (which would require a body-reading sub-handler to
+// surface the 413 — the current Delete handler does not read
+// r.Body, so the cap is structurally present but inert at the
+// response layer for DELETE today).
+func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
+	if h.cfg.MaxRequestBytes <= 0 {
+		return false
+	}
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxRequestBytes)
+	return true
+}
+
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	// MaxRequestBytes enforces a per-request body cap on every
-	// path that consumes r.Body. Wrap it once here so the cap
-	// propagates through TeeReader, io.ReadAll, and the
-	// encryption pipeline regardless of which sub-handler picks
-	// up the request. The check is body-only — HEAD and GET
-	// have no Body to wrap and net/http leaves r.Body as
-	// http.NoBody on those methods anyway. CopyObject also has
-	// no client body (the source bytes are read from the source
-	// backend), but wrapping is still cheap and a buggy client
-	// that sends a body on Copy will surface 413 instead of
-	// silently ignoring it.
-	if h.cfg.MaxRequestBytes > 0 && r.Body != nil && r.Body != http.NoBody {
-		switch r.Method {
-		case http.MethodPut, http.MethodPost:
-			r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxRequestBytes)
-		}
-	}
+	h.capRequestBody(w, r)
 	switch r.Method {
 	case http.MethodPut:
 		if q.Get("uploadId") != "" && q.Get("partNumber") != "" {
