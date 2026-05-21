@@ -347,3 +347,26 @@ func TestTLSConfig_JSONRoundTrip(t *testing.T) {
 		t.Fatalf("Health.TLS = %+v", cfg.Health.TLS)
 	}
 }
+
+// TestDefault_ControlPlanePoolDefaults pins the connection-pool
+// ceilings Default() applies to ControlPlaneConfig. Operators who
+// run with config.control_plane unset (e.g. dev / staging without
+// a bespoke config file) inherit these values; the test guards
+// against an accidental refactor that drops one of them and falls
+// back to Go's stdlib defaults (unlimited MaxOpenConns,
+// MaxIdleConns=2, no lifetime) which would silently saturate RDS.
+func TestDefault_ControlPlanePoolDefaults(t *testing.T) {
+	d := Default().ControlPlane
+	if d.MaxOpenConns != 32 {
+		t.Errorf("MaxOpenConns = %d, want 32", d.MaxOpenConns)
+	}
+	if d.MaxIdleConns != 8 {
+		t.Errorf("MaxIdleConns = %d, want 8", d.MaxIdleConns)
+	}
+	if got := d.ConnMaxLifetime.ToDuration(); got != 4*time.Minute {
+		t.Errorf("ConnMaxLifetime = %v, want 4m", got)
+	}
+	if got := d.ConnMaxIdleTime.ToDuration(); got != 2*time.Minute {
+		t.Errorf("ConnMaxIdleTime = %v, want 2m", got)
+	}
+}

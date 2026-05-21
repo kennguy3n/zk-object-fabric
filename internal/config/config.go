@@ -771,6 +771,26 @@ func Default() Config {
 			// block storage is used as the L0 / L1 hot-object cache.
 			CachePath: "",
 		},
+		// ControlPlane defaults intentionally pin the metadata
+		// connection-pool ceilings to safe values rather than
+		// inheriting Go's stdlib defaults (unlimited MaxOpenConns,
+		// MaxIdleConns=2, no connection-lifetime cap). The stdlib
+		// defaults will quickly saturate RDS or trip RDS Proxy's
+		// idle-connection timeout in production. These numbers
+		// match the comment block on ControlPlaneConfig: 32 open
+		// connections is a comfortable per-gateway-node ceiling
+		// against a t3.medium / db.t3.medium RDS class, and a
+		// 4-minute lifetime stays well under RDS Proxy's
+		// 10-minute idle timeout so the pool naturally rotates
+		// connections before the proxy retires them. Operators
+		// override any of these via config.control_plane.* when
+		// their RDS class can support a larger pool.
+		ControlPlane: ControlPlaneConfig{
+			MaxOpenConns:    32,
+			MaxIdleConns:    8,
+			ConnMaxLifetime: Duration(4 * time.Minute),
+			ConnMaxIdleTime: Duration(2 * time.Minute),
+		},
 		Providers: ProvidersConfig{
 			LocalFSDev: LocalFSDevConfig{
 				RootPath: "/var/lib/zk-object-fabric/local_fs_dev",

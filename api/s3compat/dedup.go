@@ -347,7 +347,7 @@ func (h *Handler) putDeduped(
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
+		writeBodyReadError(w, r, err)
 		return
 	}
 
