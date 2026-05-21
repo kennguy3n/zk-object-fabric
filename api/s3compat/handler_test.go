@@ -1012,3 +1012,213 @@ func TestGet_TamperedPiece_FailsClosed(t *testing.T) {
 		t.Fatalf("integrity hits after tampered GET = %d, want 1", hits)
 	}
 }
+
+// TestGet_TamperedPiece_FailsClosed_NoCache exercises the OOM-guard
+// fix in fetchPiece: verification must still run (and fail closed)
+// when the handler is configured without a hot cache. Before the
+// fix, the oversize guard AND the verification block were both
+// gated behind `cfg.Cache != nil`, so a no-cache deployment skipped
+// verification entirely. This test pins the no-cache + in-budget
+// branch.
+func TestGet_TamperedPiece_FailsClosed_NoCache(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+		// Cache deliberately nil — this is the path the OOM fix
+		// also rescued from unbounded buffering.
+	})
+
+	body := []byte("integrity matters when there is no cache to hide behind")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/no-cache.txt", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	fake.mu.Lock()
+	for k := range fake.pieces {
+		fake.pieces[k] = []byte("tampered no-cache bytes")
+	}
+	fake.mu.Unlock()
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/no-cache.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("tampered no-cache GET status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "IntegrityCheckFailed") {
+		t.Fatalf("tampered no-cache GET body missing IntegrityCheckFailed: %q", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "tampered no-cache bytes") {
+		t.Fatalf("tampered no-cache GET leaked backend bytes: %q", rec.Body.String())
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered no-cache GET = %d, want 1", hits)
+	}
+}
+
+// TestGetMultipart_TamperedPart_FailsClosed verifies the multipart
+// GET path now re-hashes every part body before assembling the
+// response. Before this fix the multipart path relied on an
+// aggregate object-size check which a same-size tamper could slip
+// past silently.
+func TestGetMultipart_TamperedPart_FailsClosed(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		Multipart:         mpStore,
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	// Create + upload two parts + complete.
+	req := httptest.NewRequest(http.MethodPost, "/bucket/mp-tamper?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("aaaa"), 256),
+		bytes.Repeat([]byte("bbbb"), 256),
+	}
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, body := range parts {
+		partNum := i + 1
+		url := fmt.Sprintf("/bucket/mp-tamper?uploadId=%s&partNumber=%d", initRes.UploadID, partNum)
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		rec := httptest.NewRecorder()
+		h.UploadPart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, want 200; body=%s", partNum, rec.Code, rec.Body)
+		}
+		etag := strings.Trim(rec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
+	}
+	completeXML, err := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	if err != nil {
+		t.Fatalf("marshal complete: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/bucket/mp-tamper?uploadId=%s", initRes.UploadID), bytes.NewReader(completeXML))
+	rec = httptest.NewRecorder()
+	h.CompleteMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Tamper one part on the backend while preserving the exact
+	// byte length (this is the case the aggregate object-size
+	// check could not catch).
+	fake.mu.Lock()
+	var pickedID string
+	for id := range fake.pieces {
+		pickedID = id
+		break
+	}
+	if pickedID == "" {
+		fake.mu.Unlock()
+		t.Fatal("no piece to tamper")
+	}
+	if got, want := len(fake.pieces[pickedID]), len(parts[0]); got != want {
+		fake.mu.Unlock()
+		t.Fatalf("picked piece size = %d, want %d", got, want)
+	}
+	fake.pieces[pickedID] = bytes.Repeat([]byte("zzzz"), 256)
+	fake.mu.Unlock()
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/mp-tamper", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("tampered multipart GET status = %d, want 502; body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "IntegrityCheckFailed") {
+		t.Fatalf("tampered multipart GET body missing IntegrityCheckFailed: %q", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "zzzz") {
+		t.Fatalf("tampered multipart GET leaked backend bytes: %q", rec.Body.String())
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered multipart GET = %d, want 1", hits)
+	}
+}
+
+// TestGetErasureCoded_TamperedShard_FailsClosed verifies an EC GET
+// treats a hash-mismatched shard as lost. With a 6+2 profile and a
+// single tampered shard the parity should still reconstruct, so the
+// GET succeeds, but the integrity metric must fire so operators see
+// the bit-rot signal even when parity hides it.
+func TestGetErasureCoded_TamperedShard_FailsClosed(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding:     erasure_coding.DefaultRegistry(),
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-tamper!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-tamper", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Tamper exactly one shard (within parity tolerance for
+	// 6+2). The decode should still succeed by reconstructing
+	// from the remaining 7 shards. Pick the first piece in the
+	// fake backend; its length is preserved so the only thing
+	// that flags it is the hash check.
+	fake.mu.Lock()
+	var pickedID string
+	for id := range fake.pieces {
+		pickedID = id
+		break
+	}
+	if pickedID == "" {
+		fake.mu.Unlock()
+		t.Fatal("no piece to tamper")
+	}
+	shardLen := len(fake.pieces[pickedID])
+	fake.pieces[pickedID] = bytes.Repeat([]byte{0xff}, shardLen)
+	fake.mu.Unlock()
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/ec-tamper", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC GET with 1 tampered shard status = %d, want 200 (parity recovers); body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, body) {
+		t.Fatalf("EC GET with 1 tampered shard returned wrong bytes: len(got)=%d, len(want)=%d", len(got), len(body))
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered EC GET = %d, want 1 (single shard mismatch)", hits)
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
@@ -298,6 +299,35 @@ func (h *Handler) getErasureCoded(
 			writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
 			return
 		}
+
+		// Verify the shard bytes match the manifest's per-shard
+		// BLAKE3 hash before handing them to the EC decoder. A
+		// silent corruption that preserves the shard length
+		// would otherwise feed bad bytes into Reed-Solomon, and
+		// the decoder cannot tell tampered data from good data
+		// when it has enough shards to "reconstruct" without
+		// rebuilding from parity. Treat a hash mismatch like a
+		// missing shard: count it as a loss, emit the per-backend
+		// metric so operators see the bit-rot signal even when
+		// parity recovers, and let the parity-tolerance gate
+		// below decide whether the stripe is still recoverable.
+		if verr := pieceintegrity.Verify(buf, p); verr != nil {
+			h.recordIntegrityFailure(p, verr)
+			losses[p.StripeIndex]++
+			shards = append(shards, erasure_coding.Shard{
+				StripeIndex: p.StripeIndex,
+				ShardIndex:  p.ShardIndex,
+				Kind:        shardKindFromManifest(p.ShardKind),
+			})
+			if losses[p.StripeIndex] > tolerance {
+				writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+					fmt.Sprintf("stripe %d exceeded parity tolerance after shard integrity failure: %v", p.StripeIndex, verr),
+					r.URL.Path)
+				return
+			}
+			continue
+		}
+
 		shards = append(shards, erasure_coding.Shard{
 			StripeIndex: p.StripeIndex,
 			ShardIndex:  p.ShardIndex,
@@ -465,6 +495,22 @@ func (h *Handler) getMultipart(
 		if rerr != nil {
 			writeError(w, http.StatusBadGateway, "BackendGetFailed",
 				fmt.Sprintf("part %d piece %q: read: %v", p.PartNumber, p.PieceID, rerr),
+				r.URL.Path)
+			return
+		}
+
+		// Verify the per-part BLAKE3 hash before decryption /
+		// concatenation. UploadPart hashes the ciphertext as it
+		// streams to the backend (PR-2), so a mismatch here
+		// means the backend either lost or tampered with the
+		// part. Fail closed: we have already read the part into
+		// memory but have not committed the response status
+		// line, so a 502 cleanly aborts the GET before any
+		// bytes reach the client.
+		if verr := pieceintegrity.Verify(buf, p); verr != nil {
+			h.recordIntegrityFailure(p, verr)
+			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+				fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, verr),
 				r.URL.Path)
 			return
 		}

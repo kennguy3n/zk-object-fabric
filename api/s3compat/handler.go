@@ -796,23 +796,27 @@ func (h *Handler) fetchPiece(
 
 	if h.cfg.Cache != nil && byteRange == nil {
 		h.emit(tenantID, bucket, billing.CacheMisses, 1)
+	}
 
-		// Pieces above the in-memory ceiling skip inline warming
-		// to keep a single very large GET from buffering hundreds
-		// of MiB on the request goroutine. The async promotion
-		// worker decides whether to fetch the piece on its own
-		// schedule. piece.SizeBytes is populated for multipart
-		// and EC pieces; legacy single-piece manifests can fall
-		// back to ObjectSize, which equals the piece size for
-		// non-multipart, non-EC objects.
-		if pieceSize > MaxInMemoryObjectBytes {
-			if piece.Hash != "" {
-				log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=oversize_full_piece size_bytes=%d ceiling=%d",
-					piece.PieceID, piece.Backend, pieceSize, MaxInMemoryObjectBytes)
-			}
-			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
-			return body, false, nil
+	// Pieces above the in-memory ceiling skip buffer-and-verify to
+	// keep a single very large GET from OOMing the request
+	// goroutine. We fall back to streaming the raw body straight to
+	// the client (the pre-PR behaviour). This guard fires whether
+	// or not a hot cache is configured: the OOM risk is identical,
+	// and the cache only changes whether we also emit a promotion
+	// signal once the piece is back in budget. piece.SizeBytes is
+	// populated for multipart and EC pieces; legacy single-piece
+	// manifests fall back to ObjectSize, which equals the piece
+	// size for non-multipart, non-EC objects.
+	if pieceSize > MaxInMemoryObjectBytes {
+		if piece.Hash != "" {
+			log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=oversize_full_piece size_bytes=%d ceiling=%d",
+				piece.PieceID, piece.Backend, pieceSize, MaxInMemoryObjectBytes)
 		}
+		if h.cfg.Cache != nil && byteRange == nil {
+			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
+		}
+		return body, false, nil
 	}
 
 	buf, rerr := io.ReadAll(body)
@@ -1355,9 +1359,20 @@ func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource s
 // Legacy manifests written before BLAKE3 hashing was added have
 // ProviderETag="" and Hash set to the provider ETag; this falls
 // through cleanly.
+//
+// Defence in depth: the fallback explicitly refuses to leak a
+// "blake3:<hex>" hash to the client. Today no write-path produces
+// a Piece with Hash set to a blake3-prefixed value and ProviderETag
+// empty, but if a future migration regresses that invariant we want
+// the client to see an empty ETag (which the S3 SDK treats as a
+// missing header) instead of a non-standard blake3 value that
+// would confuse strict ETag-matching clients.
 func pieceETag(p metadata.Piece) string {
 	if p.ProviderETag != "" {
 		return p.ProviderETag
+	}
+	if strings.HasPrefix(p.Hash, "blake3:") {
+		return ""
 	}
 	return p.Hash
 }
