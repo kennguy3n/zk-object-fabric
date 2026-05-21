@@ -54,6 +54,40 @@ type PlacementSpec struct {
 	// (e.g. "linode-sg"). It is advisory; the placement engine may
 	// override it for fair-use or cost reasons.
 	CacheLocation string `json:"cache_location,omitempty" yaml:"cache_location,omitempty"`
+	// WorkloadProfile is an optional hint about the read/write
+	// shape of the tenant's traffic. The placement engine uses it
+	// to weight per-GB egress cost against per-TB storage cost
+	// when ranking providers; absent it, the engine falls back to
+	// the legacy egress weight of 1000, which approximates a
+	// "read-mostly small-object" workload. See WorkloadProfile
+	// for the meaning of the individual fields.
+	WorkloadProfile *WorkloadProfile `json:"workload_profile,omitempty" yaml:"workload_profile,omitempty"`
+}
+
+// WorkloadProfile describes the read/write shape of a tenant's
+// expected traffic. It is consumed by the placement engine's cost
+// model so write-heavy or cold-archive workloads do not get billed
+// against an egress weight that only makes sense for read-heavy
+// CDN-fronted workloads. All fields are optional; a zero or
+// negative value falls back to the legacy egress weight.
+//
+// Sourcing: ops set this either by hand on the Policy (informed by
+// the tenant's contract) or by promoting the tenant's billing
+// rollup (e.g. last-30-day get-vs-put ratio) into the policy via
+// the control plane. The engine itself does not reach back into
+// billing — that integration lives upstream of this package.
+type WorkloadProfile struct {
+	// ReadWriteRatio is the expected GET-to-PUT request ratio.
+	// 1.0 means each object is read once per write; 10.0 means
+	// objects are read ten times per write (read-heavy);
+	// values below 1.0 indicate write-heavy workloads like
+	// audit-log ingest where egress cost matters less.
+	ReadWriteRatio float64 `json:"read_write_ratio,omitempty" yaml:"read_write_ratio,omitempty"`
+	// AvgObjectSizeMB is the expected average object size in MiB.
+	// It scales the per-object egress weight against the per-GB
+	// egress price so that small-object read-heavy and
+	// large-object cold-archive workloads are ranked correctly.
+	AvgObjectSizeMB float64 `json:"avg_object_size_mb,omitempty" yaml:"avg_object_size_mb,omitempty"`
 }
 
 // Validate performs structural and cross-field checks on the policy.
