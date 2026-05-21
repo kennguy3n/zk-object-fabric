@@ -5,13 +5,22 @@
 //
 // The orchestrator does NOT implement the rebalance loop itself
 // — that lives in migration/background_rebalancer. It only owns
-// the queueing, per-cell concurrency caps, and progress reporting
-// across many active migrations.
+// the queueing, per-cell concurrency caps, claim coordination
+// across gateway nodes, and progress reporting across many
+// active migrations.
+//
+// Distributed coordination: every claim/heartbeat/release goes
+// through a JobStore (in-memory for single-node deployments,
+// Postgres-backed for multi-gateway production). The store is
+// the canonical source of truth; the orchestrator carries no
+// in-process state besides the per-cell concurrency tracker
+// (an ephemeral counter derived from the store's running set).
 package migration
 
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -40,16 +49,19 @@ type MigrationJob struct {
 type JobState string
 
 const (
-	JobPending  JobState = "pending"
-	JobRunning  JobState = "running"
-	JobDone     JobState = "done"
-	JobFailed   JobState = "failed"
+	JobPending JobState = "pending"
+	JobRunning JobState = "running"
+	JobDone    JobState = "done"
+	JobFailed  JobState = "failed"
 )
 
 // CellLimits caps how much concurrent work a single dest-cell
 // can absorb. The orchestrator never schedules more than
 // MaxConcurrentJobs against the same DestCellID at the same
-// instant.
+// instant, ACROSS the entire fleet — the JobStore's
+// ListActiveJobs is the source of truth for the running set,
+// which is what makes the cap a global rather than per-node
+// guarantee.
 type CellLimits struct {
 	CellID            string
 	MaxConcurrentJobs int
@@ -62,37 +74,125 @@ type CellLimits struct {
 // stats; tests inject a stub.
 type JobRunner func(ctx context.Context, job MigrationJob) (bytesCopied int64, piecesCopied int, err error)
 
-// FleetOrchestrator owns the migration queue and per-cell
-// concurrency caps.
-type FleetOrchestrator struct {
-	limits map[string]int
-	runner JobRunner
+// defaultClaimTTL is the wall-clock window the orchestrator
+// installs on every AcquireJob. Picked so a crashed node's
+// jobs are recoverable within a minute without flooding the
+// JobStore with heartbeat traffic on busy fleets. Configurable
+// via FleetOrchestratorConfig.ClaimTTL; the worker heartbeats
+// at half this interval.
+const defaultClaimTTL = 30 * time.Second
 
-	mu     sync.Mutex
-	jobs   map[string]*MigrationJob
-	queue  []string // pending job IDs in submission order
+// FleetOrchestratorConfig wires a FleetOrchestrator. Store and
+// NodeID are required; the rest are optional with sensible
+// defaults so existing callers (the single-node in-process
+// shape) keep working with one extra struct field instead of a
+// large refactor.
+type FleetOrchestratorConfig struct {
+	// Store is the JobStore backing the queue. Use
+	// InMemoryJobStore for tests and single-node deployments,
+	// PgJobStore for multi-gateway production.
+	Store JobStore
+
+	// NodeID identifies this gateway instance for claim
+	// ownership. Two gateways MUST NOT share a NodeID;
+	// cmd/gateway defaults to the OS hostname when the
+	// config field is empty.
+	NodeID string
+
+	// Limits caps per-cell concurrency. Cells absent from the
+	// list default to 1; explicit MaxConcurrentJobs <= 0
+	// collapses to 1.
+	Limits []CellLimits
+
+	// Runner is the per-job dispatch function. Required.
+	Runner JobRunner
+
+	// ClaimTTL is the wall-clock window installed on every
+	// AcquireJob. Zero defaults to defaultClaimTTL (30s).
+	// Heartbeats fire at ClaimTTL/2.
+	ClaimTTL time.Duration
+
+	// Logger receives structured progress lines. Nil suppresses.
+	Logger *log.Logger
 }
 
-// NewFleetOrchestrator returns a ready orchestrator.
-//
-// limits maps DestCellID → MaxConcurrentJobs. Cells absent from
-// the map default to 1 concurrent job; setting MaxConcurrentJobs
-// to 0 also collapses to 1.
-func NewFleetOrchestrator(limits []CellLimits, runner JobRunner) *FleetOrchestrator {
+// FleetOrchestrator owns the migration queue and per-cell
+// concurrency caps. State lives in the JobStore; this struct
+// carries only the per-process dispatch loop.
+type FleetOrchestrator struct {
+	store    JobStore
+	nodeID   string
+	limits   map[string]int
+	runner   JobRunner
+	claimTTL time.Duration
+	logger   *log.Logger
+
+	// mu guards inflight (the set of jobs this node is
+	// currently running a goroutine for). It is decoupled
+	// from JobStore's atomicity guarantees: inflight is a
+	// per-process bookkeeping aid that lets RunOnce skip jobs
+	// it has already dispatched without paying a round trip
+	// to the store on every pick.
+	mu       sync.Mutex
+	inflight map[string]struct{}
+}
+
+// NewFleetOrchestratorWithStore is the v0.1.0-and-later
+// constructor. The earlier NewFleetOrchestrator signature is
+// preserved (in a thin wrapper) so existing single-node code
+// keeps compiling, but new wiring should call this one.
+func NewFleetOrchestratorWithStore(cfg FleetOrchestratorConfig) (*FleetOrchestrator, error) {
+	if cfg.Store == nil {
+		return nil, errors.New("fleet_orchestrator: FleetOrchestratorConfig.Store is required")
+	}
+	if cfg.NodeID == "" {
+		return nil, errors.New("fleet_orchestrator: FleetOrchestratorConfig.NodeID is required")
+	}
+	runner := cfg.Runner
 	if runner == nil {
 		runner = noopRunner
 	}
-	o := &FleetOrchestrator{
-		limits: make(map[string]int, len(limits)),
-		runner: runner,
-		jobs:   map[string]*MigrationJob{},
+	ttl := cfg.ClaimTTL
+	if ttl <= 0 {
+		ttl = defaultClaimTTL
 	}
-	for _, lim := range limits {
+	limits := make(map[string]int, len(cfg.Limits))
+	for _, lim := range cfg.Limits {
 		max := lim.MaxConcurrentJobs
 		if max <= 0 {
 			max = 1
 		}
-		o.limits[lim.CellID] = max
+		limits[lim.CellID] = max
+	}
+	return &FleetOrchestrator{
+		store:    cfg.Store,
+		nodeID:   cfg.NodeID,
+		limits:   limits,
+		runner:   runner,
+		claimTTL: ttl,
+		logger:   cfg.Logger,
+		inflight: map[string]struct{}{},
+	}, nil
+}
+
+// NewFleetOrchestrator preserves the v0.0.x signature. It
+// constructs an InMemoryJobStore-backed orchestrator with a
+// fixed nodeID of "single-node" so single-gateway deployments
+// keep building without a config change. New callers should
+// use NewFleetOrchestratorWithStore.
+func NewFleetOrchestrator(limits []CellLimits, runner JobRunner) *FleetOrchestrator {
+	o, err := NewFleetOrchestratorWithStore(FleetOrchestratorConfig{
+		Store:  NewInMemoryJobStore(nil),
+		NodeID: "single-node",
+		Limits: limits,
+		Runner: runner,
+	})
+	if err != nil {
+		// Construction can only fail when Store or NodeID
+		// are missing; the inlined values above mean this
+		// path is unreachable. Panic-on-impossible keeps
+		// the legacy signature error-free.
+		panic("fleet_orchestrator: legacy constructor invariant broken: " + err.Error())
 	}
 	return o
 }
@@ -102,116 +202,202 @@ func noopRunner(_ context.Context, _ MigrationJob) (int64, int, error) {
 }
 
 // Enqueue registers a new pending job. JobID must be unique;
-// duplicates return an error so callers can detect requeues.
+// duplicates return ErrDuplicateJob so callers can detect
+// requeues.
 func (o *FleetOrchestrator) Enqueue(job MigrationJob) error {
 	if job.JobID == "" || job.TenantID == "" || job.DestCellID == "" {
 		return errors.New("fleet_orchestrator: job_id, tenant_id, and dest_cell_id are required")
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if _, ok := o.jobs[job.JobID]; ok {
-		return errors.New("fleet_orchestrator: duplicate job_id")
-	}
-	job.State = JobPending
-	o.jobs[job.JobID] = &job
-	o.queue = append(o.queue, job.JobID)
-	return nil
+	return o.store.PutJob(context.Background(), job)
 }
 
-// Jobs returns a stable snapshot of every job the orchestrator
-// has seen, ordered by submission time.
+// Jobs returns a snapshot of every job the orchestrator has
+// seen, ordered by submission time. Used by the management
+// console's GET /api/v1/migrations endpoint.
 func (o *FleetOrchestrator) Jobs() []MigrationJob {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	out := make([]MigrationJob, 0, len(o.jobs))
-	for _, id := range o.queue {
-		if j, ok := o.jobs[id]; ok {
-			out = append(out, *j)
+	jobs, err := o.store.Jobs(context.Background())
+	if err != nil {
+		if o.logger != nil {
+			o.logger.Printf("fleet_orchestrator: Jobs list failed: %v", err)
 		}
+		return nil
 	}
-	return out
+	return jobs
 }
 
 // Job returns the current state of a single job.
 func (o *FleetOrchestrator) Job(id string) (MigrationJob, bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	j, ok := o.jobs[id]
-	if !ok {
+	job, ok, err := o.store.GetJob(context.Background(), id)
+	if err != nil {
+		if o.logger != nil {
+			o.logger.Printf("fleet_orchestrator: GetJob(%q) failed: %v", id, err)
+		}
 		return MigrationJob{}, false
 	}
-	return *j, true
+	return job, ok
 }
 
-// RunOnce drains as many pending jobs as the per-cell limits
-// allow. Returns the count of jobs started in this call. Pass
-// RunOnce on a ticker to drive sustained progress.
+// RunOnce drains as many runnable jobs as the per-cell limits
+// allow. Returns the count of jobs newly dispatched in this
+// call. Pass RunOnce on a ticker to drive sustained progress.
+//
+// The implementation queries the JobStore for active jobs,
+// counts how many of them this node has currently in flight
+// against each cell, and AcquireJob's the remaining pending
+// jobs in submission order. Successful acquisitions spawn a
+// worker goroutine via run().
 func (o *FleetOrchestrator) RunOnce(ctx context.Context) int {
-	picked := o.pickRunnable()
-	for _, j := range picked {
-		go o.run(ctx, j.JobID)
-	}
-	return len(picked)
-}
-
-// pickRunnable selects the next batch of pending jobs while
-// respecting per-cell concurrency caps. It marks them Running
-// and updates StartedAt before returning so a follow-up RunOnce
-// won't double-pick them.
-func (o *FleetOrchestrator) pickRunnable() []MigrationJob {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	running := map[string]int{}
-	for _, j := range o.jobs {
-		if j.State == JobRunning {
-			running[j.DestCellID]++
+	active, err := o.store.ListActiveJobs(ctx)
+	if err != nil {
+		if o.logger != nil {
+			o.logger.Printf("fleet_orchestrator: ListActiveJobs failed: %v", err)
 		}
+		return 0
 	}
-	var picked []MigrationJob
-	now := time.Now()
-	for _, id := range o.queue {
-		j, ok := o.jobs[id]
-		if !ok || j.State != JobPending {
+	o.mu.Lock()
+	running := map[string]int{}
+	for _, j := range active {
+		if j.State != JobRunning {
 			continue
 		}
-		max := o.limits[j.DestCellID]
-		if max == 0 {
-			max = 1
+		// Only this node's inflight jobs contribute to the
+		// per-cell counter from the dispatch loop's
+		// perspective; jobs claimed by other nodes count
+		// too because the CellLimits are a global cap, not
+		// a per-node cap.
+		running[j.DestCellID]++
+	}
+	o.mu.Unlock()
+
+	dispatched := 0
+	for _, j := range active {
+		if j.State != JobPending {
+			continue
 		}
+		max := o.cellLimit(j.DestCellID)
 		if running[j.DestCellID] >= max {
 			continue
 		}
-		j.State = JobRunning
-		j.StartedAt = now
+		ok, err := o.store.AcquireJob(ctx, j.JobID, o.nodeID, o.claimTTL)
+		if err != nil {
+			if o.logger != nil {
+				o.logger.Printf("fleet_orchestrator: AcquireJob(%q): %v", j.JobID, err)
+			}
+			continue
+		}
+		if !ok {
+			continue // another node grabbed it first
+		}
 		running[j.DestCellID]++
-		picked = append(picked, *j)
+		dispatched++
+		o.mu.Lock()
+		o.inflight[j.JobID] = struct{}{}
+		o.mu.Unlock()
+		go o.run(ctx, j.JobID)
 	}
-	return picked
+	return dispatched
 }
 
-// run is the per-job worker.
+// cellLimit returns the configured max-concurrent for the
+// given cell, falling back to 1 when the cell is not in the
+// limits map.
+func (o *FleetOrchestrator) cellLimit(cellID string) int {
+	max := o.limits[cellID]
+	if max == 0 {
+		max = 1
+	}
+	return max
+}
+
+// run is the per-job worker. It starts a heartbeat goroutine
+// that keeps the claim alive, invokes the runner, and writes
+// the terminal state through ReleaseJob.
 func (o *FleetOrchestrator) run(ctx context.Context, id string) {
-	o.mu.Lock()
-	jobCopy, ok := o.jobs[id]
-	if !ok {
+	defer func() {
+		o.mu.Lock()
+		delete(o.inflight, id)
 		o.mu.Unlock()
+	}()
+
+	job, ok, err := o.store.GetJob(ctx, id)
+	if err != nil {
+		if o.logger != nil {
+			o.logger.Printf("fleet_orchestrator: run GetJob(%q): %v", id, err)
+		}
 		return
 	}
-	snap := *jobCopy
-	o.mu.Unlock()
+	if !ok {
+		if o.logger != nil {
+			o.logger.Printf("fleet_orchestrator: run job(%q) vanished", id)
+		}
+		return
+	}
 
-	bytes, pieces, err := o.runner(ctx, snap)
+	// Heartbeat at half the claim TTL so a single missed
+	// tick does not lose the claim. The goroutine exits when
+	// the parent context cancels OR the runner returns and
+	// signals doneCh.
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	doneCh := make(chan struct{})
+	go o.heartbeatLoop(heartbeatCtx, id, doneCh)
 
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	j := o.jobs[id]
-	j.BytesCopied = bytes
-	j.PiecesCopied = pieces
-	j.CompletedAt = time.Now()
-	if err != nil {
-		j.State = JobFailed
-		j.Error = err.Error()
-	} else {
-		j.State = JobDone
+	bytes, pieces, runErr := o.runner(ctx, job)
+	close(doneCh)
+	cancelHeartbeat()
+
+	terminal := JobDone
+	if runErr != nil {
+		terminal = JobFailed
+	}
+	if err := o.store.ReleaseJob(ctx, id, o.nodeID, terminal, bytes, pieces, runErr); err != nil {
+		if errors.Is(err, ErrClaimNotHeld) && o.logger != nil {
+			// The claim was lost mid-flight (another node
+			// already re-acquired and possibly completed).
+			// Log loudly — this should not happen on a
+			// healthy fleet but the heartbeat backstop is
+			// our last line of defence.
+			o.logger.Printf("fleet_orchestrator: ReleaseJob(%q) found claim lost; another node owns the row", id)
+		} else if o.logger != nil {
+			o.logger.Printf("fleet_orchestrator: ReleaseJob(%q): %v", id, err)
+		}
+	}
+}
+
+// heartbeatLoop extends the claim's TTL at half-period. It
+// exits on context cancellation OR when doneCh closes (the
+// runner has finished and is about to call ReleaseJob, which
+// resets claim_until anyway). A HeartbeatJob that fails with
+// ErrClaimNotHeld means the claim has been re-acquired by
+// another node; the loop exits early so we do not extend a
+// claim we no longer own.
+func (o *FleetOrchestrator) heartbeatLoop(ctx context.Context, id string, doneCh <-chan struct{}) {
+	interval := o.claimTTL / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-doneCh:
+			return
+		case <-ticker.C:
+			if err := o.store.HeartbeatJob(ctx, id, o.nodeID, o.claimTTL); err != nil {
+				if errors.Is(err, ErrClaimNotHeld) {
+					if o.logger != nil {
+						o.logger.Printf("fleet_orchestrator: heartbeat lost claim on %q; abandoning", id)
+					}
+					return
+				}
+				if errors.Is(err, ErrJobNotFound) {
+					return
+				}
+				if o.logger != nil {
+					o.logger.Printf("fleet_orchestrator: heartbeat(%q) error: %v", id, err)
+				}
+			}
+		}
 	}
 }

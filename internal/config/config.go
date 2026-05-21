@@ -588,6 +588,24 @@ type RebalancerConfig struct {
 	Interval       Duration           `json:"interval"`
 	BytesPerSecond int64              `json:"bytes_per_second"`
 	Targets        []RebalancerTarget `json:"targets"`
+	// NodeID identifies this gateway instance for the
+	// distributed coordination JobStore. Two gateways with
+	// the same NodeID share claim ownership, which means
+	// either's heartbeat will keep the other's claim alive —
+	// usually a misconfiguration. Default: the OS hostname,
+	// resolved by cmd/gateway when this field is left empty.
+	// Setting it explicitly is the recommended path for
+	// containerised deployments where the hostname is a
+	// random hash that does not correlate with the pod
+	// identity an operator wants to see in the queue.
+	NodeID string `json:"node_id"`
+	// ClaimTTL is the TTL each AcquireJob writes onto the
+	// claim. The worker heartbeats at ClaimTTL/2 to stay
+	// well inside the expiry window. Zero defaults to 30s,
+	// which keeps a crashed node's jobs recoverable within a
+	// minute without flooding the DB with heartbeat traffic
+	// on busy fleets.
+	ClaimTTL Duration `json:"claim_ttl"`
 }
 
 // UnmarshalJSON decodes a RebalancerConfig, defaulting Enabled to
