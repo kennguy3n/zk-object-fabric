@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"strings"
 )
 
 // HeaderName is the response header the middleware writes. The
@@ -47,7 +48,12 @@ type ctxKey struct{}
 // generates a fresh id in that case.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get(HeaderName)
+		// Trim before the empty-check so a misbehaving upstream
+		// proxy that sends an all-whitespace header value (e.g.
+		// "   " from a sloppy header rewrite) does not propagate
+		// a whitespace-only id into our logs and response
+		// header. The doc above promises this behaviour.
+		id := strings.TrimSpace(r.Header.Get(HeaderName))
 		if id == "" {
 			id = newID()
 		}

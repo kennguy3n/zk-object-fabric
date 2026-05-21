@@ -123,15 +123,35 @@ func TestWithID_RoundTrip(t *testing.T) {
 // TestMiddleware_IgnoresWhitespaceOnlyHeader confirms that an
 // upstream proxy that forwarded an empty header value still gets a
 // fresh server-side id rather than ending up with an empty
-// response header.
+// response header. The whitespace-only cases (spaces, tabs,
+// mixed) exercise the strings.TrimSpace guard in Middleware
+// that backs the docstring promise of "Empty / whitespace
+// values are ignored".
 func TestMiddleware_IgnoresWhitespaceOnlyHeader(t *testing.T) {
-	h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.Header.Set(HeaderName, "")
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-	got := w.Header().Get(HeaderName)
-	if got == "" || strings.TrimSpace(got) == "" {
-		t.Fatalf("empty-header request produced empty id %q", got)
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"empty", ""},
+		{"single space", " "},
+		{"multiple spaces", "   "},
+		{"tab", "\t"},
+		{"mixed whitespace", " \t \n "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.Header.Set(HeaderName, tc.value)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			got := w.Header().Get(HeaderName)
+			if got == "" || strings.TrimSpace(got) == "" {
+				t.Fatalf("input %q produced empty/whitespace id %q; want a fresh non-empty id", tc.value, got)
+			}
+			if got == tc.value {
+				t.Fatalf("input %q was reused verbatim as id; want a fresh server-generated id", tc.value)
+			}
+		})
 	}
 }
