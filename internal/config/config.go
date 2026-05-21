@@ -4,10 +4,12 @@
 package config
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -283,6 +285,11 @@ type ConsoleConfig struct {
 	WriteTimeout Duration `json:"write_timeout"`
 	AdminToken   string   `json:"admin_token"`
 
+	// TLS configures the console API's HTTPS listener. Same
+	// semantics as GatewayConfig.TLS — empty CertPath / KeyPath
+	// means plain HTTP, both set means HTTPS.
+	TLS TLSConfig `json:"tls"`
+
 	// CaptchaProvider names the CAPTCHA backend wired onto the B2C
 	// signup flow. Supported values: "hcaptcha" (default when empty
 	// and CaptchaSecret is set), "recaptcha" (reserved; not wired
@@ -343,6 +350,76 @@ type GatewayConfig struct {
 	WriteTimeout    Duration `json:"write_timeout"`
 	MaxRequestBytes int64    `json:"max_request_bytes"`
 	CachePath       string   `json:"cache_path"`
+
+	// TLS configures the gateway's HTTPS listener. When both
+	// CertPath and KeyPath are set the listener runs HTTPS;
+	// otherwise it runs plain HTTP. Production deployments
+	// (Env == "production") that leave TLS empty get a startup
+	// WARN line — operators terminating TLS at an upstream load
+	// balancer can ignore it, deployments serving clients
+	// directly should heed it.
+	TLS TLSConfig `json:"tls"`
+}
+
+// TLSConfig configures an HTTPS listener. Empty CertPath / KeyPath
+// disables TLS for the listener it is attached to (plain HTTP).
+//
+// MinVersion accepts the case-insensitive strings "1.2" or "1.3"
+// and selects the minimum acceptable TLS handshake version. An
+// empty value defaults to TLS 1.2 (the same default Go's
+// crypto/tls applies). Operators serving clients that all support
+// TLS 1.3 should set "1.3" to lock out 1.2 cipher suites entirely.
+type TLSConfig struct {
+	CertPath   string `json:"cert_path"`
+	KeyPath    string `json:"key_path"`
+	MinVersion string `json:"min_version"`
+}
+
+// Enabled reports whether the TLS config has the minimum fields
+// needed to start an HTTPS listener (cert + key path both set).
+func (t TLSConfig) Enabled() bool {
+	return t.CertPath != "" && t.KeyPath != ""
+}
+
+// MinTLSVersion parses the configured MinVersion string and returns
+// the corresponding crypto/tls constant. An empty value defaults to
+// TLS 1.2 (the same default Go's net/http applies); an unrecognised
+// value returns an error so misconfigurations surface at startup
+// rather than as silent downgrades. TLS 1.0 / 1.1 are not
+// accepted — they are no longer considered secure and crypto/tls
+// has not supported them as defaults since Go 1.18.
+func (t TLSConfig) MinTLSVersion() (uint16, error) {
+	v := strings.TrimSpace(strings.ToLower(t.MinVersion))
+	switch v {
+	case "", "1.2", "tls1.2", "tls12":
+		return tls.VersionTLS12, nil
+	case "1.3", "tls1.3", "tls13":
+		return tls.VersionTLS13, nil
+	default:
+		return 0, fmt.Errorf("config: tls.min_version %q: must be \"1.2\" or \"1.3\"", t.MinVersion)
+	}
+}
+
+// BuildGoTLSConfig returns the *tls.Config the gateway hands to
+// http.Server.TLSConfig before calling ListenAndServeTLS. It
+// honours MinVersion (defaulting to TLS 1.2), prefers server
+// cipher order on TLS 1.2 connections, and disables session
+// tickets on TLS 1.3 (where they are session-resumption only and
+// not a confidentiality risk, but operators rotating cert
+// material expect old sessions to be invalidated).
+//
+// The function does not load the cert/key itself — that is
+// http.Server.ListenAndServeTLS's job — it only builds the
+// crypto/tls policy.
+func (t TLSConfig) BuildGoTLSConfig() (*tls.Config, error) {
+	minVer, err := t.MinTLSVersion()
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion:               minVer,
+		PreferServerCipherSuites: true,
+	}, nil
 }
 
 // ControlPlaneConfig configures the AWS-hosted control plane surface
@@ -437,6 +514,13 @@ type HealthConfig struct {
 	PollTimeout Duration `json:"poll_timeout"`
 	// DrainTimeout bounds the drain wait. Defaults to 30s.
 	DrainTimeout Duration `json:"drain_timeout"`
+
+	// TLS configures the health endpoint's HTTPS listener. Same
+	// semantics as GatewayConfig.TLS — empty CertPath / KeyPath
+	// means plain HTTP, both set means HTTPS. Operators terminating
+	// TLS at a load balancer typically leave this empty even in
+	// production.
+	TLS TLSConfig `json:"tls"`
 }
 
 // HealthPeer is a single peer gateway in the cell.

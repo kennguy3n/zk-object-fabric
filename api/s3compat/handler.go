@@ -46,6 +46,14 @@ type Authenticator interface {
 // Authenticator in production.
 const AnonymousTenant = "anonymous"
 
+// ErrAuthMisconfigured is the sentinel authenticate returns when
+// RequireAuth is true and the handler has no Authenticator wired.
+// Call sites translate it into a 500 InternalAuthMisconfigured S3
+// error via writeAuthError so the production-mode safety net
+// surfaces as an operator-visible failure instead of a silent
+// anonymous-tenant fallthrough.
+var ErrAuthMisconfigured = errors.New("s3compat: authenticator not configured but RequireAuth=true")
+
 // MaxInMemoryObjectBytes caps the size of an object the handler is
 // willing to buffer into memory on the request goroutine. The two
 // non-streaming paths that have to honour this ceiling are:
@@ -157,6 +165,23 @@ type Config struct {
 
 	// NodeID identifies the gateway node emitting billing events.
 	NodeID string
+
+	// Env is the deployment environment ("development",
+	// "staging", "production", …). The handler currently uses
+	// it for one thing: gating the production-mode safety net
+	// that refuses anonymous requests when Auth is nil. Empty
+	// or unrecognised values are treated as non-production so
+	// dev / test deploys do not change behaviour.
+	Env string
+
+	// RequireAuth, when true, makes the handler refuse every
+	// request with 500 InternalAuthMisconfigured if Auth is
+	// nil — instead of silently serving every request under
+	// AnonymousTenant. cmd/gateway sets this whenever Env is
+	// "production" so a misconfiguration that drops the
+	// authenticator can never silently grant world-write to
+	// the anonymous tenant.
+	RequireAuth bool
 
 	// ContentIndex is the intra-tenant deduplication content
 	// index. When non-nil and the resolved placement policy has
@@ -337,7 +362,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 // it to enumerate bucket names.
 func (h *Handler) PutBucket(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.authenticate(r); err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	bucket, _ := parseBucketKey(r.URL.Path)
@@ -353,7 +378,7 @@ func (h *Handler) PutBucket(w http.ResponseWriter, r *http.Request) {
 // implicit, an authenticated HEAD always returns 200 OK.
 func (h *Handler) HeadBucket(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.authenticate(r); err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -370,7 +395,7 @@ func (h *Handler) HeadBucket(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	if h.cfg.VerifiedCheck != nil {
@@ -828,7 +853,7 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
@@ -974,7 +999,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	if bucket == "" {
@@ -1043,6 +1068,12 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.StorageProvider, metadata.Piece, string, string, error) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
+		// Preserve the typed misconfiguration signal so
+		// writeResolveError can render it as 500
+		// InternalAuthMisconfigured rather than 403 AccessDenied.
+		if errors.Is(err, ErrAuthMisconfigured) {
+			return nil, nil, metadata.Piece{}, "", "", err
+		}
 		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusForbidden, s3code: "AccessDenied", msg: err.Error()}
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
@@ -1079,9 +1110,31 @@ func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.
 
 func (h *Handler) authenticate(r *http.Request) (string, error) {
 	if h.cfg.Auth == nil {
+		// Production-mode safety net: when an operator
+		// configures RequireAuth=true (cmd/gateway does this
+		// automatically when env="production") but forgets
+		// to wire an Authenticator, refuse every request
+		// instead of silently dropping into AnonymousTenant.
+		if h.cfg.RequireAuth {
+			return "", ErrAuthMisconfigured
+		}
 		return AnonymousTenant, nil
 	}
 	return h.cfg.Auth.Authenticate(r)
+}
+
+// writeAuthError translates an authenticate() error into the
+// right HTTP response. Auth-misconfiguration (operator forgot to
+// wire an Authenticator under RequireAuth=true) is a 500
+// InternalAuthMisconfigured because the server is the broken
+// party; everything else is a 403 AccessDenied (the request
+// itself is malformed or signed with bad credentials).
+func writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, ErrAuthMisconfigured) {
+		writeError(w, http.StatusInternalServerError, "InternalAuthMisconfigured", err.Error(), r.URL.Path)
+		return
+	}
+	writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
 }
 
 func (h *Handler) emit(tenantID, bucket string, dim billing.Dimension, delta uint64) {
@@ -1201,6 +1254,10 @@ type httpError struct {
 func (e *httpError) Error() string { return e.msg }
 
 func writeResolveError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, ErrAuthMisconfigured) {
+		writeError(w, http.StatusInternalServerError, "InternalAuthMisconfigured", err.Error(), r.URL.Path)
+		return
+	}
 	var he *httpError
 	if errors.As(err, &he) {
 		writeError(w, he.code, he.s3code, he.msg, r.URL.Path)

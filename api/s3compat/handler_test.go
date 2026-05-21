@@ -910,3 +910,75 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 		t.Errorf("multipart GET audit PieceID is empty; want first piece ID")
 	}
 }
+
+// TestHandler_RequireAuth_NoAuthenticator_Returns500 verifies the
+// production-mode safety net: when RequireAuth=true and Auth is
+// nil, every request returns 500 InternalAuthMisconfigured instead
+// of silently serving under AnonymousTenant. cmd/gateway turns on
+// RequireAuth whenever Env="production".
+func TestHandler_RequireAuth_NoAuthenticator_Returns500(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	bill := &recordingBilling{}
+	h := New(Config{
+		Manifests:   store,
+		Providers:   map[string]providers.StorageProvider{"test": fake},
+		Placement:   fixedPlacement{backend: "test"},
+		Billing:     bill,
+		Env:         "production",
+		RequireAuth: true,
+		// Auth intentionally nil to simulate the
+		// misconfiguration we want this safety net to catch.
+		Auth: nil,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	cases := []struct {
+		name    string
+		method  string
+		path    string
+		bodyStr string
+		fn      func(http.ResponseWriter, *http.Request)
+	}{
+		{"PUT", http.MethodPut, "/bucket/obj", "hello", h.Put},
+		{"GET", http.MethodGet, "/bucket/obj", "", h.Get},
+		{"HEAD", http.MethodHead, "/bucket/obj", "", h.Head},
+		{"DELETE", http.MethodDelete, "/bucket/obj", "", h.Delete},
+		{"LIST", http.MethodGet, "/bucket/?list-type=2", "", h.Get},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body *bytes.Reader
+			if tc.bodyStr != "" {
+				body = bytes.NewReader([]byte(tc.bodyStr))
+			} else {
+				body = bytes.NewReader(nil)
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
+			req.ContentLength = int64(body.Len())
+			rec := httptest.NewRecorder()
+			tc.fn(rec, req)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("%s status = %d, want 500; body=%s", tc.name, rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), "InternalAuthMisconfigured") {
+				t.Errorf("%s body = %s, want InternalAuthMisconfigured", tc.name, rec.Body)
+			}
+		})
+	}
+}
+
+// TestHandler_RequireAuthFalse_NoAuthenticator_AllowsAnonymous
+// pins the legacy behaviour: when RequireAuth=false (the default,
+// covering dev and non-production deploys) and Auth is nil, the
+// handler keeps falling back to AnonymousTenant.
+func TestHandler_RequireAuthFalse_NoAuthenticator_AllowsAnonymous(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader([]byte("ok")))
+	req.ContentLength = 2
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200 (dev mode anonymous); body=%s", rec.Code, rec.Body)
+	}
+}

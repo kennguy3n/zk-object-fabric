@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"flag"
@@ -103,6 +104,14 @@ func main() {
 
 	placement := placement_policy.NewEngine(defaultBackend, registry, nil)
 	tenantStore := buildTenantStore(metadataDB, *tenantsPath)
+	// Production safety net: refuse to start when the gateway is
+	// wired with the dev in-memory tenant store and no static
+	// --tenants bindings have been loaded. This is layered
+	// alongside the s3compat handler's RequireAuth check
+	// downstream so neither a missing Auth field nor a missing
+	// tenant store can leave an effectively-unauthenticated
+	// production handler in place.
+	enforceProductionAuth(cfg.Env, metadataDB, tenantStore)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -165,12 +174,15 @@ func main() {
 	orphanGCDone := startOrphanGC(workerCtx, cfg.Dedup, contentIndex, store, registry)
 	crossCellDone := startCrossCellReplicator(workerCtx, cfg.CrossCell, store, registry)
 
-	healthMon := startHealthMonitor(workerCtx, cfg.Health, cache)
+	healthMon := startHealthMonitor(workerCtx, cfg.Health, cache, cfg.Env)
 
 	erasureRegistry := erasure_coding.DefaultRegistry()
 	repairDone := startRepairQueue(workerCtx, cfg.Repair, store, registry, erasureRegistry)
 
 	gatewayEnc := buildGatewayEncryption(cfg.Encryption)
+	if gatewayEnc != nil {
+		warnProductionLocalCMK(cfg.Env, gatewayEnc.CMK.URI, gatewayEnc.CMK.HolderClass)
+	}
 	multipartStore, multipartCloser := buildMultipartStore(metadataDB, gatewayEnc, registry)
 	if multipartCloser != nil {
 		defer multipartCloser()
@@ -201,6 +213,13 @@ func main() {
 		ContentIndex:   contentIndex,
 		Compliance:     complianceHooks,
 		NodeID:         cfg.Env,
+		Env:            cfg.Env,
+		// RequireAuth gates the handler's
+		// AnonymousTenant fallback: in production any
+		// misconfiguration that drops the authenticator
+		// returns 500 InternalAuthMisconfigured instead of
+		// silently writing data under the anonymous tenant.
+		RequireAuth: cfg.Env == "production",
 	}).Register(mux)
 
 	handler := http.Handler(mux)
@@ -284,7 +303,7 @@ func main() {
 	}()
 
 	log.Printf("gateway: listening on %s (env=%s default_backend=%s)", cfg.Gateway.ListenAddr, cfg.Env, defaultBackend)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := startListener(srv, cfg.Gateway.TLS, cfg.Env, "gateway"); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("gateway: listen: %v", err)
 	}
 	<-workerDone
@@ -300,6 +319,97 @@ func main() {
 	if repairDone != nil {
 		<-repairDone
 	}
+}
+
+// startListener picks ListenAndServeTLS vs ListenAndServe based on
+// the supplied TLS config. When TLS is enabled it parses the
+// MinVersion from cfg and applies it to srv.TLSConfig before
+// handing the cert / key paths to ListenAndServeTLS. When TLS is
+// disabled and env == "production" it logs a WARNING so operators
+// terminating TLS at an upstream load balancer can ignore the
+// signal while deployments serving clients directly notice it.
+//
+// name labels the listener in log lines ("gateway", "console",
+// "health") so operators with multiple listeners on the same
+// process can tell them apart.
+func startListener(srv *http.Server, t config.TLSConfig, env, name string) error {
+	if t.Enabled() {
+		gotls, err := t.BuildGoTLSConfig()
+		if err != nil {
+			return fmt.Errorf("%s: build tls config: %w", name, err)
+		}
+		srv.TLSConfig = gotls
+		minVer := "1.2"
+		if gotls.MinVersion == tls.VersionTLS13 {
+			minVer = "1.3"
+		}
+		log.Printf("gateway: %s TLS enabled (cert=%s min_version=%s)", name, t.CertPath, minVer)
+		return srv.ListenAndServeTLS(t.CertPath, t.KeyPath)
+	}
+	if env == "production" {
+		log.Printf("WARNING: %s running without TLS in production mode (%s.tls.cert_path / key_path are empty); only safe when an upstream load balancer terminates TLS", name, name)
+	}
+	return srv.ListenAndServe()
+}
+
+// enforceProductionAuth refuses to start the gateway when
+// cfg.Env == "production" and the tenant store is the dev /
+// scaffolding configuration (in-memory store with zero bindings).
+// The intent is to make it impossible to ship a production
+// deployment whose handler effectively serves every request under
+// the AnonymousTenant fallback.
+//
+// metadataDB != nil means a Postgres-backed tenant store is wired —
+// even a fresh deploy with zero bindings is fine because new tenant
+// rows are added by the console signup flow. metadataDB == nil
+// with a non-empty store means the operator loaded bindings via
+// --tenants, which is also a supported production config (static
+// HMAC keys). The fatal path only triggers when both are missing:
+// no Postgres connection AND no static bindings.
+//
+// This guard is layered alongside the s3compat handler's
+// RequireAuth check: even if the operator zeroes out Auth on the
+// handler config, every request returns 500 instead of writing
+// data under AnonymousTenant.
+func enforceProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.TenantStore) {
+	if env != "production" {
+		return
+	}
+	if metadataDB != nil {
+		return
+	}
+	if tenantStore != nil && tenantStore.Size() > 0 {
+		return
+	}
+	log.Fatalf("gateway: env=production but no tenant bindings are configured (no control_plane.metadata_dsn AND no --tenants file with bindings); refusing to start with an effectively-unauthenticated handler")
+}
+
+// warnProductionLocalCMK emits a critical warning when the gateway
+// is started in production with the local-file CMK wrapper. The
+// warning is not fatal — some deployments intentionally back the
+// "local file" with a fuse-mounted HSM partition where the file
+// path is the only stable handle — but it surfaces the misconfig
+// loudly in case the path is a plain unencrypted file on disk.
+func warnProductionLocalCMK(env string, cmkURI, holderClass string) {
+	if env != "production" {
+		return
+	}
+	if !isLocalFileCMK(cmkURI, holderClass) {
+		return
+	}
+	log.Printf("SECURITY: using local file CMK in production (uri=%s holder=%s); this is NOT recommended for production deployments — back the master key with AWS KMS (kms://) or HashiCorp Vault Transit (vault://) instead", cmkURI, holderClass)
+}
+
+// isLocalFileCMK reports whether the resolved wrapper is the
+// LocalFileWrapper. Detection works off the (uri, holderClass)
+// pair selectGatewayWrapper records so we do not have to type-
+// assert against the concrete client_sdk.LocalFileWrapper type
+// from main.
+func isLocalFileCMK(cmkURI, holderClass string) bool {
+	if holderClass == "gateway_hsm" && (cmkURI == "" || strings.HasPrefix(cmkURI, "cmk://local")) {
+		return true
+	}
+	return false
 }
 
 // startOrphanGC spins up the content_index orphan sweep when
@@ -945,7 +1055,7 @@ func buildBillingProvider(cfg config.Config) billing.BillingProvider {
 // and, when a listen address is configured, the internal HTTP
 // endpoints it exposes. The monitor shares ctx with the other
 // background workers so SIGTERM drains all of them together.
-func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_object_cache.HotObjectCache) *health.Monitor {
+func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_object_cache.HotObjectCache, env string) *health.Monitor {
 	nodeID := hc.NodeID
 	if nodeID == "" {
 		if name, err := os.Hostname(); err == nil {
@@ -977,7 +1087,7 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 		srv := &http.Server{Addr: hc.ListenAddr, Handler: mon.ServeMux("")}
 		go func() {
 			log.Printf("gateway: health endpoints on %s", hc.ListenAddr)
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := startListener(srv, hc.TLS, env, "health"); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("gateway: health listener: %v", err)
 			}
 		}()
@@ -1048,7 +1158,7 @@ func startConsoleAPI(
 	}
 	go func() {
 		log.Printf("gateway: console API on %s", cfg.Console.ListenAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := startListener(srv, cfg.Console.TLS, cfg.Env, "console"); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("gateway: console listener: %v", err)
 		}
 	}()

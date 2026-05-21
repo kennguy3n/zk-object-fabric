@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -152,5 +153,125 @@ func TestGatewayConfig_JSONRejectsBareNumberTimeout(t *testing.T) {
 	var cfg Config
 	if err := json.Unmarshal(in, &cfg); err == nil {
 		t.Fatalf("Unmarshal bare number: want error, got nil (ReadTimeout=%v)", cfg.Gateway.ReadTimeout.ToDuration())
+	}
+}
+
+func TestTLSConfig_Enabled(t *testing.T) {
+	cases := []struct {
+		name string
+		in   TLSConfig
+		want bool
+	}{
+		{"both empty", TLSConfig{}, false},
+		{"cert only", TLSConfig{CertPath: "/etc/tls/cert.pem"}, false},
+		{"key only", TLSConfig{KeyPath: "/etc/tls/key.pem"}, false},
+		{"both set", TLSConfig{CertPath: "/etc/tls/cert.pem", KeyPath: "/etc/tls/key.pem"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.in.Enabled(); got != tc.want {
+				t.Fatalf("Enabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTLSConfig_MinTLSVersion(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    uint16
+		wantErr bool
+	}{
+		{"empty defaults to 1.2", "", tls.VersionTLS12, false},
+		{"1.2 short form", "1.2", tls.VersionTLS12, false},
+		{"1.3 short form", "1.3", tls.VersionTLS13, false},
+		{"tls1.2 long form", "tls1.2", tls.VersionTLS12, false},
+		{"tls1.3 long form", "tls1.3", tls.VersionTLS13, false},
+		{"case insensitive", "TLS1.3", tls.VersionTLS13, false},
+		{"with whitespace", "  1.3  ", tls.VersionTLS13, false},
+		{"1.1 rejected", "1.1", 0, true},
+		{"1.0 rejected", "1.0", 0, true},
+		{"garbage rejected", "yes please", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := TLSConfig{MinVersion: tc.in}
+			got, err := c.MinTLSVersion()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("MinTLSVersion(%q): want error, got %#x", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("MinTLSVersion(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Fatalf("MinTLSVersion(%q) = %#x, want %#x", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTLSConfig_BuildGoTLSConfig(t *testing.T) {
+	t.Run("default min version is 1.2", func(t *testing.T) {
+		c := TLSConfig{}
+		got, err := c.BuildGoTLSConfig()
+		if err != nil {
+			t.Fatalf("BuildGoTLSConfig: %v", err)
+		}
+		if got.MinVersion != tls.VersionTLS12 {
+			t.Fatalf("MinVersion = %#x, want %#x", got.MinVersion, tls.VersionTLS12)
+		}
+		if !got.PreferServerCipherSuites {
+			t.Fatal("PreferServerCipherSuites = false, want true")
+		}
+	})
+	t.Run("explicit 1.3", func(t *testing.T) {
+		c := TLSConfig{MinVersion: "1.3"}
+		got, err := c.BuildGoTLSConfig()
+		if err != nil {
+			t.Fatalf("BuildGoTLSConfig: %v", err)
+		}
+		if got.MinVersion != tls.VersionTLS13 {
+			t.Fatalf("MinVersion = %#x, want %#x", got.MinVersion, tls.VersionTLS13)
+		}
+	})
+	t.Run("invalid min version", func(t *testing.T) {
+		c := TLSConfig{MinVersion: "1.0"}
+		if _, err := c.BuildGoTLSConfig(); err == nil {
+			t.Fatal("BuildGoTLSConfig: want error, got nil")
+		}
+	})
+}
+
+func TestTLSConfig_JSONRoundTrip(t *testing.T) {
+	in := []byte(`{
+		"gateway": {
+			"tls": {"cert_path": "/etc/tls/cert.pem", "key_path": "/etc/tls/key.pem", "min_version": "1.3"}
+		},
+		"console": {
+			"tls": {"cert_path": "/etc/console/cert.pem", "key_path": "/etc/console/key.pem"}
+		},
+		"health": {
+			"tls": {"cert_path": "/etc/health/cert.pem", "key_path": "/etc/health/key.pem"}
+		}
+	}`)
+	var cfg Config
+	if err := json.Unmarshal(in, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if cfg.Gateway.TLS.CertPath != "/etc/tls/cert.pem" || cfg.Gateway.TLS.KeyPath != "/etc/tls/key.pem" || cfg.Gateway.TLS.MinVersion != "1.3" {
+		t.Fatalf("Gateway.TLS = %+v", cfg.Gateway.TLS)
+	}
+	if !cfg.Gateway.TLS.Enabled() {
+		t.Fatal("Gateway.TLS.Enabled() = false, want true")
+	}
+	if cfg.Console.TLS.CertPath != "/etc/console/cert.pem" || !cfg.Console.TLS.Enabled() {
+		t.Fatalf("Console.TLS = %+v", cfg.Console.TLS)
+	}
+	if cfg.Health.TLS.CertPath != "/etc/health/cert.pem" || !cfg.Health.TLS.Enabled() {
+		t.Fatalf("Health.TLS = %+v", cfg.Health.TLS)
 	}
 }

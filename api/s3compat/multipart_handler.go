@@ -112,7 +112,7 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 	}
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
@@ -204,7 +204,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	_ = tenantID
@@ -351,7 +351,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 	}
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	bucket, key := parseBucketKey(r.URL.Path)
@@ -667,7 +667,7 @@ func (h *Handler) AbortMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	uploadID := r.URL.Query().Get("uploadId")
@@ -703,7 +703,7 @@ func (h *Handler) ListMultipartUploads(w http.ResponseWriter, r *http.Request, b
 	}
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	uploads := h.cfg.Multipart.List(tenantID, bucket)

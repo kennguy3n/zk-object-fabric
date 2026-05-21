@@ -75,7 +75,7 @@ type ListVersionEntry struct {
 func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	dstBucket, dstKey := parseBucketKey(r.URL.Path)
@@ -342,7 +342,7 @@ func parseCopySource(raw string) (bucket, key, version string, err error) {
 func (h *Handler) ListObjectVersions(w http.ResponseWriter, r *http.Request, bucket string) {
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		writeError(w, http.StatusForbidden, "AccessDenied", err.Error(), r.URL.Path)
+		writeAuthError(w, r, err)
 		return
 	}
 	if h.cfg.Manifests == nil {
