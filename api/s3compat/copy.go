@@ -18,12 +18,16 @@ package s3compat
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/zeebo/blake3"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
@@ -151,6 +155,7 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 	caps := srcProvider.Capabilities()
 	var (
 		newSize int64
+		newHash string
 		newETag string
 	)
 	if caps.SupportsServerSideCopy {
@@ -162,18 +167,26 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 			}
 			newSize = res.SizeBytes
 			newETag = res.ETag
+			// Server-side copy means the backend duplicated
+			// the bytes itself; the bytes are identical to the
+			// source so the BLAKE3 hash carries over. We trust
+			// the source manifest here because we already
+			// verified the source piece (or refused to serve
+			// it) on every GET path; a separate scrubber will
+			// catch bit-rot in the destination later.
+			newHash = srcPiece.Hash
 		} else {
 			// Provider claims server-side copy capability
 			// but does not implement PieceCopier — fall
 			// back to GET+PUT.
-			newSize, newETag, err = h.copyViaGetPut(r.Context(), srcProvider, srcPiece.PieceID, dstPieceID, r.Header.Get("Content-Type"))
+			newSize, newHash, newETag, err = h.copyViaGetPut(r.Context(), srcProvider, srcPiece.PieceID, dstPieceID, r.Header.Get("Content-Type"))
 			if err != nil {
 				writeError(w, http.StatusBadGateway, "BackendCopyFailed", err.Error(), r.URL.Path)
 				return
 			}
 		}
 	} else {
-		newSize, newETag, err = h.copyViaGetPut(r.Context(), srcProvider, srcPiece.PieceID, dstPieceID, r.Header.Get("Content-Type"))
+		newSize, newHash, newETag, err = h.copyViaGetPut(r.Context(), srcProvider, srcPiece.PieceID, dstPieceID, r.Header.Get("Content-Type"))
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "BackendCopyFailed", err.Error(), r.URL.Path)
 			return
@@ -181,37 +194,53 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build a fresh piece pointer for the destination manifest.
+	// Hash is the BLAKE3 content hash (used by the GET integrity
+	// check); ProviderETag is the backend's opaque ETag. Before
+	// this commit the two were conflated and the destination
+	// manifest carried the backend's ETag in the Hash slot, which
+	// broke every cache-miss GET on the copy once integrity
+	// verification landed.
 	newPiece := metadata.Piece{
-		PieceID:   dstPieceID,
-		Hash:      newETag,
-		Backend:   srcPiece.Backend,
-		Locator:   srcPiece.Locator, // approximated; provider rewrites on first GET
-		State:     "active",
-		SizeBytes: newSize,
+		PieceID:      dstPieceID,
+		Hash:         newHash,
+		ProviderETag: newETag,
+		Backend:      srcPiece.Backend,
+		Locator:      srcPiece.Locator, // approximated; provider rewrites on first GET
+		State:        "active",
+		SizeBytes:    newSize,
 	}
 	h.writeCopyManifest(w, r, tenantID, dstBucket, dstKey, srcManifest, newPiece, srcPiece.Backend, false)
 }
 
 // copyViaGetPut streams the source piece through GetPiece and
-// re-uploads it via PutPiece.
+// re-uploads it via PutPiece. It TeeReaders the bytes through a
+// BLAKE3 hasher so the destination piece's content hash can be
+// returned alongside the backend's ETag — the caller then stamps
+// the BLAKE3 hash into Piece.Hash and the ETag into
+// Piece.ProviderETag. The two are not interchangeable: Hash is
+// what the GET integrity check (re-)computes from the bytes,
+// ETag is the backend's opaque identifier for the upload.
 func (h *Handler) copyViaGetPut(
 	ctx context.Context,
 	srcProvider providers.StorageProvider,
 	srcPieceID, dstPieceID, contentType string,
-) (int64, string, error) {
+) (size int64, blake3Hash, providerETag string, err error) {
 	body, err := srcProvider.GetPiece(ctx, srcPieceID, nil)
 	if err != nil {
-		return 0, "", fmt.Errorf("get source piece: %w", err)
+		return 0, "", "", fmt.Errorf("get source piece: %w", err)
 	}
 	defer body.Close()
-	res, err := srcProvider.PutPiece(ctx, dstPieceID, body, providers.PutOptions{
+
+	hasher := blake3.New()
+	tee := io.TeeReader(body, hasher)
+	res, err := srcProvider.PutPiece(ctx, dstPieceID, tee, providers.PutOptions{
 		ContentLength: -1,
 		ContentType:   contentType,
 	})
 	if err != nil {
-		return 0, "", fmt.Errorf("put dest piece: %w", err)
+		return 0, "", "", fmt.Errorf("put dest piece: %w", err)
 	}
-	return res.SizeBytes, res.ETag, nil
+	return res.SizeBytes, "blake3:" + hex.EncodeToString(hasher.Sum(nil)), res.ETag, nil
 }
 
 // writeCopyManifest assembles a destination manifest, persists it,

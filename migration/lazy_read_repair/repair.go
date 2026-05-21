@@ -15,18 +15,14 @@ package lazy_read_repair
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"strings"
-
-	"github.com/zeebo/blake3"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
@@ -34,6 +30,21 @@ import (
 // any backend that has the piece. The caller should surface the
 // original not-found to the user.
 var ErrRepairUnavailable = errors.New("lazy_read_repair: no backend has the piece")
+
+// IntegrityFailureSink is the minimal interface ReadRepair uses to
+// emit per-backend integrity observability when it detects a
+// content hash mismatch or an unrecognised hash claim during
+// repair. It mirrors the same-named interface in api/s3compat so
+// the cmd/gateway adapter can be reused without lazy_read_repair
+// importing internal/metrics (which would pull the metrics
+// package into the migration import graph).
+//
+// A nil sink is a valid no-op: the previous Logger-only signal is
+// preserved so tests that don't wire a sink continue to function.
+type IntegrityFailureSink interface {
+	Inc(backend string)
+	IncUnrecognized(backend string)
+}
 
 // ReadRepair coordinates the lazy read-repair path. It holds the
 // providers registry so it can pick primary/secondary by backend
@@ -46,6 +57,17 @@ type ReadRepair struct {
 	// Logger is optional; errors on the slow path are best surfaced
 	// through it so repair failures don't get lost.
 	Logger *log.Logger
+
+	// IntegrityFailures, when non-nil, receives a per-backend
+	// counter increment every time Verify detects a content
+	// mismatch (Inc) or an unrecognised hash claim
+	// (IncUnrecognized). Wired by cmd/gateway so legacy
+	// manifests resolved through repair show up on the same
+	// Prometheus counter as cache-miss GET observations — without
+	// this hook the metric would undercount because fetchPiece
+	// treats repair-supplied bodies as pre-verified and skips the
+	// in-handler counter.
+	IntegrityFailures IntegrityFailureSink
 }
 
 // New builds a ReadRepair given a provider registry and manifest
@@ -113,8 +135,34 @@ func (r *ReadRepair) Repair(ctx context.Context, key manifest_store.ManifestKey,
 		return RepairResult{}, fmt.Errorf("lazy_read_repair: drain piece: %w", err)
 	}
 
-	if err := verifyPiece(body, piece); err != nil {
-		return RepairResult{}, err
+	if err := pieceintegrity.Verify(body, piece); err != nil {
+		// A content mismatch (ErrIntegrityCheckFailed) refuses
+		// the repair: writing tampered bytes to the new backend
+		// would launder the corruption. An unrecognised hash
+		// format (ErrIntegrityClaimUnrecognized) is a legacy
+		// manifest with no recognisable integrity claim — there
+		// is no proof the bytes are wrong, so the repair
+		// proceeds. The structured log surfaces the count so
+		// operators can plan a rewrite that fills ProviderETag
+		// and clears Hash.
+		//
+		// In both cases we also fire the per-backend integrity
+		// counter through the optional sink so the repair path
+		// shows up on the same Prometheus series as cache-miss
+		// GET observations. Without the sink call,
+		// fetchPiece's preVerified shortcut would cause repair
+		// findings to be invisible to the metrics pipeline.
+		if !errors.Is(err, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+			if r.IntegrityFailures != nil {
+				r.IntegrityFailures.Inc(piece.Backend)
+			}
+			return RepairResult{}, fmt.Errorf("lazy_read_repair: %w", err)
+		}
+		if r.IntegrityFailures != nil {
+			r.IntegrityFailures.IncUnrecognized(piece.Backend)
+		}
+		r.logf("lazy_read_repair: integrity_claim_unrecognized: piece=%s backend=%s recorded_hash=%q detail=%v",
+			piece.PieceID, piece.Backend, piece.Hash, err)
 	}
 
 	putRes, err := target.PutPiece(ctx, piece.PieceID, bytes.NewReader(body), providers.PutOptions{ContentLength: int64(len(body))})
@@ -141,44 +189,6 @@ func (r *ReadRepair) Repair(ctx context.Context, key manifest_store.ManifestKey,
 		RepairedBackend: targetBackend,
 		SourceBackend:   piece.Backend,
 	}, nil
-}
-
-// verifyPiece checks body against piece.Hash. It recognises three
-// hash forms the gateway has written over time:
-//
-//  1. "blake3:<hex>" — the canonical Phase 4 content-derived hash
-//     written by api/s3compat/handler.go's PUT path after the
-//     BLAKE3 piece-integrity work landed.
-//  2. raw SHA-256 hex — the legacy Phase 2 form (no prefix). Kept
-//     so manifests written before the BLAKE3 cut-over still verify.
-//  3. an S3-style quoted ETag — also legacy; the surrounding
-//     quotes are stripped before the SHA-256 comparison.
-//
-// Empty piece.Hash skips the check. The matching algorithm is
-// selected by the prefix so a body never round-trips through two
-// hashers when the format is known.
-func verifyPiece(body []byte, piece metadata.Piece) error {
-	if piece.Hash == "" {
-		return nil
-	}
-	if strings.HasPrefix(piece.Hash, "blake3:") {
-		expected := piece.Hash[len("blake3:"):]
-		h := blake3.New()
-		_, _ = h.Write(body)
-		if hex.EncodeToString(h.Sum(nil)) == expected {
-			return nil
-		}
-		return fmt.Errorf("lazy_read_repair: piece %s blake3 mismatch: expected %q", piece.PieceID, expected)
-	}
-	expected := piece.Hash
-	if len(expected) >= 2 && expected[0] == '"' && expected[len(expected)-1] == '"' {
-		expected = expected[1 : len(expected)-1]
-	}
-	sum := sha256.Sum256(body)
-	if expected == hex.EncodeToString(sum[:]) {
-		return nil
-	}
-	return fmt.Errorf("lazy_read_repair: piece %s hash mismatch: expected %q", piece.PieceID, expected)
 }
 
 func (r *ReadRepair) logf(format string, args ...any) {

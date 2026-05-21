@@ -16,6 +16,7 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
+	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -247,6 +248,155 @@ func TestGet_OpenEndedRange(t *testing.T) {
 	}
 	if rec.Body.String() != "56789" {
 		t.Errorf("open-ended range body = %q, want %q", rec.Body.String(), "56789")
+	}
+}
+
+// recordingHotCache is a minimal HotObjectCache implementation that
+// tracks Put calls so tests can assert when fetchPiece warms the
+// cache. Get is intentionally a permanent miss: every test that
+// uses this cache wants to exercise the cache-miss path so it can
+// observe whether the warm happened.
+type recordingHotCache struct {
+	mu  sync.Mutex
+	put map[string]int
+}
+
+func (c *recordingHotCache) Get(_ context.Context, _ string) (io.ReadCloser, hot_object_cache.CachedPieceMetadata, error) {
+	return nil, hot_object_cache.CachedPieceMetadata{}, hot_object_cache.ErrCacheMiss
+}
+
+func (c *recordingHotCache) Put(_ context.Context, pieceID string, r io.Reader, _ hot_object_cache.PutOptions) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.put == nil {
+		c.put = map[string]int{}
+	}
+	c.put[pieceID]++
+	_, _ = io.Copy(io.Discard, r)
+	return nil
+}
+
+func (c *recordingHotCache) Evict(_ context.Context, _ string) error {
+	return nil
+}
+
+func (c *recordingHotCache) Stats() hot_object_cache.Stats {
+	return hot_object_cache.Stats{}
+}
+
+func (c *recordingHotCache) putCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, v := range c.put {
+		n += v
+	}
+	return n
+}
+
+// TestGet_RangeRequestWarmsCacheInline pins the optimisation
+// added after the integrity branch: when a range request triggers
+// a full-piece fetch (so the verifier can hash the whole piece),
+// the verified buffer is already in memory and the cache is keyed
+// by piece — so we warm it immediately instead of publishing a
+// promotion signal that would cause the async worker to re-fetch.
+// Without this test, a future refactor could re-gate the cache
+// put on `byteRange == nil` without anything catching it.
+func TestGet_RangeRequestWarmsCacheInline(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	cache := &recordingHotCache{}
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Cache:     cache,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("GET range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if rec.Body.String() != "2345" {
+		t.Fatalf("GET range body = %q, want %q", rec.Body.String(), "2345")
+	}
+	if got := cache.putCount(); got != 1 {
+		t.Fatalf("recordingHotCache.Put calls = %d, want 1 (range cache miss must warm the verified full piece)", got)
+	}
+}
+
+// TestGet_RangeRequestServedFromCache pins the cache-hit path for
+// range requests. The pre-fix fetchPiece gated cache.Get on
+// byteRange == nil, so every range request paid a backend
+// round-trip even when the piece was already hot in the cache.
+// After the fix the cache is consulted for any request shape; on
+// a hit the cached body is sliced down to the requested range
+// without touching the backend at all. The test enforces this by
+// (1) seeding the cache with the full piece, (2) deleting the
+// backing piece from the provider so any backend GET would fail,
+// and (3) issuing a range GET that must still succeed.
+func TestGet_RangeRequestServedFromCache(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	hotCache, err := hot_object_cache.NewMemoryCache(hot_object_cache.EvictionPolicy{
+		Kind:     hot_object_cache.EvictionLRU,
+		MaxBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryCache: %v", err)
+	}
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Cache:     hotCache,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("0123456789ABCDEF")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	// Warm the cache with a full-piece GET; the fetchPiece path
+	// puts the verified full piece into the cache on this call.
+	warmReq := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	warmRec := httptest.NewRecorder()
+	h.Get(warmRec, warmReq)
+	if warmRec.Code != http.StatusOK {
+		t.Fatalf("warm GET status = %d, want 200", warmRec.Code)
+	}
+
+	// Wipe the backend. If the range GET below still hits the
+	// provider the request fails. The MemoryCache copy must be
+	// the only source of truth.
+	fake.mu.Lock()
+	fake.pieces = map[string][]byte{}
+	fake.mu.Unlock()
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	rangeReq.Header.Set("Range", "bytes=4-9")
+	rangeRec := httptest.NewRecorder()
+	h.Get(rangeRec, rangeReq)
+	if rangeRec.Code != http.StatusPartialContent {
+		t.Fatalf("range GET status = %d, want 206; body=%s", rangeRec.Code, rangeRec.Body)
+	}
+	if rangeRec.Body.String() != "456789" {
+		t.Fatalf("range GET body = %q, want %q (cache slice must respect the requested byte range)", rangeRec.Body.String(), "456789")
+	}
+	if got, want := rangeRec.Header().Get("Content-Range"), "bytes 4-9/16"; got != want {
+		t.Fatalf("range GET Content-Range = %q, want %q", got, want)
 	}
 }
 
@@ -944,7 +1094,13 @@ func TestHandler_RequireAuth_NoAuthenticator_Returns500(t *testing.T) {
 		{"GET", http.MethodGet, "/bucket/obj", "", h.Get},
 		{"HEAD", http.MethodHead, "/bucket/obj", "", h.Head},
 		{"DELETE", http.MethodDelete, "/bucket/obj", "", h.Delete},
-		{"LIST", http.MethodGet, "/bucket/?list-type=2", "", h.Get},
+		// LIST must exercise h.List (which calls listBucket and
+		// hits its own authenticate() → writeAuthError() path).
+		// Calling h.Get here would route through resolve() →
+		// writeResolveError() which is an entirely different
+		// branch and would mask a regression in listBucket's
+		// auth handling even though both currently return 500.
+		{"LIST", http.MethodGet, "/bucket/?list-type=2", "", h.List},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -980,5 +1136,432 @@ func TestHandler_RequireAuthFalse_NoAuthenticator_AllowsAnonymous(t *testing.T) 
 	h.Put(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT status = %d, want 200 (dev mode anonymous); body=%s", rec.Code, rec.Body)
+	}
+}
+
+// integritySinkRecorder is an IntegrityFailureSink used by tests
+// to verify the GET path emits the correct observability counter
+// for each verifier outcome. Two channels are tracked separately:
+//
+//   - hits["backend"] counts ErrIntegrityCheckFailed events (the
+//     gateway returned 502 IntegrityCheckFailed).
+//   - unrecognised["backend"] counts ErrIntegrityClaimUnrecognized
+//     events (the gateway served the bytes but flagged a legacy
+//     manifest with an opaque hash format).
+//
+// Concurrent-safe so the tests can run in parallel with the rest
+// of the suite if a future maintainer adds t.Parallel().
+type integritySinkRecorder struct {
+	mu           sync.Mutex
+	hits         map[string]int
+	unrecognised map[string]int
+}
+
+func (s *integritySinkRecorder) Inc(backend string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hits == nil {
+		s.hits = make(map[string]int)
+	}
+	s.hits[backend]++
+}
+
+func (s *integritySinkRecorder) IncUnrecognized(backend string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unrecognised == nil {
+		s.unrecognised = make(map[string]int)
+	}
+	s.unrecognised[backend]++
+}
+
+func (s *integritySinkRecorder) count(backend string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hits[backend]
+}
+
+func (s *integritySinkRecorder) countUnrecognized(backend string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unrecognised[backend]
+}
+
+// TestGet_TamperedPiece_FailsClosed exercises PR-2: a backend piece
+// that has been mutated since PUT must be rejected with HTTP 502
+// IntegrityCheckFailed, the bytes must NOT reach the client, and a
+// per-backend zkof_integrity_failure_total metric must be emitted.
+func TestGet_TamperedPiece_FailsClosed(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	bill := &recordingBilling{}
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		Billing:           bill,
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("zkof piece integrity end-to-end")
+
+	// PUT through the handler so the manifest carries a real
+	// blake3 hash. This is the only writer of "well-formed"
+	// pieces in this test.
+	req := httptest.NewRequest(http.MethodPut, "/bucket/integrity.txt", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Sanity: the unmodified GET works.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/integrity.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("baseline GET status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Fatalf("baseline GET body = %q, want %q", got, body)
+	}
+	if hits := sink.count("test"); hits != 0 {
+		t.Fatalf("integrity hits on clean GET = %d, want 0", hits)
+	}
+
+	// Mutate the on-backend bytes behind the manifest's back.
+	// This is what bit-rot, a buggy backend, or an attacker who
+	// can write to the backend looks like to the gateway.
+	fake.mu.Lock()
+	if len(fake.pieces) == 0 {
+		fake.mu.Unlock()
+		t.Fatalf("fake backend has no pieces after PUT")
+	}
+	for k := range fake.pieces {
+		fake.pieces[k] = []byte("tampered bytes that do not match the manifest hash")
+	}
+	fake.mu.Unlock()
+
+	// GET must now fail closed, with no client bytes, an explicit
+	// IntegrityCheckFailed code, and a metric sample.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/integrity.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("tampered GET status = %d, want 502", rec.Code)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "IntegrityCheckFailed") {
+		t.Fatalf("tampered GET body missing IntegrityCheckFailed code: %q", got)
+	}
+	if got := rec.Body.String(); strings.Contains(got, "tampered bytes") {
+		t.Fatalf("tampered GET leaked backend bytes to the client: %q", got)
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered GET = %d, want 1", hits)
+	}
+}
+
+// TestGet_TamperedPiece_FailsClosed_NoCache exercises the OOM-guard
+// fix in fetchPiece: verification must still run (and fail closed)
+// when the handler is configured without a hot cache. Before the
+// fix, the oversize guard AND the verification block were both
+// gated behind `cfg.Cache != nil`, so a no-cache deployment skipped
+// verification entirely. This test pins the no-cache + in-budget
+// branch.
+func TestGet_TamperedPiece_FailsClosed_NoCache(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+		// Cache deliberately nil — this is the path the OOM fix
+		// also rescued from unbounded buffering.
+	})
+
+	body := []byte("integrity matters when there is no cache to hide behind")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/no-cache.txt", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	fake.mu.Lock()
+	for k := range fake.pieces {
+		fake.pieces[k] = []byte("tampered no-cache bytes")
+	}
+	fake.mu.Unlock()
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/no-cache.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("tampered no-cache GET status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "IntegrityCheckFailed") {
+		t.Fatalf("tampered no-cache GET body missing IntegrityCheckFailed: %q", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "tampered no-cache bytes") {
+		t.Fatalf("tampered no-cache GET leaked backend bytes: %q", rec.Body.String())
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered no-cache GET = %d, want 1", hits)
+	}
+}
+
+// TestGetMultipart_TamperedPart_FailsClosed verifies the multipart
+// GET path now re-hashes every part body before assembling the
+// response. Before this fix the multipart path relied on an
+// aggregate object-size check which a same-size tamper could slip
+// past silently.
+func TestGetMultipart_TamperedPart_FailsClosed(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		Multipart:         mpStore,
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	// Create + upload two parts + complete.
+	req := httptest.NewRequest(http.MethodPost, "/bucket/mp-tamper?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("aaaa"), 256),
+		bytes.Repeat([]byte("bbbb"), 256),
+	}
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, body := range parts {
+		partNum := i + 1
+		url := fmt.Sprintf("/bucket/mp-tamper?uploadId=%s&partNumber=%d", initRes.UploadID, partNum)
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		rec := httptest.NewRecorder()
+		h.UploadPart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, want 200; body=%s", partNum, rec.Code, rec.Body)
+		}
+		etag := strings.Trim(rec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
+	}
+	completeXML, err := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	if err != nil {
+		t.Fatalf("marshal complete: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/bucket/mp-tamper?uploadId=%s", initRes.UploadID), bytes.NewReader(completeXML))
+	rec = httptest.NewRecorder()
+	h.CompleteMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Tamper one part on the backend while preserving the exact
+	// byte length (this is the case the aggregate object-size
+	// check could not catch).
+	fake.mu.Lock()
+	var pickedID string
+	for id := range fake.pieces {
+		pickedID = id
+		break
+	}
+	if pickedID == "" {
+		fake.mu.Unlock()
+		t.Fatal("no piece to tamper")
+	}
+	if got, want := len(fake.pieces[pickedID]), len(parts[0]); got != want {
+		fake.mu.Unlock()
+		t.Fatalf("picked piece size = %d, want %d", got, want)
+	}
+	fake.pieces[pickedID] = bytes.Repeat([]byte("zzzz"), 256)
+	fake.mu.Unlock()
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/mp-tamper", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("tampered multipart GET status = %d, want 502; body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "IntegrityCheckFailed") {
+		t.Fatalf("tampered multipart GET body missing IntegrityCheckFailed: %q", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "zzzz") {
+		t.Fatalf("tampered multipart GET leaked backend bytes: %q", rec.Body.String())
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered multipart GET = %d, want 1", hits)
+	}
+}
+
+// TestGetErasureCoded_TamperedShard_FailsClosed verifies an EC GET
+// treats a hash-mismatched shard as lost. With a 6+2 profile and a
+// single tampered shard the parity should still reconstruct, so the
+// GET succeeds, but the integrity metric must fire so operators see
+// the bit-rot signal even when parity hides it.
+func TestGetErasureCoded_TamperedShard_FailsClosed(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding:     erasure_coding.DefaultRegistry(),
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-tamper!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-tamper", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Tamper exactly one shard (within parity tolerance for
+	// 6+2). The decode should still succeed by reconstructing
+	// from the remaining 7 shards. Pick the first piece in the
+	// fake backend; its length is preserved so the only thing
+	// that flags it is the hash check.
+	fake.mu.Lock()
+	var pickedID string
+	for id := range fake.pieces {
+		pickedID = id
+		break
+	}
+	if pickedID == "" {
+		fake.mu.Unlock()
+		t.Fatal("no piece to tamper")
+	}
+	shardLen := len(fake.pieces[pickedID])
+	fake.pieces[pickedID] = bytes.Repeat([]byte{0xff}, shardLen)
+	fake.mu.Unlock()
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/ec-tamper", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC GET with 1 tampered shard status = %d, want 200 (parity recovers); body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, body) {
+		t.Fatalf("EC GET with 1 tampered shard returned wrong bytes: len(got)=%d, len(want)=%d", len(got), len(body))
+	}
+	if hits := sink.count("test"); hits != 1 {
+		t.Fatalf("integrity hits after tampered EC GET = %d, want 1 (single shard mismatch)", hits)
+	}
+}
+
+// TestGet_UnrecognizedHashFormat_ServesWithObservabilityCounter
+// pins the legacy-manifest behaviour: when the manifest's
+// Piece.Hash is non-empty but not in any recognised format (e.g.
+// a legacy multipart / copy / dedup manifest that stamped a
+// backend ETag into Hash), the verifier returns
+// ErrIntegrityClaimUnrecognized rather than
+// ErrIntegrityCheckFailed. The handler must serve the bytes
+// (there is no proof they're wrong) and increment the dedicated
+// observability counter so operators can plan a one-shot
+// rewrite. The hard-fail counter must stay at zero.
+func TestGet_UnrecognizedHashFormat_ServesWithObservabilityCounter(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("legacy manifest with an opaque ETag in Hash")
+
+	// PUT through the handler so the manifest exists. We will
+	// then rewrite Piece.Hash on the stored manifest to simulate
+	// what a pre-PR-2 multipart / copy / dedup writer would have
+	// produced: an opaque backend ETag in the Hash slot, with the
+	// piece bytes themselves untouched.
+	req := httptest.NewRequest(http.MethodPut, "/bucket/legacy.txt", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	mkey := manifest_store.ManifestKey{
+		TenantID:      "anonymous",
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("legacy.txt"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	if len(man.Pieces) != 1 {
+		t.Fatalf("manifest pieces = %d, want 1", len(man.Pieces))
+	}
+	// Overwrite the recorded hash with a value that looks like an
+	// AWS S3 opaque ETag (32-char lowercase hex without the
+	// blake3: prefix). The verifier must classify this as
+	// ErrIntegrityClaimUnrecognized, NOT as a SHA-256 hash that
+	// happens to mismatch.
+	man.Pieces[0].Hash = "d41d8cd98f00b204e9800998ecf8427e"
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	// GET must serve the original body and emit ONLY the
+	// observability counter; the hard-fail counter must stay
+	// flat.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/legacy.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy-manifest GET status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Fatalf("legacy-manifest GET body = %q, want %q", got, body)
+	}
+	if hits := sink.count("test"); hits != 0 {
+		t.Fatalf("integrity_failure counter = %d, want 0 (unrecognised hash != content mismatch)", hits)
+	}
+	if u := sink.countUnrecognized("test"); u != 1 {
+		t.Fatalf("integrity_claim_unrecognized counter = %d, want 1", u)
+	}
+
+	// A second GET (with cache nil) must increment the counter
+	// again -- the verifier does not silently latch the legacy
+	// state, so each unverifiable GET adds to the count.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/legacy.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second legacy-manifest GET status = %d, want 200", rec.Code)
+	}
+	if u := sink.countUnrecognized("test"); u != 2 {
+		t.Fatalf("integrity_claim_unrecognized counter after 2 GETs = %d, want 2", u)
 	}
 }

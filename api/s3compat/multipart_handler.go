@@ -283,18 +283,17 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Tee the body through a BLAKE3 hasher when this upload is
-	// dedup-eligible so CompleteMultipartUpload can derive a
-	// per-part hash without re-reading the piece from the
-	// backend. We only do this for the encryption modes that
-	// produce convergent ciphertext (client_side, ""): managed /
-	// public_distribution multipart cannot dedup anyway, so the
-	// hash would be wasted work.
-	var partHasher *blake3.Hasher
-	if h.multipartDedupEligible(upload) {
-		partHasher = blake3.New()
-		body = io.TeeReader(body, partHasher)
-	}
+	// Tee the body through a BLAKE3 hasher so CompleteMultipartUpload
+	// can stamp a real content hash on each Piece (and so the GET
+	// integrity check has something to verify against). Before this
+	// commit we only hashed when the upload was dedup-eligible, which
+	// meant non-dedup multipart manifests left Piece.Hash as the
+	// backend's opaque ETag — and the GET integrity check (PR-2) would
+	// refuse to serve any of those pieces. The hash is also reused by
+	// CompleteMultipartUpload's deferred convergent consolidation
+	// path when dedup is enabled.
+	partHasher := blake3.New()
+	body = io.TeeReader(body, partHasher)
 
 	res, err := provider.PutPiece(r.Context(), pieceID, body, providers.PutOptions{
 		ContentLength: contentLength,
@@ -304,9 +303,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
 		return
 	}
-	if partHasher != nil {
-		upload.SetPartHash(partNumber, partHasher.Sum(nil))
-	}
+	upload.SetPartHash(partNumber, partHasher.Sum(nil))
 
 	// Record plaintext size on the Part so CompleteMultipartUpload
 	// sums the logical (user-visible) object size rather than the
@@ -403,16 +400,28 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 
 	// Assemble the manifest. Pieces are stored in ascending
 	// PartNumber order so the GET path can concatenate them.
+	// Each piece's Hash is BLAKE3 of the ciphertext-on-the-wire
+	// captured by the UploadPart hasher; the backend's ETag goes
+	// into ProviderETag so we keep both — Hash is what the GET
+	// integrity verifier re-computes from the bytes, ETag is the
+	// backend's opaque identifier (some backends return a
+	// multipart-style concatenated MD5 that has no relationship
+	// to the bytes, so it cannot be used for verification).
 	pieces := make([]metadata.Piece, 0, len(parts))
 	var totalSize int64
 	for _, p := range parts {
+		hash := ""
+		if raw, ok := upload.PartHash(p.PartNumber); ok && len(raw) > 0 {
+			hash = "blake3:" + hex.EncodeToString(raw)
+		}
 		pieces = append(pieces, metadata.Piece{
-			PieceID:    p.PieceID,
-			Hash:       p.ETag,
-			Backend:    p.Backend,
-			State:      "active",
-			PartNumber: p.PartNumber,
-			SizeBytes:  p.SizeBytes,
+			PieceID:      p.PieceID,
+			Hash:         hash,
+			ProviderETag: p.ETag,
+			Backend:      p.Backend,
+			State:        "active",
+			PartNumber:   p.PartNumber,
+			SizeBytes:    p.SizeBytes,
 		})
 		totalSize += p.SizeBytes
 	}
@@ -866,7 +875,15 @@ func (h *Handler) redirectManifestToCanonical(manifest *metadata.ObjectManifest,
 		}
 		manifest.Pieces[0].PieceID = existing.PieceID
 		manifest.Pieces[0].Backend = existing.Backend
-		manifest.Pieces[0].Hash = existing.ETag
+		// The content_index does not yet carry a per-piece BLAKE3
+		// hash, so we clear the manifest's Hash on dedup redirect.
+		// The GET path treats empty Hash as "no integrity claim"
+		// (legacy behaviour) rather than verifying against the
+		// backend's ETag and returning 502. Adding a PieceHash
+		// column to content_index is tracked as a follow-up so
+		// dedup-redirected manifests also get integrity checks.
+		manifest.Pieces[0].Hash = ""
+		manifest.Pieces[0].ProviderETag = existing.ETag
 		manifest.Pieces[0].SizeBytes = existing.SizeBytes
 		manifest.MigrationState.PrimaryBackend = existing.Backend
 		return nil
@@ -988,11 +1005,14 @@ func (h *Handler) dedupManagedMultipartHit(
 	h.deleteUploadedParts(ctx, parts)
 
 	manifest.Pieces = []metadata.Piece{{
-		PieceID:   existing.PieceID,
-		Backend:   existing.Backend,
-		Hash:      existing.ETag,
-		SizeBytes: existing.SizeBytes,
-		State:     "active",
+		PieceID:      existing.PieceID,
+		Backend:      existing.Backend,
+		// See redirectManifestToCanonical: dedup redirect leaves
+		// Hash empty until content_index grows a PieceHash field.
+		Hash:         "",
+		ProviderETag: existing.ETag,
+		SizeBytes:    existing.SizeBytes,
+		State:        "active",
 	}}
 	manifest.ContentHash = existing.ContentHash
 	manifest.ChunkSize = existing.SizeBytes
@@ -1120,11 +1140,13 @@ func (h *Handler) dedupManagedMultipartMiss(
 			return false
 		}
 		manifest.Pieces = []metadata.Piece{{
-			PieceID:   canonical.PieceID,
-			Backend:   canonical.Backend,
-			Hash:      canonical.ETag,
-			SizeBytes: canonical.SizeBytes,
-			State:     "active",
+			PieceID:      canonical.PieceID,
+			Backend:      canonical.Backend,
+			// See redirectManifestToCanonical.
+			Hash:         "",
+			ProviderETag: canonical.ETag,
+			SizeBytes:    canonical.SizeBytes,
+			State:        "active",
 		}}
 		manifest.ContentHash = canonical.ContentHash
 		manifest.ChunkSize = canonical.SizeBytes
@@ -1137,12 +1159,25 @@ func (h *Handler) dedupManagedMultipartMiss(
 		return true
 	}
 
+	// contentHash (computed at line 1094) is
+	// formatContentHash(blake3Hex(consolidatedCiphertext)) —
+	// the BLAKE3 of the exact ciphertext bytes PUT to the backend
+	// above. That is precisely what pieceintegrity.Verify
+	// re-computes on the cache-miss GET path: hex of
+	// blake3.Sum256(ciphertext_returned_by_backend). Stamping it
+	// into Piece.Hash gives dedup-consolidated multipart
+	// manifests full GET-path integrity coverage, closing the
+	// observability gap the comment block above used to
+	// describe. combinedDigest is a separate variable that
+	// hashes plaintext digests — unsuitable for the verifier and
+	// not used here.
 	manifest.Pieces = []metadata.Piece{{
-		PieceID:   putRes.PieceID,
-		Backend:   upload.Backend,
-		Hash:      putRes.ETag,
-		SizeBytes: putRes.SizeBytes,
-		State:     "active",
+		PieceID:      putRes.PieceID,
+		Backend:      upload.Backend,
+		Hash:         contentHash,
+		ProviderETag: putRes.ETag,
+		SizeBytes:    putRes.SizeBytes,
+		State:        "active",
 	}}
 	manifest.ContentHash = contentHash
 	manifest.ChunkSize = putRes.SizeBytes

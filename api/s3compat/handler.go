@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 	"github.com/zeebo/blake3"
@@ -55,19 +57,23 @@ const AnonymousTenant = "anonymous"
 var ErrAuthMisconfigured = errors.New("s3compat: authenticator not configured but RequireAuth=true")
 
 // MaxInMemoryObjectBytes caps the size of an object the handler is
-// willing to buffer into memory on the request goroutine. The two
-// non-streaming paths that have to honour this ceiling are:
+// willing to buffer into memory on the request goroutine. The
+// remaining non-streaming paths that have to honour this ceiling are:
 //
-//   - The gateway-encrypted GET path, which has to read the entire
-//     ciphertext before frame-decrypting it (the SDK's chunk format
-//     does not currently expose a streaming Open).
+//   - The gateway-encrypted Range GET path
+//     (bufferedGatewayDecryptedGet). Slicing an arbitrary byte
+//     range out of a chunk-framed plaintext requires the whole
+//     plaintext in memory; chunk-level range seek lands in v0.2.0.
+//     Non-range gateway-encrypted GETs use the streaming path
+//     (streamGatewayDecryptedGet) and have NO ceiling.
 //
 //   - The inline cache-warming path in fetchPiece, which buffers a
 //     piece into memory so it can hand the bytes both to the
 //     hot-object cache and to the client.
 //
-// Above the cap the gateway-encrypted GET returns 507
-// InsufficientStorage with a descriptive message, and the
+// Above the cap the buffered Range GET returns 507
+// InsufficientStorage with a descriptive message that points the
+// caller at the unbounded streaming full-object GET path; the
 // cache-warming path skips inline warming and publishes a
 // PromotionSignal so the async worker can decide whether to warm
 // the piece. Both ceilings match the multipart in-memory pre-fetch
@@ -76,8 +82,8 @@ var ErrAuthMisconfigured = errors.New("s3compat: authenticator not configured bu
 //
 // The constant lives here rather than in config so tests can
 // reference it without round-tripping through a Config field; a
-// follow-up commit can promote it to a tunable when streaming
-// decryption / streaming EC land.
+// follow-up commit can promote it to a tunable when chunk-level
+// range seek and streaming EC land.
 const MaxInMemoryObjectBytes int64 = 256 * 1024 * 1024
 
 // PlacementEngine chooses the storage backend for a new object. Phase
@@ -93,6 +99,35 @@ type PlacementEngine interface {
 // disables metering (used in tests).
 type BillingSink interface {
 	Emit(event billing.UsageEvent)
+}
+
+// IntegrityFailureSink receives observability events from the
+// piece-integrity verifier. cmd/gateway wires this to
+// internal/metrics so operators can alert on either channel
+// without api/s3compat importing internal/metrics directly.
+//
+// Two channels — semantically distinct — both fire from
+// fetchPiece / getMultipart / getErasureCoded:
+//
+//   - Inc(backend) fires when the bytes the backend returned
+//     failed to match a recognised integrity claim. This is a
+//     hard-fail signal: the gateway has refused to serve the
+//     piece, returned 502 IntegrityCheckFailed, and is shouting
+//     for an operator. Any sustained non-zero rate here is a
+//     bit-rot / tampering / wrong-hash bug.
+//
+//   - IncUnrecognized(backend) fires when the manifest's hash is
+//     present but not in any recognised format (e.g. a legacy
+//     multipart / copy / dedup manifest still has the backend's
+//     opaque ETag in Hash). The bytes were served because we
+//     cannot prove anything about them, but the verifier wants
+//     operators to see the count so they can plan / drive a
+//     one-shot rewrite to populate ProviderETag + clear Hash.
+//     A steady non-zero rate here is a migration TODO, not an
+//     incident.
+type IntegrityFailureSink interface {
+	Inc(backend string)
+	IncUnrecognized(backend string)
 }
 
 // Config collects the dependencies Handler needs.
@@ -198,6 +233,15 @@ type Config struct {
 	// pre-flight check and audit trail. Both fields are optional;
 	// when nil the gateway behaves as it did before Phase 4.
 	Compliance ComplianceHooks
+
+	// IntegrityFailures, when non-nil, is invoked once per piece
+	// the handler observed with a mismatched content hash. The
+	// handler also logs the failure at ERROR level and refuses to
+	// cache or serve the bad bytes regardless of whether a sink
+	// is wired. Hooked from cmd/gateway/main.go to
+	// internal/metrics's IncIntegrityFailure so operators can
+	// alert on the rate. Optional.
+	IntegrityFailures IntegrityFailureSink
 
 	// Now, if set, returns the current time. Tests override it to
 	// make manifests deterministic.
@@ -507,6 +551,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			Locator:      putRes.Locator,
 			Hash:         blake3Hash,
 			ProviderETag: putRes.ETag,
+			SizeBytes:    putRes.SizeBytes,
 			State:        "active",
 		}},
 		MigrationState: metadata.MigrationState{
@@ -594,65 +639,47 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		VersionID:     manifest.VersionID,
 	}
 
-	// For gateway-encrypted objects (managed / public_distribution)
-	// the backend pieces are ciphertext with self-framing nonces, so
-	// we must fetch the whole piece to decrypt and only then slice
-	// to the requested byte range. Client_side objects are opaque
-	// ciphertext from the gateway's view — byte ranges land on
-	// ciphertext bytes and the client owns the framing.
-	effectiveRange := byteRange
+	// Branch on (encrypted, range) before we touch the backend.
+	// Four paths:
+	//
+	//   1. Not gateway-encrypted, any range:
+	//      fetchPiece handles ciphertext-vs-clear-bytes
+	//      transparently; the body it returns is what we serve.
+	//   2. Gateway-encrypted, no range:
+	//      Streaming decryption path — pull ciphertext as an
+	//      io.Reader, TeeReader through a BLAKE3 hasher for
+	//      post-EOF integrity verification, then chain through
+	//      streamDecryptFromStorage so plaintext flows straight
+	//      to the client. No MaxInMemoryObjectBytes ceiling: a
+	//      multi-GiB object uses a few hundred KiB of buffers
+	//      (one DecryptObject chunk frame + os pipes).
+	//   3. Gateway-encrypted, range request:
+	//      Buffered decrypt path. We need the full plaintext in
+	//      memory to slice an arbitrary byte range; chunk-level
+	//      range seek lands in v0.2.0. Until then the
+	//      MaxInMemoryObjectBytes ceiling still applies to
+	//      protect the gateway from OOM on a 4 GiB Range GET.
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
-		effectiveRange = nil
+		if byteRange == nil {
+			h.streamGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, tenantID, bucket)
+			return
+		}
+		h.bufferedGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
+		return
 	}
 
-	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, effectiveRange, tenantID, bucket)
+	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
 	if err != nil {
+		if errors.Is(err, pieceintegrity.ErrIntegrityCheckFailed) {
+			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+				"backend returned a piece whose content hash did not match the manifest; refusing to serve",
+				r.URL.Path)
+			return
+		}
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
 		return
 	}
 	defer body.Close()
-	_ = served
-
-	if IsGatewayEncrypted(manifest.Encryption.Mode) {
-		// The gateway-encrypted GET path frame-decrypts the entire
-		// ciphertext before slicing the optional Range, so it has
-		// to buffer the whole piece in memory. Refuse objects
-		// above the in-memory ceiling so a single very large GET
-		// cannot OOM the gateway. Streaming frame-decryption is
-		// tracked as a Phase 4 workstream; until that lands
-		// operators should route very large gateway-encrypted
-		// objects through the EC path or use direct-to-backend
-		// presigned URLs.
-		if manifest.ObjectSize > MaxInMemoryObjectBytes {
-			writeError(w, http.StatusInsufficientStorage, "ObjectTooLargeForInMemoryDecrypt",
-				fmt.Sprintf("gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; streaming decryption is not yet implemented",
-					manifest.ObjectSize, MaxInMemoryObjectBytes),
-				r.URL.Path)
-			return
-		}
-		ciphertext, rerr := io.ReadAll(body)
-		if rerr != nil {
-			writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
-			return
-		}
-		plaintext, derr := h.decryptFromStorage(ciphertext, manifest.Encryption)
-		if derr != nil {
-			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
-			return
-		}
-		if byteRange != nil {
-			end := byteRange.End
-			if end < 0 || end >= int64(len(plaintext)) {
-				end = int64(len(plaintext)) - 1
-			}
-			if byteRange.Start < 0 || byteRange.Start > end+1 {
-				writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
-				return
-			}
-			plaintext = plaintext[byteRange.Start : end+1]
-		}
-		body = io.NopCloser(bytes.NewReader(plaintext))
-	}
 
 	if etag := pieceETag(piece); etag != "" {
 		w.Header().Set("ETag", quote(etag))
@@ -686,6 +713,351 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
 }
 
+// bufferedGatewayDecryptedGet serves a gateway-encrypted object
+// with a Range header. We must materialise the full plaintext to
+// slice an arbitrary range (chunk-level range seek is a v0.2.0
+// follow-up), so the MaxInMemoryObjectBytes ceiling still applies
+// here as a hard OOM guard.
+func (h *Handler) bufferedGatewayDecryptedGet(
+	w http.ResponseWriter,
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	byteRange *providers.ByteRange,
+	tenantID, bucket string,
+) {
+	if manifest.ObjectSize > MaxInMemoryObjectBytes {
+		// TODO(v0.2.0): chunk-level range seek using the SDK's
+		// 64 KiB chunk-frame headers lets us decrypt only the
+		// chunks overlapping byteRange instead of the full
+		// object. Until that lands, very large gateway-encrypted
+		// objects with Range headers are refused outright; the
+		// non-range GET path uses streamGatewayDecryptedGet and
+		// has no ceiling.
+		writeError(w, http.StatusInsufficientStorage, "RangeRequestTooLargeForBufferedDecrypt",
+			fmt.Sprintf("range GET on gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; full-object GETs stream without this ceiling",
+				manifest.ObjectSize, MaxInMemoryObjectBytes),
+			r.URL.Path)
+		return
+	}
+
+	// The fetchPiece path returns a buffered + integrity-verified
+	// ciphertext for pieces inside the ceiling, exactly what we
+	// need to feed decryptFromStorage. Forcing byteRange=nil here
+	// (instead of pre-nilling the caller's byteRange like the old
+	// code did) keeps the cache and integrity logic uniform with
+	// the unencrypted path.
+	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, nil, tenantID, bucket)
+	if err != nil {
+		if errors.Is(err, pieceintegrity.ErrIntegrityCheckFailed) {
+			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+				"backend returned a piece whose content hash did not match the manifest; refusing to serve",
+				r.URL.Path)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+	defer body.Close()
+
+	ciphertext, rerr := io.ReadAll(body)
+	if rerr != nil {
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
+		return
+	}
+	plaintext, derr := h.decryptFromStorage(ciphertext, manifest.Encryption)
+	if derr != nil {
+		writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+		return
+	}
+	end := byteRange.End
+	if end < 0 || end >= int64(len(plaintext)) {
+		end = int64(len(plaintext)) - 1
+	}
+	if byteRange.Start < 0 || byteRange.Start > end+1 {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
+		return
+	}
+	sliced := plaintext[byteRange.Start : end+1]
+
+	if etag := pieceETag(piece); etag != "" {
+		w.Header().Set("ETag", quote(etag))
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(sliced)), 10))
+	w.WriteHeader(http.StatusPartialContent)
+	n, _ := w.Write(sliced)
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	if n > 0 {
+		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
+		if !served {
+			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
+		}
+	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// streamGatewayDecryptedGet serves a gateway-encrypted, non-range
+// GET by piping ciphertext directly through the SDK's chunk-frame
+// decryptor. No MaxInMemoryObjectBytes ceiling here — a multi-GiB
+// object uses a constant ~64 KiB chunk buffer plus a small TeeReader
+// + BLAKE3 hasher.
+//
+// Integrity verification is post-stream: we Tee the ciphertext into
+// a BLAKE3 hasher before it hits the decryptor and compare the
+// final digest against piece.Hash after io.Copy returns. Unlike the
+// buffered path (which can return 502 before any bytes reach the
+// client) we may have already written plaintext to the response by
+// the time a mismatch is detected. The trade-off is documented in
+// the v0.1.0 hardening plan; the alternatives — buffer the full
+// object before sending or refuse multi-GiB GETs — both regress
+// the throughput goal of this PR. On mismatch we record the
+// failure (Prometheus + ERROR log) and stop writing, which truncates
+// the response and surfaces to the client as either a
+// Content-Length mismatch (chunked transfer or otherwise) or a
+// shorter body than declared.
+//
+// Read-repair: if the primary backend GetPiece fails, we fall back
+// to tryReadRepair which buffers the repaired piece in memory and
+// returns it with preVerified=true. We stream-decrypt the buffered
+// bytes and skip our own hash check (ReadRepair already verified).
+//
+// Cache: a cache hit returns the cached ciphertext, which the cache
+// only stores after a successful prior verification, so we skip
+// the hash check on hits. On a miss we do NOT inline-warm the
+// cache from the streaming path — buffering the full ciphertext
+// just to warm the cache would defeat the purpose of streaming.
+// We publish a promotion signal so the async worker can decide.
+func (h *Handler) streamGatewayDecryptedGet(
+	w http.ResponseWriter,
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	tenantID, bucket string,
+) {
+	ciphertextSrc, served, verifyFn, err := h.openCiphertextStream(r, mkey, manifest, piece, pieceProvider, tenantID, bucket)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+	defer ciphertextSrc.Close()
+
+	plaintext, derr := h.streamDecryptFromStorage(ciphertextSrc, manifest.Encryption)
+	if derr != nil {
+		writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+		return
+	}
+
+	if etag := pieceETag(piece); etag != "" {
+		w.Header().Set("ETag", quote(etag))
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	// manifest.ObjectSize is the plaintext length on
+	// gateway-encrypted objects, so Content-Length is honest
+	// without buffering the decrypted bytes. The client uses it
+	// to detect truncation if we abort mid-stream on integrity
+	// failure.
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	w.WriteHeader(http.StatusOK)
+	// Wrap the response writer so we can distinguish read-side
+	// errors (decryptor / chunk-AEAD reject — a real corruption
+	// signal) from write-side errors (client RST, broken pipe — a
+	// transport hiccup). io.Copy returns whichever error happened
+	// first, but only the wrapper sees write failures directly.
+	// The branching below uses this to decide whether to call
+	// verifyFn at all: on a write-side failure the TeeReader has
+	// only hashed a partial ciphertext prefix, so calling verifyFn
+	// would always mismatch and produce a false-positive
+	// zkof_integrity_failure_total tick that trains operators to
+	// ignore the counter.
+	ew := &writeErrCapturingWriter{w: w}
+	n, copyErr := io.Copy(ew, plaintext)
+
+	// Three terminal states; each chooses how to interact with the
+	// integrity counter so the metric stays a high-fidelity signal
+	// for actual content corruption:
+	//
+	//   1. copyErr == nil — full stream landed cleanly. Run the
+	//      post-EOF BLAKE3 check on the ciphertext the TeeReader
+	//      observed and record the appropriate counter on a
+	//      mismatch (or unrecognised legacy claim).
+	//
+	//   2. ew.writeErr != nil — client side aborted before we
+	//      finished writing. The TeeReader has only hashed a
+	//      ciphertext prefix; calling verifyFn would always
+	//      mismatch. Skip the integrity check entirely; the WARN
+	//      log below still surfaces the truncation. This is the
+	//      false-positive case Devin Review flagged.
+	//
+	//   3. copyErr != nil && ew.writeErr == nil — decryptor /
+	//      chunk-AEAD rejected a frame. The error itself is the
+	//      integrity signal (Poly1305 said the bytes are wrong),
+	//      so we record an integrity failure with the underlying
+	//      error rather than re-deriving the same conclusion via
+	//      a partial-hash mismatch. This preserves the
+	//      tamper-detection contract pinned by
+	//      TestManagedEncryption_StreamingGet_TamperedPieceDetected.
+	switch {
+	case copyErr == nil:
+		if verifyFn != nil {
+			if verr := verifyFn(); verr != nil {
+				if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+					h.recordIntegrityUnrecognized(piece, verr)
+				} else {
+					// Mismatch on the streaming path is a
+					// detection (we cannot un-send the bytes the
+					// client already has), but we still:
+					//   (a) emit the Prometheus counter so
+					//       operators see it on dashboards;
+					//   (b) log at ERROR with piece + backend +
+					//       expected/got so on-call can pivot.
+					h.recordIntegrityFailure(piece, verr)
+				}
+			}
+		}
+	case ew.writeErr != nil:
+		// Client disconnect / broken pipe. Don't ring the
+		// integrity bell — partial hash would lie. WARN log
+		// below carries the bytes-sent + cause.
+	default:
+		// Read-side error: decryptor or chunk-AEAD reject. The
+		// error itself is the integrity signal. Skip the
+		// post-EOF BLAKE3 check (it would either mismatch on
+		// the same partial-hash basis or be redundant with this
+		// stronger signal) and record the counter directly so
+		// the failure shows up on dashboards with the
+		// underlying error for diagnosis.
+		h.recordIntegrityFailure(piece, copyErr)
+	}
+
+	if copyErr != nil {
+		// Mid-stream failure: chunk-AEAD reject, client RST,
+		// broken pipe, etc. The status line and any headers
+		// already went out, and n bytes of plaintext were
+		// committed to the wire before the failure, so the
+		// client sees a truncated stream and the gateway has
+		// burned real egress. Surface it at WARN with piece +
+		// backend + bytes-sent so on-call can correlate the
+		// billing emission below against the failure mode. The
+		// write_err field distinguishes client disconnects
+		// (writeErr != nil) from read-side decrypt failures
+		// (writeErr == nil) so on-call doesn't need to grep
+		// chunk-AEAD error strings to triage.
+		log.Printf("s3compat: WARN streaming_get_truncated: piece=%s backend=%s bytes_sent=%d write_err=%v err=%v",
+			piece.PieceID, piece.Backend, n, ew.writeErr, copyErr)
+	}
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	// Bill on bytes actually written to the response, regardless
+	// of whether io.Copy returned an error. A mid-stream failure
+	// still committed n bytes of plaintext to the wire —
+	// gating on copyErr == nil here would silently undercount
+	// egress on flaky clients or tampered ciphertext. Every
+	// other GET path (fetchPiece-backed, EC, multipart) bills on
+	// n > 0 unconditionally; this matches that invariant.
+	if n > 0 {
+		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
+		if !served {
+			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
+		}
+	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// openCiphertextStream is the streaming-path counterpart to
+// fetchPiece for gateway-encrypted GETs. It consults the cache,
+// falls back to the backend, falls back to read-repair, and wraps
+// the resulting reader with a BLAKE3 TeeReader so the caller can
+// stream the bytes downstream while still checking integrity after
+// EOF.
+//
+// Return values:
+//   - body: io.ReadCloser yielding ciphertext. Caller MUST close.
+//   - served: true on cache hit (for billing).
+//   - verifyFn: nil if the source is already verified (cache hit
+//     or repair-supplied buffer); otherwise a function the caller
+//     invokes AFTER draining body to EOF, which returns nil on a
+//     match, pieceintegrity.ErrIntegrityCheckFailed on a mismatch,
+//     or pieceintegrity.ErrIntegrityClaimUnrecognized on a legacy
+//     manifest with an unparseable Hash field.
+//   - err: opening the stream failed entirely.
+func (h *Handler) openCiphertextStream(
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	tenantID, bucket string,
+) (io.ReadCloser, bool, func() error, error) {
+	if h.cfg.Cache != nil {
+		cached, _, cerr := h.cfg.Cache.Get(r.Context(), piece.PieceID)
+		if cerr == nil {
+			h.emit(tenantID, bucket, billing.CacheHits, 1)
+			return cached, true, nil, nil
+		}
+	}
+	if h.cfg.Cache != nil {
+		h.emit(tenantID, bucket, billing.CacheMisses, 1)
+	}
+	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, nil)
+	if err != nil {
+		repaired, repairedVerified, repairErr := h.tryReadRepair(r, mkey, manifest, nil)
+		if repairErr != nil || repaired == nil {
+			return nil, false, nil, err
+		}
+		// Read-repair returns a buffered + verified body. Stream
+		// from it directly with no TeeReader: the verifier is
+		// implicit in the preVerified flag.
+		if repairedVerified {
+			return repaired, false, nil, nil
+		}
+		body = repaired
+	}
+
+	pieceSize := piece.SizeBytes
+	if pieceSize <= 0 {
+		pieceSize = manifest.ObjectSize
+	}
+	if h.cfg.Cache != nil {
+		// Publish a promotion signal so the async worker can
+		// decide whether to fetch + cache the ciphertext on its
+		// own schedule. We do NOT inline-warm here because that
+		// would force us to buffer the full ciphertext for the
+		// cache Put, defeating the streaming path's purpose.
+		h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
+	}
+
+	// pieceintegrity.Hasher returns (a) an io.Writer keyed off
+	// piece.Hash's format (BLAKE3 / legacy SHA-256 / unrecognised)
+	// and (b) a Check closure that returns nil on a match,
+	// pieceintegrity.ErrIntegrityCheckFailed on a content
+	// mismatch, or pieceintegrity.ErrIntegrityClaimUnrecognized
+	// on a legacy unparseable manifest. TeeReader fans every byte
+	// our caller reads into the hasher, so by the time the body
+	// is drained the Check closure can fire without us having
+	// kept a copy of the ciphertext.
+	hasher, check := pieceintegrity.Hasher(piece)
+	teed := io.TeeReader(body, hasher)
+	return &teeingCloser{r: teed, c: body}, false, check, nil
+}
+
+// teeingCloser wraps a TeeReader so the gateway's caller can defer
+// .Close() on a single io.ReadCloser. The TeeReader itself is not
+// a Closer; we delegate to the underlying body so the backend
+// connection is released when the request handler unwinds.
+type teeingCloser struct {
+	r io.Reader
+	c io.Closer
+}
+
+func (t *teeingCloser) Read(p []byte) (int, error) { return t.r.Read(p) }
+func (t *teeingCloser) Close() error               { return t.c.Close() }
+
 // fetchPiece consults the hot object cache (if configured) before
 // hitting the backend. Range requests bypass the cache because the
 // cache is keyed by piece, not by byte range. The second return
@@ -696,6 +1068,30 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // back to the configured ReadRepair to fetch the piece from the
 // secondary backend, copy it to the new primary, and serve the
 // repaired body to the caller.
+//
+// Integrity verification: on a cache miss the handler re-hashes
+// the piece body and compares it against piece.Hash before
+// caching or serving. On a mismatch fetchPiece returns an error
+// wrapping pieceintegrity.ErrIntegrityCheckFailed so Get() can
+// map it to 502 IntegrityCheckFailed — the bad bytes are NEVER
+// cached and NEVER served. The handler also emits the
+// zkof_integrity_failure_total{backend="..."} counter and logs
+// the failure at ERROR level with piece id, backend, expected
+// hash, and computed hash so an on-call can correlate.
+//
+// Range requests on a cache miss fetch the full piece, verify
+// it, then slice the range out of the verified buffer. This
+// keeps the integrity guarantee end-to-end at the cost of
+// reading the whole piece on a range cache miss; the cost is
+// reclaimed on the next hit because the verified piece is also
+// promoted into the cache (subject to the same
+// MaxInMemoryObjectBytes ceiling as the cache-warming path).
+// When the piece exceeds the ceiling we cannot verify in place
+// without a streaming hasher — fall back to the legacy
+// range-forward behaviour, publish a promotion signal, and
+// surface a structured warning so operators can spot the
+// unverified path in their logs. Streaming verify is delivered
+// in the streaming-decryption PR.
 func (h *Handler) fetchPiece(
 	r *http.Request,
 	mkey manifest_store.ManifestKey,
@@ -706,102 +1102,268 @@ func (h *Handler) fetchPiece(
 	tenantID, bucket string,
 ) (io.ReadCloser, bool, error) {
 	objectSize := manifest.ObjectSize
-	if h.cfg.Cache != nil && byteRange == nil {
+	if h.cfg.Cache != nil {
 		cached, _, err := h.cfg.Cache.Get(r.Context(), piece.PieceID)
 		if err == nil {
 			h.emit(tenantID, bucket, billing.CacheHits, 1)
-			return cached, true, nil
+			if byteRange == nil {
+				return cached, true, nil
+			}
+			// Range request on a cache hit. The cache only
+			// ever stores fully-verified pieces (the cache
+			// put below gates on a successful Verify), so
+			// no second integrity check is needed. Read the
+			// cached body once and slice the requested
+			// range out of it; the slice is bounded by the
+			// per-piece cache ceiling (== MaxInMemoryObject
+			// Bytes), so this cannot OOM. Without this hit
+			// path every range request paid a backend
+			// round-trip even when the bytes were already
+			// hot — which was the pre-fix behaviour the
+			// integrity rework inadvertently locked in
+			// (fetchPiece now buffers full pieces for any
+			// request that goes upstream, so the cache hit
+			// pays off on the first range request after a
+			// full-piece warm).
+			buf, rerr := io.ReadAll(cached)
+			_ = cached.Close()
+			if rerr != nil {
+				return nil, false, rerr
+			}
+			end := byteRange.End
+			if end < 0 || end >= int64(len(buf)) {
+				end = int64(len(buf)) - 1
+			}
+			if byteRange.Start < 0 || byteRange.Start > end+1 {
+				return nil, false, fmt.Errorf("s3compat: range %d-%d out of bounds for piece %s (%d bytes)", byteRange.Start, byteRange.End, piece.PieceID, len(buf))
+			}
+			sliced := buf[byteRange.Start : end+1]
+			return io.NopCloser(bytes.NewReader(sliced)), true, nil
 		}
+		// Cache miss: emit the counter once here for both
+		// range and non-range. The legacy duplicate emission
+		// below the wantFullPiece branch only fired on
+		// byteRange == nil, which let range cache misses go
+		// uncounted; consolidating it here fixes both gaps
+		// without double-counting.
+		h.emit(tenantID, bucket, billing.CacheMisses, 1)
 	}
-	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
+
+	pieceSize := piece.SizeBytes
+	if pieceSize <= 0 {
+		pieceSize = objectSize
+	}
+
+	// Decide up front whether we will buffer + verify or stream
+	// raw. The cache-warming branch already wanted the full
+	// piece, and the integrity branch on a range cache miss
+	// likewise needs the whole piece so it can re-hash before
+	// slicing. Both paths converge on the same
+	// MaxInMemoryObjectBytes ceiling so a single very large GET
+	// cannot OOM the gateway.
+	wantFullPiece := byteRange == nil || (piece.Hash != "" && pieceSize <= MaxInMemoryObjectBytes)
+
+	fetchRange := byteRange
+	if wantFullPiece {
+		fetchRange = nil
+	}
+
+	// preVerified is set when the body we end up serving has
+	// already been integrity-checked upstream so we can skip the
+	// redundant BLAKE3 re-hash below. Today only the
+	// lazy_read_repair path satisfies this contract —
+	// tryReadRepair returns the flag explicitly (not inferred at
+	// the call site) so any future repair-path change that drops
+	// or weakens its internal Verify call must also update the
+	// returned flag, which would surface as a test failure rather
+	// than a silent regression to serving unverified bytes.
+	preVerified := false
+	body, err := pieceProvider.GetPiece(r.Context(), piece.PieceID, fetchRange)
 	if err != nil {
-		repaired, repairErr := h.tryReadRepair(r, mkey, manifest, byteRange)
+		repaired, repairedVerified, repairErr := h.tryReadRepair(r, mkey, manifest, fetchRange)
 		if repairErr != nil || repaired == nil {
 			return nil, false, err
 		}
 		body = repaired
+		preVerified = repairedVerified
 	}
-	if h.cfg.Cache != nil && byteRange == nil {
-		h.emit(tenantID, bucket, billing.CacheMisses, 1)
 
-		// Pieces above the in-memory ceiling skip inline warming
-		// to keep a single very large GET from buffering hundreds
-		// of MiB on the request goroutine. The async promotion
-		// worker decides whether to fetch the piece on its own
-		// schedule. piece.SizeBytes is populated for multipart
-		// and EC pieces; legacy single-piece manifests can fall
-		// back to ObjectSize, which equals the piece size for
-		// non-multipart, non-EC objects.
-		pieceSize := piece.SizeBytes
-		if pieceSize <= 0 {
-			pieceSize = objectSize
+	if !wantFullPiece {
+		// Range cache-miss path for pieces too large to buffer:
+		// fall back to the legacy stream-the-range behaviour. We
+		// cannot verify the slice against a full-piece hash
+		// without the streaming hasher (delivered in the
+		// streaming-decryption PR), so log a structured warning
+		// and proceed. Open-ended ranges (End == -1) resolve
+		// against the object size so the published ReadBytes is
+		// never negative.
+		if piece.Hash != "" {
+			log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=oversize_range size_bytes=%d ceiling=%d",
+				piece.PieceID, piece.Backend, pieceSize, MaxInMemoryObjectBytes)
 		}
-		if pieceSize > MaxInMemoryObjectBytes {
+		if byteRange != nil {
+			end := byteRange.End
+			if end < 0 {
+				end = objectSize - 1
+			}
+			h.signalPromotion(piece, tenantID, end-byteRange.Start+1, objectSize)
+		}
+		return body, false, nil
+	}
+
+	// Pieces above the in-memory ceiling skip buffer-and-verify to
+	// keep a single very large GET from OOMing the request
+	// goroutine. We fall back to streaming the raw body straight to
+	// the client (the pre-PR behaviour). This guard fires whether
+	// or not a hot cache is configured: the OOM risk is identical,
+	// and the cache only changes whether we also emit a promotion
+	// signal once the piece is back in budget. piece.SizeBytes is
+	// populated for multipart and EC pieces; legacy single-piece
+	// manifests fall back to ObjectSize, which equals the piece
+	// size for non-multipart, non-EC objects.
+	if pieceSize > MaxInMemoryObjectBytes {
+		if piece.Hash != "" {
+			log.Printf("s3compat: integrity check skipped: piece=%s backend=%s reason=oversize_full_piece size_bytes=%d ceiling=%d",
+				piece.PieceID, piece.Backend, pieceSize, MaxInMemoryObjectBytes)
+		}
+		if h.cfg.Cache != nil && byteRange == nil {
 			h.signalPromotion(piece, tenantID, pieceSize, pieceSize)
-			return body, false, nil
 		}
+		return body, false, nil
+	}
 
-		buf, rerr := io.ReadAll(body)
-		_ = body.Close()
-		if rerr != nil {
-			return nil, false, rerr
+	buf, rerr := io.ReadAll(body)
+	_ = body.Close()
+	if rerr != nil {
+		return nil, false, rerr
+	}
+
+	if !preVerified {
+		if verr := pieceintegrity.Verify(buf, piece); verr != nil {
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				// Legacy manifest with no recognised
+				// integrity claim. We cannot prove the bytes
+				// are wrong, so we serve them and surface the
+				// count for operators via the dedicated
+				// observability channel. A follow-up rewrite
+				// migration is expected to fix the manifests
+				// so this channel goes back to zero.
+				h.recordIntegrityUnrecognized(piece, verr)
+			} else {
+				h.recordIntegrityFailure(piece, verr)
+				return nil, false, verr
+			}
 		}
-		// Warm the cache inline so a concurrent request doesn't
-		// re-trigger the backend GET (or a redundant read-repair
-		// round-trip during migration). The promotion worker
-		// handles signals for pieces that were not cached here
-		// (e.g. range reads, oversize pieces) so we do not
-		// publish one from this path — doing so would cause a
-		// redundant origin fetch since the piece is already
-		// resident.
+	}
+
+	if h.cfg.Cache != nil {
+		// Warm the cache inline regardless of whether this is a
+		// full-piece or range request: when the integrity branch
+		// fetched the full piece (wantFullPiece == true above),
+		// the verified buffer is already in memory and the cache
+		// is keyed by piece, not by byte range. Caching it costs
+		// one memcpy and skips a backend round-trip on the next
+		// request — full OR range — for the same piece. The
+		// previous code gated this on byteRange == nil and then
+		// published a promotion signal in the range branch,
+		// which forced the async worker to re-fetch a piece we
+		// already had verified bytes for. Oversize pieces (the
+		// short-circuit above) and read-repair-supplied bodies
+		// (preVerified == true, body served raw) still flow
+		// through signalPromotion / the worker as before.
 		_ = h.cfg.Cache.Put(r.Context(), piece.PieceID, bytes.NewReader(buf), hot_object_cache.PutOptions{
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,
 		})
-		return io.NopCloser(bytes.NewReader(buf)), false, nil
 	}
+
 	if byteRange != nil {
-		// Range reads skip the inline cache warm because the cache
-		// is keyed by piece, not by byte range. Publish a signal so
-		// the promotion worker can decide whether to fetch the
-		// whole piece asynchronously. Open-ended ranges (End == -1)
-		// resolve against the object size so the published
-		// ReadBytes is never negative.
+		// We fetched the full piece for the integrity check;
+		// slice it down to the requested range. The slice is
+		// bounded by the buffered length, not ObjectSize,
+		// because EC / multipart pieces may be smaller than the
+		// object as a whole. No signalPromotion here: the cache
+		// put above already warmed the full piece, so the async
+		// worker would only cause a redundant origin fetch.
 		end := byteRange.End
-		if end < 0 {
-			end = objectSize - 1
+		if end < 0 || end >= int64(len(buf)) {
+			end = int64(len(buf)) - 1
 		}
-		h.signalPromotion(piece, tenantID, end-byteRange.Start+1, objectSize)
+		if byteRange.Start < 0 || byteRange.Start > end+1 {
+			return nil, false, fmt.Errorf("s3compat: range %d-%d out of bounds for piece %s (%d bytes)", byteRange.Start, byteRange.End, piece.PieceID, len(buf))
+		}
+		sliced := buf[byteRange.Start : end+1]
+		return io.NopCloser(bytes.NewReader(sliced)), false, nil
 	}
-	return body, false, nil
+
+	return io.NopCloser(bytes.NewReader(buf)), false, nil
+}
+
+// recordIntegrityFailure emits the structured error log and
+// optional metric increment that an integrity-mismatched piece
+// triggers. Centralised so every read path (fetchPiece today,
+// the streaming-decrypt path in the follow-up PR) reports
+// failures consistently.
+func (h *Handler) recordIntegrityFailure(piece metadata.Piece, verr error) {
+	log.Printf("s3compat: ERROR integrity_check_failed: piece=%s backend=%s expected_hash=%q err=%v",
+		piece.PieceID, piece.Backend, piece.Hash, verr)
+	if h.cfg.IntegrityFailures != nil {
+		h.cfg.IntegrityFailures.Inc(piece.Backend)
+	}
+}
+
+// recordIntegrityUnrecognized emits the WARN-level log and the
+// dedicated observability counter for a manifest whose Hash is
+// non-empty but not in any recognised format. The handler still
+// serves the piece — there is no proof the bytes are wrong, only
+// that we cannot check them — but operators get a count of
+// unverifiable manifests so they can plan a one-shot rewrite
+// that populates ProviderETag and clears the legacy Hash field.
+func (h *Handler) recordIntegrityUnrecognized(piece metadata.Piece, verr error) {
+	log.Printf("s3compat: WARN integrity_claim_unrecognized: piece=%s backend=%s recorded_hash=%q detail=%v",
+		piece.PieceID, piece.Backend, piece.Hash, verr)
+	if h.cfg.IntegrityFailures != nil {
+		h.cfg.IntegrityFailures.IncUnrecognized(piece.Backend)
+	}
 }
 
 // tryReadRepair invokes the configured ReadRepair when the primary
 // backend fails to serve a piece and the manifest sits in a
-// migration-in-progress state (Generation > 1). It returns the
-// repaired piece body (wrapped in an io.ReadCloser, sliced to
-// byteRange when one was requested) or (nil, nil) when repair is
-// not applicable. A non-nil error indicates the repair attempt
-// itself failed; callers should fall through to the original
-// backend error in that case.
+// migration-in-progress state (Generation > 1). It returns:
+//
+//   - (body, true,  nil)   — repair succeeded; body has already
+//                            been integrity-verified by ReadRepair
+//                            and the caller MAY skip a second
+//                            pieceintegrity.Verify pass.
+//   - (nil,  false, nil)   — repair is not applicable (no repair
+//                            wired, manifest not in migration, or
+//                            no pieces). Caller falls through to
+//                            the original backend error.
+//   - (nil,  false, error) — repair attempt itself failed.
+//
+// The bool is part of the signature (not inferred at the call
+// site) so the "already verified" contract is structural: any
+// future change to ReadRepair.Repair that drops or weakens its
+// internal Verify call MUST also flip the returned flag, which a
+// reviewer will catch immediately.
 func (h *Handler) tryReadRepair(
 	r *http.Request,
 	mkey manifest_store.ManifestKey,
 	manifest *metadata.ObjectManifest,
 	byteRange *providers.ByteRange,
-) (io.ReadCloser, error) {
+) (io.ReadCloser, bool, error) {
 	if h.cfg.ReadRepair == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	if manifest.MigrationState.Generation <= 1 {
-		return nil, nil
+		return nil, false, nil
 	}
 	if len(manifest.Pieces) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	res, err := h.cfg.ReadRepair.Repair(r.Context(), mkey, manifest, 0)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	data := res.Body
 	if byteRange != nil {
@@ -810,11 +1372,19 @@ func (h *Handler) tryReadRepair(
 			end = int64(len(data)) - 1
 		}
 		if byteRange.Start < 0 || byteRange.Start > end+1 {
-			return nil, fmt.Errorf("s3compat: repaired body slice out of range")
+			return nil, false, fmt.Errorf("s3compat: repaired body slice out of range")
 		}
 		data = data[byteRange.Start : end+1]
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	// ReadRepair.Repair calls pieceintegrity.Verify on the source
+	// body before returning (lazy_read_repair/repair.go ~line 112).
+	// Slicing a byte range below does not change those bytes' hash
+	// relationship to the full-piece claim because we slice a
+	// verified buffer in memory — the caller's downstream
+	// fetchPiece guard already restricts byteRange-based reads to
+	// pieces inside MaxInMemoryObjectBytes, and the full piece is
+	// what got verified.
+	return io.NopCloser(bytes.NewReader(data)), true, nil
 }
 
 func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, readBytes, pieceSize int64) {
@@ -1233,6 +1803,38 @@ func formatContentRange(r *providers.ByteRange, total int64) string {
 	return fmt.Sprintf("bytes %d-%d/%d", r.Start, end, total)
 }
 
+// writeErrCapturingWriter wraps an io.Writer and remembers the first
+// Write error it sees. streamGatewayDecryptedGet uses this to tell
+// whether an io.Copy failure came from the downstream
+// http.ResponseWriter (client disconnect / broken pipe — transport
+// hiccup) or from the upstream decryptor (chunk-AEAD reject — real
+// corruption). The two cases need different integrity-counter
+// behaviour:
+//
+//   - Write failure ⇒ TeeReader hashed only a ciphertext prefix, so a
+//     post-EOF BLAKE3 check would always mismatch. Suppress the
+//     integrity counter to avoid false positives.
+//   - Read failure with no write failure ⇒ the read-side error is the
+//     integrity signal; record an integrity failure directly.
+//
+// We intentionally do not implement http.Flusher / http.Hijacker /
+// http.Pusher here: streamGatewayDecryptedGet never relies on those
+// optional interfaces, and forwarding them would only widen the
+// blast radius if a future handler accidentally took a dependency on
+// them through this wrapper.
+type writeErrCapturingWriter struct {
+	w        io.Writer
+	writeErr error
+}
+
+func (e *writeErrCapturingWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err != nil && e.writeErr == nil {
+		e.writeErr = err
+	}
+	return n, err
+}
+
 func quote(s string) string {
 	if s == "" {
 		return ""
@@ -1287,9 +1889,20 @@ func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource s
 // Legacy manifests written before BLAKE3 hashing was added have
 // ProviderETag="" and Hash set to the provider ETag; this falls
 // through cleanly.
+//
+// Defence in depth: the fallback explicitly refuses to leak a
+// "blake3:<hex>" hash to the client. Today no write-path produces
+// a Piece with Hash set to a blake3-prefixed value and ProviderETag
+// empty, but if a future migration regresses that invariant we want
+// the client to see an empty ETag (which the S3 SDK treats as a
+// missing header) instead of a non-standard blake3 value that
+// would confuse strict ETag-matching clients.
 func pieceETag(p metadata.Piece) string {
 	if p.ProviderETag != "" {
 		return p.ProviderETag
+	}
+	if strings.HasPrefix(p.Hash, "blake3:") {
+		return ""
 	}
 	return p.Hash
 }
