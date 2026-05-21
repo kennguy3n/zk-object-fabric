@@ -5,8 +5,6 @@ import (
 	"bytes"
 	"log"
 	"net"
-	"os"
-	"os/exec"
 	"testing"
 	"time"
 )
@@ -29,22 +27,6 @@ func waitDial(t *testing.T, addr string, timeout time.Duration) error {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return lastErr
-}
-
-// newSelfExecCmd builds an *exec.Cmd that re-executes the current
-// test binary with -run pinned to the supplied test name. Used to
-// exercise code paths that call log.Fatalf / os.Exit (which would
-// otherwise tear down the parent test process).
-//
-// The child binary is the same one the parent runs in: go test
-// compiles each package's tests into a single binary and exposes
-// its path via os.Args[0].
-func newSelfExecCmd(t *testing.T, runName string) *exec.Cmd {
-	t.Helper()
-	// os.Args[0] is the test binary path; pinning -run to the
-	// caller's test name plus -test.timeout keeps the child
-	// from hanging if the inner test path forgets to exit.
-	return exec.Command(os.Args[0], "-test.run", "^"+runName+"$", "-test.timeout", "30s")
 }
 
 // captureLog redirects the default log.Logger output for the
