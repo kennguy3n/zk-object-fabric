@@ -82,8 +82,15 @@ func (e *Engine) ResolveBackend(tenantID, bucket, objectKey string) (string, met
 	if len(eligible) == 0 {
 		return "", metadata.PlacementPolicy{}, fmt.Errorf("placement: no registered backend satisfies tenant %q policy", tenantID)
 	}
+	// WorkloadHint is derived from the policy's WorkloadProfile so
+	// write-heavy and cold-archive tenants do not get ranked
+	// against the same egress-amortised cost as a read-heavy CDN
+	// workload. Zero values fall back to legacyEgressWeight so
+	// existing policies without a WorkloadProfile keep the same
+	// ordering as before this change landed.
+	hint := workloadHintFromPolicy(policy)
 	sort.Slice(eligible, func(i, j int) bool {
-		return storageRank(e.Providers[eligible[i]]) < storageRank(e.Providers[eligible[j]])
+		return storageRank(e.Providers[eligible[i]], hint) < storageRank(e.Providers[eligible[j]], hint)
 	})
 	chosen := eligible[0]
 
@@ -133,14 +140,68 @@ func matchesString(allow []string, got string) bool {
 	return false
 }
 
+// WorkloadHint is the engine-internal projection of the tenant's
+// PlacementSpec.WorkloadProfile that storageRank consumes. It is a
+// distinct type from WorkloadProfile so the engine can later be
+// fed from sources other than the policy struct (e.g. live billing
+// rollups) without changing the policy schema.
+type WorkloadHint struct {
+	// ReadWriteRatio is reads-per-write. See WorkloadProfile.
+	ReadWriteRatio float64
+	// AvgObjectSizeMB is the average object size in MiB. See
+	// WorkloadProfile.
+	AvgObjectSizeMB float64
+}
+
+// legacyEgressWeight is the weight storageRank gave to per-GB
+// egress before WorkloadHint landed. It is used as the fallback
+// when a tenant policy carries no WorkloadProfile so existing
+// deployments do not see their backend ordering shift on upgrade.
+const legacyEgressWeight = 1000.0
+
+// egressWeight returns the per-GB egress multiplier storageRank
+// should apply for this hint. When ReadWriteRatio and
+// AvgObjectSizeMB are both positive, the multiplier is the
+// expected GB egressed per GB stored (avg object size in MiB
+// times reads per write, divided by 1024 MiB/GiB). Otherwise it
+// falls back to legacyEgressWeight, which preserves the pre-PR-9
+// behaviour for policies that have not declared a workload
+// profile yet.
+func (h WorkloadHint) egressWeight() float64 {
+	if h.ReadWriteRatio <= 0 || h.AvgObjectSizeMB <= 0 {
+		return legacyEgressWeight
+	}
+	return h.ReadWriteRatio * h.AvgObjectSizeMB / 1024.0
+}
+
+// workloadHintFromPolicy projects a policy's optional
+// WorkloadProfile into the engine's WorkloadHint. A nil profile
+// yields a zero hint, which storageRank treats as the legacy
+// behaviour fallback.
+func workloadHintFromPolicy(p *Policy) WorkloadHint {
+	if p == nil || p.Spec.Placement.WorkloadProfile == nil {
+		return WorkloadHint{}
+	}
+	wp := p.Spec.Placement.WorkloadProfile
+	return WorkloadHint{
+		ReadWriteRatio:  wp.ReadWriteRatio,
+		AvgObjectSizeMB: wp.AvgObjectSizeMB,
+	}
+}
+
 // storageRank is the proxy cost used to pick "cheapest". Lower is
-// better. Phase 2 collapses the ProviderCostModel to a single scalar
-// of (storage $/TB-month + expected egress $/GB × 1000). This is
-// deliberately coarse: richer cost-shaping (per-tenant egress
-// estimates, SLA weights) is deferred until Phase 3 billing is live.
-func storageRank(p providers.StorageProvider) float64 {
+// better. The scalar collapses the ProviderCostModel to
+// (storage $/TB-month + expected egress $/GB × egressWeight),
+// where egressWeight is workload-aware: a read-heavy small-object
+// tenant amortises a lot of egress over each GB stored, while a
+// write-heavy or cold-archive tenant amortises very little. Policies
+// without a declared WorkloadProfile fall back to the historic
+// flat weight of 1000 so this change is non-breaking for existing
+// deployments. Richer shaping (SLA weights, per-region
+// adjustments) remains deferred.
+func storageRank(p providers.StorageProvider, hint WorkloadHint) float64 {
 	c := p.CostModel()
-	return c.StorageUSDPerTBMonth + c.EgressUSDPerGB*1000
+	return c.StorageUSDPerTBMonth + c.EgressUSDPerGB*hint.egressWeight()
 }
 
 // compile-time assertion that Engine implements the shape expected
