@@ -402,23 +402,24 @@ func (t TLSConfig) MinTLSVersion() (uint16, error) {
 
 // BuildGoTLSConfig returns the *tls.Config the gateway hands to
 // http.Server.TLSConfig before calling ListenAndServeTLS. It
-// honours MinVersion (defaulting to TLS 1.2), prefers server
-// cipher order on TLS 1.2 connections, and disables session
-// tickets on TLS 1.3 (where they are session-resumption only and
-// not a confidentiality risk, but operators rotating cert
-// material expect old sessions to be invalidated).
+// honours MinVersion (defaulting to TLS 1.2).
 //
 // The function does not load the cert/key itself — that is
 // http.Server.ListenAndServeTLS's job — it only builds the
 // crypto/tls policy.
+//
+// Note: PreferServerCipherSuites is intentionally not set. The
+// field has been a no-op in crypto/tls since Go 1.18; the
+// implementation always uses a fixed, security-driven cipher
+// preference order regardless of the flag, and staticcheck flags
+// any explicit assignment as SA1019.
 func (t TLSConfig) BuildGoTLSConfig() (*tls.Config, error) {
 	minVer, err := t.MinTLSVersion()
 	if err != nil {
 		return nil, err
 	}
 	return &tls.Config{
-		MinVersion:               minVer,
-		PreferServerCipherSuites: true,
+		MinVersion: minVer,
 	}, nil
 }
 

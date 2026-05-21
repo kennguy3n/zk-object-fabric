@@ -224,9 +224,10 @@ func TestTLSConfig_BuildGoTLSConfig(t *testing.T) {
 		if got.MinVersion != tls.VersionTLS12 {
 			t.Fatalf("MinVersion = %#x, want %#x", got.MinVersion, tls.VersionTLS12)
 		}
-		if !got.PreferServerCipherSuites {
-			t.Fatal("PreferServerCipherSuites = false, want true")
-		}
+		// PreferServerCipherSuites is intentionally not set
+		// (deprecated in Go 1.18). The fixed cipher order
+		// crypto/tls uses is verified indirectly by the
+		// TLS handshake roundtrip test in cmd/gateway.
 	})
 	t.Run("explicit 1.3", func(t *testing.T) {
 		c := TLSConfig{MinVersion: "1.3"}
