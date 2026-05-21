@@ -247,6 +247,44 @@ func TestTLSConfig_Validate(t *testing.T) {
 	}
 }
 
+// TestTLSConfig_Validate_MinVersionErrorHasSinglePrefix is a
+// regression guard against the double "config:" prefix bug.
+//
+// Pre-fix: MinTLSVersion returned `config: tls.min_version "1.0":
+// must be …` and Validate wrapped it as `config: %s.tls: %w`,
+// producing `config: gateway.tls: config: tls.min_version "1.0":
+// must be …` — two "config:" tokens surfacing to operators at
+// startup.
+//
+// Post-fix: MinTLSVersion returns `tls.min_version "1.0": must
+// be …` (no embedded prefix), and Validate adds the single
+// `config: gateway.tls:` prefix. The full message is
+// `config: gateway.tls: tls.min_version "1.0": must be …`.
+//
+// This test asserts the post-fix shape by pinning the substring
+// "config: gateway.tls: tls.min_version" — if a future change
+// reintroduces "config:" into the leaf or duplicates the wrap,
+// the test fails.
+func TestTLSConfig_Validate_MinVersionErrorHasSinglePrefix(t *testing.T) {
+	in := TLSConfig{
+		CertPath:   "/etc/tls/cert.pem",
+		KeyPath:    "/etc/tls/key.pem",
+		MinVersion: "1.0",
+	}
+	err := in.Validate("gateway")
+	if err == nil {
+		t.Fatal("Validate: want error for min_version 1.0, got nil")
+	}
+	msg := err.Error()
+	// Exactly one "config:" prefix at the start of the message.
+	if !strings.HasPrefix(msg, "config: gateway.tls: tls.min_version ") {
+		t.Errorf("Validate error = %q; want prefix %q", msg, "config: gateway.tls: tls.min_version ")
+	}
+	if strings.Count(msg, "config:") != 1 {
+		t.Errorf("Validate error has %d occurrences of \"config:\", want exactly 1; full message: %q", strings.Count(msg, "config:"), msg)
+	}
+}
+
 func TestTLSConfig_BuildGoTLSConfig(t *testing.T) {
 	t.Run("default min version is 1.2", func(t *testing.T) {
 		c := TLSConfig{}

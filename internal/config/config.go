@@ -432,7 +432,7 @@ func (t TLSConfig) MinTLSVersion() (uint16, error) {
 	case "1.3", "tls1.3", "tls13":
 		return tls.VersionTLS13, nil
 	default:
-		return 0, fmt.Errorf("config: tls.min_version %q: must be \"1.2\" or \"1.3\"", t.MinVersion)
+		return 0, fmt.Errorf("tls.min_version %q: must be \"1.2\" or \"1.3\"", t.MinVersion)
 	}
 }
 
