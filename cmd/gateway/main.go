@@ -1337,7 +1337,8 @@ func buildTracer(cfg config.TracingConfig) *tracing.Tracer {
 
 // integrityFailureSink adapts metrics.Registry to the
 // s3compat.IntegrityFailureSink interface so the HTTP handler
-// can emit zkof_integrity_failure_total without importing
+// can emit zkof_integrity_failure_total /
+// zkof_integrity_claim_unrecognized_total without importing
 // internal/metrics. A zero-value sink (nil registry) is a no-op
 // — useful for tests that wire the handler without a registry.
 type integrityFailureSink struct {
@@ -1349,6 +1350,13 @@ func (s integrityFailureSink) Inc(backend string) {
 		return
 	}
 	s.r.IncIntegrityFailure(backend)
+}
+
+func (s integrityFailureSink) IncUnrecognized(backend string) {
+	if s.r == nil {
+		return
+	}
+	s.r.IncIntegrityClaimUnrecognized(backend)
 }
 
 // metricsMiddleware wraps next with request-duration and

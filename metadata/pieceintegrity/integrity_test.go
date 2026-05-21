@@ -27,48 +27,62 @@ func sha256Hex(b []byte) string {
 func TestVerify_AllHashForms(t *testing.T) {
 	body := []byte("zkof-shared-piece-bytes")
 
+	// wantSentinel == nil means Verify should return nil (verified
+	// or skipped). Otherwise the returned error must wrap the named
+	// sentinel; this distinguishes content-mismatch (502-class) from
+	// unrecognised-format (legacy-class) at the API contract level.
 	cases := []struct {
-		name    string
-		hash    string
-		body    []byte
-		wantErr bool
+		name         string
+		hash         string
+		body         []byte
+		wantSentinel error
 	}{
-		{"blake3 matches", "blake3:" + blake3Hex(body), body, false},
-		{"blake3 mismatch", "blake3:" + blake3Hex([]byte("expected")), []byte("tampered"), true},
-		{"legacy sha256 matches", sha256Hex(body), body, false},
-		{"legacy sha256 mismatch", sha256Hex([]byte("expected")), []byte("tampered"), true},
-		{"legacy quoted etag matches", `"` + sha256Hex(body) + `"`, body, false},
-		{"legacy quoted etag mismatch", `"` + sha256Hex([]byte("expected")) + `"`, []byte("tampered"), true},
-		{"empty hash skips verification", "", body, false},
-		{"empty hash skips even with empty body", "", []byte{}, false},
-		// Opaque ETags written into the Hash slot are rejected
-		// rather than silently treated as legacy SHA-256. Before
-		// this rule landed, a manifest with an opaque ETag would
-		// silently fail to verify (length mismatch with the
-		// real SHA-256 produced "different" hashes and returned
-		// a confusing error). Failing closed with a structural
-		// message points operators at the actual bug - the
-		// write path is stamping ETags into Hash, which the
-		// gateway never does on any current path.
-		{"opaque etag rejected as structural error", "etag-xyz", body, true},
-		{"short hex rejected", "deadbeef", body, true},
-		{"non-hex same length rejected", strings.Repeat("g", sha256HexLen), body, true},
-		{"uppercase hex rejected", strings.ToUpper(sha256Hex(body)), body, true},
+		{"blake3 matches", "blake3:" + blake3Hex(body), body, nil},
+		{"blake3 mismatch", "blake3:" + blake3Hex([]byte("expected")), []byte("tampered"), ErrIntegrityCheckFailed},
+		{"legacy sha256 matches", sha256Hex(body), body, nil},
+		{"legacy sha256 mismatch", sha256Hex([]byte("expected")), []byte("tampered"), ErrIntegrityCheckFailed},
+		{"legacy quoted etag matches", `"` + sha256Hex(body) + `"`, body, nil},
+		{"legacy quoted etag mismatch", `"` + sha256Hex([]byte("expected")) + `"`, []byte("tampered"), ErrIntegrityCheckFailed},
+		{"empty hash skips verification", "", body, nil},
+		{"empty hash skips even with empty body", "", []byte{}, nil},
+		// Opaque ETags written into the Hash slot are reported as
+		// an unrecognised-format observation, not as a content
+		// mismatch. The legacy multipart / copy / dedup write
+		// paths in this repo stamped a backend ETag into Hash for
+		// some manifests; treating those as 502 on every GET
+		// would turn legitimate legacy reads into hard failures
+		// on upgrade. Callers log + emit a separate observability
+		// counter and serve.
+		{"opaque etag flagged unrecognised", "etag-xyz", body, ErrIntegrityClaimUnrecognized},
+		{"short hex flagged unrecognised", "deadbeef", body, ErrIntegrityClaimUnrecognized},
+		{"non-hex same length flagged unrecognised", strings.Repeat("g", sha256HexLen), body, ErrIntegrityClaimUnrecognized},
+		{"uppercase hex flagged unrecognised", strings.ToUpper(sha256Hex(body)), body, ErrIntegrityClaimUnrecognized},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := Verify(tc.body, metadata.Piece{PieceID: "p1", Hash: tc.hash})
-			if tc.wantErr {
+			switch {
+			case tc.wantSentinel == nil:
+				if err != nil {
+					t.Fatalf("Verify: %v", err)
+				}
+			default:
 				if err == nil {
-					t.Fatal("Verify: want error, got nil")
+					t.Fatalf("Verify: want error wrapping %v, got nil", tc.wantSentinel)
 				}
-				if !errors.Is(err, ErrIntegrityCheckFailed) {
-					t.Fatalf("Verify: error %v not wrapping ErrIntegrityCheckFailed", err)
+				if !errors.Is(err, tc.wantSentinel) {
+					t.Fatalf("Verify: error %v not wrapping %v", err, tc.wantSentinel)
 				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("Verify: %v", err)
+				// Make sure the two sentinels don't accidentally
+				// alias each other — the whole point of the split
+				// is that callers can distinguish them.
+				other := ErrIntegrityCheckFailed
+				if tc.wantSentinel == ErrIntegrityCheckFailed {
+					other = ErrIntegrityClaimUnrecognized
+				}
+				if errors.Is(err, other) {
+					t.Fatalf("Verify: error %v wraps both sentinels", err)
+				}
 			}
 		})
 	}
@@ -133,19 +147,25 @@ func TestHasher_StreamingMatchesVerify(t *testing.T) {
 		}
 	})
 
-	t.Run("opaque etag rejected after stream", func(t *testing.T) {
+	t.Run("opaque etag surfaces unrecognised format after stream", func(t *testing.T) {
 		// The streaming hasher writes to io.Discard while the
-		// stream is flowing, then Check returns the structural
-		// rejection. The caller is expected to clean up the
-		// destination (cache row, cached file, etc.) on the
-		// error path.
+		// stream is flowing (so the caller's Tee still feeds
+		// its destination), then Check returns the structural
+		// observation. The caller decides whether to log it as
+		// a legacy-manifest signal (zkof_integrity_claim_unrecognized_total)
+		// or treat it as a failure; the verifier itself does
+		// not impose a 502 on unrecognised formats.
 		piece := metadata.Piece{PieceID: "p1", Hash: "etag-xyz"}
 		w, check := Hasher(piece)
 		if _, err := io.Copy(w, splitReader(body, 17)); err != nil {
 			t.Fatalf("copy: %v", err)
 		}
-		if err := check(); !errors.Is(err, ErrIntegrityCheckFailed) {
-			t.Fatalf("check: want ErrIntegrityCheckFailed, got %v", err)
+		err := check()
+		if !errors.Is(err, ErrIntegrityClaimUnrecognized) {
+			t.Fatalf("check: want ErrIntegrityClaimUnrecognized, got %v", err)
+		}
+		if errors.Is(err, ErrIntegrityCheckFailed) {
+			t.Fatalf("check: unrecognised-format error must not also wrap ErrIntegrityCheckFailed: %v", err)
 		}
 	})
 }

@@ -19,11 +19,31 @@
 // An empty Piece.Hash skips verification (returns nil) so manifests
 // that predate the integrity field continue to serve. A hash that
 // is neither blake3-prefixed nor a recognised SHA-256 hex string
-// fails closed with ErrIntegrityCheckFailed wrapped in a structural
-// error — a manifest with an opaque ETag in the Hash slot is a bug
-// (the gateway never writes ETags into Hash on any current
-// write-path), so silently accepting one would mask the bug and
-// trick operators into trusting an integrity check that never ran.
+// returns ErrIntegrityClaimUnrecognized (a distinct sentinel from
+// ErrIntegrityCheckFailed). The two sentinels carry different
+// operator-facing semantics:
+//
+//   - ErrIntegrityCheckFailed → the bytes the backend returned do
+//     not match the recorded hash. This is a content-mismatch
+//     event: someone (or something) corrupted the piece. Callers
+//     must fail closed — return 502 to the client, refuse to
+//     cache, and emit zkof_integrity_failure_total.
+//   - ErrIntegrityClaimUnrecognized → the manifest does not carry
+//     a recognised integrity claim (e.g. a pre-BLAKE3 multipart /
+//     copy / dedup manifest still has the backend's opaque ETag
+//     in Hash). There is nothing to verify against; the bytes are
+//     not known to be wrong. Callers should log a structured
+//     warning, emit zkof_integrity_claim_unrecognized_total so
+//     operators see a count of unverifiable legacy manifests,
+//     and serve the bytes. Treating an unrecognised format as a
+//     content failure would turn legitimate legacy reads into
+//     hard 502s on upgrade.
+//
+// The split keeps the strict fail-closed contract for the only
+// case where it actually catches anything — a hash we can
+// recompute — while leaving the legacy migration story to be
+// resolved by a one-shot rewrite job rather than by gating every
+// GET on a successful re-hash.
 //
 // The package lives under metadata/ rather than api/s3compat or
 // migration/lazy_read_repair to keep the import graph one-way:
@@ -85,6 +105,14 @@ func stripQuotes(s string) string {
 // without string-matching the message.
 var ErrIntegrityCheckFailed = errors.New("pieceintegrity: piece content hash mismatch")
 
+// ErrIntegrityClaimUnrecognized is returned by Verify when
+// piece.Hash is non-empty but not in any recognised format. This
+// is structurally distinct from a content mismatch: the verifier
+// could not compute a comparison hash, so the bytes are not known
+// to be wrong. Callers should log a warning and emit an
+// observability counter rather than refusing to serve.
+var ErrIntegrityClaimUnrecognized = errors.New("pieceintegrity: piece hash format not recognised")
+
 // Verify recomputes the content hash of body and compares it
 // against piece.Hash. Returns nil on a match (or when the manifest
 // records no hash) and an error wrapping ErrIntegrityCheckFailed
@@ -109,8 +137,8 @@ func Verify(body []byte, piece metadata.Piece) error {
 	}
 	expected := stripQuotes(piece.Hash)
 	if !isSHA256Hex(expected) {
-		return fmt.Errorf("%w: piece %s has unrecognised hash format %q (expected blake3:<hex> or 64-char SHA-256 hex)",
-			ErrIntegrityCheckFailed, piece.PieceID, piece.Hash)
+		return fmt.Errorf("%w: piece %s has hash %q (expected blake3:<hex> or 64-char SHA-256 hex)",
+			ErrIntegrityClaimUnrecognized, piece.PieceID, piece.Hash)
 	}
 	sum := sha256.Sum256(body)
 	got := hex.EncodeToString(sum[:])
@@ -160,16 +188,18 @@ func Hasher(piece metadata.Piece) (io.Writer, func() error) {
 	}
 	expected := stripQuotes(piece.Hash)
 	if !isSHA256Hex(expected) {
-		// Fail closed: return a hasher that discards the body
-		// (so the caller's Tee still works) and a Check that
-		// reports the structural error. Streaming callers learn
-		// about the misformed hash after the stream completes,
-		// matching the post-stream detection-only contract.
+		// Unrecognised format. Return a no-op hasher (so the
+		// caller's Tee still works and the streaming destination
+		// receives the bytes) and a Check that surfaces the
+		// structural-format error via ErrIntegrityClaimUnrecognized.
+		// Streaming callers learn about the unverifiable hash
+		// after the stream completes, matching the post-stream
+		// detection-only contract.
 		pieceID := piece.PieceID
 		rawHash := piece.Hash
 		return io.Discard, func() error {
-			return fmt.Errorf("%w: piece %s has unrecognised hash format %q (expected blake3:<hex> or 64-char SHA-256 hex)",
-				ErrIntegrityCheckFailed, pieceID, rawHash)
+			return fmt.Errorf("%w: piece %s has hash %q (expected blake3:<hex> or 64-char SHA-256 hex)",
+				ErrIntegrityClaimUnrecognized, pieceID, rawHash)
 		}
 	}
 	var sha hash.Hash = sha256.New()

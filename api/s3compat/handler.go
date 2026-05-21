@@ -89,17 +89,33 @@ type BillingSink interface {
 	Emit(event billing.UsageEvent)
 }
 
-// IntegrityFailureSink receives one increment per piece served
-// from the backend that did not match its manifest-recorded
-// content hash. cmd/gateway wires this to
-// internal/metrics.Registry.IncIntegrityFailure so operators can
-// alert on a non-zero rate — the gateway never emits a positive
-// rate during normal operation, so any non-zero value indicates
-// either backend bit-rot, a tampered backend, or a manifest
-// recorded with the wrong hash. Defining this as an interface
-// keeps api/s3compat from importing internal/metrics directly.
+// IntegrityFailureSink receives observability events from the
+// piece-integrity verifier. cmd/gateway wires this to
+// internal/metrics so operators can alert on either channel
+// without api/s3compat importing internal/metrics directly.
+//
+// Two channels — semantically distinct — both fire from
+// fetchPiece / getMultipart / getErasureCoded:
+//
+//   - Inc(backend) fires when the bytes the backend returned
+//     failed to match a recognised integrity claim. This is a
+//     hard-fail signal: the gateway has refused to serve the
+//     piece, returned 502 IntegrityCheckFailed, and is shouting
+//     for an operator. Any sustained non-zero rate here is a
+//     bit-rot / tampering / wrong-hash bug.
+//
+//   - IncUnrecognized(backend) fires when the manifest's hash is
+//     present but not in any recognised format (e.g. a legacy
+//     multipart / copy / dedup manifest still has the backend's
+//     opaque ETag in Hash). The bytes were served because we
+//     cannot prove anything about them, but the verifier wants
+//     operators to see the count so they can plan / drive a
+//     one-shot rewrite to populate ProviderETag + clear Hash.
+//     A steady non-zero rate here is a migration TODO, not an
+//     incident.
 type IntegrityFailureSink interface {
 	Inc(backend string)
+	IncUnrecognized(backend string)
 }
 
 // Config collects the dependencies Handler needs.
@@ -826,8 +842,18 @@ func (h *Handler) fetchPiece(
 	}
 
 	if verr := pieceintegrity.Verify(buf, piece); verr != nil {
-		h.recordIntegrityFailure(piece, verr)
-		return nil, false, verr
+		if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+			// Legacy manifest with no recognised integrity
+			// claim. We cannot prove the bytes are wrong, so we
+			// serve them and surface the count for operators
+			// via the dedicated observability channel. A
+			// follow-up rewrite migration is expected to fix
+			// the manifests so this channel goes back to zero.
+			h.recordIntegrityUnrecognized(piece, verr)
+		} else {
+			h.recordIntegrityFailure(piece, verr)
+			return nil, false, verr
+		}
 	}
 
 	if h.cfg.Cache != nil && byteRange == nil {
@@ -877,6 +903,21 @@ func (h *Handler) recordIntegrityFailure(piece metadata.Piece, verr error) {
 		piece.PieceID, piece.Backend, piece.Hash, verr)
 	if h.cfg.IntegrityFailures != nil {
 		h.cfg.IntegrityFailures.Inc(piece.Backend)
+	}
+}
+
+// recordIntegrityUnrecognized emits the WARN-level log and the
+// dedicated observability counter for a manifest whose Hash is
+// non-empty but not in any recognised format. The handler still
+// serves the piece — there is no proof the bytes are wrong, only
+// that we cannot check them — but operators get a count of
+// unverifiable manifests so they can plan a one-shot rewrite
+// that populates ProviderETag and clears the legacy Hash field.
+func (h *Handler) recordIntegrityUnrecognized(piece metadata.Piece, verr error) {
+	log.Printf("s3compat: WARN integrity_claim_unrecognized: piece=%s backend=%s recorded_hash=%q detail=%v",
+		piece.PieceID, piece.Backend, piece.Hash, verr)
+	if h.cfg.IntegrityFailures != nil {
+		h.cfg.IntegrityFailures.IncUnrecognized(piece.Backend)
 	}
 }
 

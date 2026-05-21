@@ -911,14 +911,22 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 	}
 }
 
-// integritySinkRecorder is an IntegrityFailureSink used by tests to
-// verify the GET path emits a metric when a piece body is tampered
-// with on the backend. Concurrent-safe so the tests can run in
-// parallel with the rest of the suite if a future maintainer adds
-// t.Parallel().
+// integritySinkRecorder is an IntegrityFailureSink used by tests
+// to verify the GET path emits the correct observability counter
+// for each verifier outcome. Two channels are tracked separately:
+//
+//   - hits["backend"] counts ErrIntegrityCheckFailed events (the
+//     gateway returned 502 IntegrityCheckFailed).
+//   - unrecognised["backend"] counts ErrIntegrityClaimUnrecognized
+//     events (the gateway served the bytes but flagged a legacy
+//     manifest with an opaque hash format).
+//
+// Concurrent-safe so the tests can run in parallel with the rest
+// of the suite if a future maintainer adds t.Parallel().
 type integritySinkRecorder struct {
-	mu   sync.Mutex
-	hits map[string]int
+	mu           sync.Mutex
+	hits         map[string]int
+	unrecognised map[string]int
 }
 
 func (s *integritySinkRecorder) Inc(backend string) {
@@ -930,10 +938,25 @@ func (s *integritySinkRecorder) Inc(backend string) {
 	s.hits[backend]++
 }
 
+func (s *integritySinkRecorder) IncUnrecognized(backend string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unrecognised == nil {
+		s.unrecognised = make(map[string]int)
+	}
+	s.unrecognised[backend]++
+}
+
 func (s *integritySinkRecorder) count(backend string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.hits[backend]
+}
+
+func (s *integritySinkRecorder) countUnrecognized(backend string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unrecognised[backend]
 }
 
 // TestGet_TamperedPiece_FailsClosed exercises PR-2: a backend piece
@@ -1220,5 +1243,97 @@ func TestGetErasureCoded_TamperedShard_FailsClosed(t *testing.T) {
 	}
 	if hits := sink.count("test"); hits != 1 {
 		t.Fatalf("integrity hits after tampered EC GET = %d, want 1 (single shard mismatch)", hits)
+	}
+}
+
+// TestGet_UnrecognizedHashFormat_ServesWithObservabilityCounter
+// pins the legacy-manifest behaviour: when the manifest's
+// Piece.Hash is non-empty but not in any recognised format (e.g.
+// a legacy multipart / copy / dedup manifest that stamped a
+// backend ETag into Hash), the verifier returns
+// ErrIntegrityClaimUnrecognized rather than
+// ErrIntegrityCheckFailed. The handler must serve the bytes
+// (there is no proof they're wrong) and increment the dedicated
+// observability counter so operators can plan a one-shot
+// rewrite. The hard-fail counter must stay at zero.
+func TestGet_UnrecognizedHashFormat_ServesWithObservabilityCounter(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	sink := &integritySinkRecorder{}
+	h := New(Config{
+		Manifests:         store,
+		Providers:         map[string]providers.StorageProvider{"test": fake},
+		Placement:         fixedPlacement{backend: "test"},
+		IntegrityFailures: sink,
+		Now:               func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := []byte("legacy manifest with an opaque ETag in Hash")
+
+	// PUT through the handler so the manifest exists. We will
+	// then rewrite Piece.Hash on the stored manifest to simulate
+	// what a pre-PR-2 multipart / copy / dedup writer would have
+	// produced: an opaque backend ETag in the Hash slot, with the
+	// piece bytes themselves untouched.
+	req := httptest.NewRequest(http.MethodPut, "/bucket/legacy.txt", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	mkey := manifest_store.ManifestKey{
+		TenantID:      "anonymous",
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("legacy.txt"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	if len(man.Pieces) != 1 {
+		t.Fatalf("manifest pieces = %d, want 1", len(man.Pieces))
+	}
+	// Overwrite the recorded hash with a value that looks like an
+	// AWS S3 opaque ETag (32-char lowercase hex without the
+	// blake3: prefix). The verifier must classify this as
+	// ErrIntegrityClaimUnrecognized, NOT as a SHA-256 hash that
+	// happens to mismatch.
+	man.Pieces[0].Hash = "d41d8cd98f00b204e9800998ecf8427e"
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	// GET must serve the original body and emit ONLY the
+	// observability counter; the hard-fail counter must stay
+	// flat.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/legacy.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy-manifest GET status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Fatalf("legacy-manifest GET body = %q, want %q", got, body)
+	}
+	if hits := sink.count("test"); hits != 0 {
+		t.Fatalf("integrity_failure counter = %d, want 0 (unrecognised hash != content mismatch)", hits)
+	}
+	if u := sink.countUnrecognized("test"); u != 1 {
+		t.Fatalf("integrity_claim_unrecognized counter = %d, want 1", u)
+	}
+
+	// A second GET (with cache nil) must increment the counter
+	// again -- the verifier does not silently latch the legacy
+	// state, so each unverifiable GET adds to the count.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/legacy.txt", nil)
+	rec = httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second legacy-manifest GET status = %d, want 200", rec.Code)
+	}
+	if u := sink.countUnrecognized("test"); u != 2 {
+		t.Fatalf("integrity_claim_unrecognized counter after 2 GETs = %d, want 2", u)
 	}
 }

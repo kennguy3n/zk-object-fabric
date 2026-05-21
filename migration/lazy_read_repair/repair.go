@@ -110,7 +110,20 @@ func (r *ReadRepair) Repair(ctx context.Context, key manifest_store.ManifestKey,
 	}
 
 	if err := pieceintegrity.Verify(body, piece); err != nil {
-		return RepairResult{}, fmt.Errorf("lazy_read_repair: %w", err)
+		// A content mismatch (ErrIntegrityCheckFailed) refuses
+		// the repair: writing tampered bytes to the new backend
+		// would launder the corruption. An unrecognised hash
+		// format (ErrIntegrityClaimUnrecognized) is a legacy
+		// manifest with no recognisable integrity claim — there
+		// is no proof the bytes are wrong, so the repair
+		// proceeds. The structured log surfaces the count so
+		// operators can plan a rewrite that fills ProviderETag
+		// and clears Hash.
+		if !errors.Is(err, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+			return RepairResult{}, fmt.Errorf("lazy_read_repair: %w", err)
+		}
+		r.logf("lazy_read_repair: integrity_claim_unrecognized: piece=%s backend=%s recorded_hash=%q detail=%v",
+			piece.PieceID, piece.Backend, piece.Hash, err)
 	}
 
 	putRes, err := target.PutPiece(ctx, piece.PieceID, bytes.NewReader(body), providers.PutOptions{ContentLength: int64(len(body))})

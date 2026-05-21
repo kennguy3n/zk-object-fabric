@@ -13,8 +13,9 @@
 //   - zkof_dedup_hit_total          (counter)
 //   - zkof_dedup_bytes_saved_total  (counter)
 //   - zkof_provider_errors_total    (counter, by provider, operation)
-//   - zkof_integrity_failure_total  (counter, by backend)
-//   - zkof_active_requests          (gauge)
+//   - zkof_integrity_failure_total              (counter, by backend)
+//   - zkof_integrity_claim_unrecognized_total   (counter, by backend)
+//   - zkof_active_requests                      (gauge)
 //
 // The exporter is goroutine-safe.
 package metrics
@@ -54,8 +55,9 @@ type Registry struct {
 	dedupHits         atomic.Int64
 	dedupBytesSaved   atomic.Int64
 	activeRequests    atomic.Int64
-	providerErrors    *labeledCounter
-	integrityFailures *labeledCounter
+	providerErrors              *labeledCounter
+	integrityFailures           *labeledCounter
+	integrityClaimUnrecognized  *labeledCounter
 }
 
 // NewRegistry returns a registry initialised with the default
@@ -73,6 +75,17 @@ func NewRegistry() *Registry {
 				"on a read path. A non-zero value indicates either "+
 				"backend bit-rot, a tampered backend, or a manifest "+
 				"recorded with the wrong hash.",
+			[]string{"backend"}),
+		integrityClaimUnrecognized: newLabeledCounter("zkof_integrity_claim_unrecognized_total",
+			"Pieces served from a manifest whose recorded hash is "+
+				"non-empty but not in any recognised format (e.g. a "+
+				"legacy multipart / copy / dedup manifest that stamped "+
+				"a backend ETag into Hash). The gateway served the bytes "+
+				"— we cannot prove they're wrong — but flagged the "+
+				"manifest so operators can drive a one-shot rewrite to "+
+				"populate ProviderETag and clear Hash. Distinct from "+
+				"zkof_integrity_failure_total, which only fires on a "+
+				"verified content mismatch.",
 			[]string{"backend"}),
 	}
 }
@@ -109,6 +122,18 @@ func (r *Registry) IncIntegrityFailure(backend string) {
 	r.integrityFailures.Inc([]string{backend})
 }
 
+// IncIntegrityClaimUnrecognized increments the per-backend
+// observability counter for manifests whose Hash is set but not
+// in any recognised format. The gateway serves the bytes because
+// there is no proof they are wrong; the counter surfaces the
+// population so operators can plan a rewrite migration that
+// moves the legacy ETag into ProviderETag and clears Hash. This
+// counter is intentionally separate from IncIntegrityFailure so
+// dashboards / alerts can treat the two signals independently.
+func (r *Registry) IncIntegrityClaimUnrecognized(backend string) {
+	r.integrityClaimUnrecognized.Inc([]string{backend})
+}
+
 // IncActive / DecActive update the active-requests gauge. Pair
 // each Inc with exactly one Dec on the request goroutine.
 func (r *Registry) IncActive() { r.activeRequests.Add(1) }
@@ -135,6 +160,7 @@ func (r *Registry) write(w io.Writer) error {
 	emitGauge(w, "zkof_active_requests", "Currently in-flight S3 requests.", r.activeRequests.Load())
 	r.providerErrors.write(w)
 	r.integrityFailures.write(w)
+	r.integrityClaimUnrecognized.write(w)
 	r.requestDuration.write(w)
 	return nil
 }

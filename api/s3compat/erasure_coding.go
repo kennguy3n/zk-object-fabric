@@ -18,6 +18,7 @@ package s3compat
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -306,26 +307,34 @@ func (h *Handler) getErasureCoded(
 		// would otherwise feed bad bytes into Reed-Solomon, and
 		// the decoder cannot tell tampered data from good data
 		// when it has enough shards to "reconstruct" without
-		// rebuilding from parity. Treat a hash mismatch like a
+		// rebuilding from parity. Treat a content mismatch like a
 		// missing shard: count it as a loss, emit the per-backend
 		// metric so operators see the bit-rot signal even when
 		// parity recovers, and let the parity-tolerance gate
 		// below decide whether the stripe is still recoverable.
+		// An unrecognised hash format (legacy manifest with an
+		// opaque ETag in Hash) is reported on the dedicated
+		// observability channel; the shard's bytes are still fed
+		// to the decoder because we cannot prove they're wrong.
 		if verr := pieceintegrity.Verify(buf, p); verr != nil {
-			h.recordIntegrityFailure(p, verr)
-			losses[p.StripeIndex]++
-			shards = append(shards, erasure_coding.Shard{
-				StripeIndex: p.StripeIndex,
-				ShardIndex:  p.ShardIndex,
-				Kind:        shardKindFromManifest(p.ShardKind),
-			})
-			if losses[p.StripeIndex] > tolerance {
-				writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
-					fmt.Sprintf("stripe %d exceeded parity tolerance after shard integrity failure: %v", p.StripeIndex, verr),
-					r.URL.Path)
-				return
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				h.recordIntegrityUnrecognized(p, verr)
+			} else {
+				h.recordIntegrityFailure(p, verr)
+				losses[p.StripeIndex]++
+				shards = append(shards, erasure_coding.Shard{
+					StripeIndex: p.StripeIndex,
+					ShardIndex:  p.ShardIndex,
+					Kind:        shardKindFromManifest(p.ShardKind),
+				})
+				if losses[p.StripeIndex] > tolerance {
+					writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+						fmt.Sprintf("stripe %d exceeded parity tolerance after shard integrity failure: %v", p.StripeIndex, verr),
+						r.URL.Path)
+					return
+				}
+				continue
 			}
-			continue
 		}
 
 		shards = append(shards, erasure_coding.Shard{
@@ -503,16 +512,23 @@ func (h *Handler) getMultipart(
 		// concatenation. UploadPart hashes the ciphertext as it
 		// streams to the backend (PR-2), so a mismatch here
 		// means the backend either lost or tampered with the
-		// part. Fail closed: we have already read the part into
-		// memory but have not committed the response status
-		// line, so a 502 cleanly aborts the GET before any
-		// bytes reach the client.
+		// part. Fail closed on a content mismatch: we have
+		// already read the part into memory but have not
+		// committed the response status line, so a 502 cleanly
+		// aborts the GET before any bytes reach the client. A
+		// legacy manifest with an unrecognised hash format gets
+		// the observability counter but still serves — there is
+		// no proof the bytes are wrong.
 		if verr := pieceintegrity.Verify(buf, p); verr != nil {
-			h.recordIntegrityFailure(p, verr)
-			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
-				fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, verr),
-				r.URL.Path)
-			return
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				h.recordIntegrityUnrecognized(p, verr)
+			} else {
+				h.recordIntegrityFailure(p, verr)
+				writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+					fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, verr),
+					r.URL.Path)
+				return
+			}
 		}
 		bodies[i] = buf
 	}
