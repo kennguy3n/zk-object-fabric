@@ -27,13 +27,19 @@ COPY . .
 #
 # Version metadata is stamped into the binary via -ldflags -X.
 # Callers (CI, Makefile, manual `docker build`) pass three build
-# args; sensible defaults keep dev builds working without an
-# explicit `--build-arg`. `git rev-parse` runs against the local
-# .git directory if .dockerignore lets it through; otherwise CI
-# is expected to pass GIT_COMMIT explicitly. BUILD_DATE is
-# normalised to RFC 3339 UTC at the Dockerfile layer so two
-# builds at the same wall-clock second from different time
-# zones still produce identical ldflags.
+# args. The Dockerfile cannot resolve VERSION/GIT_COMMIT itself —
+# .dockerignore deliberately excludes .git from the build context
+# (see .dockerignore line 2) so `git rev-parse HEAD` cannot run
+# from inside the image build. The CI pipeline resolves them in a
+# pre-build step (see .github/workflows/ci.yml "Resolve version
+# metadata") and passes the resolved triple to docker/build-push-action
+# via build-args. A manual `docker build` without --build-arg
+# falls back to the ARG defaults below ("0.0.0-dev" / "unknown"),
+# which keeps dev builds runnable but reports the dev-default
+# version at /internal/version. BUILD_DATE is also resolved
+# outside the image at RFC 3339 UTC so two builds at the same
+# wall-clock second from different time zones still produce
+# identical ldflags and the gateway binary is byte-identical.
 ARG VERSION=0.0.0-dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_DATE=unknown

@@ -59,13 +59,38 @@ func TestCurrent_ReturnsLdflagsStampedFields(t *testing.T) {
 }
 
 func TestCurrent_DevDefaults(t *testing.T) {
-	// Without any ldflags override, the package defaults
-	// must keep a recognizable shape so log aggregators that
-	// alert on "unknown" still fire and so consumers parsing
-	// Version see a semver-shaped string.
+	// On an unstamped build (no `-ldflags -X …version.Version=…`)
+	// the package defaults must keep a recognizable shape so log
+	// aggregators that alert on the literal "unknown" string
+	// still fire and so consumers parsing Version see a
+	// semver-shaped string starting with "0.0.0".
+	//
+	// On a stamped build (CI passes VERSION via -ldflags) the
+	// dev-default invariant by definition does not hold, so the
+	// test skips with a message identifying the active stamp
+	// rather than logging-and-passing silently — a previous
+	// version of this test called t.Logf without t.Errorf and
+	// never failed regardless of the package-var state, which
+	// made it effectively a no-op. The current shape asserts
+	// what it can assert and explicitly skips what it cannot.
 	got := Current()
-	if !strings.HasPrefix(got.Version, "0.0.0") && got.Version != "" {
-		t.Logf("Version default = %q (ldflags override active; not the dev default)", got.Version)
+	if got.Version != "0.0.0-dev" {
+		t.Skipf("ldflags stamp active (Version=%q GitCommit=%q); dev-default assertions only meaningful on unstamped builds", got.Version, got.GitCommit)
+	}
+	if !strings.HasPrefix(got.Version, "0.0.0") {
+		t.Errorf("Version dev default = %q, want prefix 0.0.0", got.Version)
+	}
+	if got.GitCommit != "unknown" {
+		t.Errorf("GitCommit dev default = %q, want \"unknown\"", got.GitCommit)
+	}
+	if got.BuildDate != "unknown" {
+		t.Errorf("BuildDate dev default = %q, want \"unknown\"", got.BuildDate)
+	}
+	// runtime triple must still populate on dev builds — it
+	// comes from runtime.* at call time and is independent of
+	// the ldflags stamp.
+	if got.GoVersion == "" || got.GoArch == "" || got.GoOS == "" {
+		t.Errorf("runtime triple empty on dev build: %+v", got)
 	}
 }
 
