@@ -42,6 +42,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
 	"github.com/kennguy3n/zk-object-fabric/internal/metrics"
+	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/internal/tracing"
 	"github.com/kennguy3n/zk-object-fabric/internal/version"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
@@ -247,6 +248,7 @@ func main() {
 		Compliance:        complianceHooks,
 		NodeID:            cfg.Env,
 		IntegrityFailures: integrityFailureSink{r: metricsRegistry},
+		MaxRequestBytes:   cfg.Gateway.MaxRequestBytes,
 		// RequireAuth gates the handler's AnonymousTenant
 		// fallback: in production any misconfiguration that
 		// drops the authenticator returns 500
@@ -283,6 +285,14 @@ func main() {
 		applyAbuseConfigToAbuseGuard(ag, cfg.Abuse)
 		handler = ag.Middleware(rl.Middleware(handler))
 	}
+	// requestid.Middleware is the outermost layer so the
+	// generated id is in the context before any other
+	// middleware runs (rate limiter, abuse guard, metrics,
+	// tracing). This makes the id available in every log line
+	// every downstream handler emits, and also means a 429 from
+	// the rate limiter still carries an x-amz-request-id header
+	// so the client can quote it in a support ticket.
+	handler = requestid.Middleware(handler)
 
 	srv := &http.Server{
 		Addr:         cfg.Gateway.ListenAddr,

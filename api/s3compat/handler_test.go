@@ -17,6 +17,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
+	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -1562,5 +1563,69 @@ func TestGet_UnrecognizedHashFormat_ServesWithObservabilityCounter(t *testing.T)
 	}
 	if u := sink.countUnrecognized("test"); u != 2 {
 		t.Fatalf("integrity_claim_unrecognized counter after 2 GETs = %d, want 2", u)
+	}
+}
+
+// TestAudit_RequestIDFromContext verifies that the audit record's
+// RequestID field reads from the request context (where
+// requestid.Middleware installs it) rather than from the request
+// header (where the middleware does NOT install it for
+// server-generated ids). Pre-fix, the audit code did
+// r.Header.Get("x-amz-request-id"), which only caught the
+// upstream-supplied case — server-generated ids leaked through
+// as empty strings on the response header and the audit record
+// despite the middleware setting them in the context. The fix
+// flips the audit code to requestid.FromContext(r.Context()).
+//
+// The test drives a PUT through requestid.Middleware so the
+// middleware's normal context-only installation is exercised
+// (no x-amz-request-id on the inbound request), then asserts
+// that (1) the audit record's RequestID is non-empty and (2)
+// it matches the x-amz-request-id the middleware echoed back
+// on the response header — proving they came from the same
+// source.
+func TestAudit_RequestIDFromContext(t *testing.T) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:  store,
+		Providers:  map[string]providers.StorageProvider{"test": fake},
+		Placement:  fixedPlacement{backend: "test"},
+		Compliance: ComplianceHooks{Audit: audit},
+		Now:        func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	// Wrap Handler.Put in requestid.Middleware so the request
+	// context carries the middleware-installed id when audit()
+	// reads it. The inbound request deliberately omits the
+	// x-amz-request-id header so the middleware generates a
+	// fresh id (the path the bug regressed).
+	wrapped := requestid.Middleware(http.HandlerFunc(h.Put))
+
+	body := []byte("audit-requestid-ctx")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	responseID := rec.Header().Get(requestid.HeaderName)
+	if responseID == "" {
+		t.Fatal("response x-amz-request-id was empty; requestid.Middleware did not run or did not set the header")
+	}
+
+	if len(audit.entries) == 0 {
+		t.Fatal("audit recorded no entries; PUT should have emitted one")
+	}
+	got := audit.entries[0].RequestID
+	if got == "" {
+		t.Fatalf("audit RequestID = %q; want the middleware-generated id %q. The pre-fix audit code read from r.Header which the middleware never sets — this regression test pins the FromContext path.", got, responseID)
+	}
+	if got != responseID {
+		t.Errorf("audit RequestID = %q, response header x-amz-request-id = %q; they must match because both must come from requestid.FromContext(r.Context()) / requestid.Middleware's single source of truth.", got, responseID)
 	}
 }

@@ -191,7 +191,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 		}
 		plaintext, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
+			writeBodyReadError(w, r, err)
 			return metadata.EncryptionConfig{}, nil, 0, 0, false
 		}
 		ciphertext, wrapped, _, err := h.encryptForStorage(plaintext)

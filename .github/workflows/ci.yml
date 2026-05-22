@@ -28,6 +28,15 @@ jobs:
       - name: go mod download
         run: go mod download
 
+      # go mod verify reads go.sum and confirms every module the
+      # build will use matches its recorded checksum. Running it
+      # before the build catches supply-chain tampering or a
+      # corrupt module cache that would otherwise slip past
+      # build-and-test (the build only fails on type errors, not
+      # checksum drift).
+      - name: go mod verify
+        run: go mod verify
+
       - name: go vet
         run: go vet ./...
 

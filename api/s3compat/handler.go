@@ -26,6 +26,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
+	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
@@ -235,6 +236,19 @@ type Config struct {
 	// alert on the rate. Optional.
 	IntegrityFailures IntegrityFailureSink
 
+	// MaxRequestBytes caps the size of the request body the
+	// gateway is willing to consume on PUT (object write,
+	// CompleteMultipartUpload XML, dedup-aware POST) and
+	// UploadPart. When > 0 the handler wraps r.Body in an
+	// http.MaxBytesReader before any io.ReadAll / TeeReader
+	// touches it, so an oversized stream surfaces a 413
+	// RequestEntityTooLarge instead of running OOM kills or
+	// silently truncating. A zero value disables the cap (the
+	// pre-PR-10 behaviour). cmd/gateway populates this from
+	// GatewayConfig.MaxRequestBytes; the package default in
+	// internal/config is 5 GiB.
+	MaxRequestBytes int64
+
 	// Now, if set, returns the current time. Tests override it to
 	// make manifests deterministic.
 	Now func() time.Time
@@ -317,8 +331,56 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/", h.dispatch)
 }
 
+// capRequestBody installs the MaxRequestBytes cap on r.Body when
+// the request carries a body and the handler has been configured
+// with a non-zero cap. Returns true when the wrap was applied,
+// false when it was skipped (cap disabled, or r.Body is nil /
+// http.NoBody).
+//
+// The wrap is method-agnostic: GET and HEAD never have a body
+// (net/http guarantees r.Body == http.NoBody for them, which the
+// guard below filters out), so the wrap only fires on methods
+// that actually carry bytes. DELETE in well-behaved S3 clients
+// carries no body, but a misbehaving client that sends one will
+// have its body capped instead of silently consumed by an
+// unsuspecting future handler — defence in depth.
+//
+// Method-specific allowlists were tempting (just PUT/POST,
+// because those are the only methods that legitimately read the
+// body today) but they create a future trap: any handler that
+// starts consuming the body on a method outside the allowlist
+// would silently bypass the cap and reintroduce the
+// OOM/truncation hazard MaxRequestBytes exists to prevent.
+// Wrapping every non-empty body means a future contributor
+// adding (say) a DELETE-with-XML extension does not have to
+// remember to update this dispatch.
+//
+// CopyObject is a PUT with `x-amz-copy-source` set and no client
+// body — the source bytes are streamed from the source backend.
+// The wrap is a no-op for those requests because r.Body is
+// http.NoBody when no Content-Length / Transfer-Encoding was
+// sent.
+//
+// The function is factored out of dispatch so tests can verify
+// the wrap is installed without going through the full handler
+// chain (which would require a body-reading sub-handler to
+// surface the 413 — the current Delete handler does not read
+// r.Body, so the cap is structurally present but inert at the
+// response layer for DELETE today).
+func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
+	if h.cfg.MaxRequestBytes <= 0 {
+		return false
+	}
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxRequestBytes)
+	return true
+}
+
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	h.capRequestBody(w, r)
 	switch r.Method {
 	case http.MethodPut:
 		if q.Get("uploadId") != "" && q.Get("partNumber") != "" {
@@ -512,7 +574,12 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		ContentType:   r.Header.Get("Content-Type"),
 	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
+		// PutPiece reads from the MaxBytesReader-wrapped body
+		// transitively; client overflows surface here as
+		// *http.MaxBytesError and writePutPieceError converts
+		// them to 413 EntityTooLarge. All other errors are
+		// genuine backend failures and map to 502.
+		writePutPieceError(w, r, err)
 		return
 	}
 	blake3Hash := "blake3:" + hex.EncodeToString(blake3Hasher.Sum(nil))
@@ -592,7 +659,17 @@ func (h *Handler) audit(r *http.Request, op, tenantID, bucket, key, pieceID, bac
 		PieceBackend:   backend,
 		BackendCountry: country,
 		Timestamp:      h.cfg.Now(),
-		RequestID:      r.Header.Get("x-amz-request-id"),
+		// Pull the id from the request context, not from
+		// the request header. requestid.Middleware
+		// installs the id in the context (and in the
+		// RESPONSE header), but never mutates the request
+		// header — so a header-only lookup misses every
+		// server-generated id and only catches the
+		// upstream-supplied case. FromContext returns the
+		// empty string when called without the middleware
+		// (unit tests, internal goroutines), which the
+		// audit consumer already treats as "no id".
+		RequestID: requestid.FromContext(r.Context()),
 	})
 }
 
@@ -1890,6 +1967,58 @@ func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource s
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(httpCode)
 	_ = xml.NewEncoder(w).Encode(s3ErrorResponse{Code: s3Code, Message: message, Resource: resource})
+}
+
+// writeBodyReadError converts a read-body error into the right
+// S3 error response. When the error is *http.MaxBytesError (the
+// request body exceeded Config.MaxRequestBytes), it surfaces 413
+// EntityTooLarge with the limit in the message so the caller can
+// pick the right chunk size on retry; otherwise it surfaces 400
+// InvalidArgument with the underlying error string. Callers
+// should `return` immediately after invoking this helper.
+// Callers that have already written a body must not call this —
+// Go's net/http will refuse to set the status code twice and the
+// client will see a truncated response with the wrong code.
+func writeBodyReadError(w http.ResponseWriter, r *http.Request, err error) {
+	if writeMaxBytesError(w, r, err) {
+		return
+	}
+	writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
+}
+
+// writePutPieceError converts a PutPiece backend error into the
+// right S3 response. Streaming PutPiece reads from the
+// MaxBytesReader-wrapped body, so the client overflowing the
+// per-request cap surfaces here as *http.MaxBytesError (not on
+// the body read because the read happens inside the provider).
+// We surface 413 in that case so the caller sees the same
+// EntityTooLarge as the body-read path; everything else is a
+// genuine backend failure and maps to 502 BackendPutFailed.
+// Callers should `return` immediately after invoking this helper.
+func writePutPieceError(w http.ResponseWriter, r *http.Request, err error) {
+	if writeMaxBytesError(w, r, err) {
+		return
+	}
+	writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
+}
+
+// writeMaxBytesError writes a 413 EntityTooLarge response if err
+// wraps *http.MaxBytesError and returns true. Returns false
+// without writing anything when err is some other error type,
+// letting the caller fall through to its protocol-specific
+// default response. Sharing this between writeBodyReadError and
+// writePutPieceError keeps the 413 limit-string format
+// consistent across every PUT/POST surface.
+func writeMaxBytesError(w http.ResponseWriter, r *http.Request, err error) bool {
+	var mb *http.MaxBytesError
+	if errors.As(err, &mb) {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			"EntityTooLarge",
+			fmt.Sprintf("request body exceeds the configured MaxRequestBytes limit of %d bytes", mb.Limit),
+			r.URL.Path)
+		return true
+	}
+	return false
 }
 
 // pieceETag returns the S3-protocol ETag for a piece. It prefers

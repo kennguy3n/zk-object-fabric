@@ -250,7 +250,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 	case "managed", "public_distribution":
 		plaintext, rerr := io.ReadAll(r.Body)
 		if rerr != nil {
-			writeError(w, http.StatusBadRequest, "InvalidArgument", "read part body: "+rerr.Error(), r.URL.Path)
+			writeBodyReadError(w, r, rerr)
 			return
 		}
 		plaintextSize = int64(len(plaintext))
@@ -300,7 +300,14 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		ContentType:   r.Header.Get("Content-Type"),
 	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
+		// PutPiece reads from the MaxBytesReader-wrapped body
+		// transitively (single-piece Put has the same shape) —
+		// if the client overflows the request cap the error
+		// wraps *http.MaxBytesError and writePutPieceError
+		// surfaces 413 EntityTooLarge instead of a generic 502
+		// so multipart clients see the same actionable error
+		// they get on the single-piece Put path.
+		writePutPieceError(w, r, err)
 		return
 	}
 	upload.SetPartHash(partNumber, partHasher.Sum(nil))
@@ -363,7 +370,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 	uploadID := r.URL.Query().Get("uploadId")
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // cap at 1 MiB of XML
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
+		writeBodyReadError(w, r, err)
 		return
 	}
 	var req completeMultipartUploadRequest

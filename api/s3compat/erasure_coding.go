@@ -88,7 +88,13 @@ func (h *Handler) putErasureCoded(
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxECObjectSize+1))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
+		// dispatch wraps r.Body in MaxBytesReader, so a client
+		// that overflows MaxRequestBytes surfaces here as
+		// *http.MaxBytesError. Route through writeBodyReadError
+		// so EC clients see the same 413 EntityTooLarge as
+		// every other body-reading path; falls back to 400
+		// InvalidArgument for any other read failure.
+		writeBodyReadError(w, r, err)
 		return
 	}
 	if int64(len(body)) > maxECObjectSize {
