@@ -1222,6 +1222,234 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 	}
 }
 
+// TestHead_ErasureCoded_NoRange pins that HEAD on an EC manifest
+// mirrors getErasureCoded's response shape: 200 OK with the full
+// ObjectSize as Content-Length, NO ETag (EC piece hashes are
+// per-shard, not per-object), and an audit record with the EC
+// primary backend's placement labels.
+func TestHead_ErasureCoded_NoRange(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance:    ComplianceHooks{Audit: audit},
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC HEAD status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprintf("%d", len(body)) {
+		t.Errorf("EC HEAD Content-Length = %q, want %q", got, fmt.Sprintf("%d", len(body)))
+	}
+	if got := rec.Header().Get("ETag"); got != "" {
+		t.Errorf("EC HEAD must NOT set ETag (matches getErasureCoded which omits ETag for shard hashes), got %q", got)
+	}
+	ops := audit.operations()
+	if len(ops) != 2 || ops[0] != "PUT" || ops[1] != "HEAD" {
+		t.Fatalf("EC audit ops = %v, want [PUT HEAD]", ops)
+	}
+}
+
+// TestHead_ErasureCoded_RangeReturns501 pins that HEAD on an EC
+// manifest with a Range header returns 501 NotImplemented, exactly
+// what getErasureCoded does. Returning 206 with a slice-sized
+// Content-Length would advertise capability the follow-up GET
+// doesn't have, breaking AWS SDK / CDN pre-flight probes that use
+// HEAD to discover Range support.
+func TestHead_ErasureCoded_RangeReturns501(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	req.Header.Set("Range", "bytes=0-99")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("EC HEAD with Range status = %d, want 501 (mirror getErasureCoded)", rec.Code)
+	}
+	if rec.Header().Get("Content-Range") != "" {
+		t.Errorf("EC HEAD with Range must NOT set Content-Range on 501 response")
+	}
+}
+
+// TestHead_Multipart_NoRange pins that HEAD on a multipart manifest
+// mirrors getMultipart's response shape: 200 OK with the full
+// ObjectSize as Content-Length, NO ETag (the multipart-ETag from
+// CompleteMultipartUpload isn't recoverable from the manifest;
+// matching GET, we omit rather than fabricate a Pieces[0]-based
+// value), and an audit record.
+func TestHead_Multipart_NoRange(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "DE"}
+	audit := &recordingAudit{}
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests:  store,
+		Providers:  map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:  fixedPlacement{backend: "test"},
+		Multipart:  mpStore,
+		Now:        func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{Audit: audit},
+	})
+
+	// Land a multipart manifest via create + upload + complete.
+	req := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("part-1-"), 1024),
+		bytes.Repeat([]byte("part-2-"), 1024),
+	}
+	totalSize := 0
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, partBody := range parts {
+		partNum := i + 1
+		totalSize += len(partBody)
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
+		uploadReq := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		uploadReq.ContentLength = int64(len(partBody))
+		uploadRec := httptest.NewRecorder()
+		h.UploadPart(uploadRec, uploadReq)
+		if uploadRec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, want 200; body=%s", partNum, uploadRec.Code, uploadRec.Body)
+		}
+		etag := strings.Trim(uploadRec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
+	}
+	completeXML, err := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	if err != nil {
+		t.Fatalf("marshal complete body: %v", err)
+	}
+	url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID)
+	completeReq := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	// Now HEAD the assembled multipart object.
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-obj", nil)
+	headRec := httptest.NewRecorder()
+	h.Head(headRec, headReq)
+
+	if headRec.Code != http.StatusOK {
+		t.Fatalf("multipart HEAD status = %d, want 200; body=%s", headRec.Code, headRec.Body)
+	}
+	if got := headRec.Header().Get("Content-Length"); got != fmt.Sprintf("%d", totalSize) {
+		t.Errorf("multipart HEAD Content-Length = %q, want %q", got, fmt.Sprintf("%d", totalSize))
+	}
+	if got := headRec.Header().Get("ETag"); got != "" {
+		t.Errorf("multipart HEAD must NOT set ETag (matches getMultipart), got %q", got)
+	}
+	ops := audit.operations()
+	// PUT (Complete) is the only audited write here; UploadPart
+	// does not audit. So we expect ops = [PUT, HEAD].
+	if len(ops) == 0 || ops[len(ops)-1] != "HEAD" {
+		t.Errorf("multipart audit ops = %v, want last entry to be HEAD", ops)
+	}
+}
+
+// TestHead_Multipart_RangeReturns501 pins that HEAD on a multipart
+// manifest with a Range header returns 501 NotImplemented, exactly
+// what getMultipart does. Same rationale as the EC case: HEAD must
+// not advertise Range support the matching GET doesn't have.
+func TestHead_Multipart_RangeReturns501(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("part-1-"), 1024),
+		bytes.Repeat([]byte("part-2-"), 1024),
+	}
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, partBody := range parts {
+		partNum := i + 1
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
+		uploadReq := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		uploadReq.ContentLength = int64(len(partBody))
+		uploadRec := httptest.NewRecorder()
+		h.UploadPart(uploadRec, uploadReq)
+		etag := strings.Trim(uploadRec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID)
+	completeReq := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-obj", nil)
+	headReq.Header.Set("Range", "bytes=0-99")
+	headRec := httptest.NewRecorder()
+	h.Head(headRec, headReq)
+
+	if headRec.Code != http.StatusNotImplemented {
+		t.Fatalf("multipart HEAD with Range status = %d, want 501 (mirror getMultipart)", headRec.Code)
+	}
+}
+
 // TestHandler_RequireAuth_NoAuthenticator_Returns500 verifies the
 // production-mode safety net: when RequireAuth=true and Auth is
 // nil, every request returns 500 InternalAuthMisconfigured instead

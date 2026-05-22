@@ -1725,25 +1725,35 @@ func (h *Handler) notifyCacheWarmingExhausted(backend string, pieceSize int64) {
 //
 // Per RFC 9110 §13.1, HEAD must return the same response metadata
 // that a GET on the same target would, with the message body
-// omitted. Two consequences for this handler:
+// omitted. The Get handler dispatches on manifest type before
+// processing Range; HEAD mirrors that dispatch so the headers
+// HEAD emits exactly match what the matching Get would emit:
 //
-//   - Range header support: when the client sends a valid Range,
-//     HEAD must respond 206 Partial Content with Content-Range
-//     and a Content-Length equal to the range slice size — not
-//     200 OK with the full Content-Length. AWS S3 HEAD follows
-//     this rule and clients (notably the AWS SDKs and large
-//     CDN edges performing pre-flight range probes) depend on
-//     the slice-sized Content-Length to size their download
-//     buffers. Returning the full Content-Length on a HEAD-with-
-//     Range would over-allocate on the client side and surface
-//     as either a truncated GET or a "Content-Length mismatch"
-//     error after the subsequent GET completes.
+//   - Erasure-coded manifests: getErasureCoded rejects Range with
+//     501 NotImplemented (chunk-level range seek lands in a future
+//     phase). HEAD must do the same — returning 206 with a
+//     slice-sized Content-Length would advertise capability the
+//     follow-up GET doesn't have, breaking AWS SDK / CDN
+//     pre-flight probes. EC GET also does NOT set ETag (the
+//     manifest's piece hashes are per-shard, not per-object), so
+//     HEAD must skip ETag too.
 //
-//   - Invalid Range handling: an out-of-bounds or malformed
-//     Range on HEAD returns 416 RequestedRangeNotSatisfiable,
-//     matching the GET path. Silently returning 200 with full
-//     Content-Length would let buggy clients send a follow-up
-//     ranged GET that we then reject — wasting a round-trip.
+//   - Multipart manifests: getMultipart likewise rejects Range
+//     with 501 and does not set ETag. HEAD mirrors both.
+//
+//   - Gateway-encrypted manifests with a Range header:
+//     bufferedGatewayDecryptedGet rejects pieces above
+//     MaxInMemoryObjectBytes with 507 InsufficientStorage because
+//     buffered decryption would defeat the OOM guard.
+//     HEAD-with-Range on those objects mirrors that rejection
+//     so clients learn up-front the GET will fail.
+//
+//   - Single-piece (and within-ceiling encrypted): Range parses
+//     through parseHTTPRange, returning 416 on invalid /
+//     out-of-bounds and 206 + Content-Range + slice-sized
+//     Content-Length on success. ETag is set from
+//     pieceETag(piece) (the per-piece BLAKE3 hash, which is the
+//     same hash GET would set).
 //
 // HEAD also emits an AuditRecord (operation="HEAD") so the
 // compliance trail covers object-existence probes — discovering
@@ -1756,6 +1766,15 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isErasureCodedManifest(manifest) {
+		h.headErasureCoded(w, r, manifest, piece, pieceProvider, tenantID, bucket)
+		return
+	}
+	if isMultipartManifest(manifest) {
+		h.headMultipart(w, r, manifest, piece, pieceProvider, tenantID, bucket)
+		return
+	}
+
 	var byteRange *providers.ByteRange
 	if hdr := r.Header.Get("Range"); hdr != "" {
 		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
@@ -1764,6 +1783,20 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		byteRange = rng
+	}
+
+	// Gateway-encrypted oversize range: bufferedGatewayDecryptedGet
+	// rejects pieces above MaxInMemoryObjectBytes outright because
+	// it must buffer the full plaintext to slice an arbitrary
+	// range (chunk-level range seek lands in v0.2.0). Mirror that
+	// rejection on HEAD so pre-flight probes learn up-front rather
+	// than discovering the failure on the GET.
+	if IsGatewayEncrypted(manifest.Encryption.Mode) && byteRange != nil && manifest.ObjectSize > MaxInMemoryObjectBytes {
+		writeError(w, http.StatusInsufficientStorage, "RangeRequestTooLargeForBufferedDecrypt",
+			fmt.Sprintf("range GET on gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; full-object GETs stream without this ceiling",
+				manifest.ObjectSize, MaxInMemoryObjectBytes),
+			r.URL.Path)
+		return
 	}
 
 	if etag := pieceETag(piece); etag != "" {
@@ -1790,6 +1823,62 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	// piece bytes so there is no integrity check to fail before
 	// audit, mirroring the post-resolve / pre-body audit point in
 	// Get for the simple single-piece path.
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// headErasureCoded mirrors getErasureCoded's response metadata:
+// 501 for Range, 200 + full ObjectSize + no ETag otherwise. EC
+// pieces are per-shard, not per-object, so the gateway has no
+// authoritative per-object hash to advertise as ETag (the
+// Reed-Solomon decoder reconstructs the object on the fly; the
+// matching whole-object hash would be a post-EC computation we
+// don't currently persist).
+func (h *Handler) headErasureCoded(
+	w http.ResponseWriter,
+	r *http.Request,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	tenantID, bucket string,
+) {
+	if r.Header.Get("Range") != "" {
+		writeError(w, http.StatusNotImplemented, "NotImplemented",
+			"range reads on erasure-coded objects are not yet supported", r.URL.Path)
+		return
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	w.WriteHeader(http.StatusOK)
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// headMultipart mirrors getMultipart's response metadata: 501 for
+// Range, 200 + full ObjectSize + no ETag otherwise. Multipart
+// objects don't expose a per-object ETag on read (the multipart
+// ETag returned at upload completion is a non-cryptographic
+// concatenation hash that isn't recoverable from the manifest;
+// matching GET we omit it rather than fabricate a Pieces[0]-based
+// value that wouldn't agree with PUT's response).
+func (h *Handler) headMultipart(
+	w http.ResponseWriter,
+	r *http.Request,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	tenantID, bucket string,
+) {
+	if r.Header.Get("Range") != "" {
+		writeError(w, http.StatusNotImplemented, "NotImplemented",
+			"range reads on multipart objects are not yet supported", r.URL.Path)
+		return
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	w.WriteHeader(http.StatusOK)
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
 }
 
