@@ -252,6 +252,166 @@ func TestGet_OpenEndedRange(t *testing.T) {
 	}
 }
 
+// TestHead_RangeRequest_Returns206WithSliceContentLength pins
+// RFC 9110 §13.1 conformance: a HEAD on a target that the client
+// would GET with Range must report the same metadata a GET would
+// — 206 Partial Content, Content-Range, and Content-Length sized
+// to the slice rather than the full object.
+//
+// Pre-fix the handler returned 200 OK with the full Content-Length
+// for every HEAD regardless of Range, which silently broke AWS
+// SDK / CDN pre-flight probes that size their download buffers
+// off the HEAD response.
+func TestHead_RangeRequest_Returns206WithSliceContentLength(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("HEAD with Range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "4" {
+		t.Errorf("HEAD with Range Content-Length = %q, want %q (slice size 2..5 inclusive)", got, "4")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 2-5/10" {
+		t.Errorf("HEAD with Range Content-Range = %q, want %q", got, "bytes 2-5/10")
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("HEAD with Range body length = %d, want 0 (HEAD has no message body)", rec.Body.Len())
+	}
+}
+
+// TestHead_OpenEndedRange pins the open-ended Range form ("bytes=N-")
+// against HEAD. The 416 InvalidRange path is exercised separately;
+// this case asserts the happy path for the most common CDN pre-flight
+// shape: "give me the suffix starting at N".
+func TestHead_OpenEndedRange(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=5-")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("HEAD open-ended range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "5" {
+		t.Errorf("HEAD open-ended range Content-Length = %q, want %q", got, "5")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 5-9/10" {
+		t.Errorf("HEAD open-ended range Content-Range = %q, want %q", got, "bytes 5-9/10")
+	}
+}
+
+// TestHead_InvalidRange_Returns416 pins the contract that an
+// out-of-bounds or malformed Range on HEAD surfaces as
+// 416 RequestedRangeNotSatisfiable, mirroring the GET path.
+// Returning 200 + full Content-Length here would let a buggy
+// client follow up with a ranged GET that we then reject, wasting
+// a round-trip.
+func TestHead_InvalidRange_Returns416(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=100-200")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("HEAD with out-of-bounds Range status = %d, want 416", rec.Code)
+	}
+}
+
+// TestHead_NoRange_Returns200WithFullContentLength is the
+// regression test for the original non-Range HEAD shape: 200 OK
+// with the full ObjectSize as Content-Length. Easy to break if a
+// future refactor accidentally drops the no-Range branch.
+func TestHead_NoRange_Returns200WithFullContentLength(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "10" {
+		t.Errorf("HEAD Content-Length = %q, want %q", got, "10")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("HEAD with no Range must NOT set Content-Range, got %q", got)
+	}
+}
+
+// TestHead_EmitsAuditRecord pins the compliance contract that HEAD
+// — like GET, PUT, and DELETE — emits an AuditEntry through the
+// configured AuditRecorder. In zero-knowledge deployments a HEAD
+// reveals object existence and metadata, which is itself a
+// privacy-sensitive read even though no bytes are served. The
+// audit shape mirrors GET (operation="HEAD", same tenant / bucket
+// / key / pieceID / backend / country fields).
+func TestHead_EmitsAuditRecord(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:  store,
+		Providers:  map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:  fixedPlacement{backend: "test"},
+		Now:        func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{Audit: audit},
+	})
+
+	body := []byte("hello-head")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	ops := audit.operations()
+	if len(ops) != 2 || ops[0] != "PUT" || ops[1] != "HEAD" {
+		t.Fatalf("audit ops = %v, want [PUT HEAD]", ops)
+	}
+	headEntry := audit.entries[1]
+	if headEntry.PieceBackend != "test" {
+		t.Errorf("HEAD audit backend = %q, want %q", headEntry.PieceBackend, "test")
+	}
+	if headEntry.BackendCountry != "US" {
+		t.Errorf("HEAD audit country = %q, want %q", headEntry.BackendCountry, "US")
+	}
+	if headEntry.Bucket != "bucket" || headEntry.ObjectKey != "obj" {
+		t.Errorf("HEAD audit (bucket, key) = (%q, %q), want (bucket, obj)", headEntry.Bucket, headEntry.ObjectKey)
+	}
+}
+
 // recordingHotCache is a minimal HotObjectCache implementation that
 // tracks Put calls so tests can assert when fetchPiece warms the
 // cache. Get is intentionally a permanent miss: every test that
@@ -1059,6 +1219,622 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 	}
 	if getEntry.PieceID == "" {
 		t.Errorf("multipart GET audit PieceID is empty; want first piece ID")
+	}
+}
+
+// TestHead_ErasureCoded_NoRange pins that HEAD on an EC manifest
+// mirrors getErasureCoded's response shape: 200 OK with the full
+// ObjectSize as Content-Length, NO ETag (EC piece hashes are
+// per-shard, not per-object), and an audit record with the EC
+// primary backend's placement labels.
+func TestHead_ErasureCoded_NoRange(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance:    ComplianceHooks{Audit: audit},
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC HEAD status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprintf("%d", len(body)) {
+		t.Errorf("EC HEAD Content-Length = %q, want %q", got, fmt.Sprintf("%d", len(body)))
+	}
+	if got := rec.Header().Get("ETag"); got != "" {
+		t.Errorf("EC HEAD must NOT set ETag (matches getErasureCoded which omits ETag for shard hashes), got %q", got)
+	}
+	ops := audit.operations()
+	if len(ops) != 2 || ops[0] != "PUT" || ops[1] != "HEAD" {
+		t.Fatalf("EC audit ops = %v, want [PUT HEAD]", ops)
+	}
+}
+
+// TestHead_ErasureCoded_RangeReturns501 pins that HEAD on an EC
+// manifest with a Range header returns 501 NotImplemented, exactly
+// what getErasureCoded does. Returning 206 with a slice-sized
+// Content-Length would advertise capability the follow-up GET
+// doesn't have, breaking AWS SDK / CDN pre-flight probes that use
+// HEAD to discover Range support.
+func TestHead_ErasureCoded_RangeReturns501(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	req.Header.Set("Range", "bytes=0-99")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("EC HEAD with Range status = %d, want 501 (mirror getErasureCoded)", rec.Code)
+	}
+	if rec.Header().Get("Content-Range") != "" {
+		t.Errorf("EC HEAD with Range must NOT set Content-Range on 501 response")
+	}
+}
+
+// TestHead_ErasureCoded_RegistryMissingReturns500 pins that HEAD
+// on an EC manifest fails with 500 when h.cfg.ErasureCoding is
+// nil, mirroring getErasureCoded's nil-registry guard. Without
+// this, a misconfigured gateway would 200-OK pre-flight HEAD
+// probes and then 500 the subsequent GET — exactly the
+// HEAD/GET-divergence class of bug this PR aims to eliminate.
+func TestHead_ErasureCoded_RegistryMissingReturns500(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+
+	// Build the manifest with a PUT path that has a registry.
+	hWithEC := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	hWithEC.Put(httptest.NewRecorder(), req)
+
+	// Re-bind a handler over the SAME store with ErasureCoding=nil
+	// — simulating a deployment where the manifest was written
+	// when EC was configured but the current gateway forgot to
+	// wire the registry in.
+	hNoEC := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	hNoEC.Head(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("EC HEAD with nil registry status = %d, want 500 (mirror getErasureCoded)", rec.Code)
+	}
+}
+
+// TestHead_ErasureCoded_AuditUsesPrimaryBackend pins that HEAD's
+// audit attribution on an EC manifest comes from
+// MigrationState.PrimaryBackend (NOT piece.Backend from the
+// resolver), matching getErasureCoded so PUT/GET/HEAD rows for
+// the same object correlate by backend in the audit trail.
+func TestHead_ErasureCoded_AuditUsesPrimaryBackend(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance:    ComplianceHooks{Audit: audit},
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	// PUT writes MigrationState.PrimaryBackend = "test" (the only
+	// placement option), so the HEAD audit row must attribute to
+	// "test" via that field, matching how getErasureCoded audits.
+	// This test catches the historical bug where HEAD attributed
+	// to piece.Backend from the resolver instead of PrimaryBackend
+	// — silent today because both equal "test" with a single-
+	// backend placement, but a divergence the moment EC shards
+	// scatter across multiple backends.
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC HEAD status = %d, want 200", rec.Code)
+	}
+
+	if len(audit.entries) < 2 {
+		t.Fatalf("audit entries = %d, want >= 2 (PUT + HEAD)", len(audit.entries))
+	}
+	headEntry := audit.entries[len(audit.entries)-1]
+	if headEntry.Operation != "HEAD" {
+		t.Fatalf("last audit op = %q, want HEAD", headEntry.Operation)
+	}
+	if headEntry.PieceBackend != "test" {
+		t.Errorf("EC HEAD audit PieceBackend = %q, want %q (MigrationState.PrimaryBackend)",
+			headEntry.PieceBackend, "test")
+	}
+	if headEntry.PieceID == "" {
+		t.Errorf("EC HEAD audit PieceID is empty; want Pieces[0].PieceID")
+	}
+	if headEntry.BackendCountry != "US" {
+		t.Errorf("EC HEAD audit BackendCountry = %q, want US (PrimaryBackend provider's country)",
+			headEntry.BackendCountry)
+	}
+
+	// Symmetry guard: PUT-audit + HEAD-audit must agree on
+	// PieceBackend so the PUT/HEAD trail correlates by backend.
+	putEntry := audit.entries[0]
+	if putEntry.PieceBackend != headEntry.PieceBackend {
+		t.Errorf("EC PUT/HEAD audit PieceBackend divergence: PUT=%q HEAD=%q",
+			putEntry.PieceBackend, headEntry.PieceBackend)
+	}
+}
+
+// TestHead_ErasureCoded_MissingProfileReturns500 pins that HEAD
+// 500s when the EC manifest's PlacementPolicy.ErasureProfile is
+// blank — mirroring getErasureCoded's check at
+// erasure_coding.go:263-267. Without this, HEAD would 200 a
+// manifest the follow-up GET refuses to serve.
+func TestHead_ErasureCoded_MissingProfileReturns500(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("ec-obj"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	man.PlacementPolicy.ErasureProfile = ""
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("EC HEAD with blank ErasureProfile status = %d, want 500", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("ErasureProfileMissing")) {
+		t.Errorf("EC HEAD with blank ErasureProfile body = %q, want code ErasureProfileMissing", rec.Body.String())
+	}
+}
+
+// TestHead_ErasureCoded_UnregisteredProfileReturns500 pins that
+// HEAD 500s when the EC manifest names a profile that isn't
+// registered in h.cfg.ErasureCoding — mirroring
+// getErasureCoded's Lookup() check at erasure_coding.go:268-272.
+// A manifest written under one profile catalog and served from
+// a gateway with a different catalog must fail HEAD up-front, not
+// silently 200 and then 500 the GET.
+func TestHead_ErasureCoded_UnregisteredProfileReturns500(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("ec-obj"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	man.PlacementPolicy.ErasureProfile = "nonexistent-profile-name"
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("EC HEAD with unregistered profile status = %d, want 500", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("ErasureProfileNotRegistered")) {
+		t.Errorf("EC HEAD with unregistered profile body = %q, want code ErasureProfileNotRegistered", rec.Body.String())
+	}
+}
+
+// TestHead_Multipart_NoRange pins that HEAD on a multipart manifest
+// mirrors getMultipart's response shape: 200 OK with the full
+// ObjectSize as Content-Length, NO ETag (the multipart-ETag from
+// CompleteMultipartUpload isn't recoverable from the manifest;
+// matching GET, we omit rather than fabricate a Pieces[0]-based
+// value), and an audit record.
+func TestHead_Multipart_NoRange(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "DE"}
+	audit := &recordingAudit{}
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests:  store,
+		Providers:  map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:  fixedPlacement{backend: "test"},
+		Multipart:  mpStore,
+		Now:        func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{Audit: audit},
+	})
+
+	// Land a multipart manifest via create + upload + complete.
+	req := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("part-1-"), 1024),
+		bytes.Repeat([]byte("part-2-"), 1024),
+	}
+	totalSize := 0
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, partBody := range parts {
+		partNum := i + 1
+		totalSize += len(partBody)
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
+		uploadReq := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		uploadReq.ContentLength = int64(len(partBody))
+		uploadRec := httptest.NewRecorder()
+		h.UploadPart(uploadRec, uploadReq)
+		if uploadRec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, want 200; body=%s", partNum, uploadRec.Code, uploadRec.Body)
+		}
+		etag := strings.Trim(uploadRec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
+	}
+	completeXML, err := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	if err != nil {
+		t.Fatalf("marshal complete body: %v", err)
+	}
+	url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID)
+	completeReq := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	// Now HEAD the assembled multipart object.
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-obj", nil)
+	headRec := httptest.NewRecorder()
+	h.Head(headRec, headReq)
+
+	if headRec.Code != http.StatusOK {
+		t.Fatalf("multipart HEAD status = %d, want 200; body=%s", headRec.Code, headRec.Body)
+	}
+	if got := headRec.Header().Get("Content-Length"); got != fmt.Sprintf("%d", totalSize) {
+		t.Errorf("multipart HEAD Content-Length = %q, want %q", got, fmt.Sprintf("%d", totalSize))
+	}
+	if got := headRec.Header().Get("ETag"); got != "" {
+		t.Errorf("multipart HEAD must NOT set ETag (matches getMultipart), got %q", got)
+	}
+	ops := audit.operations()
+	// PUT (Complete) is the only audited write here; UploadPart
+	// does not audit. So we expect ops = [PUT, HEAD].
+	if len(ops) == 0 || ops[len(ops)-1] != "HEAD" {
+		t.Errorf("multipart audit ops = %v, want last entry to be HEAD", ops)
+	}
+}
+
+// TestHead_Multipart_RangeReturns501 pins that HEAD on a multipart
+// manifest with a Range header returns 501 NotImplemented, exactly
+// what getMultipart does. Same rationale as the EC case: HEAD must
+// not advertise Range support the matching GET doesn't have.
+func TestHead_Multipart_RangeReturns501(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	rec := httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("part-1-"), 1024),
+		bytes.Repeat([]byte("part-2-"), 1024),
+	}
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, partBody := range parts {
+		partNum := i + 1
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
+		uploadReq := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		uploadReq.ContentLength = int64(len(partBody))
+		uploadRec := httptest.NewRecorder()
+		h.UploadPart(uploadRec, uploadReq)
+		etag := strings.Trim(uploadRec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID)
+	completeReq := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-obj", nil)
+	headReq.Header.Set("Range", "bytes=0-99")
+	headRec := httptest.NewRecorder()
+	h.Head(headRec, headReq)
+
+	if headRec.Code != http.StatusNotImplemented {
+		t.Fatalf("multipart HEAD with Range status = %d, want 501 (mirror getMultipart)", headRec.Code)
+	}
+}
+
+// TestHead_Multipart_OversizeReturns507 pins that HEAD on a
+// multipart manifest above maxMultipartInMemoryBytes returns 507
+// MultipartTooLarge — mirroring getMultipart's ceiling at
+// erasure_coding.go:468-474. getMultipart pre-fetches every part
+// into memory before writing the response; if HEAD 200s but GET
+// 507s, AWS SDK / CDN pre-flight probes would record the object
+// as servable when it isn't, breaking the RFC 9110 §13.1
+// HEAD/GET-metadata-parity contract.
+//
+// Implementation: land a small multipart manifest the normal way
+// then inflate ObjectSize past the ceiling directly in the store.
+// HEAD only reads metadata so the inflated size has no bytes
+// behind it — exactly the scenario where a permissive HEAD would
+// mislead clients.
+func TestHead_Multipart_OversizeReturns507(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	// Land a small multipart manifest the normal way.
+	initReq := httptest.NewRequest(http.MethodPost, "/bucket/mp-large?uploads", nil)
+	initRec := httptest.NewRecorder()
+	h.CreateMultipartUpload(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, body=%s", initRec.Code, initRec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(initRec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+	completed := make([]completeUploadEntry, 0, 2)
+	for i := 1; i <= 2; i++ {
+		partBody := bytes.Repeat([]byte{byte('a' + i)}, 16)
+		url := fmt.Sprintf("/bucket/mp-large?uploadId=%s&partNumber=%d", uploadID, i)
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		req.ContentLength = int64(len(partBody))
+		rec := httptest.NewRecorder()
+		h.UploadPart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, body=%s", i, rec.Code, rec.Body)
+		}
+		etag := strings.Trim(rec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: i, ETag: etag})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	completeReq := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/bucket/mp-large?uploadId=%s", uploadID), bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	// Inflate ObjectSize past the 256 MiB ceiling without
+	// allocating any bytes — the manifest is opaque metadata,
+	// HEAD never reads parts, so the fake is sufficient to
+	// exercise the guard.
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("mp-large"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	man.ObjectSize = (256 * 1024 * 1024) + 1
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-large", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("oversize multipart HEAD status = %d, want 507 (mirror getMultipart ceiling)", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("MultipartTooLarge")) {
+		t.Errorf("oversize multipart HEAD body = %q, want code MultipartTooLarge", rec.Body.String())
+	}
+}
+
+// TestHead_Multipart_UnregisteredBackendReturns502 pins that HEAD
+// 502s when any part's backend is missing from h.cfg.Providers —
+// mirroring getMultipart's check at erasure_coding.go:520-530.
+// Multipart GET has no read-repair / parity fallback so a missing
+// backend is a hard failure; HEAD must surface that up-front
+// rather than letting the AWS SDK / CDN pre-flight route traffic
+// toward a guaranteed-fail GET.
+func TestHead_Multipart_UnregisteredBackendReturns502(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	initReq := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	initRec := httptest.NewRecorder()
+	h.CreateMultipartUpload(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, body=%s", initRec.Code, initRec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(initRec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+	completed := make([]completeUploadEntry, 0, 2)
+	for i := 1; i <= 2; i++ {
+		partBody := bytes.Repeat([]byte{byte('a' + i)}, 16)
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, i)
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		req.ContentLength = int64(len(partBody))
+		rec := httptest.NewRecorder()
+		h.UploadPart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, body=%s", i, rec.Code, rec.Body)
+		}
+		etag := strings.Trim(rec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: i, ETag: etag})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	completeReq := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID), bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	// Rewrite Pieces[0].Backend to a name not present in
+	// h.cfg.Providers — exactly the misconfiguration a config
+	// rollback or backend deregistration would produce. HEAD must
+	// 502 to match getMultipart's behavior on the follow-up GET.
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("mp-obj"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	// resolve() picks Pieces[0] before any manifest-type dispatch
+	// and returns 500 BackendNotRegistered if its backend is gone,
+	// which short-circuits headMultipart. To exercise
+	// headMultipart's per-part check we deregister a non-first
+	// part — exactly the GET path's `for i, p := range pieces`
+	// loop at erasure_coding.go:520-530 which iterates ALL parts,
+	// not just Pieces[0]. Find the second-largest part so we still
+	// have at least 2 entries to corrupt one.
+	if len(man.Pieces) < 2 {
+		t.Fatalf("multipart manifest pieces = %d, want >= 2", len(man.Pieces))
+	}
+	man.Pieces[1].Backend = "deregistered-backend"
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("multipart HEAD with deregistered backend status = %d, want 502 (mirror getMultipart)", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("BackendNotRegistered")) {
+		t.Errorf("multipart HEAD with deregistered backend body = %q, want code BackendNotRegistered", rec.Body.String())
 	}
 }
 

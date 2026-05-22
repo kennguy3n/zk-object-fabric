@@ -1722,20 +1722,238 @@ func (h *Handler) notifyCacheWarmingExhausted(backend string, pieceSize int64) {
 }
 
 // Head handles S3 HEAD object.
+//
+// Per RFC 9110 §13.1, HEAD must return the same response metadata
+// that a GET on the same target would, with the message body
+// omitted. The Get handler dispatches on manifest type before
+// processing Range; HEAD mirrors that dispatch so the headers
+// HEAD emits exactly match what the matching Get would emit:
+//
+//   - Erasure-coded manifests: getErasureCoded rejects Range with
+//     501 NotImplemented (chunk-level range seek lands in a future
+//     phase). HEAD must do the same — returning 206 with a
+//     slice-sized Content-Length would advertise capability the
+//     follow-up GET doesn't have, breaking AWS SDK / CDN
+//     pre-flight probes. EC GET also does NOT set ETag (the
+//     manifest's piece hashes are per-shard, not per-object), so
+//     HEAD must skip ETag too.
+//
+//   - Multipart manifests: getMultipart likewise rejects Range
+//     with 501 and does not set ETag. HEAD mirrors both.
+//
+//   - Gateway-encrypted manifests with a Range header:
+//     bufferedGatewayDecryptedGet rejects pieces above
+//     MaxInMemoryObjectBytes with 507 InsufficientStorage because
+//     buffered decryption would defeat the OOM guard.
+//     HEAD-with-Range on those objects mirrors that rejection
+//     so clients learn up-front the GET will fail.
+//
+//   - Single-piece (and within-ceiling encrypted): Range parses
+//     through parseHTTPRange, returning 416 on invalid /
+//     out-of-bounds and 206 + Content-Range + slice-sized
+//     Content-Length on success. ETag is set from
+//     pieceETag(piece) (the per-piece BLAKE3 hash, which is the
+//     same hash GET would set).
+//
+// HEAD also emits an AuditRecord (operation="HEAD") so the
+// compliance trail covers object-existence probes — discovering
+// that a key exists is a privacy-sensitive read in zero-knowledge
+// deployments, even though no bytes are served.
 func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
-	manifest, _, piece, tenantID, bucket, err := h.resolve(r)
+	manifest, pieceProvider, piece, tenantID, bucket, err := h.resolve(r)
 	if err != nil {
 		writeResolveError(w, r, err)
 		return
 	}
+
+	if isErasureCodedManifest(manifest) {
+		h.headErasureCoded(w, r, manifest, piece, pieceProvider, tenantID, bucket)
+		return
+	}
+	if isMultipartManifest(manifest) {
+		h.headMultipart(w, r, manifest, piece, pieceProvider, tenantID, bucket)
+		return
+	}
+
+	var byteRange *providers.ByteRange
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
+		if perr != nil {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+			return
+		}
+		byteRange = rng
+	}
+
+	// Gateway-encrypted oversize range: bufferedGatewayDecryptedGet
+	// rejects pieces above MaxInMemoryObjectBytes outright because
+	// it must buffer the full plaintext to slice an arbitrary
+	// range (chunk-level range seek lands in v0.2.0). Mirror that
+	// rejection on HEAD so pre-flight probes learn up-front rather
+	// than discovering the failure on the GET.
+	if IsGatewayEncrypted(manifest.Encryption.Mode) && byteRange != nil && manifest.ObjectSize > MaxInMemoryObjectBytes {
+		writeError(w, http.StatusInsufficientStorage, "RangeRequestTooLargeForBufferedDecrypt",
+			fmt.Sprintf("range GET on gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; full-object GETs stream without this ceiling",
+				manifest.ObjectSize, MaxInMemoryObjectBytes),
+			r.URL.Path)
+		return
+	}
+
 	if etag := pieceETag(piece); etag != "" {
 		w.Header().Set("ETag", quote(etag))
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	status := http.StatusOK
+	if byteRange != nil {
+		end := byteRange.End
+		if end < 0 {
+			end = manifest.ObjectSize - 1
+		}
+		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
+		status = http.StatusPartialContent
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	}
+	w.WriteHeader(status)
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	// Audit HEAD with the same shape as GET. Country comes from
+	// the resolved provider's placement labels; HEAD never reads
+	// piece bytes so there is no integrity check to fail before
+	// audit, mirroring the post-resolve / pre-body audit point in
+	// Get for the simple single-piece path.
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// headErasureCoded mirrors getErasureCoded's response metadata:
+// 501 for Range, 200 + full ObjectSize + no ETag otherwise. EC
+// pieces are per-shard, not per-object, so the gateway has no
+// authoritative per-object hash to advertise as ETag (the
+// Reed-Solomon decoder reconstructs the object on the fly; the
+// matching whole-object hash would be a post-EC computation we
+// don't currently persist).
+//
+// The ErasureCoding-nil guard matches getErasureCoded: an EC
+// manifest with no registry configured is unservable, so HEAD
+// must surface the misconfiguration as 500 rather than 200,
+// otherwise pre-flight probes would pass and the follow-up GET
+// would fail.
+//
+// Audit attribution uses manifest.MigrationState.PrimaryBackend
+// — NOT piece.Backend from resolve() — because EC shards are
+// scattered across multiple backends and PrimaryBackend is the
+// canonical write-side attribution that getErasureCoded also
+// uses. Routing through resolve()'s Pieces[0].Backend would
+// produce HEAD audit rows that point at a shard host while the
+// matching GET points at the primary, fragmenting the audit
+// trail.
+func (h *Handler) headErasureCoded(
+	w http.ResponseWriter,
+	r *http.Request,
+	manifest *metadata.ObjectManifest,
+	_ metadata.Piece,
+	_ providers.StorageProvider,
+	tenantID, bucket string,
+) {
+	// Mirror getErasureCoded's three-step configuration validation
+	// (erasure_coding.go:258-273): registry present, profile name
+	// set on the manifest, profile registered in the registry. Any
+	// missing pre-condition that would 500 the GET must 500 the
+	// HEAD too — a 200-HEAD-then-500-GET pre-flight gap is the
+	// exact divergence this PR's manifest-type dispatch removes.
+	if h.cfg.ErasureCoding == nil {
+		writeError(w, http.StatusInternalServerError, "ErasureCodingNotConfigured",
+			"object is erasure-coded but no registry is configured", r.URL.Path)
+		return
+	}
+	profile := manifest.PlacementPolicy.ErasureProfile
+	if profile == "" {
+		writeError(w, http.StatusInternalServerError, "ErasureProfileMissing",
+			"erasure-coded manifest is missing ErasureProfile", r.URL.Path)
+		return
+	}
+	if _, err := h.cfg.ErasureCoding.Lookup(profile); err != nil {
+		writeError(w, http.StatusInternalServerError, "ErasureProfileNotRegistered", err.Error(), r.URL.Path)
+		return
+	}
+	if r.Header.Get("Range") != "" {
+		writeError(w, http.StatusNotImplemented, "NotImplemented",
+			"range reads on erasure-coded objects are not yet supported", r.URL.Path)
+		return
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
 	w.WriteHeader(http.StatusOK)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	auditBackend, auditPieceID, auditCountry := h.ecAuditAttribution(manifest)
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
+}
+
+// headMultipart mirrors getMultipart's response metadata: 501 for
+// Range, 507 above maxMultipartInMemoryBytes, otherwise 200 + full
+// ObjectSize with no ETag. Multipart objects don't expose a
+// per-object ETag on read (the multipart ETag returned at upload
+// completion is a non-cryptographic concatenation hash that isn't
+// recoverable from the manifest; matching GET we omit it rather
+// than fabricate a Pieces[0]-based value that wouldn't agree with
+// PUT's response).
+//
+// The maxMultipartInMemoryBytes guard exists because getMultipart
+// must pre-fetch and concatenate all parts in memory. HEAD never
+// touches part bytes, but if HEAD returned 200 on objects above
+// the ceiling, the follow-up GET would 507 — exactly the
+// pre-flight asymmetry this PR's manifest-type dispatch exists to
+// eliminate. Both HEAD and GET reference the same constant in
+// erasure_coding.go so the threshold can't drift.
+func (h *Handler) headMultipart(
+	w http.ResponseWriter,
+	r *http.Request,
+	manifest *metadata.ObjectManifest,
+	_ metadata.Piece,
+	_ providers.StorageProvider,
+	tenantID, bucket string,
+) {
+	if r.Header.Get("Range") != "" {
+		writeError(w, http.StatusNotImplemented, "NotImplemented",
+			"range reads on multipart objects are not yet supported", r.URL.Path)
+		return
+	}
+	if manifest.ObjectSize > maxMultipartInMemoryBytes {
+		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
+			fmt.Sprintf("multipart object of %d bytes exceeds in-memory pre-fetch ceiling of %d bytes",
+				manifest.ObjectSize, maxMultipartInMemoryBytes),
+			r.URL.Path)
+		return
+	}
+	// Pre-flight every part's backend the same way getMultipart
+	// does at erasure_coding.go:520-530. Multipart GET has no
+	// read-repair / parity fallback — any deregistered backend
+	// fails the whole read with 502 BackendNotRegistered. If HEAD
+	// 200s on the same manifest, the AWS SDK and CDN pre-flight
+	// will route traffic toward a GET that's guaranteed to fail.
+	// EC HEAD intentionally skips this kind of check because EC
+	// can tolerate up to ParityShards backends being deregistered
+	// without DataLoss (the matching GET path triggers
+	// read-repair to land surviving shards on a new primary), so
+	// mirroring the GET-side feasibility check on HEAD would
+	// produce false-fail pre-flights on read-repairable manifests.
+	for _, p := range manifest.Pieces {
+		if _, ok := h.cfg.Providers[p.Backend]; !ok {
+			writeError(w, http.StatusBadGateway, "BackendNotRegistered",
+				fmt.Sprintf("part %d references unregistered backend %q", p.PartNumber, p.Backend),
+				r.URL.Path)
+			return
+		}
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	w.WriteHeader(http.StatusOK)
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	auditBackend, auditPieceID, auditCountry := h.multipartAuditAttribution(manifest)
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
 // Delete handles S3 DELETE object.
