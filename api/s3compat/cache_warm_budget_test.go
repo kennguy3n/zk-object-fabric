@@ -489,6 +489,84 @@ func TestCacheWarming_BudgetReleasedOnReadAllError(t *testing.T) {
 	}
 }
 
+// TestCacheWarming_BudgetReleasedWhenCacheNil pins the most
+// subtle release path: a handler constructed with Cache: nil
+// (legitimate per the Config doc — "Optional; nil disables
+// caching") MUST still release the cache-warming semaphore on
+// every successful GET. The pre-fix code put the only Release
+// call inside `if h.cfg.Cache != nil`, so when Cache was nil
+// the function acquired pieceSize bytes from the semaphore on
+// every GET and never returned them. After enough requests
+// (CacheWarmingMemoryBudget / pieceSize), the budget would be
+// exhausted permanently and every subsequent GET would skip
+// integrity verification via the streaming fallback — a silent
+// security regression because:
+//   - tampered pieces would be served to clients without the
+//     BLAKE3 verification that the integrity-failure metric
+//     was designed to catch
+//   - operators watching zkof_integrity_failure_total would
+//     see no spike, because the verification was never run
+//   - the only signal would be a chronically high
+//     zkof_cache_warming_budget_exhausted_total, which an
+//     operator unaware of the leak would interpret as a
+//     legitimate "budget is sized too small" event rather than
+//     as a leak
+//
+// This test runs N+1 GETs through a no-cache handler where N
+// is the largest pieces-in-budget admissible. If the leak
+// existed, the (N+1)-th GET would be rejected by the budget
+// guard (rejected.Add > 0) because the previous N GETs would
+// have held all their bytes hostage. With the defer fix, the
+// (N+1)-th GET acquires cleanly.
+func TestCacheWarming_BudgetReleasedWhenCacheNil(t *testing.T) {
+	const (
+		pieceSize = 1024
+		// admits 2 pieces at a time, then the 3rd GET would
+		// be rejected if the previous two leaked their slots.
+		budget = pieceSize * 2
+	)
+	store := memory.New()
+	fake := newFakeProvider("test")
+	pub := &recordingPublisher{}
+	var rejected atomic.Int64
+	// Deliberately nil Cache to exercise the
+	// no-cache-but-budget-guard path that the pre-fix code
+	// silently leaked from.
+	h := New(Config{
+		Manifests:                store,
+		Providers:                map[string]providers.StorageProvider{"test": fake},
+		Placement:                fixedPlacement{backend: "test"},
+		Billing:                  &recordingBilling{},
+		Cache:                    nil,
+		CachePublisher:           pub,
+		Now:                      func() time.Time { return time.Unix(1700000000, 0) },
+		CacheWarmingMemoryBudget: budget,
+		OnCacheWarmingBudgetExhausted: func(int64) {
+			rejected.Add(1)
+		},
+	})
+	if h.cacheWarmSem == nil {
+		t.Fatal("default budget must create cacheWarmSem; got nil")
+	}
+
+	body := bytes.Repeat([]byte("X"), pieceSize)
+	const totalGets = 3 // 3 > 2 (max in budget) so a leak would trip rejected
+	for i := 0; i < totalGets; i++ {
+		key := fmtKey(i)
+		putObject(t, h, key, body)
+		if code, _ := getObject(t, h, key); code != http.StatusOK {
+			t.Fatalf("GET %d status=%d, want 200", i, code)
+		}
+	}
+
+	if got := rejected.Load(); got != 0 {
+		t.Errorf("budget-exhausted hits=%d, want 0 — Cache==nil path leaked the semaphore on the first %d GETs and rejected the next one", got, totalGets-1)
+	}
+	if got := pub.count(); got != 0 {
+		t.Errorf("promotion signals=%d, want 0 — a leaked-budget regression would push these GETs onto the async signal path", got)
+	}
+}
+
 // failingReadProvider wraps fakeProvider so a single test can
 // inject a mid-stream Read error without polluting the shared
 // fakeProvider used by other tests.

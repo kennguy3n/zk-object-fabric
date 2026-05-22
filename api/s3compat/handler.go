@@ -1392,7 +1392,6 @@ func (h *Handler) fetchPiece(
 	// then DoS the gateway by issuing concurrent range GETs
 	// on N distinct hashed pieces and blow past the operator's
 	// configured memory ceiling.
-	acquired := false
 	if h.cacheWarmSem != nil {
 		tooBig := pieceSize > h.cacheWarmBudget
 		if tooBig || !h.cacheWarmSem.TryAcquire(pieceSize) {
@@ -1436,18 +1435,39 @@ func (h *Handler) fetchPiece(
 			}
 			return body, false, nil
 		}
-		acquired = true
+		// Defer the Release at the acquisition site so EVERY
+		// exit path from here on (read error, integrity
+		// failure, Cache.Put success, Cache == nil pass-through,
+		// the range-slice return below) returns the budget
+		// exactly once. Before this defer the function had
+		// three ad-hoc Release sites that each guarded a
+		// specific exit and missed the Cache == nil path,
+		// which leaked pieceSize bytes from the semaphore on
+		// every successful GET against a handler constructed
+		// without a HotObjectCache (the leak only manifested
+		// after enough requests exhausted the budget and
+		// pushed subsequent GETs into the unverified streaming
+		// fallback — a silent integrity-verification regression
+		// that the existing tests did not catch because they
+		// either ran with a Cache or used a negative budget to
+		// disable the semaphore entirely). Defer also makes
+		// every future exit path leak-safe by default.
+		//
+		// Ordering invariant: the comment block that the
+		// previous post-Put Release lived under said "release
+		// AFTER Cache.Put completes so the next warmer cannot
+		// dogpile the same eviction window." That invariant
+		// still holds: defer runs at function return, which
+		// happens after the synchronous Cache.Put call below
+		// completes (Go's defer is LIFO at return, not at
+		// scope exit, and there are no inner Release calls
+		// that could re-order it).
+		defer h.cacheWarmSem.Release(pieceSize)
 	}
 
 	buf, rerr := io.ReadAll(body)
 	_ = body.Close()
 	if rerr != nil {
-		// Release the cache-warming budget on the read-error
-		// exit so a long-lived gateway cannot leak budget over
-		// time when backends start returning truncated bodies.
-		if acquired {
-			h.cacheWarmSem.Release(pieceSize)
-		}
 		return nil, false, rerr
 	}
 
@@ -1464,12 +1484,6 @@ func (h *Handler) fetchPiece(
 				h.recordIntegrityUnrecognized(piece, verr)
 			} else {
 				h.recordIntegrityFailure(piece, verr)
-				// Release the budget on the integrity-failure
-				// exit too — we never reach Cache.Put for bad
-				// bytes, so the budget must be returned here.
-				if acquired {
-					h.cacheWarmSem.Release(pieceSize)
-				}
 				return nil, false, verr
 			}
 		}
@@ -1494,14 +1508,6 @@ func (h *Handler) fetchPiece(
 			SizeBytes: int64(len(buf)),
 			Hash:      piece.Hash,
 		})
-		// Release the budget AFTER Cache.Put completes so the
-		// next warmer cannot dogpile the same eviction window.
-		// The post-Put release means the in-flight semaphore
-		// accurately reflects bytes held by the request
-		// goroutine plus the bytes the cache is about to admit.
-		if acquired {
-			h.cacheWarmSem.Release(pieceSize)
-		}
 	}
 
 	if byteRange != nil {
