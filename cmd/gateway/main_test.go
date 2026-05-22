@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
@@ -576,5 +577,61 @@ func TestWarnProductionLocalCMK_LogsWhenProduction(t *testing.T) {
 				t.Fatalf("warn fired = %v, want %v (log=%q)", got, tc.want, out)
 			}
 		})
+	}
+}
+
+// TestDefaultCacheWarmingBudget_ConfigMatchesHandlerFallback
+// structurally pins the two independent definitions of the
+// production cache-warming budget default to the same value.
+//
+// The budget has historically been written down in two places:
+//
+//   - internal/config.Default(): seeds GatewayConfig.CacheWarmingMemoryBudget
+//     to 512 MiB so an operator who runs the gateway with no
+//     explicit override gets the production default through the
+//     normal config.Load() → Default() merge path.
+//   - api/s3compat.New(): when Config.CacheWarmingMemoryBudget == 0
+//     (i.e. a Handler constructed with a zero-valued Config, which
+//     happens in unit tests, in third-party embeddings, or if a
+//     future contributor wires the field without going through
+//     internal/config), falls back to DefaultCacheWarmingBudget.
+//
+// Both paths converge on the same number in production today,
+// but a refactor that updates one and forgets the other (e.g.
+// raising the default to 1 GiB only in internal/config) would
+// silently introduce a tier where unit-test Handlers and
+// production-config Handlers disagree on how much memory the
+// gateway will buffer for cache warming. That divergence would
+// be hard to notice — both Handlers would still appear to
+// "work" — and would defeat the dual-default's intent (a
+// defense-in-depth fallback for partial construction).
+//
+// This test makes the equality structural: any future change
+// that updates one constant without the other fails CI at this
+// site, forcing the contributor to either keep them in sync or
+// consciously fork them with a code change.
+//
+// The location is cmd/gateway/main_test.go because main is the
+// only package in the tree that already imports both
+// internal/config and api/s3compat (it's the wiring layer);
+// putting the test in either of those leaf packages would
+// create an import cycle.
+func TestDefaultCacheWarmingBudget_ConfigMatchesHandlerFallback(t *testing.T) {
+	cfgDefault := config.Default().Gateway.CacheWarmingMemoryBudget
+	handlerFallback := s3compat.DefaultCacheWarmingBudget
+	if cfgDefault != handlerFallback {
+		t.Fatalf("dual cache-warming budget defaults have diverged:\n"+
+			"  internal/config.Default().Gateway.CacheWarmingMemoryBudget = %d (%.0f MiB)\n"+
+			"  api/s3compat.DefaultCacheWarmingBudget                     = %d (%.0f MiB)\n\n"+
+			"Both paths must seed the same value so a Handler constructed\n"+
+			"with a zero-valued Config (unit tests, embeddings, partial\n"+
+			"wiring) buffers exactly as much as a Handler constructed via\n"+
+			"the production config.Load() pipeline. If you intentionally\n"+
+			"want to fork these — e.g. raise the operator-facing default\n"+
+			"without changing the unit-test fallback — update both\n"+
+			"constants AND this test in the same commit.",
+			cfgDefault, float64(cfgDefault)/(1<<20),
+			handlerFallback, float64(handlerFallback)/(1<<20),
+		)
 	}
 }

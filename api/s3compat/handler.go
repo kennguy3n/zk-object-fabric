@@ -360,21 +360,35 @@ type Handler struct {
 }
 
 // New returns a Handler ready to be wired into an HTTP mux.
+//
+// CacheWarmingMemoryBudget resolves into one of three modes:
+//
+//   - budget == 0  → DefaultCacheWarmingBudget (the production
+//     default; the typical case for a Handler constructed via
+//     internal/config's Default()).
+//   - budget > 0   → honoured verbatim as the semaphore weight.
+//   - budget < 0   → guard disabled (cacheWarmSem stays nil).
+//     This is the pre-PR-7 unbounded path and is intended only
+//     for regression tests that exercise the legacy behaviour.
+//
+// The flow is written as plain if/else (no fallthrough) so the
+// three branches read top-to-bottom: an idiomatic Go reviewer
+// should not need to remember switch-fallthrough semantics to
+// verify that "zero falls back to default and then initialises".
 func New(cfg Config) *Handler {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	h := &Handler{cfg: cfg}
 	budget := cfg.CacheWarmingMemoryBudget
-	switch {
-	case budget == 0:
+	if budget == 0 {
 		budget = DefaultCacheWarmingBudget
-		fallthrough
-	case budget > 0:
+	}
+	if budget > 0 {
 		h.cacheWarmSem = semaphore.NewWeighted(budget)
 		h.cacheWarmBudget = budget
-		// budget < 0 leaves cacheWarmSem == nil → unbounded path.
 	}
+	// budget < 0 leaves cacheWarmSem == nil → unbounded path.
 	return h
 }
 
