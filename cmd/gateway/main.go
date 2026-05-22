@@ -232,23 +232,27 @@ func main() {
 		version.Version, version.GitCommit, version.BuildDate, runtime.GOOS, runtime.GOARCH)
 	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB)
 	s3compat.New(s3compat.Config{
-		Manifests:         store,
-		Providers:         registry,
-		Placement:         placement,
-		Auth:              authenticator,
-		VerifiedCheck:     verifiedCheck,
-		Billing:           billingSink,
-		Multipart:         multipartStore,
-		ErasureCoding:     erasureRegistry,
-		Cache:             cache,
-		CachePublisher:    signalBus,
-		ReadRepair:        readRepair,
-		Encryption:        gatewayEnc,
-		ContentIndex:      contentIndex,
-		Compliance:        complianceHooks,
-		NodeID:            cfg.Env,
-		IntegrityFailures: integrityFailureSink{r: metricsRegistry},
-		MaxRequestBytes:   cfg.Gateway.MaxRequestBytes,
+		Manifests:                store,
+		Providers:                registry,
+		Placement:                placement,
+		Auth:                     authenticator,
+		VerifiedCheck:            verifiedCheck,
+		Billing:                  billingSink,
+		Multipart:                multipartStore,
+		ErasureCoding:            erasureRegistry,
+		Cache:                    cache,
+		CachePublisher:           signalBus,
+		ReadRepair:               readRepair,
+		Encryption:               gatewayEnc,
+		ContentIndex:             contentIndex,
+		Compliance:               complianceHooks,
+		NodeID:                   cfg.Env,
+		IntegrityFailures:        integrityFailureSink{r: metricsRegistry},
+		MaxRequestBytes:          cfg.Gateway.MaxRequestBytes,
+		CacheWarmingMemoryBudget: cfg.Gateway.CacheWarmingMemoryBudget,
+		OnCacheWarmingBudgetExhausted: func(backend string, pieceSize int64) {
+			metricsRegistry.IncCacheWarmingBudgetExhausted(backend, pieceSize)
+		},
 		// RequireAuth gates the handler's AnonymousTenant
 		// fallback: in production any misconfiguration that
 		// drops the authenticator returns 500

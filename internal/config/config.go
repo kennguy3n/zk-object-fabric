@@ -359,6 +359,23 @@ type GatewayConfig struct {
 	// balancer can ignore it, deployments serving clients
 	// directly should heed it.
 	TLS TLSConfig `json:"tls"`
+
+	// CacheWarmingMemoryBudget caps the total bytes the gateway
+	// is willing to buffer simultaneously across all cache-miss
+	// warming operations on the GET path. Each fetchPiece call
+	// that wants to warm the hot-object cache acquires its piece
+	// size from a semaphore initialised to this budget; if the
+	// budget is exhausted the request still serves the bytes but
+	// skips the inline warm and emits a PromotionSignal so the
+	// async worker can decide whether to warm later. This is the
+	// global ceiling that prevents a burst of concurrent cache
+	// misses on different pieces from OOM-killing the gateway.
+	//
+	// Zero (the default applied at startup, not in JSON) means
+	// 512 MiB. A negative value disables the budget guard, which
+	// restores the pre-PR-7 behaviour and is intended only for
+	// regression-testing the old code path.
+	CacheWarmingMemoryBudget int64 `json:"cache_warming_memory_budget"`
 }
 
 // TLSConfig configures an HTTPS listener. Empty CertPath / KeyPath
@@ -758,10 +775,11 @@ func Default() Config {
 	return Config{
 		Env: "development",
 		Gateway: GatewayConfig{
-			ListenAddr:      ":8080",
-			ReadTimeout:     Duration(30 * time.Second),
-			WriteTimeout:    Duration(30 * time.Second),
-			MaxRequestBytes: 5 * 1024 * 1024 * 1024, // 5 GiB
+			ListenAddr:               ":8080",
+			ReadTimeout:              Duration(30 * time.Second),
+			WriteTimeout:             Duration(30 * time.Second),
+			MaxRequestBytes:          5 * 1024 * 1024 * 1024, // 5 GiB
+			CacheWarmingMemoryBudget: 512 * 1024 * 1024,      // 512 MiB
 			// CachePath defaults to empty so developer and test
 			// environments get the in-memory cache without a
 			// DiskCache-fallback warning when the host has no
