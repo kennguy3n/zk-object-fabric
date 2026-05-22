@@ -47,6 +47,62 @@ import (
 // multipart pre-fetch, cache-warming, and EC PUT paths.
 const maxECObjectSize int64 = MaxInMemoryObjectBytes
 
+// maxMultipartInMemoryBytes is the hard ceiling on the total
+// reassembled object size for multipart GETs and the matching
+// HEAD pre-flight rejection. Multipart parts are pre-fetched and
+// concatenated in memory before being written to the response,
+// so any single GET must fit; the pathological request cannot
+// OOM the gateway. Both getMultipart and headMultipart reference
+// this constant so HEAD/GET agree on the rejection threshold.
+// Streaming multipart GETs are a Phase 4 workstream; until that
+// lands operators should route very large objects through the EC
+// path or a direct-to-backend presigned URL.
+const maxMultipartInMemoryBytes int64 = 256 * 1024 * 1024
+
+// ecAuditAttribution computes the (backend, pieceID, country)
+// triple used for audit emission on erasure-coded reads. EC
+// shards are scattered across one or more backends and the
+// gateway has no per-object identity to attribute to; the
+// write-side records MigrationState.PrimaryBackend as the
+// canonical anchor and Pieces[0].PieceID as the first shard's
+// content hash. Both getErasureCoded and headErasureCoded route
+// through this helper so the EC PUT/GET/HEAD audit trail is
+// uniformly attributed by (PrimaryBackend, Pieces[0].PieceID).
+// Country is "" if PrimaryBackend isn't currently in the
+// provider map (e.g. mid-migration before the new primary is
+// wired); callers that have a resolved fallback country may
+// substitute it themselves.
+func (h *Handler) ecAuditAttribution(manifest *metadata.ObjectManifest) (backend, pieceID, country string) {
+	backend = manifest.MigrationState.PrimaryBackend
+	if len(manifest.Pieces) > 0 {
+		pieceID = manifest.Pieces[0].PieceID
+	}
+	if prov, ok := h.cfg.Providers[backend]; ok {
+		country = prov.PlacementLabels().Country
+	}
+	return backend, pieceID, country
+}
+
+// multipartAuditAttribution computes the (backend, pieceID,
+// country) triple used for audit emission on multipart reads.
+// CreateMultipartUpload pins every part of an upload to a single
+// backend, so Pieces[0].Backend is the canonical attribution and
+// matches the PUT audit emitted from CompleteMultipartUpload.
+// Both getMultipart and headMultipart route through this helper
+// so HEAD attribution can't silently drift if resolve()'s piece
+// selection ever changes.
+func (h *Handler) multipartAuditAttribution(manifest *metadata.ObjectManifest) (backend, pieceID, country string) {
+	if len(manifest.Pieces) == 0 {
+		return "", "", ""
+	}
+	pieceID = manifest.Pieces[0].PieceID
+	backend = manifest.Pieces[0].Backend
+	if prov, ok := h.cfg.Providers[backend]; ok {
+		country = prov.PlacementLabels().Country
+	}
+	return backend, pieceID, country
+}
+
 // putErasureCoded is called by Put when the resolved placement policy
 // names an ErasureProfile. It encodes the body into k + m shards per
 // stripe and writes each shard as its own piece.
@@ -383,19 +439,10 @@ func (h *Handler) getErasureCoded(
 	}
 
 	// Audit the EC GET so the compliance trail is symmetric with
-	// the single-piece GET path. The shards are scattered across
-	// one or more backends; MigrationState.PrimaryBackend is the
-	// canonical attribution and Pieces[0].PieceID is the same
-	// shard ID putErasureCoded recorded on PUT, so PUT/GET rows
-	// correlate by piece_id in the audit trail.
-	auditBackend := manifest.MigrationState.PrimaryBackend
-	var auditPieceID, auditCountry string
-	if len(manifest.Pieces) > 0 {
-		auditPieceID = manifest.Pieces[0].PieceID
-	}
-	if prov, ok := h.cfg.Providers[auditBackend]; ok {
-		auditCountry = prov.PlacementLabels().Country
-	}
+	// the single-piece GET path. ecAuditAttribution centralises
+	// the (PrimaryBackend, Pieces[0].PieceID) anchor so HEAD and
+	// GET can't drift on the audit row's backend/piece columns.
+	auditBackend, auditPieceID, auditCountry := h.ecAuditAttribution(manifest)
 	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
@@ -455,15 +502,6 @@ func (h *Handler) getMultipart(
 			"range reads on multipart objects are not yet supported", r.URL.Path)
 		return
 	}
-
-	// maxMultipartInMemoryBytes is the hard ceiling on the total
-	// manifest size the pre-fetch path will buffer. Multipart GETs
-	// above this ceiling are rejected up front with 507 so a
-	// pathological request cannot OOM the gateway. Streaming
-	// multipart GETs are a Phase 4 workstream; until that lands
-	// operators should route very large objects through the EC
-	// path or a direct-to-backend presigned URL.
-	const maxMultipartInMemoryBytes int64 = 256 * 1024 * 1024
 
 	if manifest.ObjectSize > maxMultipartInMemoryBytes {
 		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
@@ -618,18 +656,10 @@ func (h *Handler) getMultipart(
 	}
 
 	// Audit the multipart GET so the compliance trail is symmetric
-	// with the single-piece GET path. CreateMultipartUpload pins
-	// every part of an upload to one backend, so Pieces[0].Backend
-	// is the canonical attribution for the read (and matches the
-	// PUT audit emitted from CompleteMultipartUpload).
-	var auditPieceID, auditBackend, auditCountry string
-	if len(manifest.Pieces) > 0 {
-		auditPieceID = manifest.Pieces[0].PieceID
-		auditBackend = manifest.Pieces[0].Backend
-		if prov, ok := h.cfg.Providers[auditBackend]; ok {
-			auditCountry = prov.PlacementLabels().Country
-		}
-	}
+	// with the single-piece GET path. multipartAuditAttribution
+	// pins to Pieces[0] so HEAD and GET can't drift if resolve()'s
+	// piece selection ever changes.
+	auditBackend, auditPieceID, auditCountry := h.multipartAuditAttribution(manifest)
 	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 

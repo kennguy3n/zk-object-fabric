@@ -1852,13 +1852,29 @@ func (h *Handler) headErasureCoded(
 	w http.ResponseWriter,
 	r *http.Request,
 	manifest *metadata.ObjectManifest,
-	piece metadata.Piece,
-	pieceProvider providers.StorageProvider,
+	_ metadata.Piece,
+	_ providers.StorageProvider,
 	tenantID, bucket string,
 ) {
+	// Mirror getErasureCoded's three-step configuration validation
+	// (erasure_coding.go:258-273): registry present, profile name
+	// set on the manifest, profile registered in the registry. Any
+	// missing pre-condition that would 500 the GET must 500 the
+	// HEAD too — a 200-HEAD-then-500-GET pre-flight gap is the
+	// exact divergence this PR's manifest-type dispatch removes.
 	if h.cfg.ErasureCoding == nil {
 		writeError(w, http.StatusInternalServerError, "ErasureCodingNotConfigured",
 			"object is erasure-coded but no registry is configured", r.URL.Path)
+		return
+	}
+	profile := manifest.PlacementPolicy.ErasureProfile
+	if profile == "" {
+		writeError(w, http.StatusInternalServerError, "ErasureProfileMissing",
+			"erasure-coded manifest is missing ErasureProfile", r.URL.Path)
+		return
+	}
+	if _, err := h.cfg.ErasureCoding.Lookup(profile); err != nil {
+		writeError(w, http.StatusInternalServerError, "ErasureProfileNotRegistered", err.Error(), r.URL.Path)
 		return
 	}
 	if r.Header.Get("Range") != "" {
@@ -1871,31 +1887,32 @@ func (h *Handler) headErasureCoded(
 	w.WriteHeader(http.StatusOK)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
-	auditBackend := manifest.MigrationState.PrimaryBackend
-	auditPieceID := piece.PieceID
-	if len(manifest.Pieces) > 0 {
-		auditPieceID = manifest.Pieces[0].PieceID
-	}
-	auditCountry := pieceProvider.PlacementLabels().Country
-	if prov, ok := h.cfg.Providers[auditBackend]; ok {
-		auditCountry = prov.PlacementLabels().Country
-	}
+	auditBackend, auditPieceID, auditCountry := h.ecAuditAttribution(manifest)
 	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
 // headMultipart mirrors getMultipart's response metadata: 501 for
-// Range, 200 + full ObjectSize + no ETag otherwise. Multipart
-// objects don't expose a per-object ETag on read (the multipart
-// ETag returned at upload completion is a non-cryptographic
-// concatenation hash that isn't recoverable from the manifest;
-// matching GET we omit it rather than fabricate a Pieces[0]-based
-// value that wouldn't agree with PUT's response).
+// Range, 507 above maxMultipartInMemoryBytes, otherwise 200 + full
+// ObjectSize with no ETag. Multipart objects don't expose a
+// per-object ETag on read (the multipart ETag returned at upload
+// completion is a non-cryptographic concatenation hash that isn't
+// recoverable from the manifest; matching GET we omit it rather
+// than fabricate a Pieces[0]-based value that wouldn't agree with
+// PUT's response).
+//
+// The maxMultipartInMemoryBytes guard exists because getMultipart
+// must pre-fetch and concatenate all parts in memory. HEAD never
+// touches part bytes, but if HEAD returned 200 on objects above
+// the ceiling, the follow-up GET would 507 — exactly the
+// pre-flight asymmetry this PR's manifest-type dispatch exists to
+// eliminate. Both HEAD and GET reference the same constant in
+// erasure_coding.go so the threshold can't drift.
 func (h *Handler) headMultipart(
 	w http.ResponseWriter,
 	r *http.Request,
 	manifest *metadata.ObjectManifest,
-	piece metadata.Piece,
-	pieceProvider providers.StorageProvider,
+	_ metadata.Piece,
+	_ providers.StorageProvider,
 	tenantID, bucket string,
 ) {
 	if r.Header.Get("Range") != "" {
@@ -1903,12 +1920,20 @@ func (h *Handler) headMultipart(
 			"range reads on multipart objects are not yet supported", r.URL.Path)
 		return
 	}
+	if manifest.ObjectSize > maxMultipartInMemoryBytes {
+		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
+			fmt.Sprintf("multipart object of %d bytes exceeds in-memory pre-fetch ceiling of %d bytes",
+				manifest.ObjectSize, maxMultipartInMemoryBytes),
+			r.URL.Path)
+		return
+	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
 	w.WriteHeader(http.StatusOK)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
-	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+	auditBackend, auditPieceID, auditCountry := h.multipartAuditAttribution(manifest)
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
 // Delete handles S3 DELETE object.

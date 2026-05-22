@@ -1409,6 +1409,100 @@ func TestHead_ErasureCoded_AuditUsesPrimaryBackend(t *testing.T) {
 	}
 }
 
+// TestHead_ErasureCoded_MissingProfileReturns500 pins that HEAD
+// 500s when the EC manifest's PlacementPolicy.ErasureProfile is
+// blank — mirroring getErasureCoded's check at
+// erasure_coding.go:263-267. Without this, HEAD would 200 a
+// manifest the follow-up GET refuses to serve.
+func TestHead_ErasureCoded_MissingProfileReturns500(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("ec-obj"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	man.PlacementPolicy.ErasureProfile = ""
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("EC HEAD with blank ErasureProfile status = %d, want 500", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("ErasureProfileMissing")) {
+		t.Errorf("EC HEAD with blank ErasureProfile body = %q, want code ErasureProfileMissing", rec.Body.String())
+	}
+}
+
+// TestHead_ErasureCoded_UnregisteredProfileReturns500 pins that
+// HEAD 500s when the EC manifest names a profile that isn't
+// registered in h.cfg.ErasureCoding — mirroring
+// getErasureCoded's Lookup() check at erasure_coding.go:268-272.
+// A manifest written under one profile catalog and served from
+// a gateway with a different catalog must fail HEAD up-front, not
+// silently 200 and then 500 the GET.
+func TestHead_ErasureCoded_UnregisteredProfileReturns500(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("ec-obj"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	man.PlacementPolicy.ErasureProfile = "nonexistent-profile-name"
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("EC HEAD with unregistered profile status = %d, want 500", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("ErasureProfileNotRegistered")) {
+		t.Errorf("EC HEAD with unregistered profile body = %q, want code ErasureProfileNotRegistered", rec.Body.String())
+	}
+}
+
 // TestHead_Multipart_NoRange pins that HEAD on a multipart manifest
 // mirrors getMultipart's response shape: 200 OK with the full
 // ObjectSize as Content-Length, NO ETag (the multipart-ETag from
@@ -1556,6 +1650,97 @@ func TestHead_Multipart_RangeReturns501(t *testing.T) {
 
 	if headRec.Code != http.StatusNotImplemented {
 		t.Fatalf("multipart HEAD with Range status = %d, want 501 (mirror getMultipart)", headRec.Code)
+	}
+}
+
+// TestHead_Multipart_OversizeReturns507 pins that HEAD on a
+// multipart manifest above maxMultipartInMemoryBytes returns 507
+// MultipartTooLarge — mirroring getMultipart's ceiling at
+// erasure_coding.go:468-474. getMultipart pre-fetches every part
+// into memory before writing the response; if HEAD 200s but GET
+// 507s, AWS SDK / CDN pre-flight probes would record the object
+// as servable when it isn't, breaking the RFC 9110 §13.1
+// HEAD/GET-metadata-parity contract.
+//
+// Implementation: land a small multipart manifest the normal way
+// then inflate ObjectSize past the ceiling directly in the store.
+// HEAD only reads metadata so the inflated size has no bytes
+// behind it — exactly the scenario where a permissive HEAD would
+// mislead clients.
+func TestHead_Multipart_OversizeReturns507(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	// Land a small multipart manifest the normal way.
+	initReq := httptest.NewRequest(http.MethodPost, "/bucket/mp-large?uploads", nil)
+	initRec := httptest.NewRecorder()
+	h.CreateMultipartUpload(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, body=%s", initRec.Code, initRec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(initRec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+	completed := make([]completeUploadEntry, 0, 2)
+	for i := 1; i <= 2; i++ {
+		partBody := bytes.Repeat([]byte{byte('a' + i)}, 16)
+		url := fmt.Sprintf("/bucket/mp-large?uploadId=%s&partNumber=%d", uploadID, i)
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		req.ContentLength = int64(len(partBody))
+		rec := httptest.NewRecorder()
+		h.UploadPart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, body=%s", i, rec.Code, rec.Body)
+		}
+		etag := strings.Trim(rec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: i, ETag: etag})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	completeReq := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/bucket/mp-large?uploadId=%s", uploadID), bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	// Inflate ObjectSize past the 256 MiB ceiling without
+	// allocating any bytes — the manifest is opaque metadata,
+	// HEAD never reads parts, so the fake is sufficient to
+	// exercise the guard.
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("mp-large"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	man.ObjectSize = (256 * 1024 * 1024) + 1
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-large", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("oversize multipart HEAD status = %d, want 507 (mirror getMultipart ceiling)", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("MultipartTooLarge")) {
+		t.Errorf("oversize multipart HEAD body = %q, want code MultipartTooLarge", rec.Body.String())
 	}
 }
 
