@@ -1300,6 +1300,115 @@ func TestHead_ErasureCoded_RangeReturns501(t *testing.T) {
 	}
 }
 
+// TestHead_ErasureCoded_RegistryMissingReturns500 pins that HEAD
+// on an EC manifest fails with 500 when h.cfg.ErasureCoding is
+// nil, mirroring getErasureCoded's nil-registry guard. Without
+// this, a misconfigured gateway would 200-OK pre-flight HEAD
+// probes and then 500 the subsequent GET — exactly the
+// HEAD/GET-divergence class of bug this PR aims to eliminate.
+func TestHead_ErasureCoded_RegistryMissingReturns500(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+
+	// Build the manifest with a PUT path that has a registry.
+	hWithEC := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	hWithEC.Put(httptest.NewRecorder(), req)
+
+	// Re-bind a handler over the SAME store with ErasureCoding=nil
+	// — simulating a deployment where the manifest was written
+	// when EC was configured but the current gateway forgot to
+	// wire the registry in.
+	hNoEC := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	hNoEC.Head(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("EC HEAD with nil registry status = %d, want 500 (mirror getErasureCoded)", rec.Code)
+	}
+}
+
+// TestHead_ErasureCoded_AuditUsesPrimaryBackend pins that HEAD's
+// audit attribution on an EC manifest comes from
+// MigrationState.PrimaryBackend (NOT piece.Backend from the
+// resolver), matching getErasureCoded so PUT/GET/HEAD rows for
+// the same object correlate by backend in the audit trail.
+func TestHead_ErasureCoded_AuditUsesPrimaryBackend(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance:    ComplianceHooks{Audit: audit},
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	// PUT writes MigrationState.PrimaryBackend = "test" (the only
+	// placement option), so the HEAD audit row must attribute to
+	// "test" via that field, matching how getErasureCoded audits.
+	// This test catches the historical bug where HEAD attributed
+	// to piece.Backend from the resolver instead of PrimaryBackend
+	// — silent today because both equal "test" with a single-
+	// backend placement, but a divergence the moment EC shards
+	// scatter across multiple backends.
+	req = httptest.NewRequest(http.MethodHead, "/bucket/ec-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EC HEAD status = %d, want 200", rec.Code)
+	}
+
+	if len(audit.entries) < 2 {
+		t.Fatalf("audit entries = %d, want >= 2 (PUT + HEAD)", len(audit.entries))
+	}
+	headEntry := audit.entries[len(audit.entries)-1]
+	if headEntry.Operation != "HEAD" {
+		t.Fatalf("last audit op = %q, want HEAD", headEntry.Operation)
+	}
+	if headEntry.PieceBackend != "test" {
+		t.Errorf("EC HEAD audit PieceBackend = %q, want %q (MigrationState.PrimaryBackend)",
+			headEntry.PieceBackend, "test")
+	}
+	if headEntry.PieceID == "" {
+		t.Errorf("EC HEAD audit PieceID is empty; want Pieces[0].PieceID")
+	}
+	if headEntry.BackendCountry != "US" {
+		t.Errorf("EC HEAD audit BackendCountry = %q, want US (PrimaryBackend provider's country)",
+			headEntry.BackendCountry)
+	}
+
+	// Symmetry guard: PUT-audit + HEAD-audit must agree on
+	// PieceBackend so the PUT/HEAD trail correlates by backend.
+	putEntry := audit.entries[0]
+	if putEntry.PieceBackend != headEntry.PieceBackend {
+		t.Errorf("EC PUT/HEAD audit PieceBackend divergence: PUT=%q HEAD=%q",
+			putEntry.PieceBackend, headEntry.PieceBackend)
+	}
+}
+
 // TestHead_Multipart_NoRange pins that HEAD on a multipart manifest
 // mirrors getMultipart's response shape: 200 OK with the full
 // ObjectSize as Content-Length, NO ETag (the multipart-ETag from

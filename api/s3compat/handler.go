@@ -1833,6 +1833,21 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 // Reed-Solomon decoder reconstructs the object on the fly; the
 // matching whole-object hash would be a post-EC computation we
 // don't currently persist).
+//
+// The ErasureCoding-nil guard matches getErasureCoded: an EC
+// manifest with no registry configured is unservable, so HEAD
+// must surface the misconfiguration as 500 rather than 200,
+// otherwise pre-flight probes would pass and the follow-up GET
+// would fail.
+//
+// Audit attribution uses manifest.MigrationState.PrimaryBackend
+// — NOT piece.Backend from resolve() — because EC shards are
+// scattered across multiple backends and PrimaryBackend is the
+// canonical write-side attribution that getErasureCoded also
+// uses. Routing through resolve()'s Pieces[0].Backend would
+// produce HEAD audit rows that point at a shard host while the
+// matching GET points at the primary, fragmenting the audit
+// trail.
 func (h *Handler) headErasureCoded(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -1841,6 +1856,11 @@ func (h *Handler) headErasureCoded(
 	pieceProvider providers.StorageProvider,
 	tenantID, bucket string,
 ) {
+	if h.cfg.ErasureCoding == nil {
+		writeError(w, http.StatusInternalServerError, "ErasureCodingNotConfigured",
+			"object is erasure-coded but no registry is configured", r.URL.Path)
+		return
+	}
 	if r.Header.Get("Range") != "" {
 		writeError(w, http.StatusNotImplemented, "NotImplemented",
 			"range reads on erasure-coded objects are not yet supported", r.URL.Path)
@@ -1851,7 +1871,16 @@ func (h *Handler) headErasureCoded(
 	w.WriteHeader(http.StatusOK)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
-	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+	auditBackend := manifest.MigrationState.PrimaryBackend
+	auditPieceID := piece.PieceID
+	if len(manifest.Pieces) > 0 {
+		auditPieceID = manifest.Pieces[0].PieceID
+	}
+	auditCountry := pieceProvider.PlacementLabels().Country
+	if prov, ok := h.cfg.Providers[auditBackend]; ok {
+		auditCountry = prov.PlacementLabels().Country
+	}
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
 // headMultipart mirrors getMultipart's response metadata: 501 for
