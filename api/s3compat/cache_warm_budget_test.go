@@ -125,7 +125,7 @@ func newCacheBudgetHandler(t *testing.T, budget int64) (*Handler, *budgetTestCac
 		CachePublisher:           pub,
 		Now:                      func() time.Time { return time.Unix(1700000000, 0) },
 		CacheWarmingMemoryBudget: budget,
-		OnCacheWarmingBudgetExhausted: func(int64) {
+		OnCacheWarmingBudgetExhausted: func(string, int64) {
 			rejectedHits.Add(1)
 		},
 	})
@@ -458,7 +458,7 @@ func TestCacheWarming_BudgetReleasedOnReadAllError(t *testing.T) {
 		CachePublisher:           pub,
 		Now:                      func() time.Time { return time.Unix(1700000000, 0) },
 		CacheWarmingMemoryBudget: budget,
-		OnCacheWarmingBudgetExhausted: func(int64) {
+		OnCacheWarmingBudgetExhausted: func(string, int64) {
 			rejected.Add(1)
 		},
 	})
@@ -545,7 +545,7 @@ func TestCacheWarming_BudgetReleasedWhenCacheNil(t *testing.T) {
 		CachePublisher:           pub,
 		Now:                      func() time.Time { return time.Unix(1700000000, 0) },
 		CacheWarmingMemoryBudget: budget,
-		OnCacheWarmingBudgetExhausted: func(int64) {
+		OnCacheWarmingBudgetExhausted: func(string, int64) {
 			rejected.Add(1)
 		},
 	})
@@ -679,7 +679,7 @@ func TestCacheWarming_ReadRepairServedWhenBudgetExhausted(t *testing.T) {
 		Now:                      func() time.Time { return time.Unix(1700000000, 0) },
 		CacheWarmingMemoryBudget: budget,
 		ReadRepair:               lazy_read_repair.New(repairRegistry, store),
-		OnCacheWarmingBudgetExhausted: func(int64) {
+		OnCacheWarmingBudgetExhausted: func(string, int64) {
 			rejected.Add(1)
 		},
 	})

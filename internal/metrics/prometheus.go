@@ -15,8 +15,8 @@
 //   - zkof_provider_errors_total                 (counter, by provider, operation)
 //   - zkof_integrity_failure_total               (counter, by backend)
 //   - zkof_integrity_claim_unrecognized_total    (counter, by backend)
-//   - zkof_cache_warming_budget_exhausted_total  (counter)
-//   - zkof_cache_warming_budget_exhausted_bytes  (counter)
+//   - zkof_cache_warming_budget_exhausted_total  (counter, by backend)
+//   - zkof_cache_warming_budget_exhausted_bytes  (counter, by backend)
 //   - zkof_active_requests                       (gauge)
 //
 // The exporter is goroutine-safe.
@@ -57,8 +57,8 @@ type Registry struct {
 	dedupHits                    atomic.Int64
 	dedupBytesSaved              atomic.Int64
 	activeRequests               atomic.Int64
-	cacheWarmBudgetExhaustedHits atomic.Int64
-	cacheWarmBudgetExhaustedSize atomic.Int64
+	cacheWarmBudgetExhaustedHits *labeledCounter
+	cacheWarmBudgetExhaustedSize *labeledCounter
 	providerErrors               *labeledCounter
 	integrityFailures            *labeledCounter
 	integrityClaimUnrecognized   *labeledCounter
@@ -79,6 +79,22 @@ func NewRegistry() *Registry {
 				"on a read path. A non-zero value indicates either "+
 				"backend bit-rot, a tampered backend, or a manifest "+
 				"recorded with the wrong hash.",
+			[]string{"backend"}),
+		cacheWarmBudgetExhaustedHits: newLabeledCounter("zkof_cache_warming_budget_exhausted_total",
+			"Pieces that skipped inline cache warming because the "+
+				"memory budget was exhausted. The backend label captures "+
+				"which provider served the piece that did not get warmed, "+
+				"so operators can correlate budget pressure with specific "+
+				"backends — for example, a single misbehaving backend with "+
+				"oversized pieces could chronically exhaust the budget and "+
+				"degrade integrity-verification coverage across the fleet.",
+			[]string{"backend"}),
+		cacheWarmBudgetExhaustedSize: newLabeledCounter("zkof_cache_warming_budget_exhausted_bytes",
+			"Total piece bytes that skipped inline cache warming because "+
+				"the memory budget was exhausted, labelled by the backend "+
+				"that served them. A pair with "+
+				"zkof_cache_warming_budget_exhausted_total: "+
+				"hits answers 'how often', bytes answers 'how much'.",
 			[]string{"backend"}),
 		integrityClaimUnrecognized: newLabeledCounter("zkof_integrity_claim_unrecognized_total",
 			"Pieces served from a manifest whose recorded hash is "+
@@ -145,10 +161,20 @@ func (r *Registry) IncIntegrityClaimUnrecognized(backend string) {
 // warmed; the size counter is the sum across all rejected
 // warmings and gives operators a sense of how much
 // would-have-been-cached data is going via the async path.
-func (r *Registry) IncCacheWarmingBudgetExhausted(pieceSize int64) {
-	r.cacheWarmBudgetExhaustedHits.Add(1)
+//
+// The backend label captures which provider served the piece —
+// the same convention as IncIntegrityFailure / IncProviderError
+// — so a Grafana dashboard can break the rate down per backend
+// and operators can spot "backend X is generating most of the
+// budget pressure" without needing to cross-reference logs.
+// An empty backend string is permitted (e.g. when the piece's
+// manifest field is unset) and groups under the empty-label
+// bucket; production manifests should always populate it.
+func (r *Registry) IncCacheWarmingBudgetExhausted(backend string, pieceSize int64) {
+	labels := []string{backend}
+	r.cacheWarmBudgetExhaustedHits.Inc(labels)
 	if pieceSize > 0 {
-		r.cacheWarmBudgetExhaustedSize.Add(pieceSize)
+		r.cacheWarmBudgetExhaustedSize.Add(labels, pieceSize)
 	}
 }
 
@@ -175,9 +201,9 @@ func (r *Registry) write(w io.Writer) error {
 	emitCounter(w, "zkof_cache_miss_total", "Cache misses that fell through to the origin.", r.cacheMisses.Load())
 	emitCounter(w, "zkof_dedup_hit_total", "Dedup-aware PUTs that reused an existing piece.", r.dedupHits.Load())
 	emitCounter(w, "zkof_dedup_bytes_saved_total", "Bytes that did not have to be uploaded thanks to dedup.", r.dedupBytesSaved.Load())
-	emitCounter(w, "zkof_cache_warming_budget_exhausted_total", "Pieces that skipped inline cache warming because the memory budget was exhausted.", r.cacheWarmBudgetExhaustedHits.Load())
-	emitCounter(w, "zkof_cache_warming_budget_exhausted_bytes", "Total piece bytes that skipped inline cache warming because the memory budget was exhausted.", r.cacheWarmBudgetExhaustedSize.Load())
 	emitGauge(w, "zkof_active_requests", "Currently in-flight S3 requests.", r.activeRequests.Load())
+	r.cacheWarmBudgetExhaustedHits.write(w)
+	r.cacheWarmBudgetExhaustedSize.write(w)
 	r.providerErrors.write(w)
 	r.integrityFailures.write(w)
 	r.integrityClaimUnrecognized.write(w)
@@ -201,6 +227,15 @@ func newLabeledCounter(name, help string, labels []string) *labeledCounter {
 }
 
 func (c *labeledCounter) Inc(labelValues []string) {
+	c.Add(labelValues, 1)
+}
+
+// Add increments the counter for the given label tuple by delta.
+// Used by counters that track "how much" in addition to "how many"
+// (e.g. byte counters paired with a hit counter). delta is
+// expected to be non-negative; counters that need to subtract
+// should use a gauge instead.
+func (c *labeledCounter) Add(labelValues []string, delta int64) {
 	key := joinLabelValues(labelValues)
 	c.mu.Lock()
 	v, ok := c.values[key]
@@ -209,7 +244,7 @@ func (c *labeledCounter) Inc(labelValues []string) {
 		c.values[key] = v
 	}
 	c.mu.Unlock()
-	v.Add(1)
+	v.Add(delta)
 }
 
 func (c *labeledCounter) write(w io.Writer) {

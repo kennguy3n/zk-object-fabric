@@ -264,13 +264,17 @@ type Config struct {
 	CacheWarmingMemoryBudget int64
 
 	// OnCacheWarmingBudgetExhausted, when non-nil, is invoked
-	// with the piece size every time fetchPiece would have warmed
-	// the cache inline but the budget guard rejected the acquire.
-	// Production wires this into a Prometheus counter so operators
-	// can tell when the budget is too tight and bursts are
-	// degrading hit rate. The hook runs on the request goroutine
-	// and must be cheap (atomic Add, no blocking calls).
-	OnCacheWarmingBudgetExhausted func(pieceSize int64)
+	// with the piece backend and size every time fetchPiece would
+	// have warmed the cache inline but the budget guard rejected
+	// the acquire. The backend label lets operators correlate
+	// budget pressure with specific providers — the same
+	// labelling convention as zkof_integrity_failure_total — so a
+	// chronically misbehaving backend stands out in the rate
+	// breakdown instead of being averaged into the fleet-wide
+	// counter. Production wires this into a labelled Prometheus
+	// counter. The hook runs on the request goroutine and must be
+	// cheap (atomic Add, no blocking calls).
+	OnCacheWarmingBudgetExhausted func(backend string, pieceSize int64)
 }
 
 // DefaultCacheWarmingBudget is the default total memory budget
@@ -1418,7 +1422,7 @@ func (h *Handler) fetchPiece(
 						piece.PieceID, piece.Backend, pieceSize)
 				}
 			}
-			h.notifyCacheWarmingExhausted(pieceSize)
+			h.notifyCacheWarmingExhausted(piece.Backend, pieceSize)
 			// Publish promotion regardless of byteRange so the
 			// async worker can warm the cache off the request
 			// goroutine even when this request cannot. The
@@ -1706,13 +1710,15 @@ func (h *Handler) signalPromotion(piece metadata.Piece, tenantID string, readByt
 // warmed the cache inline but the budget guard rejected the
 // acquire. Production wires this into a Prometheus counter so a
 // chronically-undersized budget shows up as a metric, not a
-// silent degradation. Tests use the hook to assert the budget
-// guard fired.
-func (h *Handler) notifyCacheWarmingExhausted(pieceSize int64) {
+// silent degradation. The backend argument labels the counter so
+// operators can tell which provider is generating the budget
+// pressure (same convention as IncIntegrityFailure). Tests use
+// the hook to assert the budget guard fired.
+func (h *Handler) notifyCacheWarmingExhausted(backend string, pieceSize int64) {
 	if h.cfg.OnCacheWarmingBudgetExhausted == nil {
 		return
 	}
-	h.cfg.OnCacheWarmingBudgetExhausted(pieceSize)
+	h.cfg.OnCacheWarmingBudgetExhausted(backend, pieceSize)
 }
 
 // Head handles S3 HEAD object.

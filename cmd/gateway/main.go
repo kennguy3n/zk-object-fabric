@@ -250,8 +250,8 @@ func main() {
 		IntegrityFailures:        integrityFailureSink{r: metricsRegistry},
 		MaxRequestBytes:          cfg.Gateway.MaxRequestBytes,
 		CacheWarmingMemoryBudget: cfg.Gateway.CacheWarmingMemoryBudget,
-		OnCacheWarmingBudgetExhausted: func(pieceSize int64) {
-			metricsRegistry.IncCacheWarmingBudgetExhausted(pieceSize)
+		OnCacheWarmingBudgetExhausted: func(backend string, pieceSize int64) {
+			metricsRegistry.IncCacheWarmingBudgetExhausted(backend, pieceSize)
 		},
 		// RequireAuth gates the handler's AnonymousTenant
 		// fallback: in production any misconfiguration that

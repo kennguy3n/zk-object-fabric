@@ -26,8 +26,9 @@ func TestRegistry_BasicCounters(t *testing.T) {
 	r.ObserveRequest("GET", "2xx", 0.5)
 	r.ObserveRequest("PUT", "5xx", 1.2)
 
-	r.IncCacheWarmingBudgetExhausted(256 * 1024)
-	r.IncCacheWarmingBudgetExhausted(128 * 1024)
+	r.IncCacheWarmingBudgetExhausted("wasabi", 256*1024)
+	r.IncCacheWarmingBudgetExhausted("wasabi", 128*1024)
+	r.IncCacheWarmingBudgetExhausted("aws_s3", 64*1024)
 
 	var buf bytes.Buffer
 	if err := r.write(&buf); err != nil {
@@ -40,8 +41,10 @@ func TestRegistry_BasicCounters(t *testing.T) {
 		"zkof_dedup_hit_total 1",
 		"zkof_dedup_bytes_saved_total 1024",
 		"zkof_active_requests 1",
-		"zkof_cache_warming_budget_exhausted_total 2",
-		"zkof_cache_warming_budget_exhausted_bytes 393216",
+		`zkof_cache_warming_budget_exhausted_total{backend="wasabi"} 2`,
+		`zkof_cache_warming_budget_exhausted_total{backend="aws_s3"} 1`,
+		`zkof_cache_warming_budget_exhausted_bytes{backend="wasabi"} 393216`,
+		`zkof_cache_warming_budget_exhausted_bytes{backend="aws_s3"} 65536`,
 		`zkof_provider_errors_total{provider="wasabi",operation="GetPiece"} 2`,
 		`zkof_provider_errors_total{provider="aws_s3",operation="PutPiece"} 1`,
 		`zkof_request_duration_seconds_bucket{method="GET",status="2xx",le="+Inf"} 2`,
