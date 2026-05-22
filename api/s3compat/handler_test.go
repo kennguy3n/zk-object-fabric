@@ -1744,6 +1744,100 @@ func TestHead_Multipart_OversizeReturns507(t *testing.T) {
 	}
 }
 
+// TestHead_Multipart_UnregisteredBackendReturns502 pins that HEAD
+// 502s when any part's backend is missing from h.cfg.Providers —
+// mirroring getMultipart's check at erasure_coding.go:520-530.
+// Multipart GET has no read-repair / parity fallback so a missing
+// backend is a hard failure; HEAD must surface that up-front
+// rather than letting the AWS SDK / CDN pre-flight route traffic
+// toward a guaranteed-fail GET.
+func TestHead_Multipart_UnregisteredBackendReturns502(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	initReq := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	initRec := httptest.NewRecorder()
+	h.CreateMultipartUpload(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, body=%s", initRec.Code, initRec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(initRec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+	completed := make([]completeUploadEntry, 0, 2)
+	for i := 1; i <= 2; i++ {
+		partBody := bytes.Repeat([]byte{byte('a' + i)}, 16)
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, i)
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		req.ContentLength = int64(len(partBody))
+		rec := httptest.NewRecorder()
+		h.UploadPart(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, body=%s", i, rec.Code, rec.Body)
+		}
+		etag := strings.Trim(rec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: i, ETag: etag})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	completeReq := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID), bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	// Rewrite Pieces[0].Backend to a name not present in
+	// h.cfg.Providers — exactly the misconfiguration a config
+	// rollback or backend deregistration would produce. HEAD must
+	// 502 to match getMultipart's behavior on the follow-up GET.
+	mkey := manifest_store.ManifestKey{
+		TenantID:      AnonymousTenant,
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("mp-obj"),
+	}
+	man, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("manifest get: %v", err)
+	}
+	// resolve() picks Pieces[0] before any manifest-type dispatch
+	// and returns 500 BackendNotRegistered if its backend is gone,
+	// which short-circuits headMultipart. To exercise
+	// headMultipart's per-part check we deregister a non-first
+	// part — exactly the GET path's `for i, p := range pieces`
+	// loop at erasure_coding.go:520-530 which iterates ALL parts,
+	// not just Pieces[0]. Find the second-largest part so we still
+	// have at least 2 entries to corrupt one.
+	if len(man.Pieces) < 2 {
+		t.Fatalf("multipart manifest pieces = %d, want >= 2", len(man.Pieces))
+	}
+	man.Pieces[1].Backend = "deregistered-backend"
+	if err := store.Put(context.Background(), mkey, man); err != nil {
+		t.Fatalf("manifest put: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, headReq)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("multipart HEAD with deregistered backend status = %d, want 502 (mirror getMultipart)", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("BackendNotRegistered")) {
+		t.Errorf("multipart HEAD with deregistered backend body = %q, want code BackendNotRegistered", rec.Body.String())
+	}
+}
+
 // TestHandler_RequireAuth_NoAuthenticator_Returns500 verifies the
 // production-mode safety net: when RequireAuth=true and Auth is
 // nil, every request returns 500 InternalAuthMisconfigured instead

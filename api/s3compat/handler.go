@@ -1927,6 +1927,26 @@ func (h *Handler) headMultipart(
 			r.URL.Path)
 		return
 	}
+	// Pre-flight every part's backend the same way getMultipart
+	// does at erasure_coding.go:520-530. Multipart GET has no
+	// read-repair / parity fallback — any deregistered backend
+	// fails the whole read with 502 BackendNotRegistered. If HEAD
+	// 200s on the same manifest, the AWS SDK and CDN pre-flight
+	// will route traffic toward a GET that's guaranteed to fail.
+	// EC HEAD intentionally skips this kind of check because EC
+	// can tolerate up to ParityShards backends being deregistered
+	// without DataLoss (the matching GET path triggers
+	// read-repair to land surviving shards on a new primary), so
+	// mirroring the GET-side feasibility check on HEAD would
+	// produce false-fail pre-flights on read-repairable manifests.
+	for _, p := range manifest.Pieces {
+		if _, ok := h.cfg.Providers[p.Backend]; !ok {
+			writeError(w, http.StatusBadGateway, "BackendNotRegistered",
+				fmt.Sprintf("part %d references unregistered backend %q", p.PartNumber, p.Backend),
+				r.URL.Path)
+			return
+		}
+	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
 	w.WriteHeader(http.StatusOK)
