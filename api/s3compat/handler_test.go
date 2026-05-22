@@ -252,6 +252,166 @@ func TestGet_OpenEndedRange(t *testing.T) {
 	}
 }
 
+// TestHead_RangeRequest_Returns206WithSliceContentLength pins
+// RFC 9110 §13.1 conformance: a HEAD on a target that the client
+// would GET with Range must report the same metadata a GET would
+// — 206 Partial Content, Content-Range, and Content-Length sized
+// to the slice rather than the full object.
+//
+// Pre-fix the handler returned 200 OK with the full Content-Length
+// for every HEAD regardless of Range, which silently broke AWS
+// SDK / CDN pre-flight probes that size their download buffers
+// off the HEAD response.
+func TestHead_RangeRequest_Returns206WithSliceContentLength(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("HEAD with Range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "4" {
+		t.Errorf("HEAD with Range Content-Length = %q, want %q (slice size 2..5 inclusive)", got, "4")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 2-5/10" {
+		t.Errorf("HEAD with Range Content-Range = %q, want %q", got, "bytes 2-5/10")
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("HEAD with Range body length = %d, want 0 (HEAD has no message body)", rec.Body.Len())
+	}
+}
+
+// TestHead_OpenEndedRange pins the open-ended Range form ("bytes=N-")
+// against HEAD. The 416 InvalidRange path is exercised separately;
+// this case asserts the happy path for the most common CDN pre-flight
+// shape: "give me the suffix starting at N".
+func TestHead_OpenEndedRange(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=5-")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("HEAD open-ended range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "5" {
+		t.Errorf("HEAD open-ended range Content-Length = %q, want %q", got, "5")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 5-9/10" {
+		t.Errorf("HEAD open-ended range Content-Range = %q, want %q", got, "bytes 5-9/10")
+	}
+}
+
+// TestHead_InvalidRange_Returns416 pins the contract that an
+// out-of-bounds or malformed Range on HEAD surfaces as
+// 416 RequestedRangeNotSatisfiable, mirroring the GET path.
+// Returning 200 + full Content-Length here would let a buggy
+// client follow up with a ranged GET that we then reject, wasting
+// a round-trip.
+func TestHead_InvalidRange_Returns416(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=100-200")
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("HEAD with out-of-bounds Range status = %d, want 416", rec.Code)
+	}
+}
+
+// TestHead_NoRange_Returns200WithFullContentLength is the
+// regression test for the original non-Range HEAD shape: 200 OK
+// with the full ObjectSize as Content-Length. Easy to break if a
+// future refactor accidentally drops the no-Range branch.
+func TestHead_NoRange_Returns200WithFullContentLength(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "10" {
+		t.Errorf("HEAD Content-Length = %q, want %q", got, "10")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("HEAD with no Range must NOT set Content-Range, got %q", got)
+	}
+}
+
+// TestHead_EmitsAuditRecord pins the compliance contract that HEAD
+// — like GET, PUT, and DELETE — emits an AuditEntry through the
+// configured AuditRecorder. In zero-knowledge deployments a HEAD
+// reveals object existence and metadata, which is itself a
+// privacy-sensitive read even though no bytes are served. The
+// audit shape mirrors GET (operation="HEAD", same tenant / bucket
+// / key / pieceID / backend / country fields).
+func TestHead_EmitsAuditRecord(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	provWithCountry := &fakeProviderWithCountry{fakeProvider: fp, country: "US"}
+	audit := &recordingAudit{}
+	h := New(Config{
+		Manifests:  store,
+		Providers:  map[string]providers.StorageProvider{"test": provWithCountry},
+		Placement:  fixedPlacement{backend: "test"},
+		Now:        func() time.Time { return time.Unix(1700000000, 0) },
+		Compliance: ComplianceHooks{Audit: audit},
+	})
+
+	body := []byte("hello-head")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+	rec := httptest.NewRecorder()
+	h.Head(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	ops := audit.operations()
+	if len(ops) != 2 || ops[0] != "PUT" || ops[1] != "HEAD" {
+		t.Fatalf("audit ops = %v, want [PUT HEAD]", ops)
+	}
+	headEntry := audit.entries[1]
+	if headEntry.PieceBackend != "test" {
+		t.Errorf("HEAD audit backend = %q, want %q", headEntry.PieceBackend, "test")
+	}
+	if headEntry.BackendCountry != "US" {
+		t.Errorf("HEAD audit country = %q, want %q", headEntry.BackendCountry, "US")
+	}
+	if headEntry.Bucket != "bucket" || headEntry.ObjectKey != "obj" {
+		t.Errorf("HEAD audit (bucket, key) = (%q, %q), want (bucket, obj)", headEntry.Bucket, headEntry.ObjectKey)
+	}
+}
+
 // recordingHotCache is a minimal HotObjectCache implementation that
 // tracks Put calls so tests can assert when fetchPiece warms the
 // cache. Get is intentionally a permanent miss: every test that

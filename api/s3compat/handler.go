@@ -1722,20 +1722,75 @@ func (h *Handler) notifyCacheWarmingExhausted(backend string, pieceSize int64) {
 }
 
 // Head handles S3 HEAD object.
+//
+// Per RFC 9110 §13.1, HEAD must return the same response metadata
+// that a GET on the same target would, with the message body
+// omitted. Two consequences for this handler:
+//
+//   - Range header support: when the client sends a valid Range,
+//     HEAD must respond 206 Partial Content with Content-Range
+//     and a Content-Length equal to the range slice size — not
+//     200 OK with the full Content-Length. AWS S3 HEAD follows
+//     this rule and clients (notably the AWS SDKs and large
+//     CDN edges performing pre-flight range probes) depend on
+//     the slice-sized Content-Length to size their download
+//     buffers. Returning the full Content-Length on a HEAD-with-
+//     Range would over-allocate on the client side and surface
+//     as either a truncated GET or a "Content-Length mismatch"
+//     error after the subsequent GET completes.
+//
+//   - Invalid Range handling: an out-of-bounds or malformed
+//     Range on HEAD returns 416 RequestedRangeNotSatisfiable,
+//     matching the GET path. Silently returning 200 with full
+//     Content-Length would let buggy clients send a follow-up
+//     ranged GET that we then reject — wasting a round-trip.
+//
+// HEAD also emits an AuditRecord (operation="HEAD") so the
+// compliance trail covers object-existence probes — discovering
+// that a key exists is a privacy-sensitive read in zero-knowledge
+// deployments, even though no bytes are served.
 func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
-	manifest, _, piece, tenantID, bucket, err := h.resolve(r)
+	manifest, pieceProvider, piece, tenantID, bucket, err := h.resolve(r)
 	if err != nil {
 		writeResolveError(w, r, err)
 		return
 	}
+
+	var byteRange *providers.ByteRange
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
+		if perr != nil {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+			return
+		}
+		byteRange = rng
+	}
+
 	if etag := pieceETag(piece); etag != "" {
 		w.Header().Set("ETag", quote(etag))
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
-	w.WriteHeader(http.StatusOK)
+	status := http.StatusOK
+	if byteRange != nil {
+		end := byteRange.End
+		if end < 0 {
+			end = manifest.ObjectSize - 1
+		}
+		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
+		status = http.StatusPartialContent
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	}
+	w.WriteHeader(status)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	// Audit HEAD with the same shape as GET. Country comes from
+	// the resolved provider's placement labels; HEAD never reads
+	// piece bytes so there is no integrity check to fail before
+	// audit, mirroring the post-resolve / pre-body audit point in
+	// Get for the simple single-piece path.
+	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
 }
 
 // Delete handles S3 DELETE object.
