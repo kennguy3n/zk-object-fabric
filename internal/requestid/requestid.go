@@ -46,6 +46,27 @@ type ctxKey struct{}
 // reuses that value so cross-service traces stay correlated.
 // Empty / whitespace values are ignored; the middleware
 // generates a fresh id in that case.
+//
+// Trust model: the middleware deliberately does NOT validate the
+// length, charset, or format of the incoming header. The point
+// of accepting a client-supplied id is to join traces across
+// services whose id format we do not control (CloudFront,
+// OpenTelemetry, customer-supplied SDKs); imposing a length or
+// hex-only check here would silently break trace correlation
+// the first time an upstream picked a different scheme. This
+// matches AWS S3's own behaviour (S3 echoes the client's
+// x-amz-request-id when present rather than validating it).
+//
+// Downstream consumers of the id MUST sanitise before any
+// substring-injection-sensitive operation. The standard library
+// already rejects header values containing CR/LF/NUL on the
+// response path, so the id can only be log-corrupting (not
+// privilege-escalating) if a malicious client crafts a
+// pathological value — and the corrupted log lines would
+// belong to the gateway's own operator-facing log, which the
+// operator would notice. The audit store records the id
+// verbatim because the audit log is an internal artifact, not
+// a public-facing one, and it is not joined on the id.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Trim before the empty-check so a misbehaving upstream
