@@ -1417,15 +1417,67 @@ func (h *Handler) fetchPiece(
 			// emit a Content-Length sized for the slice and
 			// the client would consume a truncated/wrong
 			// payload (the data-corruption bug fixed by
-			// d94e15e). Close the full body we just got and
-			// re-query the provider with the actual range so
-			// the returned reader is already trimmed.
-			// tryReadRepair is NOT invoked on this fallback:
-			// read-repair is a recovery path for upstream
-			// fetch errors, and here the first GetPiece
-			// returned a valid body we chose to discard for
-			// memory reasons.
+			// d94e15e). There are two cases:
+			//
+			//   (1) preVerified == false. body came directly
+			//   from pieceProvider.GetPiece(fetchRange=nil).
+			//   The provider succeeded; closing and re-fetching
+			//   with the actual byteRange is a clean way to
+			//   shed the unwanted prefix — one extra round-trip
+			//   to the same backend that just answered.
+			//
+			//   (2) preVerified == true. body came from
+			//   tryReadRepair, which only fires when the
+			//   ORIGINAL pieceProvider.GetPiece returned an
+			//   error. The repaired bytes were copied from the
+			//   secondary backend and the manifest's piece.Backend
+			//   was updated to point at the new primary, but
+			//   pieceProvider in this scope is still the
+			//   pre-repair lookup — same failed backend that
+			//   triggered the repair in the first place. A
+			//   close-and-refetch from pieceProvider would
+			//   target the failed backend again, almost
+			//   certainly fail, and turn a successful
+			//   read-repair into a hard 502 for the client.
+			//   We avoid that by slicing the already-buffered
+			//   repaired body (tryReadRepair returns a
+			//   NopCloser(bytes.NewReader(...)) — the bytes are
+			//   in memory). The budget guard's purpose is to
+			//   bound the BUFFERED piece bytes across concurrent
+			//   warmers; in the preVerified branch the bytes
+			//   were buffered BEFORE the budget check (inside
+			//   tryReadRepair), so the in-memory cost is
+			//   already paid and serving from it does not
+			//   violate the budget contract. signalPromotion
+			//   above fires unconditionally so an async worker
+			//   can still warm the cache off-path. This branch
+			//   was previously missing — d94e15e fixed the
+			//   data-corruption bug at the cost of breaking
+			//   read-repair correctness under simultaneous
+			//   budget exhaustion (rare-but-real: requires
+			//   primary failure, repair success, budget
+			//   exhaustion, range request on hashed piece
+			//   within MaxInMemoryObjectBytes — all five
+			//   conditions concurrent). The regression test
+			//   TestCacheWarming_ReadRepairServedWhenBudgetExhausted
+			//   pins this fix.
 			if byteRange != nil {
+				if preVerified {
+					buf, rerr := io.ReadAll(body)
+					_ = body.Close()
+					if rerr != nil {
+						return nil, false, rerr
+					}
+					end := byteRange.End
+					if end < 0 || end >= int64(len(buf)) {
+						end = int64(len(buf)) - 1
+					}
+					if byteRange.Start < 0 || byteRange.Start > end+1 {
+						return nil, false, fmt.Errorf("s3compat: range %d-%d out of bounds for repaired piece %s (%d bytes)", byteRange.Start, byteRange.End, piece.PieceID, len(buf))
+					}
+					sliced := buf[byteRange.Start : end+1]
+					return io.NopCloser(bytes.NewReader(sliced)), false, nil
+				}
 				_ = body.Close()
 				ranged, rerr := pieceProvider.GetPiece(r.Context(), piece.PieceID, byteRange)
 				if rerr != nil {

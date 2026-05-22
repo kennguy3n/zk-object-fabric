@@ -3,6 +3,7 @@ package s3compat
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,10 @@ import (
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
+	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
+	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
@@ -565,6 +569,257 @@ func TestCacheWarming_BudgetReleasedWhenCacheNil(t *testing.T) {
 	if got := pub.count(); got != 0 {
 		t.Errorf("promotion signals=%d, want 0 — a leaked-budget regression would push these GETs onto the async signal path", got)
 	}
+}
+
+// TestCacheWarming_ReadRepairServedWhenBudgetExhausted pins the
+// rare-but-real correctness bug that Devin Review flagged on
+// commit 4c22246: when (1) the outer pieceProvider.GetPiece
+// fails, (2) tryReadRepair succeeds and returns a preVerified
+// body, (3) the cache-warming budget then rejects the
+// allocation, AND (4) the request is a range GET on a hashed
+// piece within MaxInMemoryObjectBytes, the pre-fix code would
+// close the (good) repaired body and re-fetch from
+// pieceProvider — the same backend that just failed and
+// triggered the repair in the first place. The re-fetch would
+// fail again, turning a successful read-repair into a hard
+// error for the client. The fix slices the in-memory repaired
+// body instead of re-fetching, because the bytes are already
+// buffered inside tryReadRepair's NopCloser(bytes.NewReader(...))
+// return value.
+//
+// The setup wires TWO provider registries: h.cfg.Providers maps
+// the piece's backend to a failingProvider that always errors
+// on GetPiece, and lazy_read_repair.ReadRepair.Providers maps
+// the SAME backend to a working memProvider with the piece
+// bytes. This is the production-mirror scenario where the
+// outer call site sees a backend failure (transport-level,
+// rate limit, partial outage) while a separate retry-aware
+// provider instance inside the repair pipeline can still
+// fetch the bytes. The migration manifest declares Generation
+// > 1 with a distinct PrimaryBackend so tryReadRepair fires
+// instead of bouncing on the "no migration in progress"
+// guard.
+//
+// With the fix: GET returns 200 + the correct slice of the
+// repaired body. Without the fix: GET fails because the
+// budget-reject branch closes the repaired body and the
+// re-fetch from the failing outer provider errors out.
+func TestCacheWarming_ReadRepairServedWhenBudgetExhausted(t *testing.T) {
+	const (
+		pieceSize  = 1024
+		rangeStart = 100
+		rangeEnd   = 199
+	)
+	body := bytes.Repeat([]byte("R"), pieceSize)
+	pieceHash := "blake3:" + blake3Hex(body)
+	pieceID := "piece-readrepair"
+	tenantID := "anonymous"
+	bucket := "bkt"
+	objectKey := "obj"
+
+	// Outer registry: handlerProv always fails GetPiece. This
+	// drives fetchPiece into tryReadRepair.
+	handlerProv := &failingGetProvider{name: "primary"}
+
+	// Repair-side registry: a working memProvider holding the
+	// piece bytes on the "primary" backend, plus a memProvider
+	// for the migration target "newprimary" so Repair has
+	// somewhere to copy to.
+	repairSource := newMemProvider("primary")
+	repairSource.put(pieceID, body)
+	repairTarget := newMemProvider("newprimary")
+	repairRegistry := map[string]providers.StorageProvider{
+		"primary":    repairSource,
+		"newprimary": repairTarget,
+	}
+
+	store := memory.New()
+	mkey := manifest_store.ManifestKey{
+		TenantID:      tenantID,
+		Bucket:        bucket,
+		ObjectKeyHash: hashObjectKey(objectKey),
+		VersionID:     "",
+	}
+	manifest := &metadata.ObjectManifest{
+		TenantID:      tenantID,
+		Bucket:        bucket,
+		ObjectKey:     objectKey,
+		ObjectKeyHash: mkey.ObjectKeyHash,
+		ObjectSize:    int64(pieceSize),
+		ChunkSize:     int64(pieceSize),
+		Pieces: []metadata.Piece{{
+			PieceID:   pieceID,
+			Hash:      pieceHash,
+			SizeBytes: int64(pieceSize),
+			Backend:   "primary",
+			Locator:   "primary://" + pieceID,
+			State:     "active",
+		}},
+		MigrationState: metadata.MigrationState{Generation: 2, PrimaryBackend: "newprimary"},
+	}
+	if err := store.Put(context.Background(), mkey, manifest); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	cache := newBudgetTestCache()
+	pub := &recordingPublisher{}
+	var rejected atomic.Int64
+	// Tight budget that admits the piece exactly once. The
+	// test pre-acquires the full budget before the GET so the
+	// in-request TryAcquire is guaranteed to fail and we hit
+	// the budget-reject branch deterministically.
+	budget := int64(pieceSize)
+	h := New(Config{
+		Manifests:                store,
+		Providers:                map[string]providers.StorageProvider{"primary": handlerProv, "newprimary": repairTarget},
+		Placement:                fixedPlacement{backend: "primary"},
+		Billing:                  &recordingBilling{},
+		Cache:                    cache,
+		CachePublisher:           pub,
+		Now:                      func() time.Time { return time.Unix(1700000000, 0) },
+		CacheWarmingMemoryBudget: budget,
+		ReadRepair:               lazy_read_repair.New(repairRegistry, store),
+		OnCacheWarmingBudgetExhausted: func(int64) {
+			rejected.Add(1)
+		},
+	})
+
+	// Pre-acquire the entire budget so the GET's TryAcquire
+	// must fail. The acquire is held until t.Cleanup so the
+	// request goroutine cannot race past the guard.
+	if !h.cacheWarmSem.TryAcquire(budget) {
+		t.Fatal("test setup: could not pre-acquire the full budget — handler was not constructed with the expected semaphore")
+	}
+	t.Cleanup(func() { h.cacheWarmSem.Release(budget) })
+
+	// Range GET that targets a slice in the middle of the
+	// piece — verifies the slice math is correct (not just
+	// that the GET returns SOMETHING).
+	req := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+objectKey, nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd))
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+
+	if rec.Code != http.StatusPartialContent && rec.Code != http.StatusOK {
+		// Some range handlers serve 200 (full content) when
+		// the range covers the whole object; we accept either
+		// because the failure mode the test is guarding
+		// against is a 5xx from the budget-reject re-fetch.
+		t.Fatalf("GET status=%d, want 200 or 206; body=%s", rec.Code, rec.Body)
+	}
+	want := body[rangeStart : rangeEnd+1]
+	if !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Errorf("GET body=%q (%d bytes), want %q (%d bytes) — slice math from the repaired in-memory body is wrong",
+			rec.Body.Bytes(), rec.Body.Len(), want, len(want))
+	}
+	if got := rejected.Load(); got != 1 {
+		t.Errorf("budget-exhausted hits=%d, want 1 — the pre-acquire should have forced the budget guard to reject", got)
+	}
+	if got := pub.count(); got != 1 {
+		t.Errorf("promotion signals=%d, want 1 — the budget-reject branch must still publish so an async worker can warm the cache off-path", got)
+	}
+}
+
+// failingGetProvider implements providers.StorageProvider but
+// always returns an error from GetPiece, simulating a backend
+// that is unreachable from the handler's request goroutine while
+// a separate provider instance inside the repair pipeline can
+// still fetch the bytes. PutPiece is left intact so the
+// handler's PUT path is not implicitly exercised by this test.
+type failingGetProvider struct{ name string }
+
+func (f *failingGetProvider) PutPiece(_ context.Context, _ string, _ io.Reader, _ providers.PutOptions) (providers.PutResult, error) {
+	return providers.PutResult{}, errors.New("failingGetProvider: PutPiece not implemented")
+}
+func (f *failingGetProvider) GetPiece(_ context.Context, _ string, _ *providers.ByteRange) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("failingGetProvider %q: simulated outer-call failure", f.name)
+}
+func (f *failingGetProvider) HeadPiece(_ context.Context, _ string) (providers.PieceMetadata, error) {
+	return providers.PieceMetadata{}, errors.New("not found")
+}
+func (f *failingGetProvider) DeletePiece(_ context.Context, _ string) error { return nil }
+func (f *failingGetProvider) ListPieces(_ context.Context, _, _ string) (providers.ListResult, error) {
+	return providers.ListResult{}, nil
+}
+func (f *failingGetProvider) Capabilities() providers.ProviderCapabilities {
+	return providers.ProviderCapabilities{SupportsRangeReads: true}
+}
+func (f *failingGetProvider) CostModel() providers.ProviderCostModel { return providers.ProviderCostModel{} }
+func (f *failingGetProvider) PlacementLabels() providers.PlacementLabels {
+	return providers.PlacementLabels{Provider: f.name}
+}
+
+// memProvider is a minimal working StorageProvider used as the
+// repair-side source. Mirrors the one in
+// migration/lazy_read_repair/repair_test.go but lives here so
+// this test file does not import test code from another
+// package.
+type memTestProvider struct {
+	name  string
+	mu    sync.Mutex
+	store map[string][]byte
+}
+
+func newMemProvider(name string) *memTestProvider {
+	return &memTestProvider{name: name, store: map[string][]byte{}}
+}
+
+func (m *memTestProvider) put(id string, data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store[id] = append([]byte(nil), data...)
+}
+
+func (m *memTestProvider) PutPiece(_ context.Context, id string, r io.Reader, _ providers.PutOptions) (providers.PutResult, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return providers.PutResult{}, err
+	}
+	m.mu.Lock()
+	m.store[id] = data
+	m.mu.Unlock()
+	return providers.PutResult{PieceID: id, SizeBytes: int64(len(data)), Backend: m.name, Locator: m.name + "://" + id}, nil
+}
+func (m *memTestProvider) GetPiece(_ context.Context, id string, r *providers.ByteRange) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.store[id]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	if r != nil {
+		end := r.End
+		if end < 0 || end >= int64(len(data)) {
+			end = int64(len(data)) - 1
+		}
+		data = data[r.Start : end+1]
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+func (m *memTestProvider) HeadPiece(_ context.Context, id string) (providers.PieceMetadata, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.store[id]
+	if !ok {
+		return providers.PieceMetadata{}, errors.New("not found")
+	}
+	return providers.PieceMetadata{PieceID: id, SizeBytes: int64(len(data))}, nil
+}
+func (m *memTestProvider) DeletePiece(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.store, id)
+	return nil
+}
+func (m *memTestProvider) ListPieces(_ context.Context, _, _ string) (providers.ListResult, error) {
+	return providers.ListResult{}, nil
+}
+func (m *memTestProvider) Capabilities() providers.ProviderCapabilities {
+	return providers.ProviderCapabilities{SupportsRangeReads: true}
+}
+func (m *memTestProvider) CostModel() providers.ProviderCostModel { return providers.ProviderCostModel{} }
+func (m *memTestProvider) PlacementLabels() providers.PlacementLabels {
+	return providers.PlacementLabels{Provider: m.name}
 }
 
 // failingReadProvider wraps fakeProvider so a single test can
