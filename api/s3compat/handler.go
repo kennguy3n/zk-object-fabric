@@ -26,6 +26,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
+	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
@@ -658,7 +659,17 @@ func (h *Handler) audit(r *http.Request, op, tenantID, bucket, key, pieceID, bac
 		PieceBackend:   backend,
 		BackendCountry: country,
 		Timestamp:      h.cfg.Now(),
-		RequestID:      r.Header.Get("x-amz-request-id"),
+		// Pull the id from the request context, not from
+		// the request header. requestid.Middleware
+		// installs the id in the context (and in the
+		// RESPONSE header), but never mutates the request
+		// header — so a header-only lookup misses every
+		// server-generated id and only catches the
+		// upstream-supplied case. FromContext returns the
+		// empty string when called without the middleware
+		// (unit tests, internal goroutines), which the
+		// audit consumer already treats as "no id".
+		RequestID: requestid.FromContext(r.Context()),
 	})
 }
 
