@@ -14,6 +14,20 @@ import (
 
 // StorageProvider is the backend-neutral interface used by the gateway
 // and migration engine to manipulate ciphertext pieces.
+//
+// Error-wrapping contract on PutPiece: when r is an
+// http.MaxBytesReader (as the gateway always wraps it before
+// dispatch), and the client overflows the per-request cap while the
+// provider is reading from r, the provider MUST return an error
+// chain that resolves to *http.MaxBytesError via errors.As. In
+// practice this means any fmt.Errorf wrappers around the underlying
+// read error MUST use %w (not %v). The s3compat handler depends on
+// this to surface 413 EntityTooLarge to the client rather than a
+// generic 502 BackendPutFailed. The conformance test
+// "MaxBytesErrorPreserved" in tests/providers/conformance pins this
+// invariant for every adapter that ships in this repo; a future
+// adapter that ships without running the conformance suite must
+// uphold the contract by inspection.
 type StorageProvider interface {
 	PutPiece(ctx context.Context, pieceID string, r io.Reader, opts PutOptions) (PutResult, error)
 	GetPiece(ctx context.Context, pieceID string, byteRange *ByteRange) (io.ReadCloser, error)

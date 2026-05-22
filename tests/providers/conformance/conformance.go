@@ -12,6 +12,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -56,6 +58,7 @@ func Run(t *testing.T, factory Factory, opts Options) {
 		t.Run("RejectsUnsafePieceIDs", func(t *testing.T) { testRejectsUnsafePieceIDs(t, factory) })
 	}
 	t.Run("DescriptiveMethods", func(t *testing.T) { testDescriptiveMethods(t, factory) })
+	t.Run("MaxBytesErrorPreserved", func(t *testing.T) { testMaxBytesErrorPreserved(t, factory) })
 }
 
 func testPutGetRoundTrip(t *testing.T, factory Factory) {
@@ -256,6 +259,61 @@ func testRejectsUnsafePieceIDs(t *testing.T, factory Factory) {
 				t.Fatalf("DeletePiece(%q): want error, got nil", id)
 			}
 		})
+	}
+}
+
+// testMaxBytesErrorPreserved pins a defense-in-depth contract on
+// every StorageProvider: when the gateway hands PutPiece an
+// io.Reader that is actually an http.MaxBytesReader-wrapped
+// request body, and the client overruns the cap mid-stream, the
+// error returned by PutPiece MUST still be unwrappable to a
+// *http.MaxBytesError via errors.As. Without this guarantee, the
+// s3compat handler's writePutPieceError helper would silently
+// degrade a 413 EntityTooLarge into a generic 502 BackendPutFailed
+// for any provider that wraps its underlying error with `%v`
+// instead of `%w` somewhere in the chain.
+//
+// The test simulates the production wiring exactly: a fresh
+// ResponseRecorder + MaxBytesReader-wrapped reader, the same way
+// dispatch wraps r.Body at the top of every PUT/POST. The
+// provider then attempts to read from it; the read fails with
+// MaxBytesError, and the test asserts the returned error chain
+// still resolves to *http.MaxBytesError. This catches a future
+// provider that, e.g., does fmt.Errorf("put: %v", err) instead of
+// `%w` — the test would fail immediately rather than the
+// regression manifesting as a 502 in production.
+func testMaxBytesErrorPreserved(t *testing.T, factory Factory) {
+	ctx := context.Background()
+	p := factory(t)
+
+	const limit int64 = 16
+	// Body is intentionally larger than the limit so the
+	// MaxBytesReader will fire mid-read. ContentLength is set to
+	// -1 below to bypass the stdlib short-circuit that rejects
+	// the request before the reader runs.
+	payload := bytes.Repeat([]byte("M"), int(limit)*4)
+	req := httptest.NewRequest(http.MethodPut, "/conformance", bytes.NewReader(payload))
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	wrapped := http.MaxBytesReader(rec, req.Body, limit)
+
+	_, err := p.PutPiece(ctx, "piece-maxbytes", wrapped, providers.PutOptions{
+		// ContentLength: -1 instructs the provider to stream
+		// without pre-declaring the size; matches the
+		// production single-piece Put path that hands the
+		// MaxBytesReader directly through.
+		ContentLength: -1,
+	})
+	if err == nil {
+		t.Fatal("PutPiece with overflowing MaxBytesReader: want error, got nil")
+	}
+
+	var mb *http.MaxBytesError
+	if !errors.As(err, &mb) {
+		t.Fatalf("errors.As(*http.MaxBytesError) = false; provider must wrap underlying error with %%w so the s3compat handler can surface 413 EntityTooLarge. Got err type %T: %v", err, err)
+	}
+	if mb.Limit != limit {
+		t.Errorf("MaxBytesError.Limit = %d, want %d (provider must not synthesize a fresh MaxBytesError — the original must be preserved through the error chain)", mb.Limit, limit)
 	}
 }
 
