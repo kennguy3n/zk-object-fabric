@@ -300,7 +300,14 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		ContentType:   r.Header.Get("Content-Type"),
 	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
+		// PutPiece reads from the MaxBytesReader-wrapped body
+		// transitively (single-piece Put has the same shape) —
+		// if the client overflows the request cap the error
+		// wraps *http.MaxBytesError and writePutPieceError
+		// surfaces 413 EntityTooLarge instead of a generic 502
+		// so multipart clients see the same actionable error
+		// they get on the single-piece Put path.
+		writePutPieceError(w, r, err)
 		return
 	}
 	upload.SetPartHash(partNumber, partHasher.Sum(nil))

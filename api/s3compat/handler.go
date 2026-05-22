@@ -573,20 +573,12 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		ContentType:   r.Header.Get("Content-Type"),
 	})
 	if err != nil {
-		// The provider's PutPiece reads from the MaxBytesReader
-		// transitively; if the client's body exceeds the cap
-		// mid-stream the underlying read fails with
-		// *http.MaxBytesError. Surface 413 in that case instead
-		// of a generic 502 so the caller sees an actionable error.
-		var mb *http.MaxBytesError
-		if errors.As(err, &mb) {
-			writeError(w, http.StatusRequestEntityTooLarge,
-				"EntityTooLarge",
-				fmt.Sprintf("request body exceeds the configured MaxRequestBytes limit of %d bytes", mb.Limit),
-				r.URL.Path)
-			return
-		}
-		writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
+		// PutPiece reads from the MaxBytesReader-wrapped body
+		// transitively; client overflows surface here as
+		// *http.MaxBytesError and writePutPieceError converts
+		// them to 413 EntityTooLarge. All other errors are
+		// genuine backend failures and map to 502.
+		writePutPieceError(w, r, err)
 		return
 	}
 	blake3Hash := "blake3:" + hex.EncodeToString(blake3Hasher.Sum(nil))
@@ -1971,13 +1963,42 @@ func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource s
 // request body exceeded Config.MaxRequestBytes), it surfaces 413
 // EntityTooLarge with the limit in the message so the caller can
 // pick the right chunk size on retry; otherwise it surfaces 400
-// InvalidArgument with the underlying error string. Returns true
-// after writing the response so the caller can skip the rest of
-// its handler. Callers that have already written a body must not
-// call this — Go's net/http will refuse to set the status code
-// twice and the client will see a truncated response with the
-// wrong code.
-func writeBodyReadError(w http.ResponseWriter, r *http.Request, err error) bool {
+// InvalidArgument with the underlying error string. Callers
+// should `return` immediately after invoking this helper.
+// Callers that have already written a body must not call this —
+// Go's net/http will refuse to set the status code twice and the
+// client will see a truncated response with the wrong code.
+func writeBodyReadError(w http.ResponseWriter, r *http.Request, err error) {
+	if writeMaxBytesError(w, r, err) {
+		return
+	}
+	writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
+}
+
+// writePutPieceError converts a PutPiece backend error into the
+// right S3 response. Streaming PutPiece reads from the
+// MaxBytesReader-wrapped body, so the client overflowing the
+// per-request cap surfaces here as *http.MaxBytesError (not on
+// the body read because the read happens inside the provider).
+// We surface 413 in that case so the caller sees the same
+// EntityTooLarge as the body-read path; everything else is a
+// genuine backend failure and maps to 502 BackendPutFailed.
+// Callers should `return` immediately after invoking this helper.
+func writePutPieceError(w http.ResponseWriter, r *http.Request, err error) {
+	if writeMaxBytesError(w, r, err) {
+		return
+	}
+	writeError(w, http.StatusBadGateway, "BackendPutFailed", err.Error(), r.URL.Path)
+}
+
+// writeMaxBytesError writes a 413 EntityTooLarge response if err
+// wraps *http.MaxBytesError and returns true. Returns false
+// without writing anything when err is some other error type,
+// letting the caller fall through to its protocol-specific
+// default response. Sharing this between writeBodyReadError and
+// writePutPieceError keeps the 413 limit-string format
+// consistent across every PUT/POST surface.
+func writeMaxBytesError(w http.ResponseWriter, r *http.Request, err error) bool {
 	var mb *http.MaxBytesError
 	if errors.As(err, &mb) {
 		writeError(w, http.StatusRequestEntityTooLarge,
@@ -1986,8 +2007,7 @@ func writeBodyReadError(w http.ResponseWriter, r *http.Request, err error) bool 
 			r.URL.Path)
 		return true
 	}
-	writeError(w, http.StatusBadRequest, "InvalidArgument", "read body: "+err.Error(), r.URL.Path)
-	return true
+	return false
 }
 
 // pieceETag returns the S3-protocol ETag for a piece. It prefers

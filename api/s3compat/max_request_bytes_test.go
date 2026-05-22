@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
+	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
@@ -314,6 +316,102 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mux := http.NewServeMux()
 	h.Register(mux)
 	mux.ServeHTTP(w, r)
+}
+
+// TestDispatch_MaxRequestBytes_UploadPartStreamingRejectsMidStream
+// confirms the cap fires on the multipart UploadPart streaming
+// path the same way it fires on the single-piece Put streaming
+// path. Before this regression test the UploadPart PutPiece
+// error branch returned a generic 502 BackendPutFailed when the
+// body overflowed the cap because the error check only looked at
+// the read error class, not whether it wrapped
+// *http.MaxBytesError. The shared writePutPieceError helper now
+// converts those into 413 EntityTooLarge so multipart clients
+// see the same actionable error as single-piece clients.
+func TestDispatch_MaxRequestBytes_UploadPartStreamingRejectsMidStream(t *testing.T) {
+	const limit int64 = 1024
+	body := bytes.Repeat([]byte("B"), 4*1024)
+
+	fake := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests:       memory.New(),
+		Providers:       map[string]providers.StorageProvider{"test": fake},
+		Placement:       fixedPlacement{backend: "test"},
+		Multipart:       mpStore,
+		MaxRequestBytes: limit,
+	})
+
+	// Create the multipart upload first.
+	createReq := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	createRec := httptest.NewRecorder()
+	h.CreateMultipartUpload(createRec, createReq)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", createRec.Code, createRec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(createRec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+
+	// Upload a part whose body exceeds MaxRequestBytes. Stream
+	// the body through a lyingReader so MaxBytesReader cannot
+	// short-circuit on ContentLength and the cap must fire
+	// mid-stream — same shape as the single-piece streaming
+	// rejection test above.
+	url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=1", uploadID)
+	partReq := httptest.NewRequest(http.MethodPut, url, &lyingReader{r: bytes.NewReader(body)})
+	partReq.ContentLength = -1
+	partRec := httptest.NewRecorder()
+	h.ServeHTTP(partRec, partReq)
+
+	if partRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("UploadPart streaming status = %d, want 413; body=%s", partRec.Code, partRec.Body)
+	}
+	if !strings.Contains(partRec.Body.String(), "EntityTooLarge") {
+		t.Errorf("UploadPart body missing EntityTooLarge: %s", partRec.Body)
+	}
+	if !strings.Contains(partRec.Body.String(), fmt.Sprintf("%d", limit)) {
+		t.Errorf("UploadPart body should quote the configured limit %d; got: %s", limit, partRec.Body)
+	}
+}
+
+// TestDispatch_MaxRequestBytes_ErasureCodedRejectsOverlimit
+// confirms the cap also fires on the erasure-coded PUT path,
+// which has its own io.ReadAll(LimitReader(...)) sized to
+// maxECObjectSize. Before this regression the EC path used a
+// hardcoded 400 InvalidArgument for body-read errors; the fix
+// routes through writeBodyReadError so EC clients see the same
+// 413 EntityTooLarge as every other body-reading path. We use a
+// small MaxRequestBytes here because the test should run fast;
+// the same code path would fire on a large EC object against
+// the production 5 GiB default.
+func TestDispatch_MaxRequestBytes_ErasureCodedRejectsOverlimit(t *testing.T) {
+	const limit int64 = 1024
+	body := bytes.Repeat([]byte("E"), 4*1024)
+
+	fake := newFakeProvider("test")
+	h := New(Config{
+		Manifests: memory.New(),
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		// Route the upload through the erasure-coded handler.
+		ErasureCoding:   erasure_coding.DefaultRegistry(),
+		MaxRequestBytes: limit,
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", &lyingReader{r: bytes.NewReader(body)})
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("EC PUT status = %d, want 413; body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "EntityTooLarge") {
+		t.Errorf("EC PUT body missing EntityTooLarge: %s", rec.Body)
+	}
 }
 
 // drainXMLError is a tiny helper used by table tests below. It
