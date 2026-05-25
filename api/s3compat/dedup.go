@@ -185,6 +185,22 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: derive convergent dek: %w", err)
 	}
+	// DEK scrubbing via defer: zero the raw convergent DEK on
+	// every return path (success and error). Pre-fix the scrub
+	// only ran on the success path, so an intermediate
+	// EncryptObject / io.ReadAll / WrapDEK failure would leave
+	// the raw key bytes in the goroutine's heap until GC. Move
+	// the scrub to a defer so the defence-in-depth window is
+	// symmetric across all error paths, closing the gap noted in
+	// PR #74 review (3299180089). Note: the convergent DEK is
+	// deterministically re-derivable from (plaintextHash,
+	// tenantID), so this scrub bounds the in-memory exposure
+	// rather than providing forward secrecy. EncryptObject
+	// copies the DEK into the encryptReader for convergent-nonce
+	// derivation (see encryption/client_sdk/sdk.go:
+	// EncryptObject), so clearing the caller's backing array is
+	// safe.
+	defer clear(dek)
 	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, client_sdk.Options{
 		ConvergentNonce: true,
 	})
@@ -211,19 +227,6 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: wrap dek: %w", err)
 	}
-	// DEK scrubbing: zero the raw convergent DEK now that
-	// EncryptObject's AEAD has stashed an independent
-	// chacha20poly1305 key schedule and WrapDEK has produced the
-	// manifest-bound wrapped form. EncryptObject also copies the
-	// DEK into the encryptReader for convergent-nonce derivation
-	// (see encryption/client_sdk/sdk.go: EncryptObject), so the
-	// caller's backing array is safe to clear without corrupting
-	// the in-flight stream. Note: the convergent DEK is
-	// deterministically re-derivable from (plaintextHash,
-	// tenantID), so this scrub bounds the in-memory exposure
-	// rather than providing forward secrecy — defence in depth
-	// against heap-dump / paged-out memory between encrypt and GC.
-	clear(dek)
 	contentHash := formatContentHash(blake3Hex(ciphertext))
 	// Lazy-backfill plaintext_hash so future multipart uploads of
 	// the same plaintext can dedup via LookupByPlaintextHash.

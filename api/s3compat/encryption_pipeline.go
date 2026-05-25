@@ -32,6 +32,37 @@ func IsGatewayEncrypted(mode string) bool {
 		mode == string(encryption.PublicDistribution)
 }
 
+// gatewayEncryptOptions returns the canonical client_sdk.Options
+// used by every non-convergent gateway encrypt path: the
+// single-piece PUT (buffered + streaming), the erasure-coded PUT,
+// the multipart UploadPart path, and the EncryptedSize prediction
+// used to advertise the backend's ContentLength on the streaming
+// path.
+//
+// Centralising this value closes the latent maintenance hazard
+// noted in PR #74 review (3299180226): the streaming PUT path
+// calls EncryptedSize(plaintextSize, Options{}) and then
+// streamEncryptForStorage runs EncryptObject(stream, dek,
+// Options{}) — two independent literals that MUST stay in sync.
+// If a future change makes ChunkSize configurable (or adds any
+// other SDK option that affects ciphertext length) and only one
+// callsite is updated, the gateway would advertise a Content-
+// Length that no longer matches the actual ciphertext, producing
+// either truncated uploads (predicted size < emitted size) or
+// hanging connections (predicted size > emitted size, backend
+// waits for trailing bytes).
+//
+// Returning Options by value keeps the call surface unchanged
+// while making the coupling explicit at the type level.
+// Convergent-encryption paths (dedup, multipart EncryptObject
+// callsite that sets ConvergentNonce: true) intentionally do not
+// use this helper because they require the convergent-nonce
+// derivation — but those paths also do not call EncryptedSize, so
+// the size-prediction coupling does not apply.
+func gatewayEncryptOptions() client_sdk.Options {
+	return client_sdk.Options{}
+}
+
 // encryptForStorage seals plaintext with a freshly-generated DEK and
 // returns (ciphertext, wrapped DEK, error). The wrapped DEK is what
 // the caller stores on the manifest. The plaintext DEK is owned
@@ -56,7 +87,21 @@ func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.Wrappe
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: generate dek: %w", err)
 	}
-	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, client_sdk.Options{})
+	// DEK scrubbing via defer: zero the raw DEK on every return
+	// path (success and error). Pre-fix the scrub only ran on the
+	// success path, so an intermediate failure (EncryptObject /
+	// io.ReadAll / WrapDEK) would leave the raw key bytes in the
+	// goroutine's heap until GC. Move the scrub to a defer so the
+	// defence-in-depth window is symmetric across all error
+	// paths, closing the gap noted in PR #74 review (3299180089).
+	// The SDK's EncryptObject always copies the DEK into the
+	// encryptReader before returning (see
+	// encryption/client_sdk/sdk.go: EncryptObject), so clearing
+	// the caller's backing array is safe in both random-nonce and
+	// convergent-nonce modes without corrupting the in-flight
+	// stream.
+	defer clear(dek)
+	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, gatewayEncryptOptions())
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: encrypt object: %w", err)
 	}
@@ -68,17 +113,6 @@ func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.Wrappe
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: wrap dek: %w", err)
 	}
-	// DEK scrubbing: zero the raw DEK now that both EncryptObject
-	// (which holds an independent AEAD key schedule in chacha20poly1305)
-	// and WrapDEK (which has produced the wrapped form recorded on
-	// the manifest) have consumed it. The SDK's EncryptObject
-	// always copies the DEK into the encryptReader before returning
-	// (see encryption/client_sdk/sdk.go: EncryptObject), so the
-	// caller's backing array is safe to clear in both random-nonce
-	// and convergent-nonce modes without corrupting the in-flight
-	// stream. Mirrors the plaintext scrubbing pattern applied at
-	// the call sites; closes the gap noted in PR #74 review.
-	clear(dek)
 	return ciphertext, wrapped, nil
 }
 
@@ -110,7 +144,21 @@ func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, clien
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: generate dek: %w", err)
 	}
-	encReader, err := client_sdk.EncryptObject(plaintext, dek, client_sdk.Options{})
+	// DEK scrubbing via defer: zero the raw DEK on every return
+	// path (success and error). Pre-fix the scrub only ran on the
+	// success path, so an intermediate EncryptObject or WrapDEK
+	// failure would leave the raw key bytes in the goroutine's
+	// heap until GC. Move the scrub to a defer so the
+	// defence-in-depth window is symmetric across all error
+	// paths, closing the gap noted in PR #74 review (3299180089).
+	// The SDK's EncryptObject always copies the DEK into the
+	// encryptReader before returning, so clearing the caller's
+	// backing array does not corrupt the in-flight stream — even
+	// though the encReader is the value we return to the caller
+	// for streaming, the AEAD inside it is keyed off an internal
+	// copy.
+	defer clear(dek)
+	encReader, err := client_sdk.EncryptObject(plaintext, dek, gatewayEncryptOptions())
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: encrypt object: %w", err)
 	}
@@ -118,15 +166,6 @@ func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, clien
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: wrap dek: %w", err)
 	}
-	// DEK scrubbing: zero the raw DEK now that EncryptObject's AEAD
-	// has stashed an independent chacha20poly1305 key schedule and
-	// WrapDEK has produced the manifest-bound wrapped form. The
-	// SDK's EncryptObject always copies the DEK into the
-	// encryptReader before returning, so clearing the caller's
-	// backing array does not corrupt the in-flight stream. Mirrors
-	// the plaintext scrubbing pattern already in place at the call
-	// sites; closes the gap noted in PR #74 review.
-	clear(dek)
 	return encReader, wrapped, nil
 }
 
@@ -135,7 +174,7 @@ func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, clien
 // shares the same key: the DEK is generated at CreateMultipartUpload
 // time, wrapped once, and then handed to every UploadPart call.
 func (h *Handler) encryptWithDEK(plaintext []byte, dek client_sdk.DataEncryptionKey) ([]byte, error) {
-	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, client_sdk.Options{})
+	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, gatewayEncryptOptions())
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: encrypt object: %w", err)
 	}
@@ -343,7 +382,12 @@ func (h *Handler) prepareSinglePieceEncryption(
 			// to the backend (either silent truncation or
 			// header drop); reject with 400 before the encrypt
 			// stream is started.
-			ciphertextSize, err := client_sdk.EncryptedSize(plaintextSize, client_sdk.Options{})
+			// Use the same Options the actual encrypt path will use
+			// (gatewayEncryptOptions) so the predicted ciphertext
+			// size cannot drift from streamEncryptForStorage's
+			// emitted size if SDK options grow new size-affecting
+			// fields. See gatewayEncryptOptions docs (3299180226).
+			ciphertextSize, err := client_sdk.EncryptedSize(plaintextSize, gatewayEncryptOptions())
 			if err != nil {
 				switch {
 				case errors.Is(err, client_sdk.ErrEncryptedSizeOverflow):

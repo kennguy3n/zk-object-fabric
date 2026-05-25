@@ -1068,6 +1068,19 @@ func (h *Handler) dedupManagedMultipartMiss(
 		writeError(w, http.StatusInternalServerError, "DedupConvergentDEKFailed", derr.Error(), r.URL.Path)
 		return false
 	}
+	// DEK scrubbing via defer: zero the raw convergent DEK on
+	// every return path of this function. The DEK is
+	// deterministically re-derivable from (combinedDigest,
+	// tenantID), so the scrub bounds the in-memory exposure
+	// rather than providing forward secrecy — defence in depth
+	// against heap-dump / paged-out memory between encrypt and
+	// GC. Mirrors the pattern applied to encryptForStorage,
+	// streamEncryptForStorage, and prepareDedupedPutPatternB
+	// after PR #74 review (3299180089). EncryptObject copies the
+	// DEK into the encryptReader for convergent-nonce derivation
+	// before returning, so clearing the caller's backing array
+	// does not corrupt the in-flight stream.
+	defer clear(convergentDEK)
 	encReader, eerr := client_sdk.EncryptObject(bytes.NewReader(plaintext), convergentDEK, client_sdk.Options{ConvergentNonce: true})
 	if eerr != nil {
 		h.deleteUploadedParts(ctx, parts)
