@@ -171,7 +171,16 @@ func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionC
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: unwrap dek: %w", err)
 	}
-	return h.decryptWithDEK(ciphertext, dek)
+	plaintext, derr := h.decryptWithDEK(ciphertext, dek)
+	// DEK scrubbing on the read side mirrors the encrypt path:
+	// once decryptWithDEK has built its chacha20poly1305 AEAD (which
+	// holds its own key schedule) and drained the ciphertext into
+	// plaintext, the raw unwrapped DEK is no longer needed. Clearing
+	// it bounds heap-dump / paged-out memory exposure of the
+	// recovered key bytes. Mirrors the encrypt-side scrub from PR
+	// #74 and closes the symmetry gap noted in review.
+	clear(dek)
+	return plaintext, derr
 }
 
 // decryptWithDEK runs the SDK decrypt reader against an already-
@@ -226,20 +235,69 @@ func (h *Handler) streamDecryptFromStorage(ciphertext io.Reader, enc metadata.En
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: decrypt object: %w", err)
 	}
+	// DEK scrubbing on the read side: DecryptObject builds an
+	// independent chacha20poly1305 AEAD before returning, so the
+	// caller's DEK backing array is safe to clear without
+	// corrupting the in-flight decrypt stream. Mirrors the encrypt-
+	// side scrub and closes the symmetry gap noted in PR #74
+	// review.
+	clear(dek)
 	return decReader, nil
 }
+
+// byteCountingReader wraps an io.Reader and tracks the cumulative
+// number of bytes successfully read. It is the streaming PUT path's
+// answer to the manifest-ObjectSize question: "how many bytes did
+// the client *actually* send?" — distinct from "how many bytes did
+// the client *claim* via Content-Length?". The buffered path can
+// just call len(plaintext) on the io.ReadAll result; the streaming
+// path drains the body through the SDK and never holds the whole
+// plaintext, so it needs a side-channel counter.
+//
+// Read errors do not increment the counter (the contract follows
+// io.Reader: n is the number of bytes the caller can rely on).
+type byteCountingReader struct {
+	R         io.Reader
+	bytesRead int64
+}
+
+func (c *byteCountingReader) Read(p []byte) (int, error) {
+	n, err := c.R.Read(p)
+	if n > 0 {
+		c.bytesRead += int64(n)
+	}
+	return n, err
+}
+
+// BytesRead is callable at any time but is meaningful only after
+// the caller has drained the returned reader (the SDK encrypt
+// reader will pull from this counter as it produces ciphertext
+// chunks; the count reflects whatever the body actually contained
+// when EOF was reached).
+func (c *byteCountingReader) BytesRead() int64 { return c.bytesRead }
 
 // prepareSinglePieceEncryption consumes r.Body, applies the
 // encryption mode dictated by the tenant's policy, and returns the
 // body reader the gateway should hand to the storage backend, its
-// content length, the plaintext size (for manifest.ObjectSize), and
-// the EncryptionConfig to record on the manifest. A false second
-// return indicates the helper already wrote a response and the
-// caller should return.
+// content length, a callback that yields the actual plaintext
+// bytes consumed (for manifest.ObjectSize), and the
+// EncryptionConfig to record on the manifest. A false final return
+// indicates the helper already wrote a response and the caller
+// should return.
 //
-//   - managed / public_distribution: the body is read in full,
-//     encrypted with a fresh DEK, wrapped with the gateway's CMK,
-//     and handed to the backend as ciphertext.
+// The actual-size callback is the architectural answer to the
+// streaming path's manifest-fidelity problem: r.ContentLength is a
+// client claim, not ground truth. The buffered path closes over
+// len(plaintext) (truth at io.ReadAll time); the streaming path
+// closes over the byteCountingReader (truth after the SDK has
+// drained the body to EOF). Callers MUST invoke the callback only
+// AFTER the returned body reader has been fully drained — reading
+// it before drain yields whatever partial count has accumulated.
+//
+//   - managed / public_distribution: the body is encrypted with a
+//     fresh DEK, wrapped with the gateway's CMK, and handed to the
+//     backend as ciphertext. Streamed when Content-Length is
+//     known; buffered otherwise.
 //   - client_side: the body is passed through verbatim after the
 //     helper verifies the client asserted the encryption via the
 //     X-Amz-Meta-Zk-Encryption header. Missing header → 403
@@ -250,13 +308,13 @@ func (h *Handler) prepareSinglePieceEncryption(
 	w http.ResponseWriter,
 	r *http.Request,
 	encMode string,
-) (metadata.EncryptionConfig, io.Reader, int64, int64, bool) {
+) (metadata.EncryptionConfig, io.Reader, int64, func() int64, bool) {
 	switch encMode {
 	case string(encryption.ManagedEncrypted), string(encryption.PublicDistribution):
 		if h.cfg.Encryption == nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured",
 				"tenant policy requires managed encryption but no gateway encryption is configured", r.URL.Path)
-			return metadata.EncryptionConfig{}, nil, 0, 0, false
+			return metadata.EncryptionConfig{}, nil, 0, nil, false
 		}
 		// Streaming path: when the client supplied a Content-Length
 		// the SDK can stream chunk-by-chunk straight to the backend
@@ -267,10 +325,38 @@ func (h *Handler) prepareSinglePieceEncryption(
 		// at MaxInMemoryObjectBytes.
 		if r.ContentLength >= 0 {
 			plaintextSize := r.ContentLength
-			encReader, wrapped, err := h.streamEncryptForStorage(r.Body)
+			// EncryptedSize returns 0 on a positive plaintextLen
+			// when the predicted ciphertext size would overflow
+			// int64. The documented caller contract
+			// (encryption/client_sdk/sdk.go EncryptedSize) is to
+			// treat the zero return as a fatal input validation
+			// failure and reject the request before the encrypt
+			// stream is started. Without this guard a hostile
+			// Content-Length: 9223372036854775807 would either
+			// advertise zero (S3 backends drop the header) or
+			// a wrapped negative ContentLength to the backend;
+			// for local_fs_dev it would silently store a manifest
+			// with ObjectSize == 9.2 EiB while the actual file is
+			// the truncated stream the server received.
+			ciphertextSize := client_sdk.EncryptedSize(plaintextSize, client_sdk.Options{})
+			if ciphertextSize == 0 && plaintextSize > 0 {
+				writeError(w, http.StatusBadRequest, "InvalidContentLength",
+					"Content-Length too large for encrypted streaming upload (ciphertext size overflows int64)", r.URL.Path)
+				return metadata.EncryptionConfig{}, nil, 0, nil, false
+			}
+			// Wrap the body in a counter so handler.go can read
+			// the actual plaintext bytes consumed after PutPiece
+			// drains the encrypt stream. Without this the manifest
+			// would record the client's CLAIMED Content-Length
+			// instead of ground truth — a client that lies and
+			// sends fewer bytes than declared would leave a
+			// manifest pointing at a backend object whose size
+			// does not match the manifest's ObjectSize.
+			counter := &byteCountingReader{R: r.Body}
+			encReader, wrapped, err := h.streamEncryptForStorage(counter)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
-				return metadata.EncryptionConfig{}, nil, 0, 0, false
+				return metadata.EncryptionConfig{}, nil, 0, nil, false
 			}
 			cfg := metadata.EncryptionConfig{
 				Mode:          encMode,
@@ -279,8 +365,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 				WrappedDEK:    wrapped.WrappedKey,
 				WrapAlgorithm: wrapped.WrapAlgorithm,
 			}
-			ciphertextSize := client_sdk.EncryptedSize(plaintextSize, client_sdk.Options{})
-			return cfg, encReader, ciphertextSize, plaintextSize, true
+			return cfg, encReader, ciphertextSize, counter.BytesRead, true
 		}
 		// Fallback buffered path: chunked or unknown-length
 		// uploads (Content-Length: -1) cannot be streamed because
@@ -293,12 +378,12 @@ func (h *Handler) prepareSinglePieceEncryption(
 		plaintext, err := io.ReadAll(r.Body)
 		if err != nil {
 			writeBodyReadError(w, r, err)
-			return metadata.EncryptionConfig{}, nil, 0, 0, false
+			return metadata.EncryptionConfig{}, nil, 0, nil, false
 		}
 		ciphertext, wrapped, err := h.encryptForStorage(plaintext)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
-			return metadata.EncryptionConfig{}, nil, 0, 0, false
+			return metadata.EncryptionConfig{}, nil, 0, nil, false
 		}
 		plaintextSize := int64(len(plaintext))
 		// Plaintext scrubbing: zero the buffer now that the SDK
@@ -313,28 +398,38 @@ func (h *Handler) prepareSinglePieceEncryption(
 			WrappedDEK:    wrapped.WrappedKey,
 			WrapAlgorithm: wrapped.WrapAlgorithm,
 		}
-		return cfg, bytes.NewReader(ciphertext), int64(len(ciphertext)), plaintextSize, true
+		// Buffered path: plaintextSize captured here IS ground
+		// truth (io.ReadAll consumed the body to EOF), so the
+		// closure is constant.
+		return cfg, bytes.NewReader(ciphertext), int64(len(ciphertext)), func() int64 { return plaintextSize }, true
 
 	case string(encryption.StrictZK):
 		algo := r.Header.Get("X-Amz-Meta-Zk-Encryption")
 		if algo == "" {
 			writeError(w, http.StatusForbidden, "EncryptionRequired",
 				"tenant policy requires client_side encryption; set X-Amz-Meta-Zk-Encryption header", r.URL.Path)
-			return metadata.EncryptionConfig{}, nil, 0, 0, false
+			return metadata.EncryptionConfig{}, nil, 0, nil, false
 		}
 		// Pass the client's ciphertext through unchanged. The
 		// gateway does not read it, does not own the DEK, and
 		// does not record wrapping material on the manifest.
+		// ObjectSize for StrictZK comes from putRes.SizeBytes
+		// (the backend-reported ciphertext size), so the
+		// plaintext-size closure is irrelevant here — we still
+		// return r.ContentLength for handler symmetry but it
+		// is not consulted by manifest write.
 		cfg := metadata.EncryptionConfig{
 			Mode:      encMode,
 			Algorithm: algo,
 		}
-		return cfg, r.Body, r.ContentLength, r.ContentLength, true
+		claimed := r.ContentLength
+		return cfg, r.Body, r.ContentLength, func() int64 { return claimed }, true
 	}
 
 	// Empty mode = legacy / no encryption. The body is passed
 	// through verbatim and manifest.Encryption stays zero-valued.
-	return metadata.EncryptionConfig{}, r.Body, r.ContentLength, r.ContentLength, true
+	legacyClaimed := r.ContentLength
+	return metadata.EncryptionConfig{}, r.Body, r.ContentLength, func() int64 { return legacyClaimed }, true
 }
 
 // prepareErasureCodedEncryption seals the already-buffered body for

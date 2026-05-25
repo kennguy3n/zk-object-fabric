@@ -22,14 +22,19 @@
 package s3_compat_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -1391,6 +1396,204 @@ func TestManagedEncryption_StreamingGet_Concurrent(t *testing.T) {
 	for i := 0; i < N; i++ {
 		if err := <-errCh; err != nil {
 			t.Fatalf("concurrent stream %d: %v", i, err)
+		}
+	}
+}
+
+// rawPUTToServer dials the httptest server's TCP address and writes
+// a literal HTTP/1.1 PUT with the supplied Content-Length header
+// regardless of the body's actual length, then reads the status line
+// and response body. Go's net/http.Transport refuses to send a
+// Content-Length that disagrees with a known-length body, which
+// blocks the legitimate adversarial-client test case below; the
+// only reliable way to test the gateway's defence is to bypass the
+// client transport entirely and write raw HTTP bytes.
+//
+// If halfCloseAfterBody is true, the helper TCP-half-closes the
+// write side after sending the partial body so the server sees
+// io.ErrUnexpectedEOF on the body reader instead of hanging
+// indefinitely waiting for the missing declared bytes. This
+// mirrors a realistic adversarial client that lied about
+// Content-Length and then dropped the connection.
+//
+// Returns (status, respBody, didRespond). didRespond is false when
+// the server closed the connection without writing any HTTP
+// response (e.g. because the connection was already torn down by
+// the time the handler tried to flush its 4xx). In that case the
+// caller MUST fall back to manifest-store inspection to verify the
+// gateway did not commit a partial upload — see the
+// ContentLengthMismatch test.
+func rawPUTToServer(t *testing.T, tsURL, path string, declaredCL int64, body []byte, halfCloseAfterBody bool) (status int, respBody []byte, didRespond bool) {
+	t.Helper()
+	u, err := url.Parse(tsURL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", tsURL, err)
+	}
+	conn, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", u.Host, err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+
+	req := fmt.Sprintf("PUT %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+		path, u.Host, declaredCL)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write request header: %v", err)
+	}
+	if len(body) > 0 {
+		if _, err := conn.Write(body); err != nil {
+			t.Fatalf("write request body: %v", err)
+		}
+	}
+	if halfCloseAfterBody {
+		// TCP half-close: signal EOF on the read side of the
+		// server's body reader so the handler unblocks
+		// instead of hanging waiting for the missing
+		// declaredCL - len(body) bytes.
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		// Server closed the connection without writing an
+		// HTTP response. Acceptable for the short-body case
+		// because the gateway's PutPiece error path may flush
+		// to an already-closed socket; the manifest-store
+		// invariant still verifies the bug is fixed.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return 0, nil, false
+		}
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	rb, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// Partial-read of body after server tear-down: same
+		// treatment as no-response above. The status line
+		// itself parsed, so we still surface the status code.
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return resp.StatusCode, rb, true
+		}
+		t.Fatalf("read response body: %v", err)
+	}
+	return resp.StatusCode, rb, true
+}
+
+// TestManagedEncryption_StreamingPut_ContentLengthMismatch verifies
+// the streaming PUT path rejects a client whose advertised
+// Content-Length is larger than the body it actually sends. Pre-
+// fix, the gateway would persist a manifest with
+// ObjectSize == declared Content-Length while the backend held
+// only the bytes the client really uploaded, leaving every
+// subsequent GET to either fail mid-stream or serve a
+// silently-truncated object. The fix wraps r.Body in a counting
+// reader, compares the actual byte count against r.ContentLength
+// after PutPiece drains the encrypt stream, and rolls back the
+// backend piece with 400 IncompleteBody if they disagree.
+func TestManagedEncryption_StreamingPut_ContentLengthMismatch(t *testing.T) {
+	s := newEncryptionServer(t, encryptionPlacement{
+		backend:        "local_fs_dev",
+		encryptionMode: "managed",
+	}, nil)
+
+	body := []byte("real-body-19-bytes-")
+	declaredLen := int64(len(body)) + 4096 // lie: say body is much larger
+	key := "stream-put-clmismatch.bin"
+
+	status, respBody, didRespond := rawPUTToServer(t, s.ts.URL, "/"+s.bucket+"/"+key, declaredLen, body, true)
+	if didRespond {
+		if status >= 200 && status < 300 {
+			t.Fatalf("PUT with Content-Length=%d body=%d unexpectedly returned %d: %s",
+				declaredLen, len(body), status, respBody)
+		}
+		// The fix returns 400 IncompleteBody. We allow any
+		// 4xx/5xx because the Go HTTP server may surface an
+		// io.ErrUnexpectedEOF from the body reader as a
+		// 502/503 before our handler post-flight validation
+		// gets to write 400. Either way the upload was
+		// rejected.
+		if status < 400 {
+			t.Fatalf("PUT short body expected 4xx/5xx, got %d: %s", status, respBody)
+		}
+	}
+	// Whether the server flushed a response or closed the
+	// connection mid-handler, the persistent invariant we care
+	// about is below: NO manifest committed.
+
+	// The manifest store must not contain a manifest for the
+	// rejected key — a partial upload that left a manifest
+	// behind would defeat the fix.
+	res, err := s.manifests.List(context.Background(), "anonymous", s.bucket, "", 100)
+	if err != nil {
+		t.Fatalf("manifests.List: %v", err)
+	}
+	for _, m := range res.Manifests {
+		if m.ObjectKey == key {
+			t.Fatalf("manifest persisted for short-body upload %s/%s: ObjectSize=%d (claimed %d); the rollback path failed",
+				s.bucket, key, m.ObjectSize, declaredLen)
+		}
+	}
+}
+
+// TestManagedEncryption_StreamingPut_ContentLengthOverflow
+// verifies the gateway rejects a hostile Content-Length that
+// would overflow client_sdk.EncryptedSize's int64 ciphertext-
+// size computation. Pre-fix the streaming PUT path called
+// EncryptedSize unconditionally and trusted the result; when
+// the SDK returned 0 on overflow (the documented sentinel),
+// the gateway would advertise ContentLength=0 to the backend
+// and either silently store a zero-byte ciphertext or surface
+// an opaque backend error. The fix checks the zero sentinel
+// before the encrypt stream is started and returns 400
+// InvalidContentLength.
+func TestManagedEncryption_StreamingPut_ContentLengthOverflow(t *testing.T) {
+	s := newEncryptionServer(t, encryptionPlacement{
+		backend:        "local_fs_dev",
+		encryptionMode: "managed",
+	}, nil)
+
+	// Pick the largest valid int64 so EncryptedSize's
+	// addition-overflow check at the numerator step
+	// (plaintextLen + chunk-1) fires immediately. We do not
+	// actually send MaxInt64 bytes — the body is empty; the
+	// EncryptedSize guard runs before the encrypt stream is
+	// touched, so the gateway closes the connection with 400
+	// before any read of the request body.
+	const overflowingLen = int64(math.MaxInt64)
+	key := "stream-put-overflow.bin"
+
+	// halfCloseAfterBody=true here even though body is nil:
+	// the overflow check fires BEFORE the handler reads the
+	// body, but the server's connection-handler reads request
+	// headers + first read of body in parallel; half-closing
+	// after the headers ensures the test does not hang if the
+	// gateway happens to consume the (empty) body before
+	// writing 400.
+	status, respBody, didRespond := rawPUTToServer(t, s.ts.URL, "/"+s.bucket+"/"+key, overflowingLen, nil, true)
+	if !didRespond {
+		t.Fatalf("server closed connection without responding; expected 400 InvalidContentLength")
+	}
+	if status != http.StatusBadRequest {
+		t.Fatalf("PUT with Content-Length=%d expected 400 InvalidContentLength, got %d: %s",
+			overflowingLen, status, respBody)
+	}
+	if !bytes.Contains(respBody, []byte("InvalidContentLength")) {
+		t.Fatalf("response body = %q, want InvalidContentLength error code", respBody)
+	}
+
+	// The overflow path must not have committed a manifest.
+	res, err := s.manifests.List(context.Background(), "anonymous", s.bucket, "", 100)
+	if err != nil {
+		t.Fatalf("manifests.List: %v", err)
+	}
+	for _, m := range res.Manifests {
+		if m.ObjectKey == key {
+			t.Fatalf("manifest persisted for overflowing upload %s/%s; the early-reject path failed", s.bucket, key)
 		}
 	}
 }

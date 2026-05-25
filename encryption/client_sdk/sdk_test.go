@@ -534,3 +534,80 @@ func TestChunkTrailerSize_TracksAEADOverhead(t *testing.T) {
 			chunkTrailerSize, chacha20poly1305.Overhead)
 	}
 }
+
+// TestChaCha20Poly1305NewXCopiesKey is a structural / dependency-
+// upgrade guard pinning the invariant the gateway's DEK scrubbing
+// (api/s3compat/encryption_pipeline.go) relies on: chacha20poly1305
+// .NewX MUST copy the caller's key bytes into the AEAD's internal
+// state so the caller is free to clear the key slice once NewX has
+// returned. If a future golang.org/x/crypto release switches NewX
+// to retain a reference to the caller's slice (e.g. for a zero-
+// allocation Open/Seal API), every clear(dek) callsite in the
+// gateway would silently corrupt the AEAD and produce garbled
+// ciphertext / unauthenticatable tags. This test catches that
+// regression before it ships.
+//
+// The test is structural rather than mocked: it builds a real
+// AEAD, mutates the caller's key slice AFTER NewX returns, then
+// verifies that Seal on the now-mutated key still produces
+// ciphertext decryptable with the original key bytes. If the
+// invariant holds, the AEAD ignores the post-construct mutation.
+// If a future copy-removal lands, Seal would key off the mutated
+// bytes and decrypt with the original would fail authentication.
+func TestChaCha20Poly1305NewXCopiesKey(t *testing.T) {
+	dek, err := GenerateDEK()
+	if err != nil {
+		t.Fatalf("GenerateDEK: %v", err)
+	}
+
+	// Snapshot the original key bytes before any mutation.
+	original := make([]byte, len(dek))
+	copy(original, dek)
+
+	aead, err := chacha20poly1305.NewX(dek)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.NewX: %v", err)
+	}
+
+	// Mutate every byte of the caller's slice. If NewX retained
+	// a reference to it (no copy), Seal below would key off the
+	// 0xFF-filled buffer, not the snapshot.
+	for i := range dek {
+		dek[i] = 0xFF
+	}
+
+	nonce := make([]byte, chacha20poly1305.NonceSizeX)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("rand.Read nonce: %v", err)
+	}
+	plaintext := []byte("structural test: NewX must copy its key argument")
+	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+
+	// Verify Seal used the ORIGINAL key (snapshot) by opening
+	// with a fresh AEAD constructed from that snapshot. If the
+	// invariant ever breaks, Open below returns an auth error.
+	verifier, err := chacha20poly1305.NewX(original)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.NewX(snapshot): %v", err)
+	}
+	got, err := verifier.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		t.Fatalf("AEAD.Open with snapshot key failed: chacha20poly1305.NewX appears to NOT copy its key argument anymore; every clear(dek) callsite in the gateway now corrupts the AEAD. Update DEK scrubbing strategy. err=%v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("decrypted plaintext mismatch: got %q want %q", got, plaintext)
+	}
+
+	// Sanity check the inverse: an AEAD constructed from the
+	// MUTATED slice must NOT decrypt the ciphertext (otherwise
+	// the test is vacuous — e.g. NewX silently maps to a
+	// constant key). This protects future maintainers from
+	// regressions where the test passes for the wrong reason.
+	mutated, err := chacha20poly1305.NewX(dek)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.NewX(mutated): %v", err)
+	}
+	if _, err := mutated.Open(nil, nonce, ciphertext, nil); err == nil {
+		t.Fatalf("AEAD constructed from mutated key unexpectedly decrypted the ciphertext; the test is no longer probing the copy-on-construct invariant")
+	}
+}

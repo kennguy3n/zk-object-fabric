@@ -724,6 +724,109 @@ func TestWarnProductionLocalCMK_MessagesOverrideOnly(t *testing.T) {
 	}
 }
 
+// TestEnforceProductionLocalCMK_OnlyWarnsOnExplicitOverride pins
+// the behaviour of enforceProductionLocalCMK across the four
+// (env, isLocalFileCMK, allowLocalCMK) combinations that matter:
+//
+//  1. production + local-file CMK + AllowLocalCMK=true:
+//     checkProductionLocalCMK returns nil (allow override),
+//     enforce must surface a single SECURITY warning so the
+//     operator override is auditable in startup logs.
+//  2. production + local-file CMK + AllowLocalCMK=false: NOT
+//     covered here because checkProductionLocalCMK returns an
+//     error and enforce calls log.Fatalf, terminating the test
+//     binary. The error branch is exercised by
+//     TestCheckProductionLocalCMK above.
+//  3. production + KMS CMK (any AllowLocalCMK): no warning, no
+//     fatal — the CMK is HSM-backed and the override flag is a
+//     no-op.
+//  4. development + local-file CMK (any AllowLocalCMK): no
+//     warning, no fatal — dev environments are out of scope for
+//     the production guard.
+//
+// Pre-fix enforceProductionLocalCMK called warnProductionLocalCMK
+// unconditionally on the success path. warnProductionLocalCMK
+// itself returned early for cases (3) and (4), so the observable
+// behaviour was identical — but the guard belonged on the
+// caller, not in the warning helper. The refactor moves the
+// is-this-the-override-case check into enforce so the warning
+// helper is now a pure "log the message" function and the gating
+// logic lives where the override decision is made. This test
+// pins the post-refactor gating so a future contributor who
+// re-inlines the unconditional call (or who flips the AllowLocalCMK
+// check sense) trips the assertion.
+func TestEnforceProductionLocalCMK_OnlyWarnsOnExplicitOverride(t *testing.T) {
+	cases := []struct {
+		name           string
+		env            string
+		allowLocalCMK  bool
+		cmkURI         string
+		holderClass    string
+		wantWarn       bool
+	}{
+		{
+			name:          "production_localCMK_override_warns",
+			env:           "production",
+			allowLocalCMK: true,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      true,
+		},
+		{
+			name:          "production_KMS_no_warn",
+			env:           "production",
+			allowLocalCMK: false,
+			cmkURI:        "kms://aws/abc",
+			holderClass:   "aws_kms",
+			wantWarn:      false,
+		},
+		{
+			name:          "production_KMS_with_override_no_warn",
+			env:           "production",
+			allowLocalCMK: true,
+			cmkURI:        "kms://aws/abc",
+			holderClass:   "aws_kms",
+			wantWarn:      false,
+		},
+		{
+			name:          "development_localCMK_no_warn",
+			env:           "development",
+			allowLocalCMK: false,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      false,
+		},
+		{
+			name:          "development_localCMK_override_no_warn",
+			env:           "development",
+			allowLocalCMK: true,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      false,
+		},
+		{
+			name:          "staging_localCMK_no_warn",
+			env:           "staging",
+			allowLocalCMK: false,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureLog(t, func() {
+				enforceProductionLocalCMK(tc.env, tc.allowLocalCMK, tc.cmkURI, tc.holderClass)
+			})
+			got := strings.Contains(out, "SECURITY: using local file CMK")
+			if got != tc.wantWarn {
+				t.Fatalf("enforceProductionLocalCMK(%q, %v, %q, %q) warning fired = %v, want %v (log=%q)",
+					tc.env, tc.allowLocalCMK, tc.cmkURI, tc.holderClass, got, tc.wantWarn, out)
+			}
+		})
+	}
+}
+
 // TestDefaultCacheWarmingBudget_ConfigMatchesHandlerFallback
 // structurally pins the two independent definitions of the
 // production cache-warming budget default to the same value.

@@ -690,7 +690,18 @@ func enforceProductionLocalCMK(env string, allowLocalCMK bool, cmkURI, holderCla
 	if err := checkProductionLocalCMK(env, allowLocalCMK, cmkURI, holderClass); err != nil {
 		log.Fatalf("%s", err)
 	}
-	warnProductionLocalCMK(env, cmkURI, holderClass)
+	// Only emit the audit warning when the operator has flipped
+	// the AllowLocalCMK escape hatch AND the configuration would
+	// otherwise have been rejected (production + local-file CMK).
+	// The pre-fix code called warnProductionLocalCMK
+	// unconditionally, which was a no-op for every other
+	// combination but obscured the intent: warning belongs ONLY
+	// to the explicit override case so operators reading startup
+	// logs in non-production / KMS / Vault configurations are not
+	// confused by a security warning that does not apply to them.
+	if env == "production" && isLocalFileCMK(cmkURI, holderClass) && allowLocalCMK {
+		warnProductionLocalCMK(env, cmkURI, holderClass)
+	}
 }
 
 // isLocalFileCMK reports whether the resolved wrapper is the
