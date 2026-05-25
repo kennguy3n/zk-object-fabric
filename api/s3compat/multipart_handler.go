@@ -387,6 +387,22 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		refs[i] = multipart.PartReference{PartNumber: p.PartNumber, ETag: p.ETag}
 	}
 	parts, upload, err := h.cfg.Multipart.Complete(uploadID, tenantID, bucket, key, refs)
+	// DEK scrubbing for multipart sessions: the session's raw DEK
+	// (upload.DEKMaterial) is held in the multipart store across
+	// every UploadPart for the lifetime of the upload, so the
+	// PR-#74 "defer clear(dek) immediately after generation"
+	// pattern used by single-piece encrypt cannot apply here — the
+	// DEK must outlive the CreateMultipartUpload handler so
+	// subsequent UploadPart calls can seal each part. Scrub
+	// happens at session-end: Complete (here) and Abort (below)
+	// own the only paths that retire the upload from the store.
+	// Place the defer after Complete returns so it fires on every
+	// subsequent return from this handler, including the
+	// dedupManagedMultipartHit / dedupManagedMultipartMiss
+	// branches that read upload.DEKMaterial via
+	// assembleManagedMultipartPlaintext. Closes the gap noted in
+	// PR #74 review (3299218688).
+	defer scrubUploadDEK(upload)
 	if err != nil {
 		switch {
 		case errors.Is(err, multipart.ErrNotFound):
@@ -688,6 +704,14 @@ func (h *Handler) AbortMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	uploadID := r.URL.Query().Get("uploadId")
 	upload, parts, err := h.cfg.Multipart.Abort(uploadID, tenantID)
+	// DEK scrubbing for multipart sessions: see the matching
+	// defer in CompleteMultipartUpload above. Abort is the second
+	// terminal path that retires a multipart session from the
+	// store; once we own the *Upload pointer no other handler
+	// will read its DEKMaterial, so the raw key can be zeroed
+	// before the handler returns. Closes the gap noted in PR #74
+	// review (3299218688).
+	defer scrubUploadDEK(upload)
 	if err != nil {
 		switch {
 		case errors.Is(err, multipart.ErrNotFound):
@@ -858,6 +882,38 @@ func (h *Handler) deleteUploadedParts(ctx context.Context, parts []multipart.Par
 		if prov, ok := h.cfg.Providers[p.Backend]; ok {
 			_ = prov.DeletePiece(ctx, p.PieceID)
 		}
+	}
+}
+
+// scrubUploadDEK zeroes the raw DEK held on a multipart Upload
+// once the session has reached a terminal state
+// (CompleteMultipartUpload or AbortMultipartUpload). nil-safe so
+// callers can `defer scrubUploadDEK(upload)` immediately after
+// the store's Complete / Abort returns, before checking the
+// error — if the store returned ErrNotFound / ErrTenantMismatch
+// / ErrUploadMismatch the upload pointer is nil and this is a
+// no-op.
+//
+// Unlike single-piece encrypt where the raw DEK lives only
+// inside the function that generates it, multipart's
+// DEKMaterial is held in the multipart store across every
+// UploadPart call so each part can be sealed with the same key.
+// The store is in-memory today (multipart.MemoryStore) but the
+// schema (api/s3compat/multipart/schema.sql) documents
+// DEKMaterial as "in-memory only, never persisted" — only the
+// CMK-wrapped form lands in Postgres. That makes Complete and
+// Abort the right terminal points to clear the raw bytes: at
+// that moment no other handler will ever read DEKMaterial again
+// (the upload row is deleted), and the goroutine that holds the
+// last reference is about to return to the http.Server pool.
+//
+// Closes the gap noted in PR #74 review (3299218688).
+func scrubUploadDEK(upload *multipart.Upload) {
+	if upload == nil {
+		return
+	}
+	if len(upload.DEKMaterial) > 0 {
+		clear(upload.DEKMaterial)
 	}
 }
 
@@ -1251,6 +1307,16 @@ func (h *Handler) deriveConvergentEncryptionConfig(combinedDigest []byte, tenant
 	if err != nil {
 		return metadata.EncryptionConfig{}, fmt.Errorf("s3compat: derive convergent dek: %w", err)
 	}
+	// DEK scrubbing via defer: this function only needs the
+	// convergent DEK long enough to ask the Wrapper to envelope
+	// it; after WrapDEK returns the raw DEK is dead weight on the
+	// goroutine heap. Mirrors the defer-scrub pattern PR #74
+	// applied to encryptForStorage / streamEncryptForStorage /
+	// prepareDedupedPutPatternB / dedupManagedMultipartMiss. The
+	// convergent DEK is re-derivable from (combinedDigest,
+	// tenantID) so the scrub bounds in-memory exposure rather
+	// than providing forward secrecy.
+	defer clear(dek)
 	wrapped, err := h.cfg.Encryption.Wrapper.WrapDEK(dek, h.cfg.Encryption.CMK)
 	if err != nil {
 		return metadata.EncryptionConfig{}, fmt.Errorf("s3compat: wrap convergent dek: %w", err)

@@ -63,6 +63,33 @@ func gatewayEncryptOptions() client_sdk.Options {
 	return client_sdk.Options{}
 }
 
+// gatewayDecryptOptions returns the canonical client_sdk.Options
+// used by every gateway decrypt path: decryptFromStorage,
+// decryptWithDEK (single-piece + multipart consolidate),
+// streamDecryptFromStorage, and any future range-decrypt helper.
+//
+// The decrypt reader validates per-frame length against
+// chunkSize + AEAD overhead (see
+// encryption/client_sdk/sdk.go: decryptReader.nextFrame, where
+// maxCT := uint32(r.chunkSize + r.aead.Overhead())). If the
+// encrypt path is ever reconfigured to use a non-default
+// ChunkSize via gatewayEncryptOptions but the decrypt path still
+// reads from a raw client_sdk.Options{}, frames sealed by the
+// encrypt path would be rejected at read time with an
+// "oversized frame" error — a silent break that would only
+// surface in production GETs of newly-encrypted objects.
+//
+// Funnelling every decrypt callsite through this helper closes
+// the symmetric coupling noted in PR #74 review (3299218446).
+// Today the helper returns the same value as
+// gatewayEncryptOptions (both Options{}), so behaviour is
+// unchanged; the point is that any future change to encrypt-side
+// chunking forces an explicit, type-level decision about whether
+// the decrypt side must match.
+func gatewayDecryptOptions() client_sdk.Options {
+	return client_sdk.Options{}
+}
+
 // encryptForStorage seals plaintext with a freshly-generated DEK and
 // returns (ciphertext, wrapped DEK, error). The wrapped DEK is what
 // the caller stores on the manifest. The plaintext DEK is owned
@@ -211,6 +238,10 @@ func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionC
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: unwrap dek: %w", err)
 	}
+	// decryptWithDEK funnels through gatewayDecryptOptions; the
+	// raw Options{} previously used here is now routed through
+	// the helper so encrypt / decrypt option coupling stays
+	// explicit (see gatewayDecryptOptions docs, 3299218446).
 	plaintext, derr := h.decryptWithDEK(ciphertext, dek)
 	// DEK scrubbing on the read side mirrors the encrypt path:
 	// once decryptWithDEK has built its chacha20poly1305 AEAD (which
@@ -227,7 +258,7 @@ func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionC
 // unwrapped DEK. Used by the multipart GET path so parts that
 // share a key are decrypted without repeated unwraps.
 func (h *Handler) decryptWithDEK(ciphertext []byte, dek client_sdk.DataEncryptionKey) ([]byte, error) {
-	decReader, err := client_sdk.DecryptObject(bytes.NewReader(ciphertext), dek, client_sdk.Options{})
+	decReader, err := client_sdk.DecryptObject(bytes.NewReader(ciphertext), dek, gatewayDecryptOptions())
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: decrypt object: %w", err)
 	}
@@ -271,7 +302,7 @@ func (h *Handler) streamDecryptFromStorage(ciphertext io.Reader, enc metadata.En
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: unwrap dek: %w", err)
 	}
-	decReader, err := client_sdk.DecryptObject(ciphertext, dek, client_sdk.Options{})
+	decReader, err := client_sdk.DecryptObject(ciphertext, dek, gatewayDecryptOptions())
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: decrypt object: %w", err)
 	}
