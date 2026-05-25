@@ -37,6 +37,15 @@ func IsGatewayEncrypted(mode string) bool {
 // plaintext DEK is returned for callers (multipart) that need to
 // keep it in memory across a sequence of encrypt calls using the
 // same key.
+//
+// PUT-path callers should prefer streamEncryptForStorage when the
+// client supplied a Content-Length: the streaming reader pipes the
+// SDK's chunk-by-chunk output straight to the backend instead of
+// materialising the full ciphertext in memory. encryptForStorage
+// remains in use for the dedup path (which content-addresses the
+// ciphertext and therefore needs every byte to feed BLAKE3) and the
+// erasure-coded path (which always buffers because the EC encoder
+// shards a fully-formed byte slice).
 func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.WrappedDEK, client_sdk.DataEncryptionKey, error) {
 	if h.cfg.Encryption == nil {
 		return nil, client_sdk.WrappedDEK{}, nil, fmt.Errorf("s3compat: gateway encryption is not configured")
@@ -58,6 +67,45 @@ func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.Wrappe
 		return nil, client_sdk.WrappedDEK{}, nil, fmt.Errorf("s3compat: wrap dek: %w", err)
 	}
 	return ciphertext, wrapped, dek, nil
+}
+
+// streamEncryptForStorage is the streaming mirror of
+// encryptForStorage: it generates a fresh DEK, wraps it, and
+// returns the SDK's encrypt reader so the caller can io.Copy
+// ciphertext directly to the backend without ever buffering the
+// full plaintext or ciphertext in memory.
+//
+// The SDK's EncryptObject already streams chunk-by-chunk
+// (encryption/client_sdk/sdk.go: encryptReader.nextFrame), so the
+// gateway gains nothing from the buffered encryptForStorage's
+// io.ReadAll except a 2x memory spike per concurrent PUT. The
+// single-piece PUT path uses this helper when the client supplied
+// a Content-Length so the backend can be handed a known ciphertext
+// size; the buffered helper remains for the dedup path (which
+// content-addresses the ciphertext) and the EC path (which
+// requires the full plaintext in memory to shard).
+//
+// Encrypt errors surface on the first Read of the returned reader,
+// not on this function returning, so the caller MUST drain the
+// reader to EOF (or propagate any returned error) to learn whether
+// the stream was valid.
+func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, client_sdk.WrappedDEK, error) {
+	if h.cfg.Encryption == nil {
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: gateway encryption is not configured")
+	}
+	dek, err := client_sdk.GenerateDEK()
+	if err != nil {
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: generate dek: %w", err)
+	}
+	encReader, err := client_sdk.EncryptObject(plaintext, dek, client_sdk.Options{})
+	if err != nil {
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: encrypt object: %w", err)
+	}
+	wrapped, err := h.cfg.Encryption.Wrapper.WrapDEK(dek, h.cfg.Encryption.CMK)
+	if err != nil {
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: wrap dek: %w", err)
+	}
+	return encReader, wrapped, nil
 }
 
 // encryptWithDEK seals plaintext with an already-generated DEK. It
@@ -189,6 +237,38 @@ func (h *Handler) prepareSinglePieceEncryption(
 				"tenant policy requires managed encryption but no gateway encryption is configured", r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, 0, 0, false
 		}
+		// Streaming path: when the client supplied a Content-Length
+		// the SDK can stream chunk-by-chunk straight to the backend
+		// instead of materialising the full plaintext + ciphertext
+		// in memory. The pre-streaming code did two io.ReadAll
+		// passes (request body, then SDK reader) which doubled the
+		// gateway heap per concurrent PUT and capped any single PUT
+		// at MaxInMemoryObjectBytes.
+		if r.ContentLength >= 0 {
+			plaintextSize := r.ContentLength
+			encReader, wrapped, err := h.streamEncryptForStorage(r.Body)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
+				return metadata.EncryptionConfig{}, nil, 0, 0, false
+			}
+			cfg := metadata.EncryptionConfig{
+				Mode:          encMode,
+				Algorithm:     client_sdk.ContentAlgorithm,
+				KeyID:         wrapped.KeyID,
+				WrappedDEK:    wrapped.WrappedKey,
+				WrapAlgorithm: wrapped.WrapAlgorithm,
+			}
+			ciphertextSize := client_sdk.EncryptedSize(plaintextSize, client_sdk.Options{})
+			return cfg, encReader, ciphertextSize, plaintextSize, true
+		}
+		// Fallback buffered path: chunked or unknown-length
+		// uploads (Content-Length: -1) cannot be streamed because
+		// the backend wants a known ContentLength. Read the body,
+		// encrypt, then explicitly zero the plaintext slice as a
+		// defence-in-depth measure — the buffer is held by the
+		// goroutine handling the request until GC reclaims it, and
+		// without scrubbing a heap dump or paged-out memory could
+		// reveal cleartext after the encryption completes.
 		plaintext, err := io.ReadAll(r.Body)
 		if err != nil {
 			writeBodyReadError(w, r, err)
@@ -199,6 +279,12 @@ func (h *Handler) prepareSinglePieceEncryption(
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, 0, 0, false
 		}
+		plaintextSize := int64(len(plaintext))
+		// Plaintext scrubbing: zero the buffer now that the SDK
+		// has consumed it. Tracking the slice header is enough
+		// because Go's escape analysis keeps the underlying array
+		// alive only via this reference inside the handler.
+		clear(plaintext)
 		cfg := metadata.EncryptionConfig{
 			Mode:          encMode,
 			Algorithm:     client_sdk.ContentAlgorithm,
@@ -206,7 +292,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 			WrappedDEK:    wrapped.WrappedKey,
 			WrapAlgorithm: wrapped.WrapAlgorithm,
 		}
-		return cfg, bytes.NewReader(ciphertext), int64(len(ciphertext)), int64(len(plaintext)), true
+		return cfg, bytes.NewReader(ciphertext), int64(len(ciphertext)), plaintextSize, true
 
 	case string(encryption.StrictZK):
 		algo := r.Header.Get("X-Amz-Meta-Zk-Encryption")
@@ -259,6 +345,15 @@ func (h *Handler) prepareErasureCodedEncryption(
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, false
 		}
+		// Plaintext scrubbing: zero the caller's buffer once the
+		// SDK has emitted ciphertext. The EC path is the only
+		// caller and it still needs `plaintext` for its return
+		// metadata in the StrictZK / legacy branches below, but in
+		// the managed branch we own the buffer and the caller
+		// never reads it again. Defence-in-depth: a heap dump or
+		// paged-out memory taken between encrypt and GC could
+		// otherwise reveal cleartext.
+		clear(plaintext)
 		return metadata.EncryptionConfig{
 			Mode:          encMode,
 			Algorithm:     client_sdk.ContentAlgorithm,

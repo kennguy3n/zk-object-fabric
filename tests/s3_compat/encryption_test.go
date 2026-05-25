@@ -1237,6 +1237,113 @@ func TestManagedEncryption_StreamingGet_ClientDisconnectDoesNotFalsifyIntegrity(
 // stream chain (cache lookup → TeeReader → DecryptObject → response)
 // is safe across goroutines and does not share buffers.
 // ---------------------------------------------------------------
+// ---------------------------------------------------------------
+// Test 18: Streaming PUT — a large managed-mode upload round-trips
+// without buffering the full plaintext or ciphertext in the
+// gateway. The legacy buffered PUT did two io.ReadAll passes (one
+// for the body, one for the SDK reader) which capped concurrent
+// uploads at MaxInMemoryObjectBytes per request and forced a 2x
+// memory spike per concurrent PUT. The streaming path lifts both
+// limits; this test pins end-to-end correctness so a future
+// refactor that breaks the wiring (e.g. forgetting to feed the
+// SDK reader to the backend) is caught immediately.
+//
+// 32 MiB picked to exercise multiple SDK chunk frames (default
+// chunk is 16 MiB → 3 frames including the partial trailing
+// chunk) while keeping the test fast on CI.
+// ---------------------------------------------------------------
+func TestManagedEncryption_StreamingPut_LargeObject(t *testing.T) {
+	s := newEncryptionServer(t, encryptionPlacement{
+		backend:        "local_fs_dev",
+		encryptionMode: "managed",
+	}, nil)
+
+	plaintext := make([]byte, 32*1024*1024)
+	if _, err := rand.Read(plaintext); err != nil {
+		t.Fatalf("rand plaintext: %v", err)
+	}
+	key := "stream-put-big.bin"
+	if _, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(plaintext),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	got, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	if got.ContentLength == nil || *got.ContentLength != int64(len(plaintext)) {
+		t.Fatalf("GetObject Content-Length = %v, want %d", got.ContentLength, len(plaintext))
+	}
+	body, err := io.ReadAll(got.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	got.Body.Close()
+	if !bytes.Equal(body, plaintext) {
+		t.Fatalf("streaming PUT round-trip mismatch: len got=%d want=%d", len(body), len(plaintext))
+	}
+
+	// Confirm the streaming PUT actually wrote ciphertext to the
+	// backend (not the plaintext or some empty placeholder). The
+	// SDK emits at least one frame for a 32 MiB plaintext, so
+	// every piece file must be non-empty AND must not contain a
+	// 64-byte slice of the plaintext anywhere (a random 32 MiB
+	// buffer has a vanishing chance of any 64-byte run reoccurring
+	// in the ciphertext).
+	pieces := s.readAllPieces(t)
+	if len(pieces) == 0 {
+		t.Fatal("streaming PUT wrote no backend pieces; the SDK reader was likely never drained")
+	}
+	probe := plaintext[1024:1088]
+	for name, piece := range pieces {
+		if len(piece) == 0 {
+			t.Fatalf("piece %s is empty; streaming PUT did not deliver ciphertext to the backend", name)
+		}
+		if bytes.Contains(piece, probe) {
+			t.Fatalf("piece %s contains a 64-byte plaintext run; streaming PUT bypassed encryption", name)
+		}
+	}
+
+	// Manifest must reflect plaintext size for ObjectSize and the
+	// freshly-wrapped DEK; the streaming path uses
+	// EncryptedSize() to advertise ciphertext length to the
+	// backend, but the manifest is plaintext-oriented (the
+	// GET path unseals before returning to clients).
+	m := s.firstManifest(t, s.bucket, key)
+	if m.Encryption.Mode != "managed" {
+		t.Fatalf("manifest Encryption.Mode = %q, want managed", m.Encryption.Mode)
+	}
+	if m.Encryption.Algorithm != client_sdk.ContentAlgorithm {
+		t.Fatalf("manifest Encryption.Algorithm = %q, want %q", m.Encryption.Algorithm, client_sdk.ContentAlgorithm)
+	}
+	if m.ObjectSize != int64(len(plaintext)) {
+		t.Fatalf("manifest ObjectSize = %d, want %d (plaintext size)", m.ObjectSize, len(plaintext))
+	}
+	if len(m.Encryption.WrappedDEK) == 0 {
+		t.Fatal("manifest Encryption.WrappedDEK is empty; streaming PUT did not record the wrapped DEK")
+	}
+	// EncryptedSize is exposed by the SDK so the gateway can
+	// hand the backend a known ContentLength without buffering
+	// the ciphertext. The encoded piece bytes on disk must match
+	// the SDK's prediction.
+	wantCT := client_sdk.EncryptedSize(int64(len(plaintext)), client_sdk.Options{})
+	totalCT := int64(0)
+	for _, piece := range pieces {
+		totalCT += int64(len(piece))
+	}
+	if totalCT != wantCT {
+		t.Fatalf("backend ciphertext bytes = %d; EncryptedSize predicted %d (plaintext=%d). The gateway is either advertising the wrong Content-Length or the SDK's frame format drifted from EncryptedSize.",
+			totalCT, wantCT, len(plaintext))
+	}
+}
+
 func TestManagedEncryption_StreamingGet_Concurrent(t *testing.T) {
 	s := newEncryptionServer(t, encryptionPlacement{
 		backend:        "local_fs_dev",

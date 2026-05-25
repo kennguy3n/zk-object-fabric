@@ -195,6 +195,18 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: read ciphertext: %w", err)
 	}
+	// Capture plaintext size before scrubbing so the dedupResult
+	// still reports the original payload length to the caller's
+	// manifest write.
+	plaintextSize := int64(len(plaintext))
+	// Plaintext scrubbing: zero the caller's buffer once the SDK
+	// has emitted ciphertext. Pattern B is the only branch that
+	// must keep plaintext in memory long enough to hash it
+	// (BLAKE3 over plaintext drives the convergent DEK), but the
+	// buffer is no longer needed after EncryptObject consumes it.
+	// Defence-in-depth: a heap dump or paged-out memory taken
+	// between encrypt and GC could otherwise reveal cleartext.
+	clear(plaintext)
 	wrapped, err := h.cfg.Encryption.Wrapper.WrapDEK(dek, h.cfg.Encryption.CMK)
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: wrap dek: %w", err)
@@ -228,7 +240,7 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 			Existing:      existing,
 			ContentHash:   contentHash,
 			PlaintextHash: plaintextHashFmt,
-			PlaintextSize: int64(len(plaintext)),
+			PlaintextSize: plaintextSize,
 			Encryption:    encCfg,
 		}, nil
 	}
@@ -237,7 +249,7 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 		ContentHash:     contentHash,
 		PlaintextHash:   plaintextHashFmt,
 		CiphertextBytes: ciphertext,
-		PlaintextSize:   int64(len(plaintext)),
+		PlaintextSize:   plaintextSize,
 		Encryption:      encCfg,
 	}, nil
 }

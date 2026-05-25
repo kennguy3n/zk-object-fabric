@@ -580,6 +580,128 @@ func TestWarnProductionLocalCMK_LogsWhenProduction(t *testing.T) {
 	}
 }
 
+// TestCheckProductionManifestEncryption_NonProduction: in dev /
+// staging the manifest-body-encryption guard must not fire even
+// when the key path is empty.
+func TestCheckProductionManifestEncryption_NonProduction(t *testing.T) {
+	for _, env := range []string{"development", "", "staging"} {
+		if err := checkProductionManifestEncryption(env, ""); err != nil {
+			t.Errorf("checkProductionManifestEncryption(%q, \"\") = %v; want nil", env, err)
+		}
+	}
+}
+
+// TestCheckProductionManifestEncryption_ProductionWithKey: in
+// production with manifest_body_key_path configured the guard
+// must not fire (manifest JSON will be sealed at the BodyEncryptor
+// layer before it lands in Postgres).
+func TestCheckProductionManifestEncryption_ProductionWithKey(t *testing.T) {
+	if err := checkProductionManifestEncryption("production", "/etc/zkof/manifest-body.key"); err != nil {
+		t.Errorf("checkProductionManifestEncryption(production, key) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionManifestEncryption_ProductionFails verifies
+// the error path: production with no manifest_body_key_path must
+// return errProductionManifestEncryptionRequired so the startup
+// wrapper can refuse to boot rather than persisting manifests as
+// plaintext JSONB.
+func TestCheckProductionManifestEncryption_ProductionFails(t *testing.T) {
+	err := checkProductionManifestEncryption("production", "")
+	if err == nil {
+		t.Fatalf("checkProductionManifestEncryption(production, \"\") = nil; want errProductionManifestEncryptionRequired")
+	}
+	if !errors.Is(err, errProductionManifestEncryptionRequired) {
+		t.Fatalf("checkProductionManifestEncryption returned %v; want errors.Is(_, errProductionManifestEncryptionRequired)", err)
+	}
+	if !strings.Contains(err.Error(), "no manifest_body_key_path is configured") {
+		t.Errorf("error message = %q; want to mention 'no manifest_body_key_path is configured'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "plaintext JSONB") {
+		t.Errorf("error message = %q; want to mention 'plaintext JSONB' so the operator knows the at-rest impact", err.Error())
+	}
+}
+
+// TestCheckProductionLocalCMK pins the four-case truth table the
+// task spec lays out for the production local-file CMK guard:
+//
+//  1. Production + local CMK + AllowLocalCMK=false → error
+//  2. Production + local CMK + AllowLocalCMK=true  → nil (warning only)
+//  3. Production + KMS / vault CMK                  → nil
+//  4. Development + local CMK                       → nil
+//
+// Cases 3 and 4 cover the branches where the guard is intentionally
+// quiet so a real KMS deployment or a development loopback never
+// trips on an irrelevant safety net.
+func TestCheckProductionLocalCMK(t *testing.T) {
+	cases := []struct {
+		name          string
+		env           string
+		allowLocalCMK bool
+		uri           string
+		holder        string
+		wantErr       bool
+	}{
+		{"production + local CMK + AllowLocalCMK=false → error",
+			"production", false, "cmk://local/path/to/key.json", "gateway_hsm", true},
+		{"production + empty uri local + AllowLocalCMK=false → error",
+			"production", false, "", "gateway_hsm", true},
+		{"production + local CMK + AllowLocalCMK=true → nil (warning only)",
+			"production", true, "cmk://local/path/to/key.json", "gateway_hsm", false},
+		{"production + KMS CMK → nil",
+			"production", false, "arn:aws:kms:us-west-2:1234:key/abc", "aws_kms", false},
+		{"production + Vault transit CMK → nil",
+			"production", false, "vault://transit/k", "vault_transit", false},
+		{"development + local CMK → nil",
+			"development", false, "cmk://local/path/to/key.json", "gateway_hsm", false},
+		{"staging + local CMK → nil",
+			"staging", false, "cmk://local/path/to/key.json", "gateway_hsm", false},
+		{"empty env + local CMK → nil",
+			"", false, "cmk://local/path/to/key.json", "gateway_hsm", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkProductionLocalCMK(tc.env, tc.allowLocalCMK, tc.uri, tc.holder)
+			gotErr := err != nil
+			if gotErr != tc.wantErr {
+				t.Fatalf("checkProductionLocalCMK(env=%q, allow=%v, uri=%q, holder=%q) = %v; want err=%v",
+					tc.env, tc.allowLocalCMK, tc.uri, tc.holder, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if !errors.Is(err, errProductionLocalCMK) {
+					t.Fatalf("returned %v; want errors.Is(_, errProductionLocalCMK)", err)
+				}
+				if !strings.Contains(err.Error(), "--allow-local-cmk") {
+					t.Errorf("error %q must mention --allow-local-cmk so operators see the escape hatch", err.Error())
+				}
+				if !strings.Contains(err.Error(), "allow_local_cmk") {
+					t.Errorf("error %q must mention encryption.allow_local_cmk so operators see the config-file equivalent", err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestWarnProductionLocalCMK_MessagesOverrideOnly asserts that
+// the post-refactor warning message references the operator-facing
+// override flag. Without the mention, an operator who sees the
+// warning in production logs has no way to find the knob that
+// triggered it (and the original "this is NOT recommended" message
+// has been removed because it's no longer fatal-by-default — the
+// warning ONLY fires when the operator explicitly opted in via
+// AllowLocalCMK).
+func TestWarnProductionLocalCMK_MessagesOverrideOnly(t *testing.T) {
+	out := captureLog(t, func() {
+		warnProductionLocalCMK("production", "cmk://local/k", "gateway_hsm")
+	})
+	if !strings.Contains(out, "SECURITY: using local file CMK") {
+		t.Errorf("warn log %q must keep the SECURITY prefix so it survives existing log filters", out)
+	}
+	if !strings.Contains(out, "--allow-local-cmk") && !strings.Contains(out, "allow_local_cmk") {
+		t.Errorf("warn log %q must reference the override knob so operators understand why the warning is informational rather than fatal", out)
+	}
+}
+
 // TestDefaultCacheWarmingBudget_ConfigMatchesHandlerFallback
 // structurally pins the two independent definitions of the
 // production cache-warming budget default to the same value.

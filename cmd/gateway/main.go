@@ -71,6 +71,15 @@ import (
 func main() {
 	cfgPath := flag.String("config", "", "path to JSON config file (optional)")
 	tenantsPath := flag.String("tenants", "", "path to JSON tenant bindings (optional)")
+	// allowLocalCMK is the CLI override for
+	// EncryptionConfig.AllowLocalCMK. The default is the
+	// zero value (false) so the flag's mere presence (when
+	// the operator passes `--allow-local-cmk`) flips the
+	// gateway out of fail-closed mode for the local-file CMK
+	// wrapper. The CLI flag wins over the JSON config when
+	// both are set so operators can flip the behaviour at
+	// run-time without rewriting their config file.
+	allowLocalCMK := flag.Bool("allow-local-cmk", false, "permit env=production with cmk://local/... — escape hatch for HSM-fuse deployments where the local file path maps to hardware-backed key material; do NOT set this against a plaintext key file (overrides encryption.allow_local_cmk)")
 	flag.Parse()
 
 	cfg := config.Default()
@@ -80,6 +89,10 @@ func main() {
 			log.Fatalf("gateway: load config: %v", err)
 		}
 		cfg = loaded
+	}
+	// CLI flag wins over JSON config when both are set.
+	if *allowLocalCMK {
+		cfg.Encryption.AllowLocalCMK = true
 	}
 
 	// Open exactly one *sql.DB for the metadata DSN and share it
@@ -130,6 +143,15 @@ func main() {
 	// tenant store can leave an effectively-unauthenticated
 	// production handler in place.
 	enforceProductionAuth(cfg.Env, metadataDB, tenantStore)
+	// Production safety net: refuse to start when env=production
+	// and the Postgres manifest body encryption key is not
+	// configured. Without this, manifest JSON (object keys, piece
+	// locators, sizes, wrapped DEKs) is persisted as plaintext
+	// JSONB and any operator or attacker with Postgres read
+	// access can enumerate tenant content. See
+	// metadata/manifest_store/postgres BodyEncryptor for the
+	// per-row sealing logic this guard refuses to skip.
+	enforceProductionManifestEncryption(cfg.Env, cfg.Encryption.ManifestBodyKeyPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -205,7 +227,7 @@ func main() {
 
 	gatewayEnc := buildGatewayEncryption(cfg.Encryption)
 	if gatewayEnc != nil {
-		warnProductionLocalCMK(cfg.Env, gatewayEnc.CMK.URI, gatewayEnc.CMK.HolderClass)
+		enforceProductionLocalCMK(cfg.Env, cfg.Encryption.AllowLocalCMK, gatewayEnc.CMK.URI, gatewayEnc.CMK.HolderClass)
 	}
 	multipartStore, multipartCloser := buildMultipartStore(metadataDB, gatewayEnc, registry)
 	if multipartCloser != nil {
@@ -492,6 +514,52 @@ func enforceProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.Tena
 	}
 }
 
+// errProductionManifestEncryptionRequired is returned by
+// checkProductionManifestEncryption when the gateway is started
+// with env=production and the BodyEncryptor for the Postgres
+// manifest store has not been configured (manifest_body_key_path
+// is empty). Exposed as a sentinel so cmd/gateway can log a
+// friendly message and main_test.go can errors.Is against it.
+var errProductionManifestEncryptionRequired = errors.New("gateway: env=production but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development")
+
+// checkProductionManifestEncryption refuses to start the gateway
+// when cfg.Env == "production" and the Postgres manifest store
+// would persist manifest bodies as unencrypted JSONB. Without a
+// BodyEncryptor key the manifest table leaks object keys, piece
+// locators, sizes, and the wrapped DEK to anyone with Postgres
+// read access — the exact threat model the Phase 2 manifest body
+// encryption was added to defend against (see
+// metadata/manifest_store/postgres BodyEncryptor and
+// docs/PROPOSAL.md §3.7).
+//
+// Returns a sentinel error rather than calling log.Fatalf so
+// tests can exercise both branches without subprocess re-exec
+// gymnastics; the production-startup wrapper
+// enforceProductionManifestEncryption handles the fatal
+// transition.
+func checkProductionManifestEncryption(env string, manifestBodyKeyPath string) error {
+	if env != "production" {
+		return nil
+	}
+	if manifestBodyKeyPath != "" {
+		return nil
+	}
+	return errProductionManifestEncryptionRequired
+}
+
+// enforceProductionManifestEncryption wraps
+// checkProductionManifestEncryption at the startup callsite. A
+// non-nil error is fatal (the gateway must not boot in production
+// without manifest body encryption, otherwise tenant manifests
+// are stored as plaintext JSONB in Postgres). Tests should call
+// checkProductionManifestEncryption directly so they can errors.Is
+// against the sentinel.
+func enforceProductionManifestEncryption(env string, manifestBodyKeyPath string) {
+	if err := checkProductionManifestEncryption(env, manifestBodyKeyPath); err != nil {
+		log.Fatalf("SECURITY: env=production but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development.")
+	}
+}
+
 // checkAllTLSConfigs validates the TLS config for every listener
 // the gateway can start (gateway data-plane, console, health) and
 // returns the first non-nil validation error. The returned error
@@ -536,12 +604,50 @@ func validateAllTLSConfigs(cfg config.Config) {
 	}
 }
 
-// warnProductionLocalCMK emits a critical warning when the gateway
-// is started in production with the local-file CMK wrapper. The
-// warning is not fatal — some deployments intentionally back the
-// "local file" with a fuse-mounted HSM partition where the file
-// path is the only stable handle — but it surfaces the misconfig
-// loudly in case the path is a plain unencrypted file on disk.
+// errProductionLocalCMK is returned by checkProductionLocalCMK
+// when the gateway is started with env=production and the local
+// file CMK wrapper is in use without the explicit AllowLocalCMK
+// escape hatch. A plaintext CMK on the gateway disk trivially
+// defeats the encryption envelope (anyone with disk access can
+// unwrap every tenant DEK), so the default behaviour is
+// fail-closed. Exposed as a sentinel so tests can errors.Is
+// against it.
+var errProductionLocalCMK = errors.New("gateway: env=production but the local file CMK wrapper is in use; this exposes every tenant DEK to anyone with gateway disk access. Use AWS KMS (kms://) or HashiCorp Vault Transit (vault://). For HSM-fuse deployments where the local file path maps to hardware-backed key material, set --allow-local-cmk or encryption.allow_local_cmk=true to override this guard")
+
+// checkProductionLocalCMK returns an error when the gateway is
+// started with env=production using the local-file CMK wrapper
+// and AllowLocalCMK is not set. In every other configuration
+// (non-production, AWS KMS, Vault transit, or local-file with
+// an explicit operator opt-in) the function returns nil.
+//
+// Returns a sentinel error rather than calling log.Fatalf so
+// tests can exercise both branches without subprocess re-exec
+// gymnastics; the production-startup wrapper
+// enforceProductionLocalCMK handles the fatal transition.
+func checkProductionLocalCMK(env string, allowLocalCMK bool, cmkURI, holderClass string) error {
+	if env != "production" {
+		return nil
+	}
+	if !isLocalFileCMK(cmkURI, holderClass) {
+		return nil
+	}
+	if allowLocalCMK {
+		return nil
+	}
+	return errProductionLocalCMK
+}
+
+// warnProductionLocalCMK emits a critical warning when the
+// gateway is started in production with the local-file CMK
+// wrapper AND the operator has set AllowLocalCMK to opt out of
+// the fail-closed default. The log message exists so the misconfig
+// shows up loudly in startup logs even when the override is
+// intentional — an operator who flips the flag on for an HSM-fuse
+// deployment still wants the gateway to remind them why they did
+// it during every restart.
+//
+// When env != production OR the CMK is not the local-file wrapper
+// the function is a no-op.
 func warnProductionLocalCMK(env string, cmkURI, holderClass string) {
 	if env != "production" {
 		return
@@ -549,7 +655,22 @@ func warnProductionLocalCMK(env string, cmkURI, holderClass string) {
 	if !isLocalFileCMK(cmkURI, holderClass) {
 		return
 	}
-	log.Printf("SECURITY: using local file CMK in production (uri=%s holder=%s); this is NOT recommended for production deployments — back the master key with AWS KMS (kms://) or HashiCorp Vault Transit (vault://) instead", cmkURI, holderClass)
+	log.Printf("SECURITY: using local file CMK in production (uri=%s holder=%s) under --allow-local-cmk / encryption.allow_local_cmk override; this is only safe if the path maps to hardware-backed key material (HSM-fuse, TPM). A plaintext CMK file on the gateway disk defeats the encryption envelope.", cmkURI, holderClass)
+}
+
+// enforceProductionLocalCMK wraps checkProductionLocalCMK at the
+// startup callsite: a non-nil error is fatal (the gateway must
+// not boot in production with a plaintext local-file CMK unless
+// the operator has explicitly opted in). When the operator has
+// flipped AllowLocalCMK on, the function downgrades to a logged
+// warning via warnProductionLocalCMK so the misconfig still
+// surfaces in startup logs for HSM-fuse deployments where the
+// override is intentional.
+func enforceProductionLocalCMK(env string, allowLocalCMK bool, cmkURI, holderClass string) {
+	if err := checkProductionLocalCMK(env, allowLocalCMK, cmkURI, holderClass); err != nil {
+		log.Fatalf("%s", err)
+	}
+	warnProductionLocalCMK(env, cmkURI, holderClass)
 }
 
 // isLocalFileCMK reports whether the resolved wrapper is the

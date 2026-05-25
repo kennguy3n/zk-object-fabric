@@ -215,6 +215,35 @@ func deriveConvergentNonce(dek DataEncryptionKey, chunkIndex uint64, nonceSize i
 // compute frame boundaries without a separate manifest.
 const chunkHeaderSize = chacha20poly1305.NonceSizeX + 4
 
+// chunkTrailerSize is the per-frame AEAD tag overhead appended by
+// Seal. Together with chunkHeaderSize it is the deterministic
+// per-frame on-disk cost the gateway uses to compute ciphertext
+// length from plaintext length (see EncryptedSize).
+const chunkTrailerSize = 16
+
+// EncryptedSize returns the exact ciphertext byte count that
+// EncryptObject would emit for a plaintext of plaintextLen bytes
+// sealed under the given Options. It is the inverse of decryptReader's
+// frame walk: numChunks * (header + tag) + plaintextLen, where
+// numChunks is ceil(plaintextLen / chunkSize) for non-empty input
+// and 0 for empty input (no frame is emitted for a zero-length
+// plaintext, matching encryptReader.nextFrame's EOF short-circuit).
+//
+// The gateway PUT path uses this to compute opts.ContentLength
+// for backends that require a known length before the streaming
+// SDK reader has produced any bytes. plaintextLen MUST be >= 0;
+// negative inputs return 0 because the gateway falls back to the
+// buffered (non-streaming) path when the client did not supply a
+// Content-Length.
+func EncryptedSize(plaintextLen int64, opts Options) int64 {
+	if plaintextLen <= 0 {
+		return 0
+	}
+	chunk := int64(opts.chunkSize())
+	numChunks := (plaintextLen + chunk - 1) / chunk
+	return plaintextLen + numChunks*int64(chunkHeaderSize+chunkTrailerSize)
+}
+
 // encryptReader streams ciphertext chunks on demand.
 type encryptReader struct {
 	src        io.Reader
@@ -281,6 +310,12 @@ func (r *encryptReader) nextFrame() error {
 	aad := chunkAADBytes(r.chunkAAD, r.chunkIndex)
 	r.chunkIndex++
 	sealed := r.aead.Seal(nil, nonce, buf[:n], aad)
+	// Defence-in-depth plaintext scrubbing: zero the chunk
+	// buffer once the AEAD has consumed it. A heap dump or
+	// paged-out memory taken between Seal and GC would
+	// otherwise reveal cleartext for one chunk per concurrent
+	// encrypt stream.
+	clear(buf[:n])
 
 	var hdr [chunkHeaderSize]byte
 	copy(hdr[:nonceSize], nonce)

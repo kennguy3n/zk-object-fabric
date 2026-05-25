@@ -383,3 +383,72 @@ func TestChunkAADBytes_CanonicalFormat(t *testing.T) {
 		t.Errorf("chunkAADBytes([]) = %v, want nil", emptyAAD)
 	}
 }
+
+// TestEncryptedSize_MatchesActualOutput pins EncryptedSize's
+// prediction against the bytes that EncryptObject actually emits.
+// The gateway PUT path advertises EncryptedSize to the backend as
+// the ciphertext Content-Length before the SDK reader has produced
+// any bytes — if the prediction drifts from reality, every
+// streaming PUT writes an over- or under-sized object and the
+// backend either truncates the body or hangs waiting for bytes
+// that never come. This test makes the equality structural.
+func TestEncryptedSize_MatchesActualOutput(t *testing.T) {
+	dek, err := GenerateDEK()
+	if err != nil {
+		t.Fatalf("GenerateDEK: %v", err)
+	}
+	cases := []struct {
+		name      string
+		size      int
+		chunkSize int
+	}{
+		{"empty", 0, 0},
+		{"smaller-than-chunk", 1024, 0},
+		{"exact-chunk-default", DefaultChunkSize, 0},
+		{"one-byte-over-chunk", DefaultChunkSize + 1, 0},
+		{"two-chunks-default", 2 * DefaultChunkSize, 0},
+		{"odd-tail-default", 3*DefaultChunkSize + 17, 0},
+		{"small-chunk-multi", 4096, 1024},
+		{"small-chunk-odd-tail", 3333, 1024},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plaintext := make([]byte, tc.size)
+			if tc.size > 0 {
+				if _, err := rand.Read(plaintext); err != nil {
+					t.Fatalf("rand: %v", err)
+				}
+			}
+			opts := Options{ChunkSize: tc.chunkSize}
+			encR, err := EncryptObject(bytes.NewReader(plaintext), dek, opts)
+			if err != nil {
+				t.Fatalf("EncryptObject: %v", err)
+			}
+			ct, err := io.ReadAll(encR)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			want := int64(len(ct))
+			got := EncryptedSize(int64(len(plaintext)), opts)
+			if got != want {
+				t.Fatalf("EncryptedSize(plain=%d, chunk=%d) = %d; actual ciphertext = %d",
+					len(plaintext), opts.chunkSize(), got, want)
+			}
+		})
+	}
+}
+
+// TestEncryptedSize_NegativeIsZero pins the contract that
+// EncryptedSize returns 0 for negative inputs. The gateway falls
+// back to the buffered (non-streaming) PUT path when the client
+// did not supply a Content-Length (r.ContentLength == -1), and
+// callers must never advertise a negative ciphertext length to
+// the backend.
+func TestEncryptedSize_NegativeIsZero(t *testing.T) {
+	if got := EncryptedSize(-1, Options{}); got != 0 {
+		t.Errorf("EncryptedSize(-1) = %d; want 0", got)
+	}
+	if got := EncryptedSize(-1024, Options{ChunkSize: 1024}); got != 0 {
+		t.Errorf("EncryptedSize(-1024) = %d; want 0", got)
+	}
+}
