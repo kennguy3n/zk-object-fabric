@@ -185,6 +185,22 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: derive convergent dek: %w", err)
 	}
+	// DEK scrubbing via defer: zero the raw convergent DEK on
+	// every return path (success and error). Pre-fix the scrub
+	// only ran on the success path, so an intermediate
+	// EncryptObject / io.ReadAll / WrapDEK failure would leave
+	// the raw key bytes in the goroutine's heap until GC. Move
+	// the scrub to a defer so the defence-in-depth window is
+	// symmetric across all error paths, closing the gap noted in
+	// PR #74 review (3299180089). Note: the convergent DEK is
+	// deterministically re-derivable from (plaintextHash,
+	// tenantID), so this scrub bounds the in-memory exposure
+	// rather than providing forward secrecy. EncryptObject
+	// copies the DEK into the encryptReader for convergent-nonce
+	// derivation (see encryption/client_sdk/sdk.go:
+	// EncryptObject), so clearing the caller's backing array is
+	// safe.
+	defer clear(dek)
 	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, client_sdk.Options{
 		ConvergentNonce: true,
 	})
@@ -195,6 +211,18 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: read ciphertext: %w", err)
 	}
+	// Capture plaintext size before scrubbing so the dedupResult
+	// still reports the original payload length to the caller's
+	// manifest write.
+	plaintextSize := int64(len(plaintext))
+	// Plaintext scrubbing: zero the caller's buffer once the SDK
+	// has emitted ciphertext. Pattern B is the only branch that
+	// must keep plaintext in memory long enough to hash it
+	// (BLAKE3 over plaintext drives the convergent DEK), but the
+	// buffer is no longer needed after EncryptObject consumes it.
+	// Defence-in-depth: a heap dump or paged-out memory taken
+	// between encrypt and GC could otherwise reveal cleartext.
+	clear(plaintext)
 	wrapped, err := h.cfg.Encryption.Wrapper.WrapDEK(dek, h.cfg.Encryption.CMK)
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: wrap dek: %w", err)
@@ -228,7 +256,7 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 			Existing:      existing,
 			ContentHash:   contentHash,
 			PlaintextHash: plaintextHashFmt,
-			PlaintextSize: int64(len(plaintext)),
+			PlaintextSize: plaintextSize,
 			Encryption:    encCfg,
 		}, nil
 	}
@@ -237,7 +265,7 @@ func (h *Handler) prepareDedupedPutPatternB(ctx context.Context, tenantID, encMo
 		ContentHash:     contentHash,
 		PlaintextHash:   plaintextHashFmt,
 		CiphertextBytes: ciphertext,
-		PlaintextSize:   int64(len(plaintext)),
+		PlaintextSize:   plaintextSize,
 		Encryption:      encCfg,
 	}, nil
 }

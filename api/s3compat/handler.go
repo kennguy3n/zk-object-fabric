@@ -627,7 +627,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encCfg, body, contentLength, plaintextSize, ok := h.prepareSinglePieceEncryption(w, r, encMode)
+	encCfg, body, contentLength, plaintextSizeFn, ok := h.prepareSinglePieceEncryption(w, r, encMode)
 	if !ok {
 		return
 	}
@@ -654,6 +654,34 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	blake3Hash := "blake3:" + hex.EncodeToString(blake3Hasher.Sum(nil))
+
+	// Resolve actual plaintext size NOW that the encrypt stream
+	// has been drained by PutPiece. For the streaming PUT path
+	// this is the byteCountingReader's final count (ground truth);
+	// for the buffered path it is len(plaintext) captured at
+	// io.ReadAll time. The closure pattern lets the helper
+	// expose ground truth uniformly regardless of which path
+	// produced the body. See prepareSinglePieceEncryption docs.
+	plaintextSize := plaintextSizeFn()
+
+	// Post-flight Content-Length validation: when the client
+	// declared a Content-Length up-front, the gateway advertised
+	// EncryptedSize(plaintextSize, …) to the backend on the basis
+	// of that claim. If the client lied (sent fewer bytes), we
+	// would otherwise persist a manifest whose ObjectSize does
+	// not match the bytes actually stored. Roll back the backend
+	// piece and reject so the client sees an explicit error
+	// instead of a silently corrupted manifest. Only enforced
+	// when the request had a known Content-Length AND the
+	// encryption mode pulls ObjectSize from plaintextSize (the
+	// gateway-encrypted modes); for StrictZK and legacy the
+	// gateway does not own the plaintext invariant.
+	if IsGatewayEncrypted(encMode) && r.ContentLength >= 0 && plaintextSize != r.ContentLength {
+		_ = provider.DeletePiece(r.Context(), pieceID)
+		writeError(w, http.StatusBadRequest, "IncompleteBody",
+			"Content-Length declared by client does not match plaintext bytes received", r.URL.Path)
+		return
+	}
 
 	// ObjectSize must reflect what the client will read back, not
 	// the bytes we actually wrote to the backend. For managed /

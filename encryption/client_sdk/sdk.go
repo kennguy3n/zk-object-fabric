@@ -51,6 +51,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
@@ -215,6 +217,109 @@ func deriveConvergentNonce(dek DataEncryptionKey, chunkIndex uint64, nonceSize i
 // compute frame boundaries without a separate manifest.
 const chunkHeaderSize = chacha20poly1305.NonceSizeX + 4
 
+// chunkTrailerSize is the per-frame AEAD tag overhead appended by
+// Seal. Together with chunkHeaderSize it is the deterministic
+// per-frame on-disk cost the gateway uses to compute ciphertext
+// length from plaintext length (see EncryptedSize).
+//
+// Bound to chacha20poly1305.Overhead (the Poly1305 authentication
+// tag length) at compile time so any future swap of the AEAD
+// algorithm in EncryptObject/DecryptObject cannot silently produce
+// a wrong EncryptedSize prediction — the constant follows the
+// actual AEAD's tag size in lockstep instead of being hand-rolled
+// against a documented number.
+const chunkTrailerSize = chacha20poly1305.Overhead
+
+// ErrEncryptedSizeOverflow is returned by EncryptedSize when the
+// predicted ciphertext size would overflow int64. The gateway PUT
+// path must reject the request before calling Read on the encrypt
+// reader — advertising a wrapped or zero ContentLength to the
+// backend would either silently truncate the upload or cause the
+// backend to drop the header and accept an arbitrary stream
+// length. errors.Is(err, ErrEncryptedSizeOverflow) lets callers
+// distinguish overflow from other input-validation failures.
+//
+// The sentinel exists so callers do NOT have to disambiguate the
+// pre-refactor `EncryptedSize(...) == 0` overload (legitimate
+// empty input vs overflow): empty input now returns (0, nil) and
+// overflow returns (0, ErrEncryptedSizeOverflow).
+var ErrEncryptedSizeOverflow = errors.New("client_sdk: ciphertext size overflows int64")
+
+// ErrEncryptedSizeNegativePlaintext is returned by EncryptedSize
+// for a negative plaintextLen. Negative lengths come from
+// adversarial or malformed Content-Length headers; the gateway
+// streaming PUT path is the only caller that ever passes
+// untrusted plaintextLen values, and it should reject the request
+// outright rather than silently fall back to "0".
+var ErrEncryptedSizeNegativePlaintext = errors.New("client_sdk: negative plaintext length")
+
+// ErrEncryptedSizeInvalidChunkSize is returned by EncryptedSize
+// when Options.chunkSize() is non-positive. Should be unreachable
+// in practice because Options.chunkSize() floors to
+// DefaultChunkSize, but defending the contract makes future
+// changes to Options safe.
+var ErrEncryptedSizeInvalidChunkSize = errors.New("client_sdk: non-positive chunk size")
+
+// EncryptedSize returns the exact ciphertext byte count that
+// EncryptObject would emit for a plaintext of plaintextLen bytes
+// sealed under the given Options. It is the inverse of decryptReader's
+// frame walk: numChunks * (header + tag) + plaintextLen, where
+// numChunks is ceil(plaintextLen / chunkSize) for non-empty input
+// and 0 for empty input (no frame is emitted for a zero-length
+// plaintext, matching encryptReader.nextFrame's EOF short-circuit).
+//
+// The gateway PUT path uses this to compute opts.ContentLength
+// for backends that require a known length before the streaming
+// SDK reader has produced any bytes.
+//
+// Error semantics:
+//   - plaintextLen == 0  → (0, nil). Empty objects are legitimate;
+//     no frame is emitted by EncryptObject.
+//   - plaintextLen < 0   → (0, ErrEncryptedSizeNegativePlaintext).
+//   - chunkSize <= 0     → (0, ErrEncryptedSizeInvalidChunkSize).
+//   - overflow (the int64 ciphertext-size computation wraps for
+//     a hostile Content-Length like math.MaxInt64) →
+//     (0, ErrEncryptedSizeOverflow).
+//
+// Callers MUST check err != nil and reject the request before
+// reading the encrypt stream. Pre-refactor the function returned
+// a single int64 and used 0 as both "empty input" and "overflow"
+// sentinel, which was a foot-gun for any future caller that
+// forgot to add a plaintextLen > 0 disambiguation guard. The
+// typed return forces every callsite to acknowledge the failure
+// mode at the type level.
+func EncryptedSize(plaintextLen int64, opts Options) (int64, error) {
+	if plaintextLen < 0 {
+		return 0, ErrEncryptedSizeNegativePlaintext
+	}
+	if plaintextLen == 0 {
+		return 0, nil
+	}
+	chunk := int64(opts.chunkSize())
+	if chunk <= 0 {
+		return 0, ErrEncryptedSizeInvalidChunkSize
+	}
+	// numChunks = ceil(plaintextLen / chunk). Compute via
+	// math/bits.Add64 so a near-MaxInt64 plaintextLen does not wrap
+	// in the (plaintextLen + chunk - 1) intermediate.
+	numeratorLo, carry := bits.Add64(uint64(plaintextLen), uint64(chunk-1), 0)
+	if carry != 0 || numeratorLo > math.MaxInt64 {
+		return 0, ErrEncryptedSizeOverflow
+	}
+	numChunks := int64(numeratorLo) / chunk
+	// overhead = numChunks * (chunkHeaderSize + chunkTrailerSize).
+	overheadHi, overheadLo := bits.Mul64(uint64(numChunks), uint64(chunkHeaderSize+chunkTrailerSize))
+	if overheadHi != 0 || overheadLo > math.MaxInt64 {
+		return 0, ErrEncryptedSizeOverflow
+	}
+	// total = plaintextLen + overhead.
+	total, carry := bits.Add64(uint64(plaintextLen), overheadLo, 0)
+	if carry != 0 || total > math.MaxInt64 {
+		return 0, ErrEncryptedSizeOverflow
+	}
+	return int64(total), nil
+}
+
 // encryptReader streams ciphertext chunks on demand.
 type encryptReader struct {
 	src        io.Reader
@@ -281,6 +386,12 @@ func (r *encryptReader) nextFrame() error {
 	aad := chunkAADBytes(r.chunkAAD, r.chunkIndex)
 	r.chunkIndex++
 	sealed := r.aead.Seal(nil, nonce, buf[:n], aad)
+	// Defence-in-depth plaintext scrubbing: zero the chunk
+	// buffer once the AEAD has consumed it. A heap dump or
+	// paged-out memory taken between Seal and GC would
+	// otherwise reveal cleartext for one chunk per concurrent
+	// encrypt stream.
+	clear(buf[:n])
 
 	var hdr [chunkHeaderSize]byte
 	copy(hdr[:nonceSize], nonce)

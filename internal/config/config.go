@@ -247,6 +247,25 @@ type EncryptionConfig struct {
 	CMKURI              string `json:"cmk_uri"`
 	ManifestBodyKeyPath string `json:"manifest_body_key_path"`
 
+	// AllowLocalCMK downgrades the production safety check on
+	// the local-file CMK wrapper from a fatal startup error to
+	// a logged warning. The default (false) is fail-closed:
+	// shipping env=production with cmk://local/... refuses to
+	// boot, because a plaintext CMK on the gateway disk
+	// trivially defeats the encryption envelope (an operator
+	// with disk access can unwrap every tenant DEK).
+	//
+	// Set true ONLY for HSM-fuse deployments where cmk://local/
+	// is the stable path to a hardware-backed key partition
+	// (TPM, PKCS#11 module mapped via fuse, etc.) and the
+	// underlying bytes are not actually readable as plaintext.
+	// Equivalent CLI flag: --allow-local-cmk. There is no
+	// substitute for getting this right: misconfigured to true
+	// against a real plaintext key file, the gateway will run
+	// in production with the encryption envelope effectively
+	// disabled.
+	AllowLocalCMK bool `json:"allow_local_cmk"`
+
 	// KMSRegion configures the AWS region the KMS client connects
 	// to when CMKURI selects an AWS KMS wrapper. When empty the
 	// client honours the AWS_REGION environment variable.

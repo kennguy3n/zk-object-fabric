@@ -580,6 +580,253 @@ func TestWarnProductionLocalCMK_LogsWhenProduction(t *testing.T) {
 	}
 }
 
+// TestCheckProductionManifestEncryption_NonProduction: in dev /
+// staging the manifest-body-encryption guard must not fire even
+// when the Postgres manifest store is active and the key path is
+// empty. The guard is gated on env=production specifically because
+// non-production environments may legitimately run with an empty
+// key path while iterating on the BodyEncryptor wiring.
+func TestCheckProductionManifestEncryption_NonProduction(t *testing.T) {
+	for _, env := range []string{"development", "", "staging"} {
+		if err := checkProductionManifestEncryption(env, true, ""); err != nil {
+			t.Errorf("checkProductionManifestEncryption(%q, true, \"\") = %v; want nil", env, err)
+		}
+	}
+}
+
+// TestCheckProductionManifestEncryption_ProductionWithKey: in
+// production with the Postgres manifest store AND
+// manifest_body_key_path configured the guard must not fire
+// (manifest JSON will be sealed at the BodyEncryptor layer before
+// it lands in Postgres).
+func TestCheckProductionManifestEncryption_ProductionWithKey(t *testing.T) {
+	if err := checkProductionManifestEncryption("production", true, "/etc/zkof/manifest-body.key"); err != nil {
+		t.Errorf("checkProductionManifestEncryption(production, true, key) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionManifestEncryption_ProductionMemoryStore: in
+// production with the in-memory manifest store selected (no
+// metadataDB), the guard must not fire even when the key path is
+// empty. There is no Postgres table to leak manifest JSON from, so
+// requiring a body encryption key would be vacuously strict. The
+// process-lifetime memory store is in any case blocked earlier by
+// enforceProductionAuth, which insists on a metadata DSN or static
+// tenant bindings before allowing production startup.
+func TestCheckProductionManifestEncryption_ProductionMemoryStore(t *testing.T) {
+	if err := checkProductionManifestEncryption("production", false, ""); err != nil {
+		t.Errorf("checkProductionManifestEncryption(production, false, \"\") = %v; want nil (memory store has no Postgres to encrypt)", err)
+	}
+}
+
+// TestCheckProductionManifestEncryption_ProductionFails verifies
+// the error path: production with the Postgres manifest store but
+// no manifest_body_key_path must return
+// errProductionManifestEncryptionRequired so the startup wrapper
+// can refuse to boot rather than persisting manifests as plaintext
+// JSONB.
+func TestCheckProductionManifestEncryption_ProductionFails(t *testing.T) {
+	err := checkProductionManifestEncryption("production", true, "")
+	if err == nil {
+		t.Fatalf("checkProductionManifestEncryption(production, true, \"\") = nil; want errProductionManifestEncryptionRequired")
+	}
+	if !errors.Is(err, errProductionManifestEncryptionRequired) {
+		t.Fatalf("checkProductionManifestEncryption returned %v; want errors.Is(_, errProductionManifestEncryptionRequired)", err)
+	}
+	if !strings.Contains(err.Error(), "no manifest_body_key_path is configured") {
+		t.Errorf("error message = %q; want to mention 'no manifest_body_key_path is configured'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "plaintext JSONB") {
+		t.Errorf("error message = %q; want to mention 'plaintext JSONB' so the operator knows the at-rest impact", err.Error())
+	}
+	if !strings.Contains(err.Error(), "Postgres manifest store") {
+		t.Errorf("error message = %q; want to mention 'Postgres manifest store' so operators know which backend triggered the guard", err.Error())
+	}
+}
+
+// TestCheckProductionLocalCMK pins the four-case truth table the
+// task spec lays out for the production local-file CMK guard:
+//
+//  1. Production + local CMK + AllowLocalCMK=false → error
+//  2. Production + local CMK + AllowLocalCMK=true  → nil (warning only)
+//  3. Production + KMS / vault CMK                  → nil
+//  4. Development + local CMK                       → nil
+//
+// Cases 3 and 4 cover the branches where the guard is intentionally
+// quiet so a real KMS deployment or a development loopback never
+// trips on an irrelevant safety net.
+func TestCheckProductionLocalCMK(t *testing.T) {
+	cases := []struct {
+		name          string
+		env           string
+		allowLocalCMK bool
+		uri           string
+		holder        string
+		wantErr       bool
+	}{
+		{"production + local CMK + AllowLocalCMK=false → error",
+			"production", false, "cmk://local/path/to/key.json", "gateway_hsm", true},
+		{"production + empty uri local + AllowLocalCMK=false → error",
+			"production", false, "", "gateway_hsm", true},
+		{"production + local CMK + AllowLocalCMK=true → nil (warning only)",
+			"production", true, "cmk://local/path/to/key.json", "gateway_hsm", false},
+		{"production + KMS CMK → nil",
+			"production", false, "arn:aws:kms:us-west-2:1234:key/abc", "aws_kms", false},
+		{"production + Vault transit CMK → nil",
+			"production", false, "vault://transit/k", "vault_transit", false},
+		{"development + local CMK → nil",
+			"development", false, "cmk://local/path/to/key.json", "gateway_hsm", false},
+		{"staging + local CMK → nil",
+			"staging", false, "cmk://local/path/to/key.json", "gateway_hsm", false},
+		{"empty env + local CMK → nil",
+			"", false, "cmk://local/path/to/key.json", "gateway_hsm", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkProductionLocalCMK(tc.env, tc.allowLocalCMK, tc.uri, tc.holder)
+			gotErr := err != nil
+			if gotErr != tc.wantErr {
+				t.Fatalf("checkProductionLocalCMK(env=%q, allow=%v, uri=%q, holder=%q) = %v; want err=%v",
+					tc.env, tc.allowLocalCMK, tc.uri, tc.holder, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				if !errors.Is(err, errProductionLocalCMK) {
+					t.Fatalf("returned %v; want errors.Is(_, errProductionLocalCMK)", err)
+				}
+				if !strings.Contains(err.Error(), "--allow-local-cmk") {
+					t.Errorf("error %q must mention --allow-local-cmk so operators see the escape hatch", err.Error())
+				}
+				if !strings.Contains(err.Error(), "allow_local_cmk") {
+					t.Errorf("error %q must mention encryption.allow_local_cmk so operators see the config-file equivalent", err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestWarnProductionLocalCMK_MessagesOverrideOnly asserts that
+// the post-refactor warning message references the operator-facing
+// override flag. Without the mention, an operator who sees the
+// warning in production logs has no way to find the knob that
+// triggered it (and the original "this is NOT recommended" message
+// has been removed because it's no longer fatal-by-default — the
+// warning ONLY fires when the operator explicitly opted in via
+// AllowLocalCMK).
+func TestWarnProductionLocalCMK_MessagesOverrideOnly(t *testing.T) {
+	out := captureLog(t, func() {
+		warnProductionLocalCMK("production", "cmk://local/k", "gateway_hsm")
+	})
+	if !strings.Contains(out, "SECURITY: using local file CMK") {
+		t.Errorf("warn log %q must keep the SECURITY prefix so it survives existing log filters", out)
+	}
+	if !strings.Contains(out, "--allow-local-cmk") && !strings.Contains(out, "allow_local_cmk") {
+		t.Errorf("warn log %q must reference the override knob so operators understand why the warning is informational rather than fatal", out)
+	}
+}
+
+// TestEnforceProductionLocalCMK_OnlyWarnsOnExplicitOverride pins
+// the behaviour of enforceProductionLocalCMK across the four
+// (env, isLocalFileCMK, allowLocalCMK) combinations that matter:
+//
+//  1. production + local-file CMK + AllowLocalCMK=true:
+//     checkProductionLocalCMK returns nil (allow override),
+//     enforce must surface a single SECURITY warning so the
+//     operator override is auditable in startup logs.
+//  2. production + local-file CMK + AllowLocalCMK=false: NOT
+//     covered here because checkProductionLocalCMK returns an
+//     error and enforce calls log.Fatalf, terminating the test
+//     binary. The error branch is exercised by
+//     TestCheckProductionLocalCMK above.
+//  3. production + KMS CMK (any AllowLocalCMK): no warning, no
+//     fatal — the CMK is HSM-backed and the override flag is a
+//     no-op.
+//  4. development + local-file CMK (any AllowLocalCMK): no
+//     warning, no fatal — dev environments are out of scope for
+//     the production guard.
+//
+// Pre-fix enforceProductionLocalCMK called warnProductionLocalCMK
+// unconditionally on the success path. warnProductionLocalCMK
+// itself returned early for cases (3) and (4), so the observable
+// behaviour was identical — but the guard belonged on the
+// caller, not in the warning helper. The refactor moves the
+// is-this-the-override-case check into enforce so the warning
+// helper is now a pure "log the message" function and the gating
+// logic lives where the override decision is made. This test
+// pins the post-refactor gating so a future contributor who
+// re-inlines the unconditional call (or who flips the AllowLocalCMK
+// check sense) trips the assertion.
+func TestEnforceProductionLocalCMK_OnlyWarnsOnExplicitOverride(t *testing.T) {
+	cases := []struct {
+		name           string
+		env            string
+		allowLocalCMK  bool
+		cmkURI         string
+		holderClass    string
+		wantWarn       bool
+	}{
+		{
+			name:          "production_localCMK_override_warns",
+			env:           "production",
+			allowLocalCMK: true,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      true,
+		},
+		{
+			name:          "production_KMS_no_warn",
+			env:           "production",
+			allowLocalCMK: false,
+			cmkURI:        "kms://aws/abc",
+			holderClass:   "aws_kms",
+			wantWarn:      false,
+		},
+		{
+			name:          "production_KMS_with_override_no_warn",
+			env:           "production",
+			allowLocalCMK: true,
+			cmkURI:        "kms://aws/abc",
+			holderClass:   "aws_kms",
+			wantWarn:      false,
+		},
+		{
+			name:          "development_localCMK_no_warn",
+			env:           "development",
+			allowLocalCMK: false,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      false,
+		},
+		{
+			name:          "development_localCMK_override_no_warn",
+			env:           "development",
+			allowLocalCMK: true,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      false,
+		},
+		{
+			name:          "staging_localCMK_no_warn",
+			env:           "staging",
+			allowLocalCMK: false,
+			cmkURI:        "cmk://local/k",
+			holderClass:   "gateway_hsm",
+			wantWarn:      false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureLog(t, func() {
+				enforceProductionLocalCMK(tc.env, tc.allowLocalCMK, tc.cmkURI, tc.holderClass)
+			})
+			got := strings.Contains(out, "SECURITY: using local file CMK")
+			if got != tc.wantWarn {
+				t.Fatalf("enforceProductionLocalCMK(%q, %v, %q, %q) warning fired = %v, want %v (log=%q)",
+					tc.env, tc.allowLocalCMK, tc.cmkURI, tc.holderClass, got, tc.wantWarn, out)
+			}
+		})
+	}
+}
+
 // TestDefaultCacheWarmingBudget_ConfigMatchesHandlerFallback
 // structurally pins the two independent definitions of the
 // production cache-warming budget default to the same value.
