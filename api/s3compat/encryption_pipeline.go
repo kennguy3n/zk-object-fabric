@@ -32,41 +32,53 @@ func IsGatewayEncrypted(mode string) bool {
 }
 
 // encryptForStorage seals plaintext with a freshly-generated DEK and
-// returns (ciphertext, wrapped DEK, plaintext DEK, error). The
-// wrapped DEK is what the caller stores on the manifest; the
-// plaintext DEK is returned for callers (multipart) that need to
-// keep it in memory across a sequence of encrypt calls using the
-// same key.
+// returns (ciphertext, wrapped DEK, error). The wrapped DEK is what
+// the caller stores on the manifest. The plaintext DEK is owned
+// entirely by this function and is scrubbed before return as
+// defence-in-depth against heap-dump / paged-out-memory exposure of
+// raw key material; multipart-style callers that need a stable DEK
+// across a sequence of encrypt calls must use encryptWithDEK with a
+// caller-managed DEK instead.
 //
 // PUT-path callers should prefer streamEncryptForStorage when the
 // client supplied a Content-Length: the streaming reader pipes the
 // SDK's chunk-by-chunk output straight to the backend instead of
 // materialising the full ciphertext in memory. encryptForStorage
-// remains in use for the dedup path (which content-addresses the
-// ciphertext and therefore needs every byte to feed BLAKE3) and the
-// erasure-coded path (which always buffers because the EC encoder
-// shards a fully-formed byte slice).
-func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.WrappedDEK, client_sdk.DataEncryptionKey, error) {
+// remains in use for the erasure-coded path (which always buffers
+// because the EC encoder shards a fully-formed byte slice) and the
+// chunked / unknown-length single-piece fallback.
+func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.WrappedDEK, error) {
 	if h.cfg.Encryption == nil {
-		return nil, client_sdk.WrappedDEK{}, nil, fmt.Errorf("s3compat: gateway encryption is not configured")
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: gateway encryption is not configured")
 	}
 	dek, err := client_sdk.GenerateDEK()
 	if err != nil {
-		return nil, client_sdk.WrappedDEK{}, nil, fmt.Errorf("s3compat: generate dek: %w", err)
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: generate dek: %w", err)
 	}
 	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, client_sdk.Options{})
 	if err != nil {
-		return nil, client_sdk.WrappedDEK{}, nil, fmt.Errorf("s3compat: encrypt object: %w", err)
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: encrypt object: %w", err)
 	}
 	ciphertext, err := io.ReadAll(encReader)
 	if err != nil {
-		return nil, client_sdk.WrappedDEK{}, nil, fmt.Errorf("s3compat: read ciphertext: %w", err)
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: read ciphertext: %w", err)
 	}
 	wrapped, err := h.cfg.Encryption.Wrapper.WrapDEK(dek, h.cfg.Encryption.CMK)
 	if err != nil {
-		return nil, client_sdk.WrappedDEK{}, nil, fmt.Errorf("s3compat: wrap dek: %w", err)
+		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: wrap dek: %w", err)
 	}
-	return ciphertext, wrapped, dek, nil
+	// DEK scrubbing: zero the raw DEK now that both EncryptObject
+	// (which holds an independent AEAD key schedule in chacha20poly1305)
+	// and WrapDEK (which has produced the wrapped form recorded on
+	// the manifest) have consumed it. The SDK's EncryptObject
+	// always copies the DEK into the encryptReader before returning
+	// (see encryption/client_sdk/sdk.go: EncryptObject), so the
+	// caller's backing array is safe to clear in both random-nonce
+	// and convergent-nonce modes without corrupting the in-flight
+	// stream. Mirrors the plaintext scrubbing pattern applied at
+	// the call sites; closes the gap noted in PR #74 review.
+	clear(dek)
+	return ciphertext, wrapped, nil
 }
 
 // streamEncryptForStorage is the streaming mirror of
@@ -105,6 +117,15 @@ func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, clien
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: wrap dek: %w", err)
 	}
+	// DEK scrubbing: zero the raw DEK now that EncryptObject's AEAD
+	// has stashed an independent chacha20poly1305 key schedule and
+	// WrapDEK has produced the manifest-bound wrapped form. The
+	// SDK's EncryptObject always copies the DEK into the
+	// encryptReader before returning, so clearing the caller's
+	// backing array does not corrupt the in-flight stream. Mirrors
+	// the plaintext scrubbing pattern already in place at the call
+	// sites; closes the gap noted in PR #74 review.
+	clear(dek)
 	return encReader, wrapped, nil
 }
 
@@ -274,7 +295,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 			writeBodyReadError(w, r, err)
 			return metadata.EncryptionConfig{}, nil, 0, 0, false
 		}
-		ciphertext, wrapped, _, err := h.encryptForStorage(plaintext)
+		ciphertext, wrapped, err := h.encryptForStorage(plaintext)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, 0, 0, false
@@ -340,7 +361,7 @@ func (h *Handler) prepareErasureCodedEncryption(
 				"tenant policy requires managed encryption but no gateway encryption is configured", r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, false
 		}
-		ciphertext, wrapped, _, err := h.encryptForStorage(plaintext)
+		ciphertext, wrapped, err := h.encryptForStorage(plaintext)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, false

@@ -582,34 +582,53 @@ func TestWarnProductionLocalCMK_LogsWhenProduction(t *testing.T) {
 
 // TestCheckProductionManifestEncryption_NonProduction: in dev /
 // staging the manifest-body-encryption guard must not fire even
-// when the key path is empty.
+// when the Postgres manifest store is active and the key path is
+// empty. The guard is gated on env=production specifically because
+// non-production environments may legitimately run with an empty
+// key path while iterating on the BodyEncryptor wiring.
 func TestCheckProductionManifestEncryption_NonProduction(t *testing.T) {
 	for _, env := range []string{"development", "", "staging"} {
-		if err := checkProductionManifestEncryption(env, ""); err != nil {
-			t.Errorf("checkProductionManifestEncryption(%q, \"\") = %v; want nil", env, err)
+		if err := checkProductionManifestEncryption(env, true, ""); err != nil {
+			t.Errorf("checkProductionManifestEncryption(%q, true, \"\") = %v; want nil", env, err)
 		}
 	}
 }
 
 // TestCheckProductionManifestEncryption_ProductionWithKey: in
-// production with manifest_body_key_path configured the guard
-// must not fire (manifest JSON will be sealed at the BodyEncryptor
-// layer before it lands in Postgres).
+// production with the Postgres manifest store AND
+// manifest_body_key_path configured the guard must not fire
+// (manifest JSON will be sealed at the BodyEncryptor layer before
+// it lands in Postgres).
 func TestCheckProductionManifestEncryption_ProductionWithKey(t *testing.T) {
-	if err := checkProductionManifestEncryption("production", "/etc/zkof/manifest-body.key"); err != nil {
-		t.Errorf("checkProductionManifestEncryption(production, key) = %v; want nil", err)
+	if err := checkProductionManifestEncryption("production", true, "/etc/zkof/manifest-body.key"); err != nil {
+		t.Errorf("checkProductionManifestEncryption(production, true, key) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionManifestEncryption_ProductionMemoryStore: in
+// production with the in-memory manifest store selected (no
+// metadataDB), the guard must not fire even when the key path is
+// empty. There is no Postgres table to leak manifest JSON from, so
+// requiring a body encryption key would be vacuously strict. The
+// process-lifetime memory store is in any case blocked earlier by
+// enforceProductionAuth, which insists on a metadata DSN or static
+// tenant bindings before allowing production startup.
+func TestCheckProductionManifestEncryption_ProductionMemoryStore(t *testing.T) {
+	if err := checkProductionManifestEncryption("production", false, ""); err != nil {
+		t.Errorf("checkProductionManifestEncryption(production, false, \"\") = %v; want nil (memory store has no Postgres to encrypt)", err)
 	}
 }
 
 // TestCheckProductionManifestEncryption_ProductionFails verifies
-// the error path: production with no manifest_body_key_path must
-// return errProductionManifestEncryptionRequired so the startup
-// wrapper can refuse to boot rather than persisting manifests as
-// plaintext JSONB.
+// the error path: production with the Postgres manifest store but
+// no manifest_body_key_path must return
+// errProductionManifestEncryptionRequired so the startup wrapper
+// can refuse to boot rather than persisting manifests as plaintext
+// JSONB.
 func TestCheckProductionManifestEncryption_ProductionFails(t *testing.T) {
-	err := checkProductionManifestEncryption("production", "")
+	err := checkProductionManifestEncryption("production", true, "")
 	if err == nil {
-		t.Fatalf("checkProductionManifestEncryption(production, \"\") = nil; want errProductionManifestEncryptionRequired")
+		t.Fatalf("checkProductionManifestEncryption(production, true, \"\") = nil; want errProductionManifestEncryptionRequired")
 	}
 	if !errors.Is(err, errProductionManifestEncryptionRequired) {
 		t.Fatalf("checkProductionManifestEncryption returned %v; want errors.Is(_, errProductionManifestEncryptionRequired)", err)
@@ -619,6 +638,9 @@ func TestCheckProductionManifestEncryption_ProductionFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "plaintext JSONB") {
 		t.Errorf("error message = %q; want to mention 'plaintext JSONB' so the operator knows the at-rest impact", err.Error())
+	}
+	if !strings.Contains(err.Error(), "Postgres manifest store") {
+		t.Errorf("error message = %q; want to mention 'Postgres manifest store' so operators know which backend triggered the guard", err.Error())
 	}
 }
 

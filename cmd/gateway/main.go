@@ -143,15 +143,23 @@ func main() {
 	// tenant store can leave an effectively-unauthenticated
 	// production handler in place.
 	enforceProductionAuth(cfg.Env, metadataDB, tenantStore)
-	// Production safety net: refuse to start when env=production
-	// and the Postgres manifest body encryption key is not
-	// configured. Without this, manifest JSON (object keys, piece
-	// locators, sizes, wrapped DEKs) is persisted as plaintext
-	// JSONB and any operator or attacker with Postgres read
-	// access can enumerate tenant content. See
-	// metadata/manifest_store/postgres BodyEncryptor for the
-	// per-row sealing logic this guard refuses to skip.
-	enforceProductionManifestEncryption(cfg.Env, cfg.Encryption.ManifestBodyKeyPath)
+	// Production safety net: refuse to start when env=production,
+	// the gateway is wired with the Postgres manifest store, and
+	// the BodyEncryptor key is not configured. Without this,
+	// manifest JSON (object keys, piece locators, sizes, wrapped
+	// DEKs) is persisted as plaintext JSONB and any operator or
+	// attacker with Postgres read access can enumerate tenant
+	// content. See metadata/manifest_store/postgres BodyEncryptor
+	// for the per-row sealing logic this guard refuses to skip.
+	//
+	// The Postgres-backed store is selected when metadataDB != nil
+	// (see buildManifestStore). The in-memory dev store has no
+	// persistent backing table to leak, so the guard skips that
+	// branch — if env=production also implies the memory store,
+	// enforceProductionAuth above will already have failed because
+	// the in-memory tenant store cannot satisfy production auth
+	// without static --tenants bindings.
+	enforceProductionManifestEncryption(cfg.Env, metadataDB != nil, cfg.Encryption.ManifestBodyKeyPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -516,11 +524,12 @@ func enforceProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.Tena
 
 // errProductionManifestEncryptionRequired is returned by
 // checkProductionManifestEncryption when the gateway is started
-// with env=production and the BodyEncryptor for the Postgres
-// manifest store has not been configured (manifest_body_key_path
-// is empty). Exposed as a sentinel so cmd/gateway can log a
-// friendly message and main_test.go can errors.Is against it.
-var errProductionManifestEncryptionRequired = errors.New("gateway: env=production but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development")
+// with env=production, the Postgres manifest store is selected,
+// and the BodyEncryptor for that store has not been configured
+// (manifest_body_key_path is empty). Exposed as a sentinel so
+// cmd/gateway can log a friendly message and main_test.go can
+// errors.Is against it.
+var errProductionManifestEncryptionRequired = errors.New("gateway: env=production with Postgres manifest store but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development")
 
 // checkProductionManifestEncryption refuses to start the gateway
 // when cfg.Env == "production" and the Postgres manifest store
@@ -532,13 +541,24 @@ var errProductionManifestEncryptionRequired = errors.New("gateway: env=productio
 // metadata/manifest_store/postgres BodyEncryptor and
 // docs/PROPOSAL.md §3.7).
 //
+// The check is conditional on the Postgres manifest store being
+// active: the in-memory dev store has no persistent backing
+// table, so a manifest body key would be ineffectual there. This
+// matches the threat model precisely — the guard fires when the
+// gateway is about to write tenant data to a long-lived table
+// that survives the process lifetime, never when the process is
+// the only authority on the manifests.
+//
 // Returns a sentinel error rather than calling log.Fatalf so
 // tests can exercise both branches without subprocess re-exec
 // gymnastics; the production-startup wrapper
 // enforceProductionManifestEncryption handles the fatal
 // transition.
-func checkProductionManifestEncryption(env string, manifestBodyKeyPath string) error {
+func checkProductionManifestEncryption(env string, manifestStoreUsesPostgres bool, manifestBodyKeyPath string) error {
 	if env != "production" {
+		return nil
+	}
+	if !manifestStoreUsesPostgres {
 		return nil
 	}
 	if manifestBodyKeyPath != "" {
@@ -554,9 +574,9 @@ func checkProductionManifestEncryption(env string, manifestBodyKeyPath string) e
 // are stored as plaintext JSONB in Postgres). Tests should call
 // checkProductionManifestEncryption directly so they can errors.Is
 // against the sentinel.
-func enforceProductionManifestEncryption(env string, manifestBodyKeyPath string) {
-	if err := checkProductionManifestEncryption(env, manifestBodyKeyPath); err != nil {
-		log.Fatalf("SECURITY: env=production but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development.")
+func enforceProductionManifestEncryption(env string, manifestStoreUsesPostgres bool, manifestBodyKeyPath string) {
+	if err := checkProductionManifestEncryption(env, manifestStoreUsesPostgres, manifestBodyKeyPath); err != nil {
+		log.Fatalf("SECURITY: env=production with Postgres manifest store but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development.")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -450,5 +451,86 @@ func TestEncryptedSize_NegativeIsZero(t *testing.T) {
 	}
 	if got := EncryptedSize(-1024, Options{ChunkSize: 1024}); got != 0 {
 		t.Errorf("EncryptedSize(-1024) = %d; want 0", got)
+	}
+}
+
+// TestEncryptedSize_OverflowReturnsZero pins the contract that
+// EncryptedSize refuses to wrap int64 on a hostile / nonsensical
+// plaintextLen. A malicious client could send
+// "Content-Length: 9223372036854775807" to drive the streaming PUT
+// path through EncryptedSize; without overflow guards the
+// (plaintextLen + chunk - 1) intermediate would wrap to a negative
+// numerator, the numChunks * overhead multiplication would silently
+// wrap again, and the gateway would advertise a negative
+// ContentLength to the backend (or worse: a small positive number
+// that lets the request begin a stream the backend cannot complete).
+//
+// The guard turns every overflow into a zero return; the caller
+// MUST treat zero on a positive plaintextLen as a hard rejection,
+// not a silent zero-byte upload.
+func TestEncryptedSize_OverflowReturnsZero(t *testing.T) {
+	cases := []struct {
+		name        string
+		plaintext   int64
+		opts        Options
+		description string
+	}{
+		{
+			name:        "MaxInt64-default-chunk",
+			plaintext:   math.MaxInt64,
+			opts:        Options{},
+			description: "ceil(MaxInt64 / DefaultChunkSize) * overhead exceeds remaining int64 headroom",
+		},
+		{
+			name:        "MaxInt64-tiny-chunk",
+			plaintext:   math.MaxInt64,
+			opts:        Options{ChunkSize: 1},
+			description: "1-byte chunks: per-chunk overhead is (24+4+16)x plaintext, numChunks * overhead wraps in bits.Mul64",
+		},
+		{
+			name:        "MaxInt64-minus-1-tiny-chunk",
+			plaintext:   math.MaxInt64 - 1,
+			opts:        Options{ChunkSize: 1},
+			description: "boundary: even a single byte short of MaxInt64 overflows when chunk=1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := EncryptedSize(tc.plaintext, tc.opts)
+			if got != 0 {
+				t.Errorf("EncryptedSize(%d, chunk=%d) = %d; want 0 (overflow guard)\n%s",
+					tc.plaintext, tc.opts.chunkSize(), got, tc.description)
+			}
+		})
+	}
+}
+
+// TestEncryptedSize_LargeButSafeReturnsExact confirms the overflow
+// guards do not over-eagerly reject inputs that fit cleanly. A 1 GiB
+// upload is representative of the upper end of the streaming PUT
+// path's real workload and must produce a deterministic, non-zero
+// prediction.
+func TestEncryptedSize_LargeButSafeReturnsExact(t *testing.T) {
+	const oneGiB = int64(1 << 30)
+	got := EncryptedSize(oneGiB, Options{})
+	if got <= 0 {
+		t.Fatalf("EncryptedSize(1 GiB, default) = %d; want positive (1 GiB is well within int64 with default chunk)", got)
+	}
+	// numChunks = ceil(1 GiB / 16 MiB) = 64; overhead = 64 * 44 = 2816.
+	want := oneGiB + 64*int64(chunkHeaderSize+chunkTrailerSize)
+	if got != want {
+		t.Errorf("EncryptedSize(1 GiB, default) = %d; want %d (1 GiB + 64 frames * (header+tag))", got, want)
+	}
+}
+
+// TestChunkTrailerSize_TracksAEADOverhead is a compile-time guard
+// against a future contributor swapping the AEAD in EncryptObject
+// without updating the constant chunkTrailerSize. Bound to
+// chacha20poly1305.Overhead in the SDK so the prediction stays in
+// lockstep with the actual on-disk tag length.
+func TestChunkTrailerSize_TracksAEADOverhead(t *testing.T) {
+	if chunkTrailerSize != chacha20poly1305.Overhead {
+		t.Fatalf("chunkTrailerSize = %d; want chacha20poly1305.Overhead (= %d)",
+			chunkTrailerSize, chacha20poly1305.Overhead)
 	}
 }

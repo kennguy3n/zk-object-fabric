@@ -51,6 +51,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
@@ -219,7 +221,14 @@ const chunkHeaderSize = chacha20poly1305.NonceSizeX + 4
 // Seal. Together with chunkHeaderSize it is the deterministic
 // per-frame on-disk cost the gateway uses to compute ciphertext
 // length from plaintext length (see EncryptedSize).
-const chunkTrailerSize = 16
+//
+// Bound to chacha20poly1305.Overhead (the Poly1305 authentication
+// tag length) at compile time so any future swap of the AEAD
+// algorithm in EncryptObject/DecryptObject cannot silently produce
+// a wrong EncryptedSize prediction — the constant follows the
+// actual AEAD's tag size in lockstep instead of being hand-rolled
+// against a documented number.
+const chunkTrailerSize = chacha20poly1305.Overhead
 
 // EncryptedSize returns the exact ciphertext byte count that
 // EncryptObject would emit for a plaintext of plaintextLen bytes
@@ -235,13 +244,42 @@ const chunkTrailerSize = 16
 // negative inputs return 0 because the gateway falls back to the
 // buffered (non-streaming) path when the client did not supply a
 // Content-Length.
+//
+// EncryptedSize returns 0 for any plaintextLen that would cause
+// int64 overflow when computing the ciphertext size — this guards
+// the gateway PUT path against a hostile Content-Length header
+// (e.g. Content-Length: 9223372036854775807) producing a negative
+// or wrapped ContentLength advertised to the backend. Callers MUST
+// treat a zero return on a positive plaintextLen as a fatal input
+// validation failure and reject the request before calling Read on
+// the encrypt reader.
 func EncryptedSize(plaintextLen int64, opts Options) int64 {
 	if plaintextLen <= 0 {
 		return 0
 	}
 	chunk := int64(opts.chunkSize())
-	numChunks := (plaintextLen + chunk - 1) / chunk
-	return plaintextLen + numChunks*int64(chunkHeaderSize+chunkTrailerSize)
+	if chunk <= 0 {
+		return 0
+	}
+	// numChunks = ceil(plaintextLen / chunk). Compute via
+	// math/bits.Add64 so a near-MaxInt64 plaintextLen does not wrap
+	// in the (plaintextLen + chunk - 1) intermediate.
+	numeratorLo, carry := bits.Add64(uint64(plaintextLen), uint64(chunk-1), 0)
+	if carry != 0 || numeratorLo > math.MaxInt64 {
+		return 0
+	}
+	numChunks := int64(numeratorLo) / chunk
+	// overhead = numChunks * (chunkHeaderSize + chunkTrailerSize).
+	overheadHi, overheadLo := bits.Mul64(uint64(numChunks), uint64(chunkHeaderSize+chunkTrailerSize))
+	if overheadHi != 0 || overheadLo > math.MaxInt64 {
+		return 0
+	}
+	// total = plaintextLen + overhead.
+	total, carry := bits.Add64(uint64(plaintextLen), overheadLo, 0)
+	if carry != 0 || total > math.MaxInt64 {
+		return 0
+	}
+	return int64(total)
 }
 
 // encryptReader streams ciphertext chunks on demand.
