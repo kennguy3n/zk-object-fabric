@@ -12,6 +12,7 @@ package s3compat
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -325,23 +326,44 @@ func (h *Handler) prepareSinglePieceEncryption(
 		// at MaxInMemoryObjectBytes.
 		if r.ContentLength >= 0 {
 			plaintextSize := r.ContentLength
-			// EncryptedSize returns 0 on a positive plaintextLen
-			// when the predicted ciphertext size would overflow
-			// int64. The documented caller contract
-			// (encryption/client_sdk/sdk.go EncryptedSize) is to
-			// treat the zero return as a fatal input validation
-			// failure and reject the request before the encrypt
-			// stream is started. Without this guard a hostile
-			// Content-Length: 9223372036854775807 would either
-			// advertise zero (S3 backends drop the header) or
-			// a wrapped negative ContentLength to the backend;
-			// for local_fs_dev it would silently store a manifest
-			// with ObjectSize == 9.2 EiB while the actual file is
-			// the truncated stream the server received.
-			ciphertextSize := client_sdk.EncryptedSize(plaintextSize, client_sdk.Options{})
-			if ciphertextSize == 0 && plaintextSize > 0 {
-				writeError(w, http.StatusBadRequest, "InvalidContentLength",
-					"Content-Length too large for encrypted streaming upload (ciphertext size overflows int64)", r.URL.Path)
+			// EncryptedSize now returns a typed error so the
+			// gateway distinguishes overflow (a hostile
+			// Content-Length: 9223372036854775807 that would
+			// wrap the int64 ciphertext-size computation),
+			// negative input (malformed Content-Length header),
+			// and the legitimate (0, nil) for empty objects.
+			// Pre-refactor the SDK used a 0 sentinel that
+			// overloaded "empty input" with "overflow"; the
+			// typed return removes the foot-gun for future
+			// callers and forces every callsite to acknowledge
+			// the failure mode at the type level. Overflow on
+			// the streaming PUT path means we cannot honour the
+			// client's declared ContentLength without
+			// advertising a wrapped or zero ciphertext length
+			// to the backend (either silent truncation or
+			// header drop); reject with 400 before the encrypt
+			// stream is started.
+			ciphertextSize, err := client_sdk.EncryptedSize(plaintextSize, client_sdk.Options{})
+			if err != nil {
+				switch {
+				case errors.Is(err, client_sdk.ErrEncryptedSizeOverflow):
+					writeError(w, http.StatusBadRequest, "InvalidContentLength",
+						"Content-Length too large for encrypted streaming upload (ciphertext size overflows int64)", r.URL.Path)
+				case errors.Is(err, client_sdk.ErrEncryptedSizeNegativePlaintext):
+					// Defence-in-depth: r.ContentLength >= 0
+					// gates this branch so negative is
+					// unreachable here, but ErrEncryptedSize
+					// NegativePlaintext is the documented
+					// rejection if it ever does arrive.
+					writeError(w, http.StatusBadRequest, "InvalidContentLength",
+						"Content-Length must not be negative", r.URL.Path)
+				default:
+					// ErrEncryptedSizeInvalidChunkSize or any
+					// future error: treat as 500 because
+					// chunkSize() comes from gateway config,
+					// not the request.
+					writeError(w, http.StatusInternalServerError, "EncryptionConfigInvalid", err.Error(), r.URL.Path)
+				}
 				return metadata.EncryptionConfig{}, nil, 0, nil, false
 			}
 			// Wrap the body in a counter so handler.go can read

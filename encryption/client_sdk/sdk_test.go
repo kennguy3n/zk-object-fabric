@@ -3,6 +3,7 @@ package client_sdk
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"io"
 	"math"
 	"os"
@@ -430,7 +431,11 @@ func TestEncryptedSize_MatchesActualOutput(t *testing.T) {
 				t.Fatalf("ReadAll: %v", err)
 			}
 			want := int64(len(ct))
-			got := EncryptedSize(int64(len(plaintext)), opts)
+			got, err := EncryptedSize(int64(len(plaintext)), opts)
+			if err != nil {
+				t.Fatalf("EncryptedSize(plain=%d, chunk=%d) returned err=%v",
+					len(plaintext), opts.chunkSize(), err)
+			}
 			if got != want {
 				t.Fatalf("EncryptedSize(plain=%d, chunk=%d) = %d; actual ciphertext = %d",
 					len(plaintext), opts.chunkSize(), got, want)
@@ -439,36 +444,65 @@ func TestEncryptedSize_MatchesActualOutput(t *testing.T) {
 	}
 }
 
-// TestEncryptedSize_NegativeIsZero pins the contract that
-// EncryptedSize returns 0 for negative inputs. The gateway falls
-// back to the buffered (non-streaming) PUT path when the client
-// did not supply a Content-Length (r.ContentLength == -1), and
-// callers must never advertise a negative ciphertext length to
-// the backend.
-func TestEncryptedSize_NegativeIsZero(t *testing.T) {
-	if got := EncryptedSize(-1, Options{}); got != 0 {
-		t.Errorf("EncryptedSize(-1) = %d; want 0", got)
-	}
-	if got := EncryptedSize(-1024, Options{ChunkSize: 1024}); got != 0 {
-		t.Errorf("EncryptedSize(-1024) = %d; want 0", got)
+// TestEncryptedSize_NegativeReturnsTypedError pins the contract
+// that EncryptedSize rejects negative inputs with
+// ErrEncryptedSizeNegativePlaintext. The gateway falls back to
+// the buffered (non-streaming) PUT path when the client did not
+// supply a Content-Length (r.ContentLength == -1), so in
+// practice the streaming PUT path never reaches this branch —
+// but the typed return forces every other potential caller
+// (multipart pre-checks, dedup pre-checks, future helpers) to
+// acknowledge the error rather than silently fall back to a 0
+// sentinel that would conflate with the legitimate empty-input
+// case.
+func TestEncryptedSize_NegativeReturnsTypedError(t *testing.T) {
+	for _, n := range []int64{-1, -1024, math.MinInt64} {
+		got, err := EncryptedSize(n, Options{})
+		if got != 0 {
+			t.Errorf("EncryptedSize(%d) returned non-zero %d on error path; want 0", n, got)
+		}
+		if !errors.Is(err, ErrEncryptedSizeNegativePlaintext) {
+			t.Errorf("EncryptedSize(%d) err = %v; want errors.Is(_, ErrEncryptedSizeNegativePlaintext)", n, err)
+		}
 	}
 }
 
-// TestEncryptedSize_OverflowReturnsZero pins the contract that
-// EncryptedSize refuses to wrap int64 on a hostile / nonsensical
-// plaintextLen. A malicious client could send
-// "Content-Length: 9223372036854775807" to drive the streaming PUT
-// path through EncryptedSize; without overflow guards the
-// (plaintextLen + chunk - 1) intermediate would wrap to a negative
-// numerator, the numChunks * overhead multiplication would silently
-// wrap again, and the gateway would advertise a negative
-// ContentLength to the backend (or worse: a small positive number
-// that lets the request begin a stream the backend cannot complete).
+// TestEncryptedSize_EmptyInputReturnsZeroNoError pins the
+// legitimate-empty-input contract: an empty object (no frame
+// emitted by EncryptObject) must return (0, nil), NOT the
+// pre-refactor (0, sentinel) overload. This is the case the
+// typed-error refactor was designed to disambiguate from
+// overflow.
+func TestEncryptedSize_EmptyInputReturnsZeroNoError(t *testing.T) {
+	got, err := EncryptedSize(0, Options{})
+	if err != nil {
+		t.Errorf("EncryptedSize(0) err = %v; want nil (empty objects are legitimate)", err)
+	}
+	if got != 0 {
+		t.Errorf("EncryptedSize(0) = %d; want 0 (no frame emitted for empty plaintext)", got)
+	}
+}
+
+// TestEncryptedSize_OverflowReturnsTypedError pins the contract
+// that EncryptedSize refuses to wrap int64 on a hostile /
+// nonsensical plaintextLen and surfaces overflow as
+// ErrEncryptedSizeOverflow. A malicious client could send
+// "Content-Length: 9223372036854775807" to drive the streaming
+// PUT path through EncryptedSize; without overflow guards the
+// (plaintextLen + chunk - 1) intermediate would wrap to a
+// negative numerator, the numChunks * overhead multiplication
+// would silently wrap again, and the gateway would advertise a
+// negative ContentLength to the backend (or worse: a small
+// positive number that lets the request begin a stream the
+// backend cannot complete).
 //
-// The guard turns every overflow into a zero return; the caller
-// MUST treat zero on a positive plaintextLen as a hard rejection,
-// not a silent zero-byte upload.
-func TestEncryptedSize_OverflowReturnsZero(t *testing.T) {
+// The typed error lets callers distinguish overflow (HTTP 400
+// InvalidContentLength) from negative input or invalid chunk
+// configuration without needing an out-of-band "plaintextLen > 0"
+// disambiguation guard at the callsite. Pre-refactor every
+// callsite had to do `if got == 0 && plaintextLen > 0 { fail }` —
+// a foot-gun for any future caller that omitted the guard.
+func TestEncryptedSize_OverflowReturnsTypedError(t *testing.T) {
 	cases := []struct {
 		name        string
 		plaintext   int64
@@ -496,10 +530,14 @@ func TestEncryptedSize_OverflowReturnsZero(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := EncryptedSize(tc.plaintext, tc.opts)
+			got, err := EncryptedSize(tc.plaintext, tc.opts)
 			if got != 0 {
-				t.Errorf("EncryptedSize(%d, chunk=%d) = %d; want 0 (overflow guard)\n%s",
+				t.Errorf("EncryptedSize(%d, chunk=%d) = %d; want 0 on overflow\n%s",
 					tc.plaintext, tc.opts.chunkSize(), got, tc.description)
+			}
+			if !errors.Is(err, ErrEncryptedSizeOverflow) {
+				t.Errorf("EncryptedSize(%d, chunk=%d) err = %v; want errors.Is(_, ErrEncryptedSizeOverflow)\n%s",
+					tc.plaintext, tc.opts.chunkSize(), err, tc.description)
 			}
 		})
 	}
@@ -512,9 +550,12 @@ func TestEncryptedSize_OverflowReturnsZero(t *testing.T) {
 // prediction.
 func TestEncryptedSize_LargeButSafeReturnsExact(t *testing.T) {
 	const oneGiB = int64(1 << 30)
-	got := EncryptedSize(oneGiB, Options{})
+	got, err := EncryptedSize(oneGiB, Options{})
+	if err != nil {
+		t.Fatalf("EncryptedSize(1 GiB, default) returned err=%v; want nil (1 GiB is well within int64 with default chunk)", err)
+	}
 	if got <= 0 {
-		t.Fatalf("EncryptedSize(1 GiB, default) = %d; want positive (1 GiB is well within int64 with default chunk)", got)
+		t.Fatalf("EncryptedSize(1 GiB, default) = %d; want positive", got)
 	}
 	// numChunks = ceil(1 GiB / 16 MiB) = 64; overhead = 64 * 44 = 2816.
 	want := oneGiB + 64*int64(chunkHeaderSize+chunkTrailerSize)

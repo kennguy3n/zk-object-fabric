@@ -1338,7 +1338,10 @@ func TestManagedEncryption_StreamingPut_LargeObject(t *testing.T) {
 	// hand the backend a known ContentLength without buffering
 	// the ciphertext. The encoded piece bytes on disk must match
 	// the SDK's prediction.
-	wantCT := client_sdk.EncryptedSize(int64(len(plaintext)), client_sdk.Options{})
+	wantCT, err := client_sdk.EncryptedSize(int64(len(plaintext)), client_sdk.Options{})
+	if err != nil {
+		t.Fatalf("client_sdk.EncryptedSize returned err=%v; the SDK rejected a legitimate plaintext size", err)
+	}
 	totalCT := int64(0)
 	for _, piece := range pieces {
 		totalCT += int64(len(piece))
