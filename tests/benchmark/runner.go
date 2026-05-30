@@ -118,6 +118,7 @@ func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 			res.Pending = true
 			res.PendingReason = "benchmark: ProviderRunner does not drive control-plane signals; use SustainedRunner with a wired control plane"
 		case MetricSustainedRPS, MetricRPSEfficiency, MetricErrorRate,
+			MetricSkippedOpFraction,
 			MetricPutP99CacheHit, MetricPutP99Origin,
 			MetricGetP99L0CacheHit, MetricGetP99L1CacheHit, MetricGetP99Origin:
 			// Sustained-load + cache-tier-segmented metrics require
@@ -125,8 +126,14 @@ func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 			// worker concurrency, HDR histograms tagged by tier.
 			// ProviderRunner is a synchronous unit-test driver and
 			// cannot measure them; report Pending so SLA gates skip.
+			// MetricSkippedOpFraction also belongs here because
+			// the precondition-not-met skip path only exists in
+			// SustainedRunner (where ops are drawn from a mix
+			// against a possibly-empty shared working set);
+			// ProviderRunner walks scenario.Steps deterministically
+			// and never produces a skip.
 			res.Pending = true
-			res.PendingReason = "benchmark: ProviderRunner cannot measure sustained-load or tier-segmented metrics; use SustainedRunner"
+			res.PendingReason = "benchmark: ProviderRunner cannot measure sustained-load, tier-segmented, or skip-fraction metrics; use SustainedRunner"
 		default:
 			// Defensive default: any metric ProviderRunner does not
 			// know about must NOT silently report 0 and fail an SLA

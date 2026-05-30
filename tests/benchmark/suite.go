@@ -183,6 +183,22 @@ const (
 	// the steady-state window. Workstream 1.1 caps it at 1e-3.
 	MetricErrorRate Metric = "error_rate"
 
+	// MetricSkippedOpFraction is skipped_ops / (attempts + skipped),
+	// where a skipped op is one drawn from the request mix but
+	// not actually executed because its precondition was not met
+	// (currently: GET / HEAD / DELETE drawn while the working
+	// set is empty). It is an informational signal — typically
+	// non-zero only in the brief ramp window before PUTs have
+	// seeded the working set, or in mis-configured scenarios
+	// that draw reads against a never-seeded provider. A high
+	// value means the reported attempted-RPS is far below the
+	// configured TargetRPS (rate-limiter tokens were spent on
+	// no-ops) and the histograms were built from a smaller
+	// success sample than expected. The harness reports this
+	// value as informational; scenarios may set Max if they
+	// want a hard gate.
+	MetricSkippedOpFraction Metric = "skipped_op_fraction"
+
 	// MetricPutP99CacheHit is the 99th-percentile PUT latency
 	// when the gateway's hot-tier cache is warm. Workstream 1.1
 	// caps it at 50 ms. The harness selects this metric for
@@ -507,6 +523,16 @@ func DefaultSuite() Suite {
 					{Metric: MetricSustainedRPS, Min: TargetSustainedRPS, Unit: "req/s"},
 					{Metric: MetricRPSEfficiency, Min: TargetRPSEfficiencyMin, Unit: "ratio"},
 					{Metric: MetricErrorRate, Max: TargetErrorRateMax, Unit: "ratio"},
+					// Hard gate the no-op skip fraction at 5% for
+					// the 10K-RPS scenario. The seeded working set
+					// (SeedObjects defaults to max(64, TargetRPS/10)
+					// = 1000 keys at 10K RPS) plus the 20% PUT
+					// share should keep skips well under that bar;
+					// a higher value would indicate the early-ramp
+					// PUTs are not seeding fast enough and the GET
+					// histograms are being built from a smaller
+					// sample than expected (see MetricSkippedOpFraction).
+					{Metric: MetricSkippedOpFraction, Max: 0.05, Unit: "ratio"},
 				},
 			},
 			{

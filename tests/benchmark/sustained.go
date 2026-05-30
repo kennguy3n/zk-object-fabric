@@ -42,6 +42,20 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
+// errOpSkipped is returned by executeOnce for an op whose
+// precondition is not met (e.g. a GET / HEAD / DELETE drawn
+// against an empty working set during the early ramp-up of a
+// PUT-then-GET scenario). It is NOT a failure (it never trips
+// the consecutive-failure circuit breaker) and it is NOT a
+// success (it does not contribute to latency histograms or to
+// the `attempts` denominator for error-rate / RPS). Workers
+// instead bump a separate `skipped` counter so the report can
+// surface the count and the operator can tell
+// "my scenario actually produced N real operations and S
+// no-ops" rather than "my scenario produced N+S operations all
+// at near-zero latency".
+var errOpSkipped = errors.New("benchmark: op skipped (precondition not met, e.g. empty working set)")
+
 // SustainedRunner is the production-grade load driver. The zero
 // value is not valid; use NewSustainedRunner.
 type SustainedRunner struct {
@@ -54,8 +68,11 @@ type SustainedRunner struct {
 
 	// SeedObjects is the number of pieces to pre-populate before
 	// the steady-state run begins. 0 -> max(64, TargetRPS/10).
-	// Pre-seeded keys are reused as the working set for GET, HEAD
-	// and DELETE operations.
+	// A negative value disables seeding entirely so the working
+	// set starts empty — useful for measuring cold-start no-op
+	// rate (MetricSkippedOpFraction) and for unit tests that
+	// want to assert the skip path. Pre-seeded keys are reused
+	// as the working set for GET, HEAD and DELETE operations.
 	SeedObjects int
 
 	// DurationOverride, when > 0, replaces the scenario's declared
@@ -203,7 +220,14 @@ func (r *SustainedRunner) effectiveWorkload(w Workload) (runConfig, error) {
 		}
 	}
 	out.seedObjects = r.SeedObjects
-	if out.seedObjects <= 0 {
+	switch {
+	case out.seedObjects < 0:
+		// Explicit opt-out: leave the working set empty. Reads
+		// drawn from the mix will short-circuit to errOpSkipped.
+		out.seedObjects = 0
+	case out.seedObjects == 0:
+		// Default: scale with RPS so a small smoke run still
+		// has a working set and a 10K-RPS run has 1000 keys.
 		out.seedObjects = out.targetRPS / 10
 		if out.seedObjects < 64 {
 			out.seedObjects = 64
@@ -322,13 +346,21 @@ func (r *SustainedRunner) drive(ctx context.Context, scenario string, payload []
 				err := r.executeOnce(ctx, scenario, op, payload, cfg, state, workingSet)
 				dur := r.nowFn()().Sub(start)
 				state.record(op, dur, err)
-				if err != nil {
+				switch {
+				case errors.Is(err, errOpSkipped):
+					// Skip is neither success nor failure.
+					// Leave the consecutive-failure counter
+					// unchanged: a real in-flight error streak
+					// is still a streak even if interleaved
+					// with no-op skips, and a skip itself is
+					// not an error.
+				case err != nil:
 					if consecutive.Add(1) >= int64(cfg.failureLimit) {
 						tripped.Store(true)
 						cancel()
 						return
 					}
-				} else {
+				default:
 					consecutive.Store(0)
 				}
 			}
@@ -365,7 +397,12 @@ func (r *SustainedRunner) executeOnce(ctx context.Context, scenario, op string, 
 	case "GET":
 		key, ok := ks.pick(state.rng)
 		if !ok {
-			return nil
+			// No keys in the working set yet — early-ramp PUTs
+			// have not seeded one. Signal as a skip so the
+			// caller does not record a fake zero-latency GET
+			// success that would pollute agg.get percentiles
+			// and inflate `attempts`.
+			return errOpSkipped
 		}
 		if r.Cache != nil {
 			rc, _, cerr := r.Cache.Get(ctx, key)
@@ -395,14 +432,18 @@ func (r *SustainedRunner) executeOnce(ctx context.Context, scenario, op string, 
 	case "HEAD":
 		key, ok := ks.pick(state.rng)
 		if !ok {
-			return nil
+			// See GET branch for rationale.
+			return errOpSkipped
 		}
 		_, err := r.Provider.HeadPiece(ctx, key)
 		return err
 	case "DELETE":
 		key, ok := ks.popOne(state.rng)
 		if !ok {
-			return nil
+			// See GET branch for rationale. DELETE additionally
+			// pops the key, but pop-from-empty is the same
+			// precondition-not-met case.
+			return errOpSkipped
 		}
 		return r.Provider.DeletePiece(ctx, key)
 	case "LIST":
@@ -514,6 +555,17 @@ func (r *SustainedRunner) buildResults(scenario Scenario, cfg runConfig, agg *ag
 			if totalRequests > 0 {
 				res.Value = float64(agg.errors) / float64(totalRequests)
 			}
+		case MetricSkippedOpFraction:
+			// Denominator is attempts + skipped, i.e. every op
+			// the worker drew from the mix. This makes "I ran
+			// 1000 ops and 200 were no-ops" report 0.20, which
+			// is the operator-meaningful number. Using attempts
+			// alone would inflate the ratio (200/800=0.25) and
+			// understate the seeded-load coverage.
+			drawn := totalRequests + agg.skipped
+			if drawn > 0 {
+				res.Value = float64(agg.skipped) / float64(drawn)
+			}
 		case MetricDedupHitRatio,
 			MetricDedupBytesSavedRatio,
 			MetricDedupPutLatencyOverheadP95,
@@ -581,6 +633,14 @@ type aggregate struct {
 	cacheMiss int64
 	attempts  int64
 	errors    int64
+	// skipped is the count of ops drawn from the mix but not
+	// actually executed because their precondition was not met
+	// (currently: GET / HEAD / DELETE drawn while the working
+	// set is empty). Separate from attempts so the RPS /
+	// error-rate denominators stay honest about real ops, and so
+	// the operator can see the no-op count in the report instead
+	// of having it silently inflate attempts and pull p99 down.
+	skipped int64
 }
 
 func newAggregate() *aggregate { return &aggregate{} }
@@ -595,6 +655,7 @@ func (a *aggregate) merge(ws *workerState) {
 	a.cacheMiss += ws.cacheMiss
 	a.attempts += ws.attempts
 	a.errors += ws.errors
+	a.skipped += ws.skipped
 }
 
 // workerState is the per-goroutine recording state.
@@ -610,8 +671,11 @@ type workerState struct {
 	cacheMiss int64
 	attempts  int64
 	errors    int64
-	seq       atomic.Uint64
-	opOrder   []string
+	// skipped: see aggregate.skipped. Per-worker so the merge is
+	// lock-free; aggregated once in aggregate.merge.
+	skipped int64
+	seq     atomic.Uint64
+	opOrder []string
 }
 
 func newWorkerState(targetRPS int, id, baseSeed uint64) *workerState {
@@ -634,17 +698,29 @@ func (s *workerState) nextOp(mix map[string]float64) string {
 // record updates the worker-local counters and per-op latency
 // histogram for one completed operation.
 //
-// attempts is incremented for every call, success or failure, so
-// it is the correct denominator for error-rate and
-// attempted-throughput metrics.
+// attempts is incremented for every real attempt, success or
+// failure, so it is the correct denominator for error-rate and
+// attempted-throughput metrics. Skipped operations (executeOnce
+// returning errOpSkipped — a precondition-not-met no-op, such as
+// a GET drawn against an empty working set) are NOT counted as
+// attempts or as errors; they are bucketed into a separate
+// `skipped` counter so RPS / error-rate denominators stay honest
+// and the report can surface the no-op count.
 //
 // Failed-request durations are NOT recorded into the histogram:
 // latency SLAs are a success-path property, and including
 // error-path durations (often near-zero connection refused or
 // near-timeout) would pollute the percentile metrics. This
 // matches the older ProviderRunner semantics and the conventional
-// behaviour of load-test tools (wrk, vegeta, k6).
+// behaviour of load-test tools (wrk, vegeta, k6). Skipped
+// operations are likewise excluded from the histogram for the
+// same reason — they would otherwise contribute fake near-zero
+// latency samples and pull p99 down.
 func (s *workerState) record(op string, d time.Duration, err error) {
+	if errors.Is(err, errOpSkipped) {
+		s.skipped++
+		return
+	}
 	s.attempts++
 	if err != nil {
 		s.errors++

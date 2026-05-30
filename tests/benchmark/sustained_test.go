@@ -1055,3 +1055,136 @@ func TestProviderRunner_CacheHitRatioPendingWhenCacheNil(t *testing.T) {
 			rep.Scenarios[0].Failures)
 	}
 }
+
+// TestSustainedRunner_GetOnEmptyWorkingSetSkipsNotSucceeds asserts
+// that a GET drawn against an empty working set is reported as a
+// SKIP, not as a fake zero-latency success. The fix this test
+// guards is the regression that GET / HEAD / DELETE returned `nil`
+// when `ks.pick` returned !ok, which (a) bumped the latency
+// histogram with a near-zero sample (polluting p99), (b) inflated
+// `attempts` so `attainedRPS` looked higher than reality, and
+// (c) potentially reset the consecutive-failure circuit breaker.
+//
+// The scenario below uses a 100% GET mix with SeedObjects=0, so
+// the working set starts (and stays) empty. Every op the worker
+// draws must therefore be a skip. We assert:
+//
+//   1. The GET latency histogram count is 0 (no fake samples).
+//   2. MetricSustainedRPS reports 0 (skips don't inflate it).
+//   3. MetricErrorRate is 0 (skips are not errors).
+//   4. MetricSkippedOpFraction is 1.0 (every draw was a skip).
+//   5. The fakeProvider.gets counter is 0 (no Provider call was
+//      made; the skip happened before executeOnce dispatched).
+func TestSustainedRunner_GetOnEmptyWorkingSetSkipsNotSucceeds(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+	runner.SeedObjects = -1 // disable seeding entirely
+
+	sc := Scenario{
+		Name: "skip-on-empty-working-set",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"GET": 1.0},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       50,
+		},
+		Targets: []Target{
+			{Metric: MetricGetP99, Unit: "ms"},
+			{Metric: MetricSustainedRPS, Unit: "req/s"},
+			{Metric: MetricErrorRate, Unit: "ratio"},
+			{Metric: MetricSkippedOpFraction, Unit: "ratio"},
+		},
+	}
+
+	results, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	byMetric := map[Metric]Result{}
+	for _, r := range results {
+		byMetric[r.Metric] = r
+	}
+
+	getP99, ok := byMetric[MetricGetP99]
+	if !ok {
+		t.Fatalf("missing %s", MetricGetP99)
+	}
+	hist := getP99.Histogram
+	if hist == nil {
+		t.Fatalf("MetricGetP99 must include a HistogramSummary so we " +
+			"can assert it received zero samples")
+	}
+	if got := hist.Count; got != 0 {
+		t.Errorf("GET histogram count = %d, want 0. A non-zero count "+
+			"means the no-op skip path is still recording fake "+
+			"zero-latency samples and polluting p99.", got)
+	}
+
+	rps, ok := byMetric[MetricSustainedRPS]
+	if !ok {
+		t.Fatalf("missing %s", MetricSustainedRPS)
+	}
+	if rps.Value != 0 {
+		t.Errorf("MetricSustainedRPS = %v, want 0. A skipped op is "+
+			"not a real attempt and must not inflate attained RPS.",
+			rps.Value)
+	}
+
+	er, ok := byMetric[MetricErrorRate]
+	if !ok {
+		t.Fatalf("missing %s", MetricErrorRate)
+	}
+	if er.Value != 0 {
+		t.Errorf("MetricErrorRate = %v, want 0. A skipped op is "+
+			"a precondition-not-met no-op, not an error.", er.Value)
+	}
+
+	skip, ok := byMetric[MetricSkippedOpFraction]
+	if !ok {
+		t.Fatalf("missing %s", MetricSkippedOpFraction)
+	}
+	if skip.Value != 1.0 {
+		t.Errorf("MetricSkippedOpFraction = %v, want 1.0. Every "+
+			"draw against an empty working set must report as a skip.",
+			skip.Value)
+	}
+
+	if g := prov.gets.Load(); g != 0 {
+		t.Errorf("fakeProvider.gets = %d, want 0. The skip must "+
+			"short-circuit before dispatching to the provider; "+
+			"otherwise the precondition-not-met guard isn't actually "+
+			"guarding anything.", g)
+	}
+}
+
+// TestSustainedRunner_SkipDoesNotTripFailureLimit guards the worker
+// loop's switch: a streak of skipped ops, even longer than
+// FailureLimit, must NOT trip the circuit breaker. The reverse
+// regression (treating skips as errors) would abort any 100%-GET
+// scenario with SeedObjects=0 before it ever measured anything.
+func TestSustainedRunner_SkipDoesNotTripFailureLimit(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+	runner.SeedObjects = -1   // working set stays empty -> every draw skips
+	runner.FailureLimit = 2   // very low cap; trips fast if skips were counted
+
+	sc := Scenario{
+		Name: "skip-does-not-trip-failure-limit",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"GET": 1.0},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       100,
+		},
+		Targets: []Target{
+			{Metric: MetricSkippedOpFraction, Unit: "ratio"},
+		},
+	}
+
+	_, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run aborted, likely because skips tripped the "+
+			"consecutive-failure breaker. err=%v", err)
+	}
+}
