@@ -143,17 +143,23 @@ func TestCellSizing_PinnedToProposalDoc(t *testing.T) {
 }
 
 func TestAvailability_DerivedFromErrorRate(t *testing.T) {
-	want := 1.0 - ErrorRateMax
-	if AvailabilityFractionMin != want {
-		t.Fatalf("AvailabilityFractionMin = %v, want 1 - ErrorRateMax = %v", AvailabilityFractionMin, want)
-	}
-	// Round-trip sanity: the documented "99.9%" prose value must
-	// match the constant to 6 decimal places (i.e. the rounding the
-	// dossier uses).
+	// We do NOT assert `AvailabilityFractionMin == 1.0 - ErrorRateMax`:
+	// targets.go declares the constant as exactly that expression, so
+	// the equality is tautological at compile time. Per the round-2
+	// cleanup of TestPerformanceTargets_PinnedToBenchmarkSuite, this
+	// package does not ship tautological runtime checks.
+	//
+	// What this test actually verifies is the prose-value round-trip:
+	// the constant — derivation aside — must materialize to exactly
+	// the "99.9%" figure that docs/CAPACITY.md commits to in prose.
+	// If anyone ever tightens ErrorRateMax (e.g. to 5e-4 for a 99.95%
+	// commitment), this assertion will fail until either the prose in
+	// the dossier is updated to the new percentage, or the new value
+	// is wired through here. Catches "constant moved, prose didn't."
 	const documentedPct = 99.9
 	gotPct := AvailabilityFractionMin * 100.0
 	if !approxEqual(gotPct, documentedPct, 1e-6) {
-		t.Fatalf("AvailabilityFractionMin*100 = %v, want %v (docs/CAPACITY.md states 99.9%%)", gotPct, documentedPct)
+		t.Fatalf("AvailabilityFractionMin*100 = %v, want %v (docs/CAPACITY.md §7 states %v%%) — either revert the ErrorRateMax change, or update the dossier prose and the documentedPct literal here together", gotPct, documentedPct, documentedPct)
 	}
 }
 
