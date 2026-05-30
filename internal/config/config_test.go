@@ -402,3 +402,89 @@ func TestGatewayConfig_CacheWarmingMemoryBudget_NegativeDisablesGuard(t *testing
 		t.Fatalf("CacheWarmingMemoryBudget = %d, want -1 (disabled)", got)
 	}
 }
+
+// TestConfig_Validate_RejectsHeaderTimeoutGreaterThanRead pins the
+// cross-field check that surfaces the Slowloris-defence footgun:
+// when ReadHeaderTimeout > ReadTimeout, ReadTimeout (which bounds
+// the entire request lifecycle including headers and body) fires
+// first and the cheaper header-stall timeout is never reached.
+// Devin Review on PR #80 flagged this as an unguarded operational
+// pitfall; this test pins the guard so a future refactor that
+// drops the check fails loudly here rather than in production.
+func TestConfig_Validate_RejectsHeaderTimeoutGreaterThanRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutator func(c *Config)
+		wantErr string
+	}{
+		{
+			name: "gateway",
+			mutator: func(c *Config) {
+				c.Gateway.ReadTimeout = Duration(30 * time.Second)
+				c.Gateway.ReadHeaderTimeout = Duration(60 * time.Second)
+			},
+			wantErr: "gateway.read_header_timeout",
+		},
+		{
+			name: "console",
+			mutator: func(c *Config) {
+				c.Console.ReadTimeout = Duration(15 * time.Second)
+				c.Console.ReadHeaderTimeout = Duration(20 * time.Second)
+			},
+			wantErr: "console.read_header_timeout",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutator(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate returned nil, want error mentioning %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestConfig_Validate_AcceptsDefault locks in the invariant that
+// Default() returns a Config that Validate() accepts. A future
+// change that lowers the gateway ReadTimeout below the
+// ReadHeaderTimeout default (10s) would break this test before
+// any deployment does the same thing accidentally.
+func TestConfig_Validate_AcceptsDefault(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Default() failed Validate: %v", err)
+	}
+}
+
+// TestConfig_Validate_EqualHeaderAndReadTimeoutsAllowed allows the
+// operator to set ReadHeaderTimeout == ReadTimeout — there is no
+// silent nullification at the boundary (both fire at the same
+// moment) and an operator who pins them equal has explicitly
+// chosen a single timeout window. The guard is a strict
+// less-than-or-equal check, not a less-than check.
+func TestConfig_Validate_EqualHeaderAndReadTimeoutsAllowed(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.ReadTimeout = Duration(30 * time.Second)
+	cfg.Gateway.ReadHeaderTimeout = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected equal timeouts: %v", err)
+	}
+}
+
+// TestConfig_Validate_ZeroTimeoutSkipsCheck pins that the guard
+// no-ops when either ReadTimeout or ReadHeaderTimeout is zero so
+// deployments that intentionally leave one unset (e.g. only
+// ReadTimeout configured, ReadHeaderTimeout left to Go's
+// default) are not blocked.
+func TestConfig_Validate_ZeroTimeoutSkipsCheck(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.ReadTimeout = 0
+	cfg.Gateway.ReadHeaderTimeout = Duration(60 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected zero ReadTimeout: %v", err)
+	}
+}

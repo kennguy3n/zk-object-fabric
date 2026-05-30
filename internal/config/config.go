@@ -655,6 +655,35 @@ type HealthConfig struct {
 	// TLS at a load balancer typically leave this empty even in
 	// production.
 	TLS TLSConfig `json:"tls"`
+
+	// ReadHeaderTimeout caps how long the health endpoint server
+	// waits for request headers to arrive. The internal health
+	// endpoints are normally fronted by a cluster-internal
+	// listener that NetworkPolicy hides from the public internet,
+	// but a misconfigured NetworkPolicy or a debug deployment
+	// that exposes the listener directly would otherwise be
+	// silently vulnerable to Slowloris-style header-stalling.
+	// Mirror the gateway / console posture (10s default, see
+	// Default()) so the hardening is defence-in-depth, not
+	// opt-in.
+	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+
+	// IdleTimeout caps the lifetime of an idle keep-alive
+	// connection between requests. Default 120s. The health
+	// monitor's primary client is the peer-quorum poller which
+	// reuses TCP across PollInterval ticks; the 120s ceiling is
+	// well above the conventional PollInterval (default 2s) so
+	// reused connections are not churned, but bounded so an
+	// abandoned client cannot pin a goroutine indefinitely.
+	IdleTimeout Duration `json:"idle_timeout"`
+
+	// MaxHeaderBytes caps total header size for a single health
+	// request. Zero means "use Go's default" (1 MiB) which is
+	// far larger than any realistic /health request needs and
+	// gives an attacker more memory to exhaust per connection;
+	// pin a tight 64 KiB ceiling by default. Matches the gateway
+	// and console knobs.
+	MaxHeaderBytes int `json:"max_header_bytes"`
 }
 
 // HealthPeer is a single peer gateway in the cell.
@@ -912,7 +941,66 @@ func Default() Config {
 			IdleTimeout:       Duration(120 * time.Second),
 			MaxHeaderBytes:    64 * 1024,
 		},
+		// Health endpoint Slowloris defaults match the gateway and
+		// console posture so an upgrade picks them up automatically
+		// (see HealthConfig.ReadHeaderTimeout doc for threat model).
+		Health: HealthConfig{
+			ReadHeaderTimeout: Duration(10 * time.Second),
+			IdleTimeout:       Duration(120 * time.Second),
+			MaxHeaderBytes:    64 * 1024,
+		},
 	}
+}
+
+// Validate performs cross-field sanity checks that cannot be
+// expressed structurally. The intent is to surface operational
+// footguns at startup with a clear error message rather than
+// silently letting the http.Server use a configuration that
+// undermines the security knobs the operator thought they were
+// setting.
+//
+// Today the only checks are on the gateway and console listener
+// timeouts: ReadHeaderTimeout > ReadTimeout would mean
+// ReadTimeout (which bounds the *entire* request lifecycle
+// including headers + body) fires first and the cheaper
+// header-stall timeout is never reached. An operator setting
+// ReadHeaderTimeout=60s with ReadTimeout=30s is almost certainly
+// confused about which knob does what, and the gateway should
+// refuse to start rather than silently degrade their Slowloris
+// defence.
+//
+// Validate is called by Load() after JSON unmarshaling so config
+// files exercise the checks. Callers constructing a Config
+// programmatically (tests, fixtures) should also call Validate
+// before passing the value to a server constructor.
+func (c *Config) Validate() error {
+	if err := validateTimeoutOrder("gateway", c.Gateway.ReadHeaderTimeout, c.Gateway.ReadTimeout); err != nil {
+		return err
+	}
+	if err := validateTimeoutOrder("console", c.Console.ReadHeaderTimeout, c.Console.ReadTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTimeoutOrder enforces ReadHeaderTimeout < ReadTimeout
+// on a listener whose config exposes both. Equal values are
+// accepted because they are an explicit operator choice (the
+// listener degrades to a single timeout window without any
+// hidden silent-nullification — both knobs fire at the same
+// moment). Returns nil when either timeout is zero so deployments
+// that intentionally leave one unset are not blocked.
+func validateTimeoutOrder(name string, readHeader, read Duration) error {
+	if readHeader <= 0 || read <= 0 {
+		return nil
+	}
+	if readHeader.ToDuration() > read.ToDuration() {
+		return fmt.Errorf(
+			"config: %s.read_header_timeout (%s) > %s.read_timeout (%s); ReadTimeout bounds the whole request including headers and would fire first, silently nullifying the header-stall defence. Lower read_header_timeout below read_timeout or raise read_timeout.",
+			name, readHeader.ToDuration(), name, read.ToDuration(),
+		)
+	}
+	return nil
 }
 
 // Load reads a JSON configuration file from path and returns a fully
@@ -925,6 +1013,9 @@ func Load(path string) (Config, error) {
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("config: validate %s: %w", path, err)
 	}
 	return cfg, nil
 }

@@ -95,6 +95,21 @@ func main() {
 		cfg.Encryption.AllowLocalCMK = true
 	}
 
+	// Cross-field config validation runs AFTER CLI overrides so
+	// the error message reflects the effective configuration the
+	// gateway is actually about to use (a flag that overrode a
+	// JSON value into an inconsistent state would otherwise slip
+	// past). The current checks catch operational footguns the
+	// type system cannot — e.g. read_header_timeout >
+	// read_timeout would silently nullify the Slowloris defence
+	// because ReadTimeout fires first. Refusing to start is the
+	// right failure mode here; a degraded edge defence is worse
+	// than no edge defence because it gives a false sense of
+	// security in the runbook.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
+
 	// Open exactly one *sql.DB for the metadata DSN and share it
 	// across every Postgres-backed store. This keeps
 	// ControlPlaneConfig.MaxOpenConns as a single
@@ -337,6 +352,18 @@ func main() {
 	// "header-stall" attack independently. See
 	// tests/abuse/slowloris_test.go for the regression test that
 	// pins these knobs.
+	//
+	// The MaxHeaderBytes <= 0 guard mirrors the console server
+	// (see startConsoleAPI). Go's http.Server falls back to
+	// http.DefaultMaxHeaderBytes (1 MiB) for a zero or negative
+	// value internally, but pinning the floor in our own code
+	// keeps the two listeners syntactically identical so a future
+	// reader does not have to know about that internal fallback
+	// to convince themselves the gateway is hardened.
+	gatewayMaxHdr := cfg.Gateway.MaxHeaderBytes
+	if gatewayMaxHdr <= 0 {
+		gatewayMaxHdr = http.DefaultMaxHeaderBytes
+	}
 	srv := &http.Server{
 		Addr:              cfg.Gateway.ListenAddr,
 		Handler:           handler,
@@ -344,7 +371,7 @@ func main() {
 		WriteTimeout:      cfg.Gateway.WriteTimeout.ToDuration(),
 		ReadHeaderTimeout: cfg.Gateway.ReadHeaderTimeout.ToDuration(),
 		IdleTimeout:       cfg.Gateway.IdleTimeout.ToDuration(),
-		MaxHeaderBytes:    cfg.Gateway.MaxHeaderBytes,
+		MaxHeaderBytes:    gatewayMaxHdr,
 	}
 
 	// fleetOrchestrator coordinates large multi-tenant
@@ -1513,7 +1540,27 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 	}
 	go func() { _ = mon.Run(ctx) }()
 	if hc.ListenAddr != "" {
-		srv := &http.Server{Addr: hc.ListenAddr, Handler: mon.ServeMux("")}
+		// Slowloris hardening for the health endpoints: the
+		// internal /health surface is normally fronted by a
+		// cluster-internal listener (the comment block on
+		// HealthConfig.ListenAddr notes "e.g. :29090"), but a
+		// misconfigured NetworkPolicy or a debug deployment that
+		// exposes the listener directly should not be silently
+		// vulnerable. Apply the same three knobs the gateway and
+		// console servers use; the defaults (10s / 120s / 64 KiB)
+		// come from HealthConfig.Default() so an upgrade picks
+		// them up automatically without a config edit.
+		healthMaxHdr := hc.MaxHeaderBytes
+		if healthMaxHdr <= 0 {
+			healthMaxHdr = http.DefaultMaxHeaderBytes
+		}
+		srv := &http.Server{
+			Addr:              hc.ListenAddr,
+			Handler:           mon.ServeMux(""),
+			ReadHeaderTimeout: hc.ReadHeaderTimeout.ToDuration(),
+			IdleTimeout:       hc.IdleTimeout.ToDuration(),
+			MaxHeaderBytes:    healthMaxHdr,
+		}
 		go func() {
 			log.Printf("gateway: health endpoints on %s", hc.ListenAddr)
 			if err := startListener(srv, hc.TLS, env, "health"); err != nil && !errors.Is(err, http.ErrServerClosed) {
