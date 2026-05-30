@@ -176,7 +176,12 @@ func (p *FaultProvider) now() time.Time {
 	return time.Now()
 }
 
-func (p *FaultProvider) sleep(d time.Duration) {
+// sleep blocks for d unless ctx cancels first. A real degraded
+// backend whose response is slow MUST honour the caller's deadline;
+// otherwise the chaos suite would be more pathological than reality
+// (every gateway timeout would also leak a goroutine here). Tests
+// can override p.Sleep to skip wall-clock sleeps entirely.
+func (p *FaultProvider) sleep(ctx context.Context, d time.Duration) {
 	if d <= 0 {
 		return
 	}
@@ -184,7 +189,18 @@ func (p *FaultProvider) sleep(d time.Duration) {
 		p.Sleep(d)
 		return
 	}
-	time.Sleep(d)
+	if ctx == nil {
+		time.Sleep(d)
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-t.C:
+		return
+	}
 }
 
 // shouldFail consults the FaultConfig and decides whether this call
@@ -259,20 +275,25 @@ func (p *FaultProvider) bumpCounter(op string) int64 {
 
 // applyLatency injects the configured latency for cfg, either because
 // the mode is ModeSlowResponse or because the caller asked for a
-// generic Latency budget on top of a different mode.
-func (p *FaultProvider) applyLatency(cfg FaultConfig) {
+// generic Latency budget on top of a different mode. Honours ctx
+// cancellation so a caller-side deadline aborts the slow call
+// instead of pinning the goroutine.
+func (p *FaultProvider) applyLatency(ctx context.Context, cfg FaultConfig) {
 	switch {
 	case cfg.Mode == ModeSlowResponse:
-		p.sleep(cfg.Latency)
+		p.sleep(ctx, cfg.Latency)
 	case cfg.Latency > 0:
-		p.sleep(cfg.Latency)
+		p.sleep(ctx, cfg.Latency)
 	}
 }
 
 // PutPiece dispatches through the PutFault config.
 func (p *FaultProvider) PutPiece(ctx context.Context, pieceID string, r io.Reader, opts providers.PutOptions) (providers.PutResult, error) {
 	p.Calls.Add(1)
-	p.applyLatency(p.PutFault)
+	p.applyLatency(ctx, p.PutFault)
+	if err := ctx.Err(); err != nil {
+		return providers.PutResult{}, err
+	}
 	fail, err := p.shouldFail("PUT", p.PutFault)
 	if fail {
 		p.Failures.Add(1)
@@ -286,7 +307,10 @@ func (p *FaultProvider) PutPiece(ctx context.Context, pieceID string, r io.Reade
 // ReadCloser; every other mode is handled by shouldFail.
 func (p *FaultProvider) GetPiece(ctx context.Context, pieceID string, byteRange *providers.ByteRange) (io.ReadCloser, error) {
 	p.Calls.Add(1)
-	p.applyLatency(p.GetFault)
+	p.applyLatency(ctx, p.GetFault)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if p.GetFault.Mode == ModeTruncatedRead {
 		rc, err := p.Inner.GetPiece(ctx, pieceID, byteRange)
 		if err != nil {
@@ -310,7 +334,10 @@ func (p *FaultProvider) GetPiece(ctx context.Context, pieceID string, byteRange 
 // HeadPiece dispatches through the HeadFault config.
 func (p *FaultProvider) HeadPiece(ctx context.Context, pieceID string) (providers.PieceMetadata, error) {
 	p.Calls.Add(1)
-	p.applyLatency(p.HeadFault)
+	p.applyLatency(ctx, p.HeadFault)
+	if err := ctx.Err(); err != nil {
+		return providers.PieceMetadata{}, err
+	}
 	fail, err := p.shouldFail("HEAD", p.HeadFault)
 	if fail {
 		p.Failures.Add(1)
@@ -322,7 +349,10 @@ func (p *FaultProvider) HeadPiece(ctx context.Context, pieceID string) (provider
 // DeletePiece dispatches through the DeleteFault config.
 func (p *FaultProvider) DeletePiece(ctx context.Context, pieceID string) error {
 	p.Calls.Add(1)
-	p.applyLatency(p.DeleteFault)
+	p.applyLatency(ctx, p.DeleteFault)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	fail, err := p.shouldFail("DELETE", p.DeleteFault)
 	if fail {
 		p.Failures.Add(1)
@@ -334,7 +364,10 @@ func (p *FaultProvider) DeletePiece(ctx context.Context, pieceID string) error {
 // ListPieces dispatches through the ListFault config.
 func (p *FaultProvider) ListPieces(ctx context.Context, prefix, cursor string) (providers.ListResult, error) {
 	p.Calls.Add(1)
-	p.applyLatency(p.ListFault)
+	p.applyLatency(ctx, p.ListFault)
+	if err := ctx.Err(); err != nil {
+		return providers.ListResult{}, err
+	}
 	fail, err := p.shouldFail("LIST", p.ListFault)
 	if fail {
 		p.Failures.Add(1)
