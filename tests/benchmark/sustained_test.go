@@ -835,3 +835,158 @@ func TestMakePayload_DeterministicAndReused(t *testing.T) {
 		t.Errorf("makePayload(-5) length = %d; want 1024 default", got)
 	}
 }
+
+// TestEffectiveWorkload_MaxObjectSizeBytesCapsDefault verifies the
+// MaxObjectSizeBytes cap is honoured even when a scenario declares
+// ObjectSizeBytes=0 (e.g. LIST-only scenarios). Regression for
+// Devin Review finding ANALYSIS_pr-review-job-…_0002: the cap was
+// previously applied before the 1024-default fallback, so a 0
+// declared size fell through to 1024 and silently bypassed the
+// operator-set ceiling.
+func TestEffectiveWorkload_MaxObjectSizeBytesCapsDefault(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+	runner.MaxObjectSizeBytes = 512
+
+	sc := Scenario{
+		Name: "size-cap-default",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"PUT": 1.0},
+			ObjectSizeBytes: 0, // explicit 0 — runner must apply 1024 default, then cap to 512
+			DurationSeconds: 1,
+			TargetRPS:       100,
+		},
+	}
+	cfg, err := runner.effectiveWorkload(sc.Workload)
+	if err != nil {
+		t.Fatalf("effectiveWorkload: %v", err)
+	}
+	if cfg.objectSize != 512 {
+		t.Errorf("effectiveWorkload.objectSize = %d; want 512 "+
+			"(1024 default capped to MaxObjectSizeBytes=512). "+
+			"Cap must be applied AFTER the default fallback so a "+
+			"declared 0 cannot silently bypass the ceiling.", cfg.objectSize)
+	}
+
+	// Also verify the explicit-size path still caps correctly:
+	// a 2048 declared size capped to 512.
+	sc.Workload.ObjectSizeBytes = 2048
+	cfg, err = runner.effectiveWorkload(sc.Workload)
+	if err != nil {
+		t.Fatalf("effectiveWorkload: %v", err)
+	}
+	if cfg.objectSize != 512 {
+		t.Errorf("effectiveWorkload.objectSize = %d; want 512 "+
+			"(2048 capped to MaxObjectSizeBytes=512)", cfg.objectSize)
+	}
+}
+
+// TestProviderRunner_PendingForUnmeasurableMetrics verifies that
+// ProviderRunner (the synchronous unit-test driver) marks
+// sustained-load and cache-tier-segmented metrics as Pending
+// instead of silently reporting 0 — symmetric with SustainedRunner.
+// Regression for Devin Review finding ANALYSIS_…_0003: the runner
+// previously fell through to a zero-valued Result, which would
+// breach Min-bounded SLA gates (e.g. sustained_rps Min=10000).
+func TestProviderRunner_PendingForUnmeasurableMetrics(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewProviderRunner(prov)
+
+	sc := Scenario{
+		Name: "provider-pending",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"PUT": 1.0},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       1,
+		},
+		Targets: []Target{
+			// ProviderRunner CAN measure these — no Pending.
+			{Metric: MetricPutP99, Max: 1000, Unit: "ms"},
+			// ProviderRunner CANNOT measure these — must be Pending,
+			// not silently 0.
+			{Metric: MetricSustainedRPS, Min: 10000, Unit: "req/s"},
+			{Metric: MetricRPSEfficiency, Min: 0.95, Unit: "ratio"},
+			{Metric: MetricErrorRate, Max: 1e-3, Unit: "ratio"},
+			{Metric: MetricPutP99CacheHit, Max: 50, Unit: "ms"},
+			{Metric: MetricPutP99Origin, Max: 200, Unit: "ms"},
+			{Metric: MetricGetP99L0CacheHit, Max: 20, Unit: "ms"},
+			{Metric: MetricGetP99L1CacheHit, Max: 100, Unit: "ms"},
+			{Metric: MetricGetP99Origin, Max: 300, Unit: "ms"},
+			// Control-plane metrics — also Pending.
+			{Metric: MetricMigrationThroughput, Min: 1e6, Unit: "bytes_per_sec"},
+		},
+	}
+
+	results, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(results) != len(sc.Targets) {
+		t.Fatalf("Run returned %d results, want %d", len(results), len(sc.Targets))
+	}
+	if results[0].Pending {
+		t.Errorf("MetricPutP99 unexpectedly Pending (ProviderRunner CAN measure put p99)")
+	}
+	for i := 1; i < len(results); i++ {
+		r := results[i]
+		if !r.Pending {
+			t.Errorf("Targets[%d] (%s) should be Pending — ProviderRunner has no "+
+				"measurement path. value=%v", i, r.Metric, r.Value)
+		}
+		if r.PendingReason == "" {
+			t.Errorf("Targets[%d] (%s) Pending but PendingReason is empty; "+
+				"runners must explain WHY a metric is unmeasurable so report "+
+				"consumers can distinguish 'not wired in' from 'not applicable'.",
+				i, r.Metric)
+		}
+	}
+
+	// And via RunSuite the scenario should still pass: Pending
+	// must NOT be treated as a Min-gate breach.
+	rep, err := RunSuite(Suite{Name: "test", Scenarios: []Scenario{sc}}, runner)
+	if err != nil {
+		t.Fatalf("RunSuite: %v", err)
+	}
+	if !rep.AllPassed {
+		t.Errorf("AllPassed = false; want true (Pending metrics must not fail). "+
+			"Failures=%v", rep.Scenarios[0].Failures)
+	}
+	if len(rep.Scenarios[0].Pending) != 9 {
+		t.Errorf("ReportScenario.Pending count = %d; want 9 unmeasurable metrics. "+
+			"Pending list = %v", len(rep.Scenarios[0].Pending), rep.Scenarios[0].Pending)
+	}
+}
+
+// TestBucketIndex_NoNegativeShift exercises the bucketIndex
+// invariant that mag is always >= 1 for ns >= subBucketCount.
+// Regression for Devin Review finding ANALYSIS_…_0004: the
+// previous `if mag < 0 { mag = 0 }` clamp was unreachable and
+// would have caused a negative-count shift panic if it ever
+// triggered. This test asserts the bucketing is panic-free across
+// the full spectrum from 0ns to the histogram ceiling.
+func TestBucketIndex_NoNegativeShift(t *testing.T) {
+	// Walk a wide spread of nanosecond values including the edge
+	// cases that previously triggered the dead guard's review.
+	samples := []int64{
+		0,
+		1,
+		int64(subBucketCount - 1),
+		int64(subBucketCount),
+		int64(subBucketCount + 1),
+		1 << 16,
+		1 << 24,
+		1 << 32,
+		int64((1 << 60) - 1),
+		1 << 60,
+	}
+	for _, ns := range samples {
+		// Must not panic and must return a valid bucket index in
+		// [0, totalBuckets).
+		idx := bucketIndex(ns)
+		if idx < 0 || idx >= totalBuckets {
+			t.Errorf("bucketIndex(%d) = %d; out of range [0, %d)",
+				ns, idx, totalBuckets)
+		}
+	}
+}

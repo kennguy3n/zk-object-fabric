@@ -263,13 +263,17 @@ func bucketIndex(ns int64) int {
 		return int(ns)
 	}
 	// Determine magnitude: the most-significant bit position
-	// relative to subBucketCountPow. For ns >= subBucketCount the
-	// bit length is > subBucketCountPow.
+	// relative to subBucketCountPow. The early return above for
+	// ns < subBucketCount (== 1 << subBucketCountPow) guarantees
+	// bitLen >= subBucketCountPow + 1 here, so mag is always >= 1
+	// and the subsequent `ns >> (mag - 1)` is a non-negative
+	// shift. No defensive `mag < 0` clamp: clamping to 0 would
+	// turn line `ns >> (mag - 1)` into a negative-count shift
+	// (panic in Go 1.13+), giving a false sense of safety. If a
+	// future constants change ever broke the invariant, we want a
+	// hard failure here surfaced by tests, not a silent clamp.
 	bitLen := bits.Len64(uint64(ns))
 	mag := bitLen - subBucketCountPow
-	if mag < 0 {
-		mag = 0
-	}
 	if mag >= magnitudeCount {
 		return totalBuckets - 1
 	}

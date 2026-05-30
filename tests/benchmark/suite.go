@@ -296,6 +296,13 @@ type Result struct {
 	// Zero value (false) means "measured normally" so existing
 	// runners stay correct without a code change.
 	Pending bool `json:"pending,omitempty"`
+	// PendingReason is an optional human-readable explanation of
+	// why the runner could not measure this metric. Populated by
+	// runners that mark a result Pending so report consumers can
+	// distinguish "not wired in yet" from "not applicable to this
+	// runner" without re-reading the runner source. Empty when
+	// Pending is false.
+	PendingReason string `json:"pending_reason,omitempty"`
 }
 
 // Runner executes a Suite against a single StorageProvider and

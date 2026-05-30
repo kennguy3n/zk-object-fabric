@@ -54,8 +54,10 @@ func NewProviderRunner(provider providers.StorageProvider) *ProviderRunner {
 
 // Run executes one scenario and returns a Result for every Target
 // declared on the scenario plus one labelled Result per scenario-
-// level counter (e.g. total_requests). Unknown metrics return a
-// zeroed Result so CI can pick them up as "not yet measured".
+// level counter (e.g. total_requests). Metrics that ProviderRunner
+// cannot measure (sustained-load metrics, cache-tier-segmented
+// latency, etc.) are returned with Pending=true so SLA gates skip
+// them instead of treating the zero value as an SLA breach.
 func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 	if r.Provider == nil {
 		return nil, errors.New("benchmark: ProviderRunner.Provider is required")
@@ -101,8 +103,27 @@ func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 				res.Value = float64(r.WasabiEgressBytes) / float64(r.WasabiStoredBytes)
 			}
 		case MetricMigrationThroughput, MetricRepairTimeSeconds, MetricNetworkCostUSDPerTB:
-			// Reported as zero-valued placeholders for CI to track
-			// until the control-plane driver wires them in.
+			// Control-plane metrics; ProviderRunner has no driver
+			// wired in. Mark Pending so SLA evaluation skips them.
+			res.Pending = true
+			res.PendingReason = "benchmark: ProviderRunner does not drive control-plane signals; use SustainedRunner with a wired control plane"
+		case MetricSustainedRPS, MetricRPSEfficiency, MetricErrorRate,
+			MetricPutP99CacheHit, MetricPutP99Origin,
+			MetricGetP99L0CacheHit, MetricGetP99L1CacheHit, MetricGetP99Origin:
+			// Sustained-load + cache-tier-segmented metrics require
+			// the SustainedRunner: rate-limited token bucket, per-
+			// worker concurrency, HDR histograms tagged by tier.
+			// ProviderRunner is a synchronous unit-test driver and
+			// cannot measure them; report Pending so SLA gates skip.
+			res.Pending = true
+			res.PendingReason = "benchmark: ProviderRunner cannot measure sustained-load or tier-segmented metrics; use SustainedRunner"
+		default:
+			// Defensive default: any metric ProviderRunner does not
+			// know about must NOT silently report 0 and fail an SLA
+			// Min gate. Mark Pending so the asymmetry between Runner
+			// implementations cannot produce a false SLA breach.
+			res.Pending = true
+			res.PendingReason = "benchmark: ProviderRunner has no measurement path for this metric"
 		}
 		results = append(results, res)
 	}

@@ -162,11 +162,17 @@ func (r *SustainedRunner) effectiveWorkload(w Workload) (runConfig, error) {
 	if r.RPSOverride > 0 {
 		out.targetRPS = r.RPSOverride
 	}
-	if r.MaxObjectSizeBytes > 0 && out.objectSize > r.MaxObjectSizeBytes {
-		out.objectSize = r.MaxObjectSizeBytes
-	}
+	// Apply the default object size BEFORE the cap so a workload
+	// declared with ObjectSizeBytes=0 (e.g. LIST-only scenarios)
+	// still has the runner-level cap honoured. Order matters: if
+	// the cap is applied first, a 0 value falls through unchanged
+	// and the subsequent default fallback to 1024 silently bypasses
+	// the operator-set MaxObjectSizeBytes ceiling.
 	if out.objectSize <= 0 {
 		out.objectSize = 1024
+	}
+	if r.MaxObjectSizeBytes > 0 && out.objectSize > r.MaxObjectSizeBytes {
+		out.objectSize = r.MaxObjectSizeBytes
 	}
 	if out.targetRPS <= 0 {
 		return out, errors.New("workload.target_rps must be > 0")
@@ -464,6 +470,7 @@ func (r *SustainedRunner) buildResults(scenario Scenario, cfg runConfig, agg *ag
 			// gate doesn't silently fail on a 0.0 reading.
 			if r.Cache == nil {
 				res.Pending = true
+				res.PendingReason = "benchmark: SustainedRunner.Cache not wired; cache hit ratio is only measurable when a HotObjectCache is attached"
 			} else if cacheTotal > 0 {
 				res.Value = float64(agg.cacheHit) / float64(cacheTotal)
 			}
@@ -494,12 +501,14 @@ func (r *SustainedRunner) buildResults(scenario Scenario, cfg runConfig, agg *ag
 			// can populate these from the gateway's metrics
 			// pipeline.
 			res.Pending = true
+			res.PendingReason = "benchmark: SustainedRunner driving a raw StorageProvider cannot observe gateway-layer state (dedup, content index, migration coordinator, repair worker, egress accounting); wire a gateway-level runner to populate"
 		default:
 			// Unknown metric — also mark Pending so a typo in a
 			// scenario definition surfaces in the report's
 			// Pending list rather than silently passing a 0.0
 			// reading against a Min-bounded target.
 			res.Pending = true
+			res.PendingReason = "benchmark: SustainedRunner has no measurement path for this metric (check for typo in scenario definition)"
 		}
 		res.Histogram = histogramFor(t.Metric, agg)
 		res.Duration = elapsed
