@@ -3,15 +3,19 @@
 | Field | Value |
 |---|---|
 | Document version | 2026-05-30 (WS1.4) |
-| Source commit | `dac9ef3` (`main`) |
+| Source commit | branch HEAD of PR #77 (recorded in the bundle's `MANIFEST.txt` at build time; merge-base was `dac9ef3` on `main`) |
 | Audience | Third-party cryptography auditor |
 | Companion | [`audit-package-security.md`](audit-package-security.md), [`threat-model.md`](threat-model.md) |
 | Scope | AEAD construction, AAD design, DEK / KEK / CMK hierarchy, KDF use, RNG use, nonce handling, convergent-encryption parameters, SigV4 HMAC chaining |
 
 Read [`threat-model.md`](threat-model.md) first. Every `path:line`
-reference is grep-verified against the source commit; any drift
-means a later change has landed and the bundle should be
-regenerated (`make audit-bundle`).
+reference below is grep-verified against the branch state captured
+in the corresponding `make audit-bundle` tarball's `MANIFEST.txt`.
+If this document is read against a later commit on `main`, line
+numbers will drift — re-pin to the exact tree by hashing the
+shipped sources against `MANIFEST.txt`, or regenerate the bundle
+from that later commit. The contract is *SHA-anchored source*, not
+SHA-anchored line numbers.
 
 ## Table of contents
 
@@ -35,13 +39,13 @@ Concrete claims we need the auditor to confirm or refute:
 
 | # | Claim | Code primary |
 |---|---|---|
-| C1 | Per-chunk XChaCha20-Poly1305 framing is misuse-resistant: nonces are unique within a `(DEK, mode)` pair, and a chunk lifted from one object cannot decrypt inside another. | `encryption/client_sdk/sdk.go:118-149`, `encryption/client_sdk/sdk.go:183-201`, `encryption/client_sdk/sdk.go:202-213` |
-| C2 | The chunk-AAD binding (`tenant_id|bucket|object_key_hash|version_id || "|" || u64BE(idx)`) defeats both cross-object replay and within-object reorder. | `encryption/client_sdk/sdk.go:7-42`, `encryption/client_sdk/sdk.go:183-201` |
-| C3 | `DeriveConvergentDEK(contentHash, tenantID)` is cross-tenant unreachable: the HKDF salt binds the derivation to `tenantID` so distinct tenants always derive distinct DEKs. | `encryption/client_sdk/keygen.go:36-66` |
-| C4 | The convergent-nonce mode never reuses a `(key, nonce)` pair across distinct plaintexts inside the same tenant. | `encryption/client_sdk/sdk.go:202-213` |
-| C5 | The CMK wrap envelope (`xchacha20-poly1305-wrap-v1`) binds the wrapped DEK to the specific CMK URI and rejects open under a different CMK. | `encryption/client_sdk/wrap.go:63-122` |
-| C6 | The manifest BodyEncryptor binds ciphertext to `(tenant_id, bucket, object_key_hash)` so a row swapped between primary-key columns will fail to open. | `metadata/manifest_store/postgres/body_encryptor.go:66-86`, `metadata/manifest_store/postgres/body_encryptor.go:121-155` |
-| C7 | SigV4 chunked-upload signatures form a hash chain rooted in the seed signature; a captured `(chunkData, signature)` cannot be spliced into a different upload. | `internal/auth/authenticator.go:484-505`, `internal/auth/authenticator.go:626-631` |
+| C1 | Per-chunk XChaCha20-Poly1305 framing is misuse-resistant: nonces are unique within a `(DEK, mode)` pair, and a chunk lifted from one object cannot decrypt inside another. | `encryption/client_sdk/sdk.go:118-182`, `encryption/client_sdk/sdk.go:224-235`, `encryption/client_sdk/sdk.go:243-253` |
+| C2 | The chunk-AAD binding (`tenant_id|bucket|object_key_hash|version_id || "|" || u64BE(idx)`) defeats both cross-object replay and within-object reorder. | `encryption/client_sdk/sdk.go:1-46`, `encryption/client_sdk/sdk.go:224-235` |
+| C3 | `DeriveConvergentDEK(contentHash, tenantID)` is cross-tenant unreachable: the HKDF salt binds the derivation to `tenantID` so distinct tenants always derive distinct DEKs. | `encryption/client_sdk/keygen.go:35-68` |
+| C4 | The convergent-nonce mode never reuses a `(key, nonce)` pair across distinct plaintexts inside the same tenant. | `encryption/client_sdk/sdk.go:243-253` |
+| C5 | The CMK wrap envelope (`xchacha20-poly1305-wrap-v1`) binds the wrapped DEK to the specific CMK URI and rejects open under a different CMK. | `encryption/client_sdk/wrap.go:63-117` |
+| C6 | The manifest BodyEncryptor binds ciphertext to `(tenant_id, bucket, object_key_hash)` so a row swapped between primary-key columns will fail to open. | `metadata/manifest_store/postgres/body_encryptor.go:62-77`, `metadata/manifest_store/postgres/body_encryptor.go:121-160` |
+| C7 | SigV4 chunked-upload signatures form a hash chain rooted in the seed signature; a captured `(chunkData, signature)` cannot be spliced into a different upload. | `internal/auth/authenticator.go:484-502`, `internal/auth/authenticator.go:626-631` |
 | C8 | All key material lives in process memory only as long as needed; multipart DEKs are scrubbed at session end (see PR #74 — outside this package's scope but relevant to the threat model). | `api/s3compat/multipart/...` |
 
 ## 2. Cryptographic primitives in use
@@ -79,14 +83,14 @@ documented in the package doc:
 - Frame overhead: 28 bytes / chunk plus the 16-byte AEAD tag baked
   into the ciphertext (so 44 bytes of overhead per non-empty
   chunk). The expected total is exposed via `EncryptedSize`
-  (`encryption/client_sdk/sdk.go:291-323`) which the gateway uses
+  (`encryption/client_sdk/sdk.go:332-362`) which the gateway uses
   to advertise a known `Content-Length` to the backend ahead of
   the streaming PUT.
 
 ### 3.1 What the auditor should verify
 
 - The AEAD construction call in `EncryptObject`
-  (`encryption/client_sdk/sdk.go:118-149`):
+  (`encryption/client_sdk/sdk.go:118-182`):
   ```go
   aead, err := chacha20poly1305.NewX(dek)
   ```
@@ -100,11 +104,11 @@ documented in the package doc:
   decrypt time. This means rolling forward the convergent-nonce
   flag (which changes the derivation function on the encrypt
   side) does NOT require a parallel branch on the decrypt side
-  — `DecryptObject` (`encryption/client_sdk/sdk.go:151-168`)
+  — `DecryptObject` (`encryption/client_sdk/sdk.go:192-206`)
   reads the nonce off the wire either way.
 - `EncryptedSize` is the inverse of the frame layout and has
   explicit typed errors for overflow, negative input, and
-  non-positive chunk size (`encryption/client_sdk/sdk.go:236-289`).
+  non-positive chunk size (`encryption/client_sdk/sdk.go:259-323`).
   An auditor should construct an adversarial `plaintextLen` close
   to `math.MaxInt64` and confirm `ErrEncryptedSizeOverflow` is
   returned, not a silent wrap.
@@ -141,7 +145,7 @@ separated tuple
 `object_key_hash` is a SHA-256 over the object key.
 
 Implementation: `chunkAADBytes`
-(`encryption/client_sdk/sdk.go:183-201`):
+(`encryption/client_sdk/sdk.go:224-235`):
 ```go
 aad := make([]byte, 0, len(chunkAAD)+1+8)
 aad = append(aad, chunkAAD...)
@@ -202,7 +206,7 @@ return aad
 
 ### 5.1 DEK derivation
 
-`encryption/client_sdk/keygen.go:36-66`:
+`encryption/client_sdk/keygen.go:35-68`:
 ```go
 const ConvergentDEKInfo = "zkof-convergent-dek-v1"
 
@@ -245,7 +249,7 @@ The auditor should verify:
 
 ### 5.3 Why intra-tenant dedup loses forward secrecy (explicit)
 
-We document this trade-off in `keygen.go:42-46`:
+We document this trade-off in `keygen.go:43-47`:
 
 > stored ciphertext loses forward secrecy for the deduped object —
 > a future leak of the DEK reveals every historical and future
@@ -262,7 +266,7 @@ When `Options.ConvergentNonce` is set, per-chunk nonces are also
 deterministic — derived from the DEK and the chunk index via
 HKDF:
 
-`encryption/client_sdk/sdk.go:202-213`:
+`encryption/client_sdk/sdk.go:243-253`:
 ```go
 const ConvergentNonceInfo = "zkof-nonce-v1"
 
@@ -323,7 +327,7 @@ helper at line 744-747 is the textbook two-arg
 
 ### 6.2 Per-chunk signature chain (aws-chunked PUT)
 
-`internal/auth/authenticator.go:484-505`:
+`internal/auth/authenticator.go:484-502`:
 ```go
 func VerifyChunkSignature(prevSig string, chunkData []byte, signingKey []byte, timestamp, scope string) (string, error) {
     stringToSign := strings.Join([]string{
@@ -399,7 +403,7 @@ header signature computed at request entry by
 
 ### 8.1 Local-file wrap
 
-`encryption/client_sdk/wrap.go:63-93`:
+`encryption/client_sdk/wrap.go:63-89`:
 ```go
 aead.Seal(nil, nonce, dek, []byte(cmk.URI))
 ```
@@ -412,11 +416,11 @@ aead.Seal(nil, nonce, dek, []byte(cmk.URI))
 - The serialized `WrappedDEK.WrappedKey` is `nonce || ciphertext_with_tag`.
 - A separate `dekKeyID` derives a 16-byte SHA-256-based ID that
   the manifest stores so a reader can locate the right wrapped
-  material even after CMK rotation (`encryption/client_sdk/wrap.go:124-156`).
+  material even after CMK rotation (`encryption/client_sdk/wrap.go:124-140`).
 
 ### 8.2 AWS KMS wrap
 
-`encryption/client_sdk/kms_wrapper.go:66-130`:
+`encryption/client_sdk/kms_wrapper.go:66-126`:
 
 - Uses `kms.Encrypt` / `kms.Decrypt` with `EncryptionContext`
   populated from the CMK URI (the auditor should confirm the
@@ -429,7 +433,7 @@ aead.Seal(nil, nonce, dek, []byte(cmk.URI))
 
 ### 8.3 Vault Transit wrap
 
-`encryption/client_sdk/vault_wrapper.go:93-160`:
+`encryption/client_sdk/vault_wrapper.go:93-159`:
 
 - Uses Vault's `transit/encrypt/<key>` and `transit/decrypt/<key>`
   endpoints. The CMK URI maps to the Vault key name via
@@ -460,13 +464,13 @@ aead.Seal(nil, nonce, dek, []byte(cmk.URI))
 
 | Site | Source | Length | Notes |
 |---|---|---|---|
-| Per-object DEK | `randReader` (= `crypto/rand`) | 32 B | `keygen.go:24-31` |
+| Per-object DEK | `randReader` (= `crypto/rand`) | 32 B | `keygen.go:24-30` |
 | Per-chunk nonce (random mode) | `crypto/rand` inside `encryptReader.nextFrame` | 24 B | One per frame |
 | Per-chunk nonce (convergent mode) | HKDF-SHA256 over `(DEK, chunkIndex)` | 24 B | See §5.4 |
-| CMK-wrap nonce | `randReader` | 24 B | `wrap.go:74-78` |
-| BodyEncryptor nonce | `crypto/rand` | 24 B | `body_encryptor.go:121-138` |
-| Convergent DEK | HKDF-SHA256 over `(contentHash, tenantID)` | 32 B | `keygen.go:36-66` |
-| `randReader` in tests | overridable | — | Production code path is unaffected (`keygen.go:14-15`) |
+| CMK-wrap nonce | `randReader` | 24 B | `wrap.go:75-78` |
+| BodyEncryptor nonce | `crypto/rand` | 24 B | `body_encryptor.go:121-131` |
+| Convergent DEK | HKDF-SHA256 over `(contentHash, tenantID)` | 32 B | `keygen.go:35-68` |
+| `randReader` in tests | overridable | — | Production code path is unaffected (`keygen.go:14-16`) |
 
 ### 9.1 What the auditor should verify
 
@@ -558,7 +562,7 @@ Non-exhaustive list to seed the audit's threat-modelling session:
    row to make it open under a legacy (AAD=nil) decryption path
    instead of the modern AAD-bound path. The relevant code is
    `AEADBodyEncryptor.Decrypt` in
-   `metadata/manifest_store/postgres/body_encryptor.go:138-160`,
+   `metadata/manifest_store/postgres/body_encryptor.go:139-160`,
    which implements a *try-then-fallback* pattern:
 
    1. Compute `aad = bodyContextAAD(ctx)` — the canonical
@@ -623,7 +627,7 @@ Non-exhaustive list to seed the audit's threat-modelling session:
      and is XORed against plaintext to produce ciphertext. With
      same DEK and same convergent-nonce derivation
      (`HKDF(DEK, chunkIndex)`, see `deriveConvergentNonce` in
-     `encryption/client_sdk/sdk.go:202-213`), two callers
+     `encryption/client_sdk/sdk.go:243-253`), two callers
      sealing the *same plaintext* produce *identical
      ciphertext bytes*. This is not classical nonce reuse
      (different plaintexts under the same key+nonce, which
@@ -631,7 +635,7 @@ Non-exhaustive list to seed the audit's threat-modelling session:
      output of convergent mode.
    - **The tags diverge.** `ChunkAAD` is mixed into the
      Poly1305 tag input (see `chunkAADBytes` in
-     `encryption/client_sdk/sdk.go:183-195`) but NOT into the
+     `encryption/client_sdk/sdk.go:224-235`) but NOT into the
      nonce derivation. Two callers with different `ChunkAAD`
      values produce the same ciphertext bytes paired with
      different 16-byte Poly1305 tags. Each tag verifies only
@@ -649,7 +653,7 @@ Non-exhaustive list to seed the audit's threat-modelling session:
 
    **Defence (added 2026-05-30, this PR):** the SDK refuses the
    combination at the entry point. `EncryptObject` in
-   `encryption/client_sdk/sdk.go:118-162` returns
+   `encryption/client_sdk/sdk.go:118-182` returns
    `"client_sdk: ConvergentNonce and ChunkAAD are mutually
    exclusive: …"` when both are set, so the operator is forced
    to pick a single mode at integration time rather than
