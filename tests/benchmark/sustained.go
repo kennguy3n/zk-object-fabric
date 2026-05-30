@@ -465,12 +465,30 @@ func (r *SustainedRunner) buildResults(scenario Scenario, cfg runConfig, agg *ag
 		case MetricPutP95:
 			res.Value = float64(agg.put.Percentile(95)) / float64(time.Millisecond)
 		case MetricPutP99, MetricPutP99CacheHit, MetricPutP99Origin:
+			// CacheHit / Origin variants intentionally read the
+			// same aggregate histogram. The runner does not split
+			// PUT samples by tier — every PUT to the configured
+			// provider is recorded into agg.put — so the per-tier
+			// SLA distinction comes from how the *scenario* is
+			// configured, not from runner-side bucketing. Run
+			// `put-cache-hit` against a cache-fronted provider to
+			// gate the cache-hit SLA; run `put-origin` against the
+			// raw origin to gate the origin SLA. Stacking both
+			// variants in a single scenario over a mixed-tier
+			// provider would conflate distributions and is not a
+			// supported configuration today.
 			res.Value = float64(agg.put.Percentile(99)) / float64(time.Millisecond)
 		case MetricGetP50:
 			res.Value = float64(agg.get.Percentile(50)) / float64(time.Millisecond)
 		case MetricGetP95:
 			res.Value = float64(agg.get.Percentile(95)) / float64(time.Millisecond)
 		case MetricGetP99, MetricGetP99L0CacheHit, MetricGetP99L1CacheHit, MetricGetP99Origin:
+			// L0CacheHit / L1CacheHit / Origin variants share the
+			// same aggregate histogram for the same reason as the
+			// PUT case above: scenario configuration selects which
+			// tier the traffic actually hits. The runner records
+			// all GETs into agg.get and lets the scenario-runner
+			// pairing enforce the tier-specific SLA.
 			res.Value = float64(agg.get.Percentile(99)) / float64(time.Millisecond)
 		case MetricListP95:
 			res.Value = float64(agg.list.Percentile(95)) / float64(time.Millisecond)
