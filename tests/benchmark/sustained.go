@@ -445,7 +445,30 @@ func (r *SustainedRunner) executeOnce(ctx context.Context, scenario, op string, 
 			// precondition-not-met case.
 			return errOpSkipped
 		}
-		return r.Provider.DeletePiece(ctx, key)
+		if err := r.Provider.DeletePiece(ctx, key); err != nil {
+			// Push the key back into the working set so a
+			// transient DeletePiece error (network blip,
+			// 503, context cancellation, etc.) does not
+			// permanently erode the working set. The
+			// object still exists in the provider, so
+			// future GET / HEAD / DELETE operations from
+			// this or any other worker can still reach it.
+			// Without this push-back the working set
+			// shrinks monotonically on every transient
+			// DELETE error, which inflates
+			// MetricSkippedOpFraction over a long run and
+			// reduces the effective sample size for the
+			// GET / HEAD histograms — i.e. the run reports
+			// fewer real operations than the operator
+			// configured, silently, with no error in the
+			// log to explain why. The cost of the
+			// push-back is one mutex acquisition on the
+			// keySet; in steady state the DELETE error
+			// rate is bounded by FailureLimit anyway.
+			ks.add(key)
+			return err
+		}
+		return nil
 	case "LIST":
 		_, err := r.Provider.ListPieces(ctx, "", "")
 		return err

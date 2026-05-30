@@ -1188,3 +1188,126 @@ func TestSustainedRunner_SkipDoesNotTripFailureLimit(t *testing.T) {
 			"consecutive-failure breaker. err=%v", err)
 	}
 }
+
+// TestSustainedRunner_DeleteFailureRetainsKeyInWorkingSet guards
+// the regression where a DELETE op that fails after the key was
+// already popped from the working set would permanently lose the
+// key. Symptoms (without the push-back fix):
+//
+//   1. The object still exists in the provider (DELETE never
+//      committed), so storage is silently leaked from the
+//      benchmark's POV — future ListPieces would still report it.
+//   2. The working set shrinks by one per failed DELETE. Over a
+//      long run with non-zero transient DELETE error rate, the
+//      working set drains to empty even though no object was
+//      actually removed.
+//   3. Once the working set is empty, every subsequent GET / HEAD
+//      / DELETE drawn from the mix short-circuits to errOpSkipped
+//      (the precondition-not-met case guarded by the sibling
+//      TestSustainedRunner_GetOnEmptyWorkingSetSkipsNotSucceeds),
+//      so MetricSkippedOpFraction inflates and the GET / HEAD
+//      histograms get fewer real samples than the operator
+//      configured. The harness reports plausible-looking results
+//      but they cover a smaller workload than declared, silently.
+//
+// The fix in executeOnce push-back-on-error makes the working set
+// stable under transient DELETE errors. This test wires a provider
+// that fails EVERY DeletePiece and asserts:
+//
+//   - the provider's piece map is unchanged at the end of the run
+//     (every DELETE failed, so no key was actually removed);
+//   - MetricErrorRate is ~1.0 (every drawn op was a real attempt
+//     that returned an error, not a skipped no-op);
+//   - MetricSkippedOpFraction is 0 (the working set never
+//     drained because failed DELETEs were pushed back).
+//
+// Run-duration is intentionally short and FailureLimit is set very
+// large so the breaker does not trip; we want to exercise the
+// retain-on-error path over many failed DELETEs in a row.
+func TestSustainedRunner_DeleteFailureRetainsKeyInWorkingSet(t *testing.T) {
+	prov := newFakeProvider()
+	// Hard-fail every DELETE from the very first call. Seeded
+	// PUTs in seedObjects still need to succeed, so we can't
+	// just set failOp[PUT] — only DELETE fails.
+	prov.setFailAfter("DELETE", 0)
+
+	const seeded = 8
+	runner := NewSustainedRunner(prov)
+	runner.SeedObjects = seeded
+	// FailureLimit large enough that the breaker does not trip
+	// during the run. We want to exercise many DELETE errors in
+	// a row to prove the working set survives.
+	runner.FailureLimit = 1 << 30
+
+	sc := Scenario{
+		Name: "delete-failure-retains-working-set",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"DELETE": 1.0},
+			ObjectSizeBytes: 64,
+			DurationSeconds: 1,
+			TargetRPS:       200,
+		},
+		Targets: []Target{
+			{Metric: MetricErrorRate, Unit: "ratio"},
+			{Metric: MetricSkippedOpFraction, Unit: "ratio"},
+		},
+	}
+
+	results, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Provider state assertion: every DELETE failed, so no
+	// piece should have been removed. The exact set of seeded
+	// keys may have been added to by the runner's PUT path if
+	// the mix included PUTs — it does not here, so the piece
+	// map should still hold exactly `seeded` entries from the
+	// pre-run seeding.
+	prov.mu.Lock()
+	remaining := len(prov.pieces)
+	prov.mu.Unlock()
+	if remaining != seeded {
+		t.Fatalf("provider piece count = %d, want %d. A failed "+
+			"DELETE must NOT remove the object from the "+
+			"provider; the provider's piece map should be "+
+			"unchanged.", remaining, seeded)
+	}
+
+	byMetric := map[Metric]Result{}
+	for _, r := range results {
+		byMetric[r.Metric] = r
+	}
+
+	er, ok := byMetric[MetricErrorRate]
+	if !ok {
+		t.Fatalf("missing %s", MetricErrorRate)
+	}
+	// We expect ~1.0; allow a small floor in case the first
+	// DELETE per worker raced with a context-canceled return,
+	// but anything below 0.95 means real attempts were not made.
+	if er.Value < 0.95 {
+		t.Errorf("MetricErrorRate = %v, want >= 0.95. The "+
+			"DELETE mix with an always-failing provider must "+
+			"produce real errors on every attempt, not be "+
+			"short-circuited to a skip.", er.Value)
+	}
+
+	skip, ok := byMetric[MetricSkippedOpFraction]
+	if !ok {
+		t.Fatalf("missing %s", MetricSkippedOpFraction)
+	}
+	// The whole point of the fix is that the working set never
+	// drains, so MetricSkippedOpFraction stays at 0. Anything
+	// above 0 means at some point a worker drew a DELETE
+	// against an empty working set — i.e. the push-back didn't
+	// happen and prior failed DELETEs permanently removed keys.
+	if skip.Value != 0 {
+		t.Errorf("MetricSkippedOpFraction = %v, want 0. A "+
+			"non-zero skip fraction means the working set "+
+			"drained during the run — proof that the failed "+
+			"DELETE path did NOT push the popped key back, "+
+			"and so future ops drew against an empty set.",
+			skip.Value)
+	}
+}
