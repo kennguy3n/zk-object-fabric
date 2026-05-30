@@ -495,6 +495,22 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // that wires up (say) tagging should remove the `tagging` key from
 // this map and add tagging routing in the dispatch switch below.
 //
+// Rejection is method-agnostic: the moment a sub-resource key is in
+// this map, requests for that key are refused regardless of HTTP
+// method. This is the right semantics for the current state of the
+// gateway because every entry here is unsupported across ALL methods
+// (e.g. neither GET ?acl nor PUT ?acl is implemented). If partial
+// per-method support is ever added — say, GET ?acl works but PUT
+// ?acl does not — the corresponding key MUST be removed from this
+// map entirely (which unblocks BOTH methods) and the method-specific
+// rejection moved into the relevant dispatch arm (in this example,
+// the PUT arm would emit 501 for ?acl and the GET arm would handle
+// it). Leaving a key in this map while wiring up one method would
+// produce a confusing 501-on-GET response after the GET handler
+// exists, because rejectUnsupportedSubresource runs before the
+// per-method dispatch and would never give the GET handler a chance
+// to run.
+//
 // `delete` is intentionally NOT in this map: it is the
 // POST DeleteObjects (bulk delete) endpoint, which the dispatcher's
 // POST arm routes explicitly. Adding `delete` here would
@@ -549,6 +565,11 @@ var unsupportedSubresourceKeys = func() []string {
 // multiple unsupported sub-resource keys, the error names the
 // lexicographically-first matching key so the response body is
 // deterministic for snapshot testing.
+//
+// The check is also method-agnostic: it fires for any HTTP method
+// against the listed sub-resources. See the doc on
+// unsupportedSubresources above for the trap this creates if partial
+// per-method support is ever wired up for one of the listed keys.
 func (h *Handler) rejectUnsupportedSubresource(w http.ResponseWriter, r *http.Request, q url.Values) bool {
 	for _, key := range unsupportedSubresourceKeys {
 		if !q.Has(key) {

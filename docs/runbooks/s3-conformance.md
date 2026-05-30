@@ -263,6 +263,30 @@ When the gateway gains a new operation (e.g. versioning lands):
    the `mint` skip set) so the external runs start exercising the
    new surface.
 
+### Partial per-method support for a sub-resource
+
+`rejectUnsupportedSubresource` is intentionally method-agnostic: any
+sub-resource listed in `unsupportedSubresources` is refused for every
+HTTP method (the rejection runs before the per-method dispatch). That
+is the right behaviour today because every entry in the map is
+unsupported across all methods.
+
+If a future change implements support for ONE method of a sub-resource
+but not the others (e.g. `GET ?acl` is wired up but `PUT ?acl` is not),
+the operator MUST:
+
+1. Remove the sub-resource key from `unsupportedSubresources`
+   entirely — leaving it in the map would 501 every request including
+   the newly-wired GET, because the global rejection runs before the
+   GET dispatch.
+2. Add a method-specific rejection inside the un-implemented method's
+   dispatch arm (the PUT arm in the example), emitting the same
+   `501 NotImplemented` + `NotImplemented` S3 code.
+3. Add the working method to `tests/s3_conformance/runner.go`'s
+   relevant op group AND keep an `unsupportedOps` probe for the
+   un-implemented method so the matrix continues to assert that
+   PUT-side 501.
+
 ## Where this matrix is consumed
 
 - **Internal**: the in-process gate runs on every commit; broken

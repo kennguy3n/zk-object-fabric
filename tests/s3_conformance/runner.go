@@ -773,27 +773,80 @@ func (r *Runner) unsupportedOps(ctx context.Context) []OpResult {
 	return out
 }
 
-// cleanup attempts to delete every object the runner wrote. It uses
-// ListObjectsV2 + DeleteObject in a loop rather than DeleteObjects
-// (multi-object delete) because that operation is in unsupportedOps.
+// cleanup attempts to delete every object the runner wrote. It
+// drives DeleteObject one key at a time rather than using the bulk
+// DeleteObjects endpoint because that operation is in unsupportedOps.
+//
+// The cleanup is version-aware: the gateway exposes server-side
+// versioning by default (every PUT creates a new version, every
+// DELETE writes a delete marker), so a naive ListObjectsV2 +
+// DeleteObject loop would only see the *latest* version of each key
+// and would orphan every prior version + delete marker in the
+// underlying manifest store / provider. For an in-process test gateway
+// that gets torn down via t.TempDir() this would be invisible, but
+// runs against a long-lived endpoint (see
+// docs/runbooks/s3-conformance.md#using-the-runner-against-a-live-endpoint)
+// would steadily accumulate residual versions and inflate storage.
+//
+// The implementation enumerates everything under r.KeyPrefix via
+// ListObjectVersions and issues a per-version DeleteObject with the
+// VersionId attached so each version is permanently removed (the
+// gateway honours ?versionId; see api/s3compat/handler.go DeleteObject).
+// DeleteMarkers are deleted the same way — DeleteObject with the
+// delete-marker's VersionId removes the marker itself rather than
+// stacking another one.
+//
+// If the gateway returns 4xx/501 to ListObjectVersions (some
+// S3-compatible backends omit it), we fall back to the original
+// ListObjectsV2 path. This is no regression over the previous
+// behaviour — the same residual-versions caveat applies — and is
+// surfaced via a "(versions API unsupported, fell back to v2)" note
+// in the matrix Detail field.
 func (r *Runner) cleanup(ctx context.Context) OpResult {
 	return r.run("bulk", "Cleanup", func(ctx context.Context) (string, OpStatus, error) {
 		deleted := 0
 		failed := 0
-		var token *string
+
+		// Primary path: enumerate every version + delete marker
+		// under the prefix and delete each one by VersionId.
+		usedVersions := true
+		var keyMarker, versionMarker *string
 		for {
-			page, err := r.Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-				Bucket:            aws.String(r.Bucket),
-				Prefix:            aws.String(r.KeyPrefix),
-				ContinuationToken: token,
+			page, err := r.Client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+				Bucket:          aws.String(r.Bucket),
+				Prefix:          aws.String(r.KeyPrefix),
+				KeyMarker:       keyMarker,
+				VersionIdMarker: versionMarker,
 			})
 			if err != nil {
-				return fmt.Sprintf("ListObjectsV2 in cleanup: %v", err), OpFailed, nil
+				if code := statusCode(err); isUnsupportedCode(code) {
+					// Gateway does not surface
+					// ListObjectVersions — fall back
+					// to the v2-list cleanup. We still
+					// report success on the runner side,
+					// but the Detail field will note the
+					// downgrade so operators see it.
+					usedVersions = false
+					break
+				}
+				return fmt.Sprintf("ListObjectVersions in cleanup: %v", err), OpFailed, nil
 			}
-			for _, obj := range page.Contents {
+			for _, v := range page.Versions {
 				if _, err := r.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-					Bucket: aws.String(r.Bucket),
-					Key:    obj.Key,
+					Bucket:    aws.String(r.Bucket),
+					Key:       v.Key,
+					VersionId: v.VersionId,
+				}); err != nil {
+					failed++
+				} else {
+					deleted++
+				}
+			}
+			for _, dm := range page.DeleteMarkers {
+				if _, err := r.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+					Bucket:    aws.String(r.Bucket),
+					Key:       dm.Key,
+					VersionId: dm.VersionId,
 				}); err != nil {
 					failed++
 				} else {
@@ -803,12 +856,55 @@ func (r *Runner) cleanup(ctx context.Context) OpResult {
 			if !aws.ToBool(page.IsTruncated) {
 				break
 			}
-			token = page.NextContinuationToken
+			keyMarker = page.NextKeyMarker
+			versionMarker = page.NextVersionIdMarker
 		}
+
+		if !usedVersions {
+			// Fallback: original ListObjectsV2 + DeleteObject
+			// (latest-version-only) cleanup. Used when the
+			// gateway under test does not implement
+			// ListObjectVersions; the operator should be
+			// aware that prior versions will accumulate.
+			var token *string
+			for {
+				page, err := r.Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+					Bucket:            aws.String(r.Bucket),
+					Prefix:            aws.String(r.KeyPrefix),
+					ContinuationToken: token,
+				})
+				if err != nil {
+					return fmt.Sprintf("ListObjectsV2 in cleanup (fallback): %v", err), OpFailed, nil
+				}
+				for _, obj := range page.Contents {
+					if _, err := r.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+						Bucket: aws.String(r.Bucket),
+						Key:    obj.Key,
+					}); err != nil {
+						failed++
+					} else {
+						deleted++
+					}
+				}
+				if !aws.ToBool(page.IsTruncated) {
+					break
+				}
+				token = page.NextContinuationToken
+			}
+		}
+
 		if failed > 0 {
-			return fmt.Sprintf("deleted %d, %d failed", deleted, failed), OpFailed, nil
+			suffix := ""
+			if !usedVersions {
+				suffix = " (versions API unsupported, fell back to v2)"
+			}
+			return fmt.Sprintf("deleted %d, %d failed%s", deleted, failed, suffix), OpFailed, nil
 		}
-		return fmt.Sprintf("deleted %d objects under prefix %q", deleted, r.KeyPrefix), OpPassed, nil
+		suffix := ""
+		if !usedVersions {
+			suffix = " (versions API unsupported, fell back to v2 \u2014 prior versions may remain)"
+		}
+		return fmt.Sprintf("deleted %d entries under prefix %q%s", deleted, r.KeyPrefix, suffix), OpPassed, nil
 	})(ctx)
 }
 

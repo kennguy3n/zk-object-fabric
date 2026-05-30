@@ -2,6 +2,8 @@ package s3_conformance_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -376,4 +378,140 @@ func TestRunner_RunDoesNotMutateReceiver(t *testing.T) {
 	if r2.KeyPrefix != explicit {
 		t.Errorf("Run() altered caller-supplied KeyPrefix: got %q want %q", r2.KeyPrefix, explicit)
 	}
+}
+
+// TestRunner_CleanupRemovesAllVersions pins the version-aware cleanup
+// behaviour. The gateway exposes server-side versioning by default
+// (every PUT under the same key creates a new version), so a naive
+// ListObjectsV2 + DeleteObject cleanup would only see the latest
+// version and orphan the prior ones in the manifest store.
+//
+// The assertion that catches a v2-only regression has to inspect the
+// manifest store directly, not the gateway's ListObjectVersions. The
+// gateway bootstraps ListObjectVersions from a "latest version per
+// key" index (api/s3compat/copy.go ListObjectVersions → Manifests.List
+// → returns latest only), so once the latest version is deleted the
+// older versions become invisible to ListObjectVersions even though
+// they still exist in the store. That separate gateway gap would
+// otherwise mask a v2-only cleanup regression here.
+//
+// The flow:
+//
+//  1. PUTs the same key three times under a fixed prefix and captures
+//     the underlying memory.Store so the test can later count
+//     manifests directly.
+//  2. Runs Runner.cleanup() (via Run() with Cleanup=true) scoped to
+//     the prefix.
+//  3. Calls memory.Store.ListVersions() directly and asserts zero
+//     manifests remain for the object's key hash. A v2-only cleanup
+//     would leave the two older manifests behind and fail this check.
+func TestRunner_CleanupRemovesAllVersions(t *testing.T) {
+	root := t.TempDir()
+	provider, err := local_fs_dev.New(root)
+	if err != nil {
+		t.Fatalf("local_fs_dev.New: %v", err)
+	}
+	store := memory.New()
+	mux := http.NewServeMux()
+	s3compat.New(s3compat.Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"local": provider},
+		Placement:     fixedPlacement{backend: "local"},
+		Multipart:     multipart.NewMemoryStore(),
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           time.Now,
+	}).Register(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	cfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithRegion("us-east-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatalf("config.LoadDefaultConfig: %v", err)
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(ts.URL)
+		o.UsePathStyle = true
+	})
+	bucket := "version-cleanup-bucket"
+	ctx := context.Background()
+	prefix := "version-cleanup-test/"
+	key := prefix + "object.txt"
+
+	// Stage 1: write three versions of the same key. Each PUT lands
+	// a distinct manifest in `store` (verified below).
+	for i, body := range []string{"v1", "v2", "v3"} {
+		out, err := client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+			Body:   strings.NewReader(body),
+		})
+		if err != nil {
+			t.Fatalf("put v%d: %v", i+1, err)
+		}
+		t.Logf("put v%d: VersionID=%q ETag=%q", i+1, aws.ToString(out.VersionId), aws.ToString(out.ETag))
+	}
+
+	// Precondition: the memory store carries exactly 3 manifests
+	// for this object's key hash. hashObjectKey is package-private,
+	// so the test computes it the same way (sha256 hex).
+	hk := sha256Hex(key)
+	versionsBefore, err := store.ListVersions(ctx, "anonymous", bucket, hk)
+	if err != nil {
+		t.Fatalf("store.ListVersions before cleanup: %v", err)
+	}
+	if got := len(versionsBefore); got != 3 {
+		t.Fatalf("precondition: store carries %d manifests for key %q before cleanup; want 3", got, key)
+	}
+
+	// Stage 2: drive the runner with Cleanup=true on the same
+	// prefix. CreateBucket is false since the bucket is implicit.
+	r := &conformance.Runner{
+		Client:       client,
+		Endpoint:     ts.URL,
+		Bucket:       bucket,
+		CreateBucket: false,
+		Cleanup:      true,
+		KeyPrefix:    prefix,
+	}
+	matrix := r.Run(ctx)
+
+	var cleanupOp *conformance.OpResult
+	for i := range matrix.Operations {
+		if matrix.Operations[i].Op == "Cleanup" {
+			cleanupOp = &matrix.Operations[i]
+			break
+		}
+	}
+	if cleanupOp == nil {
+		t.Fatalf("matrix missing Cleanup entry; ops=%+v", matrix.Operations)
+	}
+	if cleanupOp.Status != conformance.OpPassed {
+		t.Errorf("Cleanup status=%s detail=%s; want OpPassed", cleanupOp.Status, cleanupOp.Detail)
+	}
+
+	// Stage 3: the manifest store must hold zero manifests for the
+	// object after cleanup. A v2-only cleanup would only delete the
+	// latest version and leave the two older manifests in the store.
+	versionsAfter, err := store.ListVersions(ctx, "anonymous", bucket, hk)
+	if err != nil {
+		t.Fatalf("store.ListVersions after cleanup: %v", err)
+	}
+	if got := len(versionsAfter); got != 0 {
+		t.Errorf("store carries %d residual manifests after cleanup; want 0 (cleanup.Detail=%s)",
+			got, cleanupOp.Detail)
+		for i, m := range versionsAfter {
+			t.Logf("residual[%d] VersionID=%s", i, m.VersionID)
+		}
+	}
+}
+
+// sha256Hex mirrors api/s3compat.hashObjectKey for the cleanup test,
+// since the gateway's hash function is package-private.
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
