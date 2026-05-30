@@ -293,6 +293,11 @@ type ReportScenario struct {
 	Results   []Result `json:"results"`
 	Pass      bool     `json:"pass"`
 	Failures  []string `json:"failures,omitempty"`
+	// Pending lists metric names the runner could not yet measure
+	// (Result.Pending=true). These do not fail the scenario but
+	// are surfaced in the report so CI artifacts make it obvious
+	// which targets are still un-wired.
+	Pending []string `json:"pending,omitempty"`
 }
 
 // Report is the top-level JSON emitted by RunSuite. The shape is
@@ -333,6 +338,10 @@ func RunSuite(suite Suite, runner Runner) (*Report, error) {
 		for i, t := range sc.Targets {
 			if i >= len(results) {
 				break
+			}
+			if results[i].Pending {
+				reportSc.Pending = append(reportSc.Pending, string(t.Metric))
+				continue
 			}
 			if msg := EvaluateTarget(t, results[i].Value); msg != "" {
 				reportSc.Pass = false

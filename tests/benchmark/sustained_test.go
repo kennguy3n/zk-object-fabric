@@ -31,6 +31,11 @@ type fakeProvider struct {
 	// test seed the working set successfully and only then start
 	// returning failures.
 	failAfter map[string]int64
+	// failEveryN[op] = N>0 makes only every Nth call (after
+	// failAfter) fail, simulating a low transient error rate
+	// rather than a hard outage. 0 keeps the all-fail behaviour
+	// of setFailAfter.
+	failEveryN map[string]int64
 
 	puts    atomic.Int64
 	gets    atomic.Int64
@@ -41,10 +46,11 @@ type fakeProvider struct {
 
 func newFakeProvider() *fakeProvider {
 	return &fakeProvider{
-		pieces:    map[string][]byte{},
-		latency:   map[string]time.Duration{},
-		failOp:    map[string]bool{},
-		failAfter: map[string]int64{},
+		pieces:     map[string][]byte{},
+		latency:    map[string]time.Duration{},
+		failOp:     map[string]bool{},
+		failAfter:  map[string]int64{},
+		failEveryN: map[string]int64{},
 	}
 }
 
@@ -63,6 +69,17 @@ func (f *fakeProvider) setFailAfter(op string, after int64) {
 	f.failAfter[op] = after
 }
 
+// setFailEveryNth arms a transient-failure injector: only every
+// Nth call of op (counted past `after`) fails. Use this to model
+// a low background error rate without simulating a hard outage.
+func (f *fakeProvider) setFailEveryNth(op string, every, after int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failOp[op] = true
+	f.failAfter[op] = after
+	f.failEveryN[op] = every
+}
+
 func (f *fakeProvider) sleepFor(op string) {
 	f.mu.Lock()
 	d := f.latency[op]
@@ -78,7 +95,15 @@ func (f *fakeProvider) shouldFail(op string, count int64) bool {
 	if !f.failOp[op] {
 		return false
 	}
-	return count > f.failAfter[op]
+	if count <= f.failAfter[op] {
+		return false
+	}
+	if every := f.failEveryN[op]; every > 0 {
+		// (count - failAfter) is the index of this drive-phase
+		// call; fail only every `every`th one.
+		return ((count - f.failAfter[op]) % every) == 0
+	}
+	return true
 }
 
 func (f *fakeProvider) PutPiece(_ context.Context, pieceID string, r io.Reader, _ providers.PutOptions) (providers.PutResult, error) {
@@ -495,5 +520,144 @@ func TestSustainedRunner_ContextDeadline(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatalf("Run did not return within 3s")
+	}
+}
+
+// TestSustainedRunner_FailureLimitDoesNotTripUnderTransientErrors
+// verifies the fix for the cumulative-vs-consecutive bug: a low
+// background error rate must NOT trip the consecutive failure
+// limit, even when total errors over the run exceed it.
+func TestSustainedRunner_FailureLimitDoesNotTripUnderTransientErrors(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+	runner.DurationOverride = 500 * time.Millisecond
+	runner.FailureLimit = 8 // low, so a cumulative counter would trip
+	runner.SeedObjects = 8
+
+	// Inject a transient PUT failure every 10th call. With 50/50
+	// PUT/GET this gives ~5% error rate -- well above
+	// TargetErrorRateMax for a real run, but no streak ever hits
+	// 8 consecutive failures because GETs always succeed and PUT
+	// successes between failures reset the counter.
+	prov.setFailEveryNth("PUT", 10, int64(runner.SeedObjects))
+
+	sc := Scenario{
+		Name: "transient-errors",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"PUT": 0.5, "GET": 0.5},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       400,
+		},
+		Targets: []Target{{Metric: MetricPutP99, Unit: "ms"}},
+	}
+
+	results, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run: unexpected failure-limit trip on transient errors: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Run returned 0 results")
+	}
+}
+
+// TestSustainedRunner_PendingForUnmeasurableMetrics verifies that
+// SustainedRunner emits Result.Pending=true for metrics that the
+// raw StorageProvider interface cannot observe (e.g. dedup hit
+// ratio, cross-cell migration throughput). These must NOT cause
+// the scenario to fail; instead they surface in
+// ReportScenario.Pending when RunSuite is used.
+func TestSustainedRunner_PendingForUnmeasurableMetrics(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+	runner.DurationOverride = 200 * time.Millisecond
+	runner.SeedObjects = 4
+
+	sc := Scenario{
+		Name: "dedup-pending",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"PUT": 0.5, "GET": 0.5},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       100,
+		},
+		Targets: []Target{
+			{Metric: MetricPutP99, Unit: "ms"},
+			{Metric: MetricDedupHitRatio, Min: 0.75, Unit: "ratio"},
+			{Metric: MetricMigrationThroughput, Min: 1e6, Unit: "bytes_per_sec"},
+		},
+	}
+
+	results, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("Run returned %d results, want 3", len(results))
+	}
+	if results[0].Pending {
+		t.Errorf("MetricPutP99 unexpectedly Pending")
+	}
+	if !results[1].Pending {
+		t.Errorf("MetricDedupHitRatio should be Pending (provider-level runner cannot measure dedup)")
+	}
+	if !results[2].Pending {
+		t.Errorf("MetricMigrationThroughput should be Pending (provider-level runner cannot measure cross-cell migration)")
+	}
+
+	// And via RunSuite the scenario should pass (Pending is not a
+	// failure), with the two unmeasured metrics surfaced in
+	// ReportScenario.Pending.
+	rep, err := RunSuite(Suite{Name: "test", Scenarios: []Scenario{sc}}, runner)
+	if err != nil {
+		t.Fatalf("RunSuite: %v", err)
+	}
+	if !rep.AllPassed {
+		t.Errorf("AllPassed = false; want true (Pending metrics must not fail the suite). Failures=%v", rep.Scenarios[0].Failures)
+	}
+	if len(rep.Scenarios[0].Pending) != 2 {
+		t.Errorf("ReportScenario.Pending = %v, want 2 entries (dedup_hit_ratio, migration_throughput_bytes_per_sec)", rep.Scenarios[0].Pending)
+	}
+}
+
+// TestSustainedRunner_CtxCancelStopsRun verifies that cancelling
+// the Ctx field aborts an in-flight scenario instead of waiting
+// for the duration to elapse.
+func TestSustainedRunner_CtxCancelStopsRun(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+	runner.DurationOverride = 30 * time.Second // would block well past test timeout
+	runner.SeedObjects = 4
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runner.Ctx = ctx
+
+	sc := Scenario{
+		Name: "ctx-cancel",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"PUT": 1.0},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 30,
+			TargetRPS:       50,
+		},
+		Targets: []Target{{Metric: MetricPutP99, Unit: "ms"}},
+	}
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	t0 := time.Now()
+	_, err := runner.Run(sc)
+	elapsed := time.Since(t0)
+	// Ctx cancellation should drain quickly. We don't assert on
+	// err vs nil because the runner may return either a clean
+	// nil (all goroutines drained on Ctx.Done) or a context
+	// error depending on which phase saw the cancel first; what
+	// matters is we did not run for the full 30s.
+	_ = err
+	if elapsed > 3*time.Second {
+		t.Fatalf("Run elapsed %v after Ctx cancel; want fast exit", elapsed)
 	}
 }

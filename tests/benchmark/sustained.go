@@ -80,9 +80,19 @@ type SustainedRunner struct {
 	// at the same scenario produce the same op sequence.
 	RNGSeed uint64
 
-	// FailureLimit caps the number of consecutive request errors
-	// before the run aborts. 0 -> 64.
+	// FailureLimit caps the number of *consecutive* request errors
+	// before the run aborts. "Consecutive" is fleet-wide: any
+	// successful request from any worker resets the counter, so
+	// the limit trips only when no worker has succeeded in the
+	// last FailureLimit requests. 0 -> 64.
 	FailureLimit int
+
+	// Ctx, if non-nil, parents the run's internal context. A
+	// caller (e.g. the CLI signal handler) can cancel a long
+	// scenario by cancelling this context. When nil, the run
+	// uses context.Background() so the existing Runner interface
+	// stays backward compatible.
+	Ctx context.Context
 }
 
 // NewSustainedRunner returns a runner for provider.
@@ -99,7 +109,11 @@ func (r *SustainedRunner) Run(scenario Scenario) ([]Result, error) {
 		return nil, fmt.Errorf("benchmark: scenario %q: %w", scenario.Name, err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	parent := r.Ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
 	cfg, err := r.effectiveWorkload(scenario.Workload)
@@ -250,7 +264,17 @@ func (r *SustainedRunner) drive(ctx context.Context, scenario string, payload []
 	// region is a slice-index pick or append, not the I/O itself.
 	workingSet := &keySet{keys: append([]string(nil), seeded...)}
 
-	var failures atomic.Int64
+	// consecutive tracks fleet-wide consecutive errors: any
+	// success resets it to 0, any error increments it. When the
+	// counter reaches cfg.failureLimit the run aborts. The race
+	// where a success in worker A clobbers an error increment in
+	// worker B is acceptable: the worst case is a slightly
+	// delayed abort, which is the safe direction for a circuit
+	// breaker. tripped is set once when the limit is hit so the
+	// caller can distinguish "failure limit reached" from "clean
+	// shutdown".
+	var consecutive atomic.Int64
+	var tripped atomic.Bool
 
 	for i := 0; i < workers; i++ {
 		state := perWorker[i]
@@ -266,10 +290,13 @@ func (r *SustainedRunner) drive(ctx context.Context, scenario string, payload []
 				dur := r.nowFn()().Sub(start)
 				state.record(op, dur, err)
 				if err != nil {
-					if failures.Add(1) >= int64(cfg.failureLimit) {
+					if consecutive.Add(1) >= int64(cfg.failureLimit) {
+						tripped.Store(true)
 						cancel()
 						return
 					}
+				} else {
+					consecutive.Store(0)
 				}
 			}
 		}()
@@ -280,8 +307,8 @@ func (r *SustainedRunner) drive(ctx context.Context, scenario string, payload []
 	for _, ws := range perWorker {
 		agg.merge(ws)
 	}
-	if failures.Load() >= int64(cfg.failureLimit) {
-		return fmt.Errorf("benchmark: failure limit %d reached", cfg.failureLimit)
+	if tripped.Load() {
+		return fmt.Errorf("benchmark: consecutive failure limit %d reached", cfg.failureLimit)
 	}
 	return nil
 }
@@ -411,7 +438,14 @@ func (r *SustainedRunner) buildResults(scenario Scenario, cfg runConfig, agg *ag
 		case MetricListP95:
 			res.Value = float64(agg.list.Percentile(95)) / float64(time.Millisecond)
 		case MetricCacheHitRatioHot:
-			if cacheTotal > 0 {
+			// We can only measure cache hit ratio when a
+			// HotObjectCache is wired into the runner; against a
+			// raw StorageProvider there is no cache layer to
+			// hit. Surface that distinction so a Min-bounded
+			// gate doesn't silently fail on a 0.0 reading.
+			if r.Cache == nil {
+				res.Pending = true
+			} else if cacheTotal > 0 {
 				res.Value = float64(agg.cacheHit) / float64(cacheTotal)
 			}
 		case MetricSustainedRPS:
@@ -424,6 +458,29 @@ func (r *SustainedRunner) buildResults(scenario Scenario, cfg runConfig, agg *ag
 			if totalRequests > 0 {
 				res.Value = float64(agg.errors) / float64(totalRequests)
 			}
+		case MetricDedupHitRatio,
+			MetricDedupBytesSavedRatio,
+			MetricDedupPutLatencyOverheadP95,
+			MetricWasabiOriginEgressRatio,
+			MetricMigrationThroughput,
+			MetricRepairTimeSeconds,
+			MetricNetworkCostUSDPerTB:
+			// These metrics are not measurable from a raw
+			// providers.StorageProvider — they require visibility
+			// into gateway-layer state (dedup index, content
+			// index, cross-cell migration coordinator, repair
+			// worker, egress accounting). Mark Pending so RunSuite
+			// skips EvaluateTarget instead of failing the scenario
+			// with a 0.0 reading. A future gateway-level runner
+			// can populate these from the gateway's metrics
+			// pipeline.
+			res.Pending = true
+		default:
+			// Unknown metric — also mark Pending so a typo in a
+			// scenario definition surfaces in the report's
+			// Pending list rather than silently passing a 0.0
+			// reading against a Min-bounded target.
+			res.Pending = true
 		}
 		res.Histogram = histogramFor(t.Metric, agg)
 		res.Duration = elapsed
@@ -563,11 +620,12 @@ func (k *keySet) popOne(rng *rand.Rand) (string, bool) {
 // tokenBucket is a simple rate-controlled token source. A
 // background goroutine emits tokens at the configured rate; the
 // bucket is bounded so a slow consumer cannot accumulate
-// unbounded burst credit.
+// unbounded burst credit. The emitter goroutine and all
+// consumers exit via the shared context passed to start/acquire;
+// no separate stop channel is needed.
 type tokenBucket struct {
 	rate   int
 	tokens chan struct{}
-	stop   chan struct{}
 }
 
 func newTokenBucket(rate int) *tokenBucket {
@@ -584,7 +642,6 @@ func newTokenBucket(rate int) *tokenBucket {
 	return &tokenBucket{
 		rate:   rate,
 		tokens: make(chan struct{}, burst),
-		stop:   make(chan struct{}),
 	}
 }
 
@@ -606,7 +663,6 @@ func (b *tokenBucket) start(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				close(b.stop)
 				return
 			case <-ticker.C:
 				for i := 0; i < perTick; i++ {

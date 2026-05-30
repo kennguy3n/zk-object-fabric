@@ -69,6 +69,9 @@ func run() error {
 		return err
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	runner := &benchmark.SustainedRunner{
 		Provider:           provider,
 		Concurrency:        flags.concurrency,
@@ -77,10 +80,11 @@ func run() error {
 		RPSOverride:        flags.rpsOverride,
 		MaxObjectSizeBytes: flags.maxObjectBytes,
 		FailureLimit:       flags.failureLimit,
+		// Plumb the signal context into the runner so SIGINT/SIGTERM
+		// actually cancels the in-flight scenario instead of leaving
+		// it to finish in a now-orphaned goroutine.
+		Ctx: ctx,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	report, err := runSuite(ctx, suite, runner)
 	if err != nil {
@@ -335,12 +339,18 @@ func logReport(report *benchmark.Report) {
 		if !sc.Pass {
 			status = "FAIL"
 		}
-		log.Printf("  [%s] scenario=%s metrics=%d failures=%d",
-			status, sc.Name, len(sc.Results), len(sc.Failures))
+		log.Printf("  [%s] scenario=%s metrics=%d failures=%d pending=%d",
+			status, sc.Name, len(sc.Results), len(sc.Failures), len(sc.Pending))
 		for _, fmsg := range sc.Failures {
-			log.Printf("    - %s", fmsg)
+			log.Printf("    - FAIL: %s", fmsg)
+		}
+		for _, pmsg := range sc.Pending {
+			log.Printf("    - PENDING: metric=%s (not yet measurable by SustainedRunner)", pmsg)
 		}
 		for _, r := range sc.Results {
+			if r.Pending {
+				continue
+			}
 			log.Printf("    metric=%s value=%.6f unit=%s duration=%s",
 				r.Metric, r.Value, r.Labels["unit"], r.Duration)
 		}

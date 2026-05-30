@@ -286,6 +286,16 @@ type Result struct {
 	// metric was computed from. Latency-shaped metrics populate
 	// it; counters (RPS, ratios, error rate) leave it nil.
 	Histogram *HistogramSummary `json:"histogram,omitempty"`
+	// Pending is set by a runner when it cannot yet measure the
+	// requested metric — e.g. SustainedRunner asked to measure a
+	// dedup hit ratio against a raw StorageProvider, where dedup
+	// is enforced one layer up in the gateway and is structurally
+	// invisible to the provider interface. RunSuite skips
+	// EvaluateTarget for Pending=true results and tallies them in
+	// ReportScenario.Pending rather than failing the scenario.
+	// Zero value (false) means "measured normally" so existing
+	// runners stay correct without a code change.
+	Pending bool `json:"pending,omitempty"`
 }
 
 // Runner executes a Suite against a single StorageProvider and
