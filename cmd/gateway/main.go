@@ -353,17 +353,15 @@ func main() {
 	// tests/abuse/slowloris_test.go for the regression test that
 	// pins these knobs.
 	//
-	// The MaxHeaderBytes <= 0 guard mirrors the console server
-	// (see startConsoleAPI). Go's http.Server falls back to
-	// http.DefaultMaxHeaderBytes (1 MiB) for a zero or negative
-	// value internally, but pinning the floor in our own code
-	// keeps the two listeners syntactically identical so a future
-	// reader does not have to know about that internal fallback
-	// to convince themselves the gateway is hardened.
-	gatewayMaxHdr := cfg.Gateway.MaxHeaderBytes
-	if gatewayMaxHdr <= 0 {
-		gatewayMaxHdr = http.DefaultMaxHeaderBytes
-	}
+	// MaxHeaderBytes routes through config.EffectiveMaxHeaderBytes
+	// so a hand-rolled config explicitly setting the field to 0
+	// re-floors to config.DefaultMaxHeaderBytes (64 KiB) instead
+	// of falling through to Go's stdlib 1 MiB default. This
+	// collapses the explicit-0 and omitted-field paths so the
+	// operator's diff is the only way to land at a different
+	// effective ceiling. (Devin Review ANALYSIS_0001 on PR #80
+	// flagged the prior 1-MiB fallback inconsistency.)
+	warnIfSlowlorisDisabled("gateway", cfg.Gateway.ListenAddr, cfg.Gateway.ReadHeaderTimeout)
 	srv := &http.Server{
 		Addr:              cfg.Gateway.ListenAddr,
 		Handler:           handler,
@@ -371,7 +369,7 @@ func main() {
 		WriteTimeout:      cfg.Gateway.WriteTimeout.ToDuration(),
 		ReadHeaderTimeout: cfg.Gateway.ReadHeaderTimeout.ToDuration(),
 		IdleTimeout:       cfg.Gateway.IdleTimeout.ToDuration(),
-		MaxHeaderBytes:    gatewayMaxHdr,
+		MaxHeaderBytes:    config.EffectiveMaxHeaderBytes(cfg.Gateway.MaxHeaderBytes),
 	}
 
 	// fleetOrchestrator coordinates large multi-tenant
@@ -487,6 +485,32 @@ func tlsVersionLabel(v uint16) string {
 // production-warning log lines share the "gateway: %s …" prefix
 // (where %s is the per-listener name) so log scrapers can match
 // every gateway-process line with one regex.
+//
+// warnIfSlowlorisDisabled emits a structured WARN log line at
+// startup when the named listener is enabled (ListenAddr non-
+// empty) but its ReadHeaderTimeout is zero or negative. Zero
+// ReadHeaderTimeout is a legitimate operator opt-out (the field
+// docs document this and Validate() accepts it), but it disables
+// the cheaper header-stall Slowloris defence entirely, so the
+// fleet observability signal is what operators rely on to notice
+// the misconfiguration. Logging at startup rather than refusing
+// to start preserves the opt-out while making it auditable: a
+// log scraper match on "slowloris-defence-disabled" surfaces
+// every node running with the protection off. (Devin Review
+// ANALYSIS_0003 on PR #80 flagged the silent-opt-out path.)
+func warnIfSlowlorisDisabled(name, listenAddr string, readHeader config.Duration) {
+	if listenAddr == "" {
+		return
+	}
+	if readHeader > 0 {
+		return
+	}
+	log.Printf(
+		"gateway: %s listener WARN slowloris-defence-disabled: read_header_timeout=%s on %s; Slowloris header-stall protection is OFF (zero ReadHeaderTimeout means the entire ReadTimeout window must elapse before a slow-header attacker is dropped). Set %s.read_header_timeout to a non-zero duration (default 10s) unless you have a deliberate reason to disable.",
+		name, readHeader.ToDuration(), listenAddr, name,
+	)
+}
+
 func startListener(srv *http.Server, t config.TLSConfig, env, name string) error {
 	if err := t.Validate(name); err != nil {
 		return err
@@ -1546,20 +1570,30 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 		// HealthConfig.ListenAddr notes "e.g. :29090"), but a
 		// misconfigured NetworkPolicy or a debug deployment that
 		// exposes the listener directly should not be silently
-		// vulnerable. Apply the same three knobs the gateway and
-		// console servers use; the defaults (10s / 120s / 64 KiB)
-		// come from HealthConfig.Default() so an upgrade picks
-		// them up automatically without a config edit.
-		healthMaxHdr := hc.MaxHeaderBytes
-		if healthMaxHdr <= 0 {
-			healthMaxHdr = http.DefaultMaxHeaderBytes
-		}
+		// vulnerable. Apply the same four knobs the gateway and
+		// console servers use; the defaults (ReadTimeout 30s,
+		// ReadHeaderTimeout 10s, IdleTimeout 120s, MaxHeaderBytes
+		// 64 KiB) come from HealthConfig.Default() so an upgrade
+		// picks them up automatically without a config edit.
+		//
+		// ReadTimeout is included even though current /health
+		// surface is GET-only: it is defence-in-depth for any
+		// future POST/PUT health endpoint (drain control,
+		// manual quorum override) and it is the upper bound
+		// validateTimeoutOrder enforces ReadHeaderTimeout to
+		// stay strictly below — a missing ReadTimeout would
+		// silently let an operator set ReadHeaderTimeout to any
+		// value, masking the misconfig the validator is meant
+		// to catch on the gateway and console. (Devin Review
+		// ANALYSIS_0004 on PR #80.)
+		warnIfSlowlorisDisabled("health", hc.ListenAddr, hc.ReadHeaderTimeout)
 		srv := &http.Server{
 			Addr:              hc.ListenAddr,
 			Handler:           mon.ServeMux(""),
+			ReadTimeout:       hc.ReadTimeout.ToDuration(),
 			ReadHeaderTimeout: hc.ReadHeaderTimeout.ToDuration(),
 			IdleTimeout:       hc.IdleTimeout.ToDuration(),
-			MaxHeaderBytes:    healthMaxHdr,
+			MaxHeaderBytes:    config.EffectiveMaxHeaderBytes(hc.MaxHeaderBytes),
 		}
 		go func() {
 			log.Printf("gateway: health endpoints on %s", hc.ListenAddr)
@@ -1632,13 +1666,13 @@ func startConsoleAPI(
 	// MaxHeaderBytes mirror the gateway's posture so a
 	// misconfigured ingress that accidentally exposes the console
 	// API to the internet is not silently exploitable. The
-	// defaults are set in config.Default(); we use
-	// http.DefaultMaxHeaderBytes as the floor if an operator left
-	// the value at zero in a hand-rolled config file.
-	consoleMaxHdr := cfg.Console.MaxHeaderBytes
-	if consoleMaxHdr <= 0 {
-		consoleMaxHdr = http.DefaultMaxHeaderBytes
-	}
+	// defaults are set in config.Default(); MaxHeaderBytes routes
+	// through config.EffectiveMaxHeaderBytes so an explicit-0 in
+	// the JSON config re-floors to config.DefaultMaxHeaderBytes
+	// (64 KiB) instead of falling through to Go's 1 MiB stdlib
+	// default (matches gateway and health; Devin Review
+	// ANALYSIS_0001 on PR #80).
+	warnIfSlowlorisDisabled("console", cfg.Console.ListenAddr, cfg.Console.ReadHeaderTimeout)
 	srv := &http.Server{
 		Addr:              cfg.Console.ListenAddr,
 		Handler:           mux,
@@ -1646,7 +1680,7 @@ func startConsoleAPI(
 		WriteTimeout:      cfg.Console.WriteTimeout.ToDuration(),
 		ReadHeaderTimeout: cfg.Console.ReadHeaderTimeout.ToDuration(),
 		IdleTimeout:       cfg.Console.IdleTimeout.ToDuration(),
-		MaxHeaderBytes:    consoleMaxHdr,
+		MaxHeaderBytes:    config.EffectiveMaxHeaderBytes(cfg.Console.MaxHeaderBytes),
 	}
 	go func() {
 		log.Printf("gateway: console API on %s", cfg.Console.ListenAddr)

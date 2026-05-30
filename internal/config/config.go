@@ -13,6 +13,37 @@ import (
 	"time"
 )
 
+// DefaultMaxHeaderBytes is the floor applied by Default() to every
+// HTTP listener config (gateway, console, health). It is exported
+// so http.Server construction sites can apply the same floor when
+// a hand-rolled JSON config explicitly sets the field to zero —
+// matching the effective behavior of an omitted field (which
+// Default() populates) rather than falling through to Go's stdlib
+// http.DefaultMaxHeaderBytes (1 MiB).
+//
+// The bot's review observation (ANALYSIS_0001 on PR #80) called
+// out the surprise: omitted-field → 64 KiB, explicit-0 → 1 MiB.
+// Routing both through this constant collapses the two paths so
+// the only way to get the larger 1 MiB ceiling is to explicitly
+// set the field to that value (which an attentive operator would
+// then see in their config diff).
+const DefaultMaxHeaderBytes = 64 * 1024
+
+// EffectiveMaxHeaderBytes returns v when v > 0, otherwise
+// DefaultMaxHeaderBytes. Use this at every http.Server
+// construction site in place of an inline
+//
+//	if v <= 0 { v = http.DefaultMaxHeaderBytes }
+//
+// pattern so explicit-0 and omitted-field produce the same
+// effective MaxHeaderBytes ceiling.
+func EffectiveMaxHeaderBytes(v int) int {
+	if v > 0 {
+		return v
+	}
+	return DefaultMaxHeaderBytes
+}
+
 // Duration is a time.Duration that (un)marshals through JSON using
 // the human-readable syntax accepted by time.ParseDuration
 // (e.g. "30s", "5m", "250ms"). Bare JSON numbers are rejected to
@@ -321,10 +352,15 @@ type ConsoleConfig struct {
 	IdleTimeout Duration `json:"idle_timeout"`
 
 	// MaxHeaderBytes caps total header size for a single request.
-	// Zero means "use Go's default" (1 MiB) which is far larger
-	// than any well-formed console request needs and gives an
-	// attacker more memory to exhaust per connection; pin a tight
-	// 64 KiB ceiling by default. Matches the gateway knob.
+	// Default 64 KiB — large enough for any realistic console
+	// payload, small enough to bound the memory cost of a flood
+	// of oversized-header connections. A hand-rolled config that
+	// explicitly sets this to 0 (or any non-positive value) is
+	// re-floored to DefaultMaxHeaderBytes (64 KiB) at server
+	// construction via EffectiveMaxHeaderBytes; the operator must
+	// set the field to an explicit larger value to relax the
+	// ceiling, so the only way to silently land at Go's stdlib
+	// 1 MiB fallback is to do so deliberately.
 	MaxHeaderBytes int `json:"max_header_bytes"`
 
 	AdminToken string `json:"admin_token"`
@@ -423,12 +459,14 @@ type GatewayConfig struct {
 	IdleTimeout Duration `json:"idle_timeout"`
 
 	// MaxHeaderBytes caps the total size of request headers the
-	// gateway is willing to parse. A zero value uses Go's default
-	// of 1 MiB, which is wildly generous for an S3-compatible
-	// API where realistic SigV4 headers are under 4 KiB. The
-	// default applied here is 64 KiB — large enough for any
-	// reasonable SDK and small enough that a flood of
-	// oversized-header connections runs out of buffer quickly.
+	// gateway is willing to parse. Default 64 KiB — large enough
+	// for any reasonable SDK (realistic SigV4 headers are under
+	// 4 KiB) and small enough that a flood of oversized-header
+	// connections runs out of buffer quickly. A hand-rolled config
+	// that explicitly sets this to 0 (or any non-positive value)
+	// is re-floored to DefaultMaxHeaderBytes (64 KiB) at server
+	// construction via EffectiveMaxHeaderBytes so explicit-0 and
+	// omitted-field produce the same effective ceiling.
 	MaxHeaderBytes int `json:"max_header_bytes"`
 
 	// TLS configures the gateway's HTTPS listener. When both
@@ -678,12 +716,25 @@ type HealthConfig struct {
 	IdleTimeout Duration `json:"idle_timeout"`
 
 	// MaxHeaderBytes caps total header size for a single health
-	// request. Zero means "use Go's default" (1 MiB) which is
-	// far larger than any realistic /health request needs and
-	// gives an attacker more memory to exhaust per connection;
-	// pin a tight 64 KiB ceiling by default. Matches the gateway
-	// and console knobs.
+	// request. Default 64 KiB — far larger than any realistic
+	// /health request needs but bounded so an attacker cannot
+	// trivially exhaust memory per connection. Like the gateway
+	// and console knobs, explicit-0 is re-floored to
+	// DefaultMaxHeaderBytes (64 KiB) at server construction via
+	// EffectiveMaxHeaderBytes.
 	MaxHeaderBytes int `json:"max_header_bytes"`
+
+	// ReadTimeout caps the wall-clock duration of a single health
+	// request (headers + body). The internal /health surface is
+	// GET-only with no request body, so this primarily serves as
+	// defence-in-depth for a future POST/PUT health surface (e.g.
+	// drain control, manual quorum override) and as the upper
+	// bound that ReadHeaderTimeout must stay strictly below to
+	// avoid the silent-nullification footgun documented on
+	// ReadHeaderTimeout. Default 30s matches the gateway / console
+	// posture. Validate() refuses to start when
+	// ReadHeaderTimeout > ReadTimeout for this listener.
+	ReadTimeout Duration `json:"read_timeout"`
 }
 
 // HealthPeer is a single peer gateway in the cell.
@@ -889,7 +940,7 @@ func Default() Config {
 			WriteTimeout:             Duration(30 * time.Second),
 			ReadHeaderTimeout:        Duration(10 * time.Second),
 			IdleTimeout:              Duration(120 * time.Second),
-			MaxHeaderBytes:           64 * 1024,
+			MaxHeaderBytes:           DefaultMaxHeaderBytes,
 			MaxRequestBytes:          5 * 1024 * 1024 * 1024, // 5 GiB
 			CacheWarmingMemoryBudget: 512 * 1024 * 1024,      // 512 MiB
 			// CachePath defaults to empty so developer and test
@@ -939,15 +990,16 @@ func Default() Config {
 			WriteTimeout:      Duration(30 * time.Second),
 			ReadHeaderTimeout: Duration(10 * time.Second),
 			IdleTimeout:       Duration(120 * time.Second),
-			MaxHeaderBytes:    64 * 1024,
+			MaxHeaderBytes:    DefaultMaxHeaderBytes,
 		},
 		// Health endpoint Slowloris defaults match the gateway and
 		// console posture so an upgrade picks them up automatically
 		// (see HealthConfig.ReadHeaderTimeout doc for threat model).
 		Health: HealthConfig{
+			ReadTimeout:       Duration(30 * time.Second),
 			ReadHeaderTimeout: Duration(10 * time.Second),
 			IdleTimeout:       Duration(120 * time.Second),
-			MaxHeaderBytes:    64 * 1024,
+			MaxHeaderBytes:    DefaultMaxHeaderBytes,
 		},
 	}
 }
@@ -959,15 +1011,17 @@ func Default() Config {
 // undermines the security knobs the operator thought they were
 // setting.
 //
-// Today the only checks are on the gateway and console listener
-// timeouts: ReadHeaderTimeout > ReadTimeout would mean
+// Today the only checks are on the gateway, console, and health
+// listener timeouts: ReadHeaderTimeout > ReadTimeout would mean
 // ReadTimeout (which bounds the *entire* request lifecycle
 // including headers + body) fires first and the cheaper
 // header-stall timeout is never reached. An operator setting
 // ReadHeaderTimeout=60s with ReadTimeout=30s is almost certainly
 // confused about which knob does what, and the gateway should
 // refuse to start rather than silently degrade their Slowloris
-// defence.
+// defence. The health listener is only checked when its
+// ListenAddr is set (without a listener the timeouts are inert
+// configuration values that cannot harm anything).
 //
 // Validate is called by Load() after JSON unmarshaling so config
 // files exercise the checks. Callers constructing a Config
@@ -979,6 +1033,15 @@ func (c *Config) Validate() error {
 	}
 	if err := validateTimeoutOrder("console", c.Console.ReadHeaderTimeout, c.Console.ReadTimeout); err != nil {
 		return err
+	}
+	// The health listener only enforces the timeout-order check
+	// when ListenAddr is set; an unset ListenAddr means the
+	// monitor runs as a background quorum watcher with no HTTP
+	// surface, so a misconfigured timeout cannot harm anything.
+	if c.Health.ListenAddr != "" {
+		if err := validateTimeoutOrder("health", c.Health.ReadHeaderTimeout, c.Health.ReadTimeout); err != nil {
+			return err
+		}
 	}
 	return nil
 }
