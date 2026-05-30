@@ -208,7 +208,7 @@ func validID(s string) bool {
 		switch {
 		case r >= 'a' && r <= 'z':
 			// always allowed
-		case r >= '0' && r <= '9' || r == '_':
+		case (r >= '0' && r <= '9') || r == '_':
 			if i == 0 {
 				return false // must start with a letter
 			}

@@ -107,12 +107,24 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create %q: %w", tmpPath, err)
 	}
-	// We rename on success, but always close the handle on the
-	// way out. defer-close-then-rename is the canonical pattern.
-	defer func() { _ = os.Remove(tmpPath) }()
-
+	// Safety-net cleanup: on the error return paths below, the
+	// explicit close chain that runs before os.Rename is never
+	// reached, which would leak the file descriptor and leave
+	// tmpPath on disk. These defers ensure both are cleaned up
+	// even if a writePath/writeIndex/writeFileBytes call fails.
+	// On the success path they are no-ops:
+	//   - tw / gzw / tmpFile have already been explicitly closed
+	//     in order (tar -> gzip -> file). tar.Writer.Close and
+	//     gzip.Writer.Close are idempotent; os.File.Close on an
+	//     already-closed file returns an error we discard.
+	//   - os.Remove(tmpPath) hits ErrNotExist after the rename,
+	//     also discarded.
 	gzw := gzip.NewWriter(tmpFile)
 	tw := tar.NewWriter(gzw)
+	defer func() { _ = os.Remove(tmpPath) }()
+	defer func() { _ = tmpFile.Close() }()
+	defer func() { _ = gzw.Close() }()
+	defer func() { _ = tw.Close() }()
 
 	w := &bundleWriter{
 		tw:        tw,
@@ -342,12 +354,17 @@ func (w *bundleWriter) writeIndex(m *Manifest, opts BundleOptions, included, mis
 	fmt.Fprintf(&sb, "`docs/security/README.md` if this bundle has the audit_bundle component.\n\n")
 	fmt.Fprintf(&sb, "Components\n----------\n\n")
 	for _, c := range m.Components {
+		// Default is "MISSING (optional)" because in practice every
+		// optional component with no real file lands in `missing`
+		// (see Build's hadReal/included/missing accounting), and
+		// every required component lands in `included` or the build
+		// hard-fails before this point. Initialising to the same
+		// string the (formerly explicit) `case containsString(missing,...)`
+		// branch would have produced removes a redundant case without
+		// changing behaviour.
 		status := "MISSING (optional)"
-		switch {
-		case containsString(included, c.ID):
+		if containsString(included, c.ID) {
 			status = "included"
-		case containsString(missing, c.ID):
-			status = "MISSING (optional)"
 		}
 		fmt.Fprintf(&sb, "## %s — %s\n\n", c.ID, c.Title)
 		fmt.Fprintf(&sb, "Status: **%s**  \n", status)

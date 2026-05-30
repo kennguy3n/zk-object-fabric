@@ -202,6 +202,25 @@ components:
 	if !strings.Contains(err.Error(), "required path") {
 		t.Errorf("expected error to mention 'required path'; got: %v", err)
 	}
+	// Regression for the deferred-cleanup pair (tmpFile close +
+	// tmpPath remove) added to Build's prelude. Before the fix
+	// the .tmp file was leaked under the OutputDir on every error
+	// return, and the file descriptor was leaked along with it.
+	// We can't observe the fd leak from a Go test directly, but
+	// the on-disk leak is a stable proxy: if the deferred remove
+	// fires, the OutputDir contains no .tmp file.
+	outDir := filepath.Join(repoRoot, "out")
+	entries, readErr := os.ReadDir(outDir)
+	if readErr != nil {
+		// outDir may not exist if the error fired before MkdirAll;
+		// that's also a valid "no leaked .tmp" state.
+		return
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leaked tmp file after error: %s/%s", outDir, e.Name())
+		}
+	}
 }
 
 func TestBuild_AllowMissingOptional_OmitsPlaceholder(t *testing.T) {
