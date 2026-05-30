@@ -219,7 +219,8 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 		return rpt, errors.New("replicator made zero progress; fixture is broken")
 	}
 
-	if _, err := v.seedInFlight(ctx); err != nil {
+	inFlightObjects, err := v.seedInFlight(ctx)
+	if err != nil {
 		return rpt, fmt.Errorf("seed in-flight: %w", err)
 	}
 
@@ -236,8 +237,25 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 		return rpt, err
 	}
 
-	rpt.LostObjects = v.InFlightObjects
-	rpt.MeasuredRPO = rpt.LostObjects
+	// Phase 4: Measure RPO by actually probing the destination
+	// cell for the in-flight manifests. We do NOT assume
+	// LostObjects == InFlightObjects by construction — if a
+	// future refactor breaks the Phase-2 ordering and lets the
+	// replicator drain some in-flight pieces before cancellation,
+	// the measurement here surfaces it as a Phase-2 invariant
+	// breach rather than silently inflating LostObjects.
+	lost, leaked, err := v.measureRPO(ctx, inFlightObjects)
+	if err != nil {
+		return rpt, fmt.Errorf("measure RPO: %w", err)
+	}
+	if leaked > 0 {
+		return rpt, fmt.Errorf(
+			"phase-2 invariant breach: %d in-flight manifests reached the destination cell despite the replicator being cancelled before the in-flight seed; the ordering in Run() is the only guarantee that MeasuredRPO == InFlightObjects, so any leakage here means a future refactor broke it",
+			leaked,
+		)
+	}
+	rpt.LostObjects = lost
+	rpt.MeasuredRPO = lost
 	rpt.FinishedAt = now()
 
 	if v.RTOTarget > 0 && rpt.MeasuredRTO > v.RTOTarget {
@@ -436,6 +454,23 @@ func (v *Verifier) countDestManifests(ctx context.Context) (int, error) {
 // steady-object body from the destination cell, asserts byte
 // equality, captures the first-successful-GET timestamp for the
 // RTO measurement, and records counts on the report.
+//
+// A backend regression — a piece in the destination manifest
+// still pointing at the source cell — counts as a per-object
+// failure, not a soft warning. The replicator's contract is to
+// rewrite every piece's Backend on copy; a violation means the
+// production GET path would route to the wrong backend and serve
+// stale data, so the verifier must treat the object as
+// unrecovered. This is the architecturally correct behaviour
+// rather than appending to a mismatches log and quietly counting
+// the object as recovered when the body happens to match.
+//
+// The function also defers populating RecoveryReadyAt / MeasuredRTO
+// until it has confirmed every steady object was recovered. A
+// JSON consumer reading the artifact for a failed run gets a zero
+// RTO (the natural sentinel for "no recovery happened") rather
+// than the timestamp of whichever GET happened to succeed before
+// the run gave up.
 func (v *Verifier) verifyRecovery(
 	ctx context.Context,
 	rpt *Report,
@@ -460,14 +495,22 @@ func (v *Verifier) verifyRecovery(
 		}
 		// The replicator rewrites every piece's Backend to the
 		// destination cell ID. A piece still pointing at the
-		// source cell is a replicator regression.
+		// source cell is a replicator regression — the production
+		// GET path would route to the wrong backend. Treat the
+		// object as unrecovered so RecoveredObjects is short of
+		// SteadyObjects and the run fails loudly.
+		backendOK := true
 		for _, p := range m.Pieces {
 			if p.Backend != v.Dest.ID {
 				mismatches = append(mismatches, fmt.Sprintf(
 					"%s: dest piece %s backend=%q want %q",
 					obj.objectKey, p.PieceID, p.Backend, v.Dest.ID,
 				))
+				backendOK = false
 			}
+		}
+		if !backendOK {
+			continue
 		}
 
 		rc, err := v.Dest.Provider.GetPiece(ctx, m.Pieces[0].PieceID, nil)
@@ -498,24 +541,70 @@ func (v *Verifier) verifyRecovery(
 	}
 
 	if firstGetAt.IsZero() {
-		// No successful GET happened. RTO is unbounded; we
-		// still need a value on the report so leave RecoveryReadyAt
-		// at zero and report the breach in the error message.
+		// No successful GET happened. Leave RecoveryReadyAt and
+		// MeasuredRTO at zero — a consumer reading the JSON report
+		// can rely on a non-zero MeasuredRTO meaning "recovery
+		// succeeded".
 		return fmt.Errorf(
-			"recovery failed: 0/%d steady objects recoverable from dest cell (%d mismatches)",
-			len(steady), len(mismatches),
+			"recovery failed: 0/%d steady objects recoverable from dest cell (%d mismatches: %v)",
+			len(steady), len(mismatches), mismatches,
 		)
 	}
-	rpt.RecoveryReadyAt = firstGetAt
-	rpt.MeasuredRTO = firstGetAt.Sub(rpt.FailureDetectedAt)
 
 	if rpt.RecoveredObjects < v.SteadyObjects {
+		// Partial recovery is still a failed run from a DR
+		// standpoint; suppress the RTO measurement so the JSON
+		// artifact does not advertise a recovery time for a run
+		// that left objects unreachable.
 		return fmt.Errorf(
 			"steady-object recovery short: recovered %d/%d (mismatches: %v)",
 			rpt.RecoveredObjects, v.SteadyObjects, mismatches,
 		)
 	}
+
+	// Sanity-check: an empty mismatches slice is invariant when
+	// RecoveredObjects == SteadyObjects, but if a future refactor
+	// adds a path that appends to mismatches without decrementing
+	// RecoveredObjects we still want the run to fail loudly
+	// rather than silently masking the problem.
+	if len(mismatches) > 0 {
+		return fmt.Errorf(
+			"recovery accounting drift: RecoveredObjects=%d == SteadyObjects=%d but %d mismatches were recorded: %v",
+			rpt.RecoveredObjects, v.SteadyObjects, len(mismatches), mismatches,
+		)
+	}
+
+	rpt.RecoveryReadyAt = firstGetAt
+	rpt.MeasuredRTO = firstGetAt.Sub(rpt.FailureDetectedAt)
 	return nil
+}
+
+// measureRPO probes the destination cell for each in-flight
+// manifest and returns (lost, leaked, error). "lost" is the
+// number of in-flight manifests NOT present in the destination
+// (the value reported as MeasuredRPO). "leaked" is the number
+// present in the destination despite the replicator being
+// cancelled before the in-flight seed — a non-zero value here
+// means the Phase-2 ordering invariant was broken and the caller
+// should surface it as an error.
+//
+// The verifier asserts "the replicator did not drain any in-flight
+// pieces" by measurement, not by construction, so a future
+// refactor that breaks the cancel-before-seed ordering surfaces
+// here rather than silently inflating MeasuredRPO to the
+// configured InFlightObjects value.
+func (v *Verifier) measureRPO(ctx context.Context, inFlight []seededObject) (lost, leaked int, err error) {
+	for _, obj := range inFlight {
+		if _, getErr := v.Dest.Manifests.Get(ctx, obj.manifestKey); getErr != nil {
+			if errors.Is(getErr, manifest_store.ErrNotFound) {
+				lost++
+				continue
+			}
+			return 0, 0, fmt.Errorf("dest Manifests.Get(%s): %w", obj.objectKey, getErr)
+		}
+		leaked++
+	}
+	return lost, leaked, nil
 }
 
 func deterministicBody(objKey string, size int) []byte {
