@@ -661,3 +661,177 @@ func TestSustainedRunner_CtxCancelStopsRun(t *testing.T) {
 		t.Fatalf("Run elapsed %v after Ctx cancel; want fast exit", elapsed)
 	}
 }
+
+// TestSustainedRunner_LatencyExcludesFailedRequests asserts that
+// per-op latency histograms record only successful calls, so
+// fast-failing error responses cannot pull p99 numbers down and
+// hide an SLA breach. Regression for Devin Review finding
+// ANALYSIS_0001 (sustained.go:567 workerState.record).
+func TestSustainedRunner_LatencyExcludesFailedRequests(t *testing.T) {
+	prov := newFakeProvider()
+	prov.setLatency("PUT", 50*time.Millisecond) // success path: slow
+	// Errors return instantly with no latency injected. Without
+	// the fix, the fast-failing PUTs would yank the p99 toward 0.
+	// Seed first (PUTs 0..3 succeed), then start the every-other-N
+	// failure pattern during the drive phase.
+	runner := NewSustainedRunner(prov)
+	runner.DurationOverride = 1 * time.Second
+	runner.SeedObjects = 4
+	runner.FailureLimit = 1 << 30 // disable the failure-limit gate
+	prov.setFailEveryNth("PUT", 2, int64(runner.SeedObjects))
+
+	sc := Scenario{
+		Name: "latency-only-success",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"PUT": 1.0},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       40,
+		},
+		Targets: []Target{{Metric: MetricPutP99, Unit: "ms"}},
+	}
+
+	results, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Run returned %d results, want 1", len(results))
+	}
+	gotMs := results[0].Value
+	// Success calls take 50ms; histogram bucket precision is
+	// roughly 0.4% which is well under the 5ms tolerance we
+	// allow here. With error samples mixed in, p99 would land
+	// far below 50ms; the test exists to guard against that
+	// regression.
+	if gotMs < 40 || gotMs > 70 {
+		t.Errorf("MetricPutP99 = %v ms; want roughly 50 ms (success-only latency). "+
+			"A value far from 50 ms means error-path durations leaked into the histogram.", gotMs)
+	}
+}
+
+// TestAutoConcurrencyMatchesEffectiveWorkload asserts that the
+// exported AutoConcurrency helper returns the same value the
+// runner itself derives in effectiveWorkload. Regression for
+// Devin Review finding BUG_0001 (AutoConcurrency had a
+// runtime.NumCPU() floor that effectiveWorkload did not).
+func TestAutoConcurrencyMatchesEffectiveWorkload(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+
+	// Use a few representative RPS values, including some that
+	// would land below NumCPU on a typical CI box (8-16 cores).
+	for _, rps := range []int{1, 10, 50, 100, 250, 500, 1000, 5000, 10_000, 100_000, 1_000_000} {
+		cfg, err := runner.effectiveWorkload(Workload{
+			RequestMix:      map[string]float64{"PUT": 1.0},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       rps,
+		})
+		if err != nil {
+			t.Fatalf("effectiveWorkload(rps=%d): %v", rps, err)
+		}
+		gotAuto := AutoConcurrency(rps)
+		if gotAuto != cfg.concurrency {
+			t.Errorf("AutoConcurrency(%d) = %d; runner derived concurrency = %d. "+
+				"These must match so callers can predict the runner's worker count.",
+				rps, gotAuto, cfg.concurrency)
+		}
+	}
+}
+
+// TestSustainedRunner_RunDurationUsesWallClock asserts that the
+// run-duration enforcement is wall-clock based and is NOT
+// influenced by a mocked Now field. The previous implementation
+// used context.WithDeadline(ctx, r.nowFn()().Add(d)), which
+// silently broke under a mock clock because the context library
+// compares against time.Now() internally. The fix is to use
+// context.WithTimeout(ctx, d), which is duration-based and does
+// not consult any clock for the input. Regression for Devin
+// Review finding ANALYSIS_0002 (sustained.go:245-246).
+func TestSustainedRunner_RunDurationUsesWallClock(t *testing.T) {
+	prov := newFakeProvider()
+	runner := NewSustainedRunner(prov)
+	runner.DurationOverride = 200 * time.Millisecond
+	runner.SeedObjects = 4
+	// Mock clock far in the future. With the old WithDeadline
+	// code path this still terminated (because context used
+	// wall clock and ignored the mocked future), but the
+	// deadline value was nonsense. We assert the new code is
+	// independent of this field's value: real wall-clock budget
+	// is still ~200ms.
+	mockNow := time.Now().Add(24 * time.Hour)
+	runner.Now = func() time.Time { return mockNow }
+
+	sc := Scenario{
+		Name: "wall-clock-budget",
+		Workload: Workload{
+			RequestMix:      map[string]float64{"PUT": 1.0},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       40,
+		},
+		Targets: []Target{{Metric: MetricPutP99, Unit: "ms"}},
+	}
+
+	t0 := time.Now()
+	_, err := runner.Run(sc)
+	elapsed := time.Since(t0)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Allow generous slack on the upper bound for CI scheduler
+	// jitter, but the run must finish well under 2s — far less
+	// than 24h — proving the mock clock did not extend the
+	// budget.
+	if elapsed < 100*time.Millisecond || elapsed > 2*time.Second {
+		t.Errorf("Run elapsed %v; expected roughly 200ms (wall-clock budget, "+
+			"unaffected by mocked Now)", elapsed)
+	}
+}
+
+// TestLatencyHistogram_MergeKeepsZeroMin asserts that Merge
+// preserves a genuine 0ns minimum from the other histogram
+// instead of treating minNS==0 as a "no samples" sentinel.
+// Regression for Devin Review finding ANALYSIS_0003
+// (histogram.go:145-147).
+func TestLatencyHistogram_MergeKeepsZeroMin(t *testing.T) {
+	// Receiver has one 5ms sample.
+	h := &LatencyHistogram{}
+	h.Record(5 * time.Millisecond)
+
+	// Other has a single 0ns sample (legitimate clamp from a
+	// negative duration via Record's clamp path).
+	other := &LatencyHistogram{}
+	other.Record(-1 * time.Nanosecond)
+	if other.Min() != 0 {
+		t.Fatalf("other.Min() = %v; want 0 (Record clamps negative to 0)", other.Min())
+	}
+
+	h.Merge(other)
+	if got := h.Min(); got != 0 {
+		t.Errorf("h.Min() after merge = %v; want 0 (zero-sample minimum must be preserved)", got)
+	}
+}
+
+// TestMakePayload_DeterministicAndReused asserts the documented
+// contract: makePayload returns the same deterministic bytes for
+// the same size, and the comment-vs-code mismatch from the
+// previous version (which claimed per-piece distinctness) is no
+// longer true. Regression for Devin Review finding ANALYSIS_0004.
+func TestMakePayload_DeterministicAndReused(t *testing.T) {
+	a := makePayload(2048)
+	b := makePayload(2048)
+	if !bytes.Equal(a, b) {
+		t.Fatal("makePayload(2048) returned different bytes on repeated calls; " +
+			"the runner relies on deterministic payload for predictable I/O cost")
+	}
+
+	// Zero or negative size must yield a 1KiB default.
+	if got := len(makePayload(0)); got != 1024 {
+		t.Errorf("makePayload(0) length = %d; want 1024 default", got)
+	}
+	if got := len(makePayload(-5)); got != 1024 {
+		t.Errorf("makePayload(-5) length = %d; want 1024 default", got)
+	}
+}

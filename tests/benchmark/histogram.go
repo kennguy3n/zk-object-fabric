@@ -142,7 +142,14 @@ func (h *LatencyHistogram) Merge(other *LatencyHistogram) {
 	if other.maxNS > h.maxNS {
 		h.maxNS = other.maxNS
 	}
-	if h.minNS == 0 || (other.minNS != 0 && other.minNS < h.minNS) {
+	// Use the receiver's pre-merge count to decide whether it had
+	// no samples yet. h.minNS == 0 cannot be used as a sentinel
+	// here because Record clamps negative durations to zero, so a
+	// genuine 0ns sample is a possible legitimate minimum. The
+	// fold-merge step has already incremented h.count above; track
+	// the pre-merge value via the difference.
+	hadNoSamples := (h.count - other.count) == 0
+	if hadNoSamples || other.minNS < h.minNS {
 		h.minNS = other.minNS
 	}
 }

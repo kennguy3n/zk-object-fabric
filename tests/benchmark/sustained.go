@@ -34,7 +34,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,7 +72,12 @@ type SustainedRunner struct {
 	// memory bounded without rewriting the scenario.
 	MaxObjectSizeBytes int64
 
-	// Now overrides time.Now for tests. Optional.
+	// Now overrides time.Now for measurement timestamps in tests.
+	// This affects scenario start/finish timestamps and per-operation
+	// latency measurement only. Run-duration enforcement uses
+	// context.WithTimeout, which is wall-clock based regardless of
+	// this field; a mock clock here will not shorten or lengthen the
+	// drive phase. Optional.
 	Now func() time.Time
 
 	// RNGSeed seeds the deterministic op-choice RNG so two runs
@@ -213,8 +217,14 @@ func makePayload(size int64) []byte {
 		size = 1024
 	}
 	buf := make([]byte, size)
-	// Fill with a non-trivial pattern so providers that perform
-	// content-based deduplication still see distinct content.
+	// Fill with a deterministic, non-trivial bit pattern. This is
+	// the same payload for every PUT in the run; uniqueness comes
+	// from the object key, not the body. That is the correct shape
+	// for raw provider-I/O benchmarking. It is NOT suitable for
+	// content-based dedup benchmarking, which would need
+	// per-operation byte variation. The dedup scenarios in
+	// DefaultSuite mark their dedup-specific metrics Pending for
+	// exactly this reason.
 	for i := range buf {
 		buf[i] = byte(i*1103515245 + 12345)
 	}
@@ -242,8 +252,13 @@ func (r *SustainedRunner) seedObjects(ctx context.Context, scenario string, payl
 // drive spins up the worker pool and runs until cfg.duration
 // elapses or the failure limit trips.
 func (r *SustainedRunner) drive(ctx context.Context, scenario string, payload []byte, cfg runConfig, seeded []string, agg *aggregate) error {
-	deadline := r.nowFn()().Add(cfg.duration)
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	// Run-duration is a wall-clock budget. context.WithTimeout
+	// uses time.Now() internally; do not substitute r.nowFn()
+	// here because the context library will still compare against
+	// the real wall clock and a mock-time deadline would either
+	// expire instantly or never. r.nowFn() is reserved for
+	// measurement timestamps (see the Now field doc).
+	ctx, cancel := context.WithTimeout(ctx, cfg.duration)
 	defer cancel()
 
 	limiter := newTokenBucket(cfg.targetRPS)
@@ -405,7 +420,11 @@ func byteRangeFor(rangeFrac float64, size int64, rng *rand.Rand) *providers.Byte
 // buildResults turns the aggregate into one Result per Target.
 func (r *SustainedRunner) buildResults(scenario Scenario, cfg runConfig, agg *aggregate, elapsed time.Duration) []Result {
 	results := make([]Result, 0, len(scenario.Targets))
-	totalRequests := agg.put.Count() + agg.get.Count() + agg.head.Count() + agg.del.Count() + agg.list.Count()
+	// Use attempts (success + failure) as the denominator for
+	// throughput and error-rate, not the histogram counts, since
+	// histograms exclude failed requests by design (see
+	// workerState.record).
+	totalRequests := agg.attempts
 	attainedRPS := 0.0
 	if elapsed > 0 {
 		attainedRPS = float64(totalRequests) / elapsed.Seconds()
@@ -507,6 +526,12 @@ func histogramFor(m Metric, agg *aggregate) *HistogramSummary {
 }
 
 // aggregate holds the merged statistics for a scenario.
+//
+// attempts is the total number of request operations sent to the
+// provider, success or failure. Histogram counts are
+// success-only (failed-request latency is not recorded; see
+// workerState.record), so the histogram counts cannot be used as
+// the denominator for error-rate or attempted-throughput metrics.
 type aggregate struct {
 	put       LatencyHistogram
 	get       LatencyHistogram
@@ -515,6 +540,7 @@ type aggregate struct {
 	list      LatencyHistogram
 	cacheHit  int64
 	cacheMiss int64
+	attempts  int64
 	errors    int64
 }
 
@@ -528,6 +554,7 @@ func (a *aggregate) merge(ws *workerState) {
 	a.list.Merge(&ws.list)
 	a.cacheHit += ws.cacheHit
 	a.cacheMiss += ws.cacheMiss
+	a.attempts += ws.attempts
 	a.errors += ws.errors
 }
 
@@ -542,6 +569,7 @@ type workerState struct {
 	list      LatencyHistogram
 	cacheHit  int64
 	cacheMiss int64
+	attempts  int64
 	errors    int64
 	seq       atomic.Uint64
 	opOrder   []string
@@ -564,9 +592,24 @@ func (s *workerState) nextOp(mix map[string]float64) string {
 	return s.opOrder[s.rng.IntN(len(s.opOrder))]
 }
 
+// record updates the worker-local counters and per-op latency
+// histogram for one completed operation.
+//
+// attempts is incremented for every call, success or failure, so
+// it is the correct denominator for error-rate and
+// attempted-throughput metrics.
+//
+// Failed-request durations are NOT recorded into the histogram:
+// latency SLAs are a success-path property, and including
+// error-path durations (often near-zero connection refused or
+// near-timeout) would pollute the percentile metrics. This
+// matches the older ProviderRunner semantics and the conventional
+// behaviour of load-test tools (wrk, vegeta, k6).
 func (s *workerState) record(op string, d time.Duration, err error) {
+	s.attempts++
 	if err != nil {
 		s.errors++
+		return
 	}
 	switch op {
 	case "PUT":
@@ -700,14 +743,15 @@ func (r *SustainedRunner) nowFn() func() time.Time {
 
 // AutoConcurrency returns the default concurrency for the given
 // RPS. Exposed so the CLI can echo the effective value back to
-// the operator without re-running the runner.
+// the operator without re-running the runner. The formula must
+// match the runner's actual derivation in effectiveWorkload
+// (8 + rps/250, capped at 512); any caller relying on this
+// function to predict or display the runner's effective
+// concurrency would otherwise get a wrong value.
 func AutoConcurrency(rps int) int {
 	c := 8 + rps/250
 	if c > 512 {
 		c = 512
-	}
-	if c < runtime.NumCPU() {
-		c = runtime.NumCPU()
 	}
 	return c
 }
