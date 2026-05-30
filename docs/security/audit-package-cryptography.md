@@ -172,6 +172,34 @@ return aad
     not on any tenant configuration — meaning new writes from
     the gateway always pass a non-empty AAD if the gateway is
     invoked with it.
+
+> **Important auditor note — current gateway wiring.** As of the
+> source commit captured in this bundle's `MANIFEST.txt`, the
+> centralised helpers `gatewayEncryptOptions()` and
+> `gatewayDecryptOptions()` in
+> `api/s3compat/encryption_pipeline.go` both return
+> `client_sdk.Options{}` with no `ChunkAAD` set. Every
+> non-convergent managed-encrypted gateway write path
+> (single-piece PUT, EC PUT, multipart UploadPart) therefore
+> rides the legacy `AAD = nil` compat path today. Strict-ZK
+> (client-side) writes already pass operator-supplied `ChunkAAD`
+> directly through the SDK and are unaffected.
+>
+> This is a known integration gap, *not* a cryptographic defect
+> in the SDK itself: the AEAD construction, AAD binding, and
+> chunk-index framing in `encryption/client_sdk/sdk.go` are
+> correct, and adding a non-empty `ChunkAAD` at the call site is
+> a one-line change. The gap is the migration story for the
+> objects already on the legacy path: until a per-manifest
+> marker indicating which AAD shape was used at Seal time is
+> wired into the manifest, switching the call site would make
+> every legacy object unreadable. That wiring is tracked as a
+> separate workstream and is out of scope for this audit
+> package. The auditor should evaluate the SDK in isolation
+> (the test suite in `encryption/client_sdk/sdk_test.go` exercises
+> the modern AAD path) and flag this gap in
+> `docs/security/findings/` so it is addressed before the gateway
+> is brought onto the modern AAD-bound path.
 - The chunk index is big-endian uint64. Within an object, every
   chunk has a distinct index — so two chunks at positions `i`
   and `j > i` cannot have their ciphertexts swapped without
@@ -327,9 +355,17 @@ helper at line 744-747 is the textbook two-arg
 
 ### 6.2 Per-chunk signature chain (aws-chunked PUT)
 
-`internal/auth/authenticator.go:484-502`:
+The chunk-signature surface is split deliberately into
+*compute* and *verify* halves so that callers cannot accidentally
+use a timing-vulnerable `==` comparison.
+
+`internal/auth/authenticator.go` — `ComputeChunkSignature` (returns
+the expected SigV4 chunk signature; pure derivation, no
+comparison):
+
 ```go
-func VerifyChunkSignature(prevSig string, chunkData []byte, signingKey []byte, timestamp, scope string) (string, error) {
+func ComputeChunkSignature(prevSig string, chunkData []byte, signingKey []byte, timestamp, scope string) (string, error) {
+    // ... validates inputs ...
     stringToSign := strings.Join([]string{
         "AWS4-HMAC-SHA256-PAYLOAD",
         timestamp,
@@ -338,15 +374,48 @@ func VerifyChunkSignature(prevSig string, chunkData []byte, signingKey []byte, t
         hex.EncodeToString(sha256.Sum256(nil)[:]),       // empty body sha (per AWS spec)
         hex.EncodeToString(sha256.Sum256(chunkData)[:]),
     }, "\n")
-    sig := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
-    return sig, nil
+    return hex.EncodeToString(hmacSHA256(signingKey, stringToSign)), nil
 }
 ```
 
-The handler in `api/s3compat/` calls this for every chunk, passing
-the previous signature as `prevSig`. The seed signature is the
+`internal/auth/authenticator.go` — `VerifyChunkSignature`
+(authenticates a received chunk-signature header against the
+expected value using `subtle.ConstantTimeCompare`; returns the
+expected signature on success so the caller can use it as the
+prevSig anchor for the next chunk):
+
+```go
+func VerifyChunkSignature(prevSig string, chunkData []byte, signingKey []byte, timestamp, scope, receivedSig string) (string, error) {
+    expected, err := ComputeChunkSignature(prevSig, chunkData, signingKey, timestamp, scope)
+    if err != nil { return "", err }
+    if len(receivedSig) != len(expected) || subtle.ConstantTimeCompare([]byte(receivedSig), []byte(expected)) != 1 {
+        return "", errors.New("auth: chunk signature mismatch")
+    }
+    return expected, nil
+}
+```
+
+The handler in `api/s3compat/` is expected to call
+`VerifyChunkSignature` for every chunk, passing the previous
+chunk's signature as `prevSig`. The seed signature is the
 header signature computed at request entry by
 `HeaderV4Strategy.Authenticate`.
+
+**Note for the auditor:** at the time this audit package was
+prepared, no `api/s3compat/` handler call site currently invokes
+these helpers — the chunked-upload handler that consumes them is
+tracked as a separate workstream. The functions are exported,
+tested in `internal/auth/authenticator_test.go`
+(`TestHeaderV4Strategy_AwsChunkedSeed_*`,
+`TestComputeChunkSignature_*`, `TestVerifyChunkSignature_*`), and
+intended as the canonical chunk-signature surface — but they are
+not on a hot data path yet. The audit should evaluate the
+*correctness* of `ComputeChunkSignature` / `VerifyChunkSignature`
+(matches AWS reference vector, constant-time comparison, no
+implicit case folding, rejects truncated / empty `receivedSig`)
+and flag the absence of a current consumer in
+`docs/security/findings/` so it is not forgotten before the
+chunked-upload path is brought online.
 
 ### 6.3 What the auditor should verify
 
@@ -362,10 +431,17 @@ header signature computed at request entry by
   different anchor → different chain → mismatch.
 - The `chunkData` hash is `SHA-256` over the chunk bytes, not
   over the chunk header. (Auditor should confirm by walking the
-  handler.)
+  handler once it lands.)
 - The `"AWS4-HMAC-SHA256-PAYLOAD"` literal matches AWS's
   documented algorithm tag. Drift would silently produce
   incompatible signatures with `aws-cli --use-aws-chunked`.
+- The signature comparison is `subtle.ConstantTimeCompare` over
+  raw hex bytes (no case folding, no whitespace trimming) and
+  rejects every length-mismatched / empty `receivedSig`. AWS
+  always emits lower-case hex, so the comparison is exact; if a
+  future strategy needs to accept upper-case hex, the comparison
+  must canonicalise *before* `ConstantTimeCompare` to preserve
+  the constant-time property.
 
 ## 7. Manifest body AEAD with key-bound AAD
 
@@ -536,10 +612,27 @@ treat it as in-scope for the current package.
 
 Non-exhaustive list to seed the audit's threat-modelling session:
 
-1. **AAD downgrade**: a tenant tries to write a new object with
-   `Options.ChunkAAD == nil` to land on the legacy compat path.
-   Confirm the gateway always passes a non-empty AAD on every
-   new write (grep callsites in `api/s3compat/encryption_pipeline.go`).
+1. **AAD downgrade — known integration gap on the gateway hot
+   path.** The audit doc §4.1 ("Important auditor note — current
+   gateway wiring") documents that
+   `api/s3compat/encryption_pipeline.go` currently calls
+   `gatewayEncryptOptions()` / `gatewayDecryptOptions()`, both of
+   which return `client_sdk.Options{}` with no `ChunkAAD`. Every
+   managed-encrypted object written today therefore rides the
+   legacy `AAD = nil` path. The auditor should:
+   - Verify the SDK *itself* honours `ChunkAAD` correctly in
+     isolation (the test suite in
+     `encryption/client_sdk/sdk_test.go` exercises this).
+   - Confirm that the gateway's migration plan to ChunkAAD is
+     tractable: a per-manifest marker indicating which AAD shape
+     to use on Open is the documented approach, mirroring the
+     `AEADBodyEncryptor.Decrypt` try-then-fallback pattern
+     already in production on the manifest body path
+     (§11.6 / `metadata/manifest_store/postgres/body_encryptor.go`).
+   - Flag any code path where a tenant could *force* the legacy
+     nil-AAD path even after the gateway is brought onto the
+     modern AAD-bound path (e.g. a header-controlled override
+     would be a finding).
 2. **Cross-CMK envelope lift**: take a `WrappedDEK` sealed for
    `cmk://kms/key-A` and present it on a manifest whose CMK
    reference is `cmk://kms/key-B`. The wrap's AAD (CMK URI for

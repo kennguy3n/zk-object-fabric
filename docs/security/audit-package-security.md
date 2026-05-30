@@ -3,17 +3,21 @@
 | Field | Value |
 |---|---|
 | Document version | 2026-05-30 (WS1.3) |
-| Source commit | `dac9ef3` (`main`) |
+| Source commit | branch HEAD of PR #77 (recorded in the bundle's `MANIFEST.txt` at build time; merge-base was `dac9ef3` on `main`) |
 | Audience | Third-party security firm (Trail of Bits / Cure53 / NCC Group) |
 | Companion | [`audit-package-cryptography.md`](audit-package-cryptography.md), [`threat-model.md`](threat-model.md) |
 | Scope | Authentication, authorization, multi-tenancy isolation, manifest sealing, CMK handling, presigned-URL semantics, S3 SigV4 plumbing |
 
 The audit team should read [`threat-model.md`](threat-model.md)
 first. Every `path:line` reference below is grep-verified against
-the source commit; any drift means a later change has landed and
-the bundle should be regenerated (`make audit-bundle`). The
-package is intentionally a single file so an auditor can read it
-linearly and pivot into source only when they want detail.
+the branch state captured in the corresponding `make audit-bundle`
+tarball's `MANIFEST.txt`. If this document is read against a later
+commit on `main`, line numbers will drift — re-pin to the exact
+tree by hashing the shipped sources against `MANIFEST.txt`, or
+regenerate the bundle from that later commit. The contract is
+*SHA-anchored source*, not SHA-anchored line numbers. The package
+is intentionally a single file so an auditor can read it linearly
+and pivot into source only when they want detail.
 
 ## Table of contents
 
@@ -196,13 +200,24 @@ clock as an argument.)
 
 aws-chunked streaming PUTs sign each chunk with an HMAC chained
 off the previous chunk's signature. The seed signature is
-verified by `HeaderV4Strategy.Authenticate` (line 242-291); the
-per-chunk signatures are verified by
-`VerifyChunkSignature` (line 484-505). The handler in
-`api/s3compat/` consumes the request body chunk-by-chunk and
-calls `VerifyChunkSignature(prevSig, chunkData, signingKey,
-timestamp, scope)` after each. A mismatched signature aborts the
-upload.
+verified by `HeaderV4Strategy.Authenticate`; the per-chunk
+signatures are authenticated by `VerifyChunkSignature`, which
+wraps `ComputeChunkSignature` (returns the expected SigV4 chunk
+signature) plus a `crypto/subtle.ConstantTimeCompare` against the
+`receivedSig` from the chunk header. The intended call shape is
+
+```go
+expected, err := auth.VerifyChunkSignature(prevSig, chunkData, signingKey, ts, scope, receivedSig)
+if err != nil { /* abort upload, return 403 */ }
+prevSig = expected
+```
+
+so the comparison and the chain-advance are a single typed
+operation that cannot accidentally degrade to a `==`. Note that
+the consuming handler in `api/s3compat/` is tracked as a separate
+workstream (see crypto §6.2 "Note for the auditor") — the
+function pair is fully tested in `internal/auth/`, but no
+production call site invokes it yet.
 
 Specific failure modes the audit should attempt:
 
