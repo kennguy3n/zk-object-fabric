@@ -386,13 +386,31 @@ func ParseMintLogDir(root string) ([]MatrixEntry, error) {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || d.Name() != "log.json" {
+		// Skip directories deeper than {root}/{sdk}/. mint does not
+		// produce nested log.json files, so a deeper hit is almost
+		// certainly an operator mistake (e.g. a tarball extracted
+		// into the reports tree). Refusing to descend keeps the
+		// "exactly one subdir deep" contract documented above
+		// honest, and prevents a stray fixture-test log from
+		// influencing audit-grade output.
+		if d.IsDir() {
+			if path == cleanRoot {
+				return nil
+			}
+			if filepath.Dir(path) != cleanRoot {
+				return filepath.SkipDir
+			}
 			return nil
 		}
-		// Skip the aggregated top-level log.json: its parent
-		// directory IS the walk root, so it would duplicate every
-		// per-SDK entry.
-		if filepath.Dir(path) == cleanRoot {
+		if d.Name() != "log.json" {
+			return nil
+		}
+		// Only files at exactly one subdir deep: {root}/{sdk}/log.json.
+		// This rejects (a) the aggregated top-level {root}/log.json
+		// that mint.sh writes alongside the per-SDK files
+		// (cat>>log/log.json), and (b) any unexpected nested
+		// log.json that survived the SkipDir filter above.
+		if filepath.Dir(filepath.Dir(path)) != cleanRoot {
 			return nil
 		}
 		f, err := os.Open(path)

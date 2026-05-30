@@ -236,6 +236,41 @@ func TestParseMintLogDir_SkipsAggregatedTopLevelLog(t *testing.T) {
 	}
 }
 
+// Regression: ParseMintLogDir must reject log.json files deeper
+// than one subdir below the walk root. The doc comment promises
+// "exactly one subdirectory deep" so the implementation must match.
+// A stray nested log.json (e.g. from an extracted tarball or a
+// fixture inside an SDK's test data) must not be counted.
+func TestParseMintLogDir_RejectsDeeperThanOneSubdir(t *testing.T) {
+	root := t.TempDir()
+	// Legitimate: {root}/aws-sdk-go/log.json - SHOULD be parsed.
+	if err := os.MkdirAll(filepath.Join(root, "aws-sdk-go"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	perSDK := []byte(`{"name":"aws-sdk-go","function":"PutObject","duration":12,"status":"PASS"}` + "\n")
+	if err := os.WriteFile(filepath.Join(root, "aws-sdk-go", "log.json"), perSDK, 0o644); err != nil {
+		t.Fatalf("write per-sdk: %v", err)
+	}
+	// Stray nested log.json - SHOULD be ignored.
+	if err := os.MkdirAll(filepath.Join(root, "aws-sdk-go", "fixtures", "stray"), 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	stray := []byte(`{"name":"aws-sdk-go","function":"StrayTest","duration":1,"status":"PASS"}` + "\n")
+	if err := os.WriteFile(filepath.Join(root, "aws-sdk-go", "fixtures", "stray", "log.json"), stray, 0o644); err != nil {
+		t.Fatalf("write stray: %v", err)
+	}
+	entries, err := ParseMintLogDir(root)
+	if err != nil {
+		t.Fatalf("ParseMintLogDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("entries = %d, want 1 (deeper-than-one-subdir log.json must be ignored)", len(entries))
+	}
+	if len(entries) == 1 && entries[0].Op != "PutObject" {
+		t.Errorf("entry[0].Op = %q, want PutObject (stray nested log leaked in)", entries[0].Op)
+	}
+}
+
 // Regression: trailing-slash root path must work (operators often
 // pass paths with trailing slashes). The top-level aggregated log
 // skip relies on filepath.Dir(path) == cleanRoot, which only holds

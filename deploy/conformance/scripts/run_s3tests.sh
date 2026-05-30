@@ -13,12 +13,16 @@
 # only needs the gateway endpoint + S3 keys.
 #
 # Required environment variables:
-#   GATEWAY_ENDPOINT       https URL of the gateway
-#   GATEWAY_BUCKET         bucket name to test against
+#   GATEWAY_ENDPOINT       http(s) URL of the gateway
 #   GATEWAY_ACCESS_KEY     S3 access key
 #   GATEWAY_SECRET_KEY     S3 secret key
 #
 # Optional environment variables:
+#   GATEWAY_BUCKET         informational only — Ceph s3-tests creates
+#                          its own buckets dynamically per test, so this
+#                          variable is not threaded into s3tests.conf.
+#                          Kept symmetric with run_mint.sh's env block so
+#                          operators set one consistent variable set.
 #   GATEWAY_REGION         defaults to us-east-1
 #   S3TESTS_REPO           defaults to https://github.com/ceph/s3-tests
 #   S3TESTS_REV            defaults to master (pin a SHA in production)
@@ -41,9 +45,12 @@ require() {
 }
 
 require GATEWAY_ENDPOINT
-require GATEWAY_BUCKET
 require GATEWAY_ACCESS_KEY
 require GATEWAY_SECRET_KEY
+# GATEWAY_BUCKET is intentionally NOT required: Ceph s3-tests creates
+# per-test buckets via its own bucket_prefix mechanism and ignores any
+# operator-supplied name. We only log it for operator visibility.
+GATEWAY_BUCKET="${GATEWAY_BUCKET:-<unset>}"
 
 GATEWAY_REGION="${GATEWAY_REGION:-us-east-1}"
 S3TESTS_REPO="${S3TESTS_REPO:-https://github.com/ceph/s3-tests}"
@@ -85,11 +92,19 @@ pip install --quiet -e "$S3TESTS_WORKDIR"
 
 # Build s3tests.conf pointing at the gateway. The host field
 # accepts a bare host or host:port; we extract from the
-# GATEWAY_ENDPOINT URL.
+# GATEWAY_ENDPOINT URL. The default port is scheme-aware: 443
+# for https://, 80 for http:// (mirrors run_mint.sh's logic).
+case "$GATEWAY_ENDPOINT" in
+  https://*) default_port=443; is_secure="yes" ;;
+  http://*)  default_port=80;  is_secure="no"  ;;
+  *)
+    echo "run_s3tests: GATEWAY_ENDPOINT must start with http:// or https://" >&2
+    exit 64
+    ;;
+esac
 host=$(echo "$GATEWAY_ENDPOINT" | sed -e 's|^https\?://||' -e 's|/.*$||')
-port=$(echo "$host" | awk -F: '{print ($2 == "") ? "443" : $2}')
+port=$(echo "$host" | awk -F: -v dp="$default_port" '{print ($2 == "") ? dp : $2}')
 host_only=$(echo "$host" | awk -F: '{print $1}')
-is_secure=$(echo "$GATEWAY_ENDPOINT" | grep -q '^https' && echo "yes" || echo "no")
 
 conf_path="$S3TESTS_WORKDIR/zkof-s3tests-${timestamp}.conf"
 cat > "$conf_path" <<EOF
