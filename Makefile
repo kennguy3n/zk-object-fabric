@@ -135,9 +135,26 @@ audit-bundle: audit-verify
 	@# Embed the static-analysis reports produced by audit-verify.
 	@mkdir -p $(STAGING)/reports
 	@cp $(BUILD_DIR)/reports/*.txt $(STAGING)/reports/
-	@# MANIFEST.txt records SHA-256 of every file shipped plus the
-	@# commit SHA. An auditor can verify integrity against this file
-	@# alone (e.g. `cd unpacked && shasum -a 256 -c MANIFEST.txt`).
+	@# The bundle ships two top-level metadata files:
+	@#
+	@#   BUNDLE-INFO.txt — human-readable provenance (commit SHA,
+	@#       build timestamp, who/what produced the bundle). Auditor
+	@#       reads this first to know what they are looking at.
+	@#
+	@#   MANIFEST.txt — pure list of `<hex>  <path>` lines, one per
+	@#       file under the staging root. An auditor verifies the
+	@#       entire bundle with a single `cd unpacked && $(SHA256) -c
+	@#       MANIFEST.txt`. Splitting the human-readable header into
+	@#       BUNDLE-INFO.txt keeps the manifest format strictly
+	@#       conforming so `sha256sum -c` / `shasum -a 256 -c` exits 0
+	@#       with zero per-line warnings (previously the header lines
+	@#       triggered "improperly formatted SHA256 checksum line"
+	@#       warnings even though all hashes verified correctly).
+	@#
+	@# BUNDLE-INFO.txt is itself listed in MANIFEST.txt, so it cannot
+	@# be tampered with after the bundle is built without also
+	@# tampering with MANIFEST.txt — the auditor's chain of trust is
+	@# preserved.
 	@#
 	@# The hashing pipeline uses null-separated paths end-to-end
 	@# (find -print0 -> sort -z -> xargs -0 $(SHA256)) rather than
@@ -158,11 +175,17 @@ audit-bundle: audit-verify
 	        echo "commit: $(COMMIT)"; \
 	        echo "built:  $$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 	        echo ""; \
-	        echo "sha256  path"; \
-	        find . -type f ! -name MANIFEST.txt -print0 \
-	          | LC_ALL=C sort -z \
-	          | xargs -0 $(SHA256); \
-	    } > MANIFEST.txt )
+	        echo "To verify file integrity:"; \
+	        echo "    cd <unpacked-bundle> && $(SHA256) -c MANIFEST.txt"; \
+	        echo ""; \
+	        echo "MANIFEST.txt contains <hex>  <path> lines only, so"; \
+	        echo "the check above exits 0 with no warnings on Linux"; \
+	        echo "(sha256sum) and macOS (shasum -a 256) alike."; \
+	    } > BUNDLE-INFO.txt )
+	@( cd $(STAGING) && \
+	    find . -type f ! -name MANIFEST.txt -print0 \
+	      | LC_ALL=C sort -z \
+	      | xargs -0 $(SHA256) > MANIFEST.txt )
 	@tar -czf $(BUNDLE) -C $(STAGING) .
 	@echo "==> Wrote $(BUNDLE)"
 	@ls -lh $(BUNDLE)
