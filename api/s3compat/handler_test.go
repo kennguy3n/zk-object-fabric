@@ -2405,3 +2405,56 @@ func TestAudit_RequestIDFromContext(t *testing.T) {
 		t.Errorf("audit RequestID = %q, response header x-amz-request-id = %q; they must match because both must come from requestid.FromContext(r.Context()) / requestid.Middleware's single source of truth.", got, responseID)
 	}
 }
+
+// TestRejectUnsupportedSubresource_DeterministicErrorMessage pins the
+// behaviour that, when a request carries multiple unimplemented
+// sub-resource keys, the gateway always names the
+// lexicographically-first matching key. The pre-fix implementation
+// iterated `for key := range unsupportedSubresources`, which Go
+// randomises across map iterations, so the same request could surface
+// any one of the unsupported keys in the error body depending on the
+// runtime's seed. That made error snapshots non-deterministic and
+// hampered both the conformance harness and any downstream tooling
+// that parses NotImplemented responses by code+resource.
+//
+// We assert determinism by issuing the same multi-subresource request
+// many times in succession — if the response body varies even once,
+// the iteration order is unstable and the test fails. Picking three
+// keys (`acl`, `tagging`, `versioning`) means random selection would
+// surface a different one within the first dozen iterations with
+// overwhelming probability.
+func TestRejectUnsupportedSubresource_DeterministicErrorMessage(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+
+	// Request carries three unimplemented sub-resources at once.
+	// Sorted, the lexicographically-first key is "acl", so every
+	// response should name "acl".
+	url := "/bucket/obj?acl&tagging&versioning"
+
+	// The error body is XML; `"acl"` gets `&#34;`-escaped to
+	// `&#34;acl&#34;`. We match on the bare `acl` token surrounded
+	// by the XML quote-entity so this passes regardless of which
+	// escape style the encoder picks (the surrounding entities also
+	// guarantee we don't accidentally match a partial fragment from
+	// another key like `analytics`).
+	const expectedFragment = `&#34;acl&#34;`
+	const otherKeys = `&#34;tagging&#34;` // also `&#34;versioning&#34;`
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader([]byte("x")))
+		req.ContentLength = 1
+		rec := httptest.NewRecorder()
+		h.dispatch(rec, req)
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("iter %d: status = %d, want 501; body=%s", i, rec.Code, rec.Body)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, expectedFragment) {
+			t.Fatalf("iter %d: body %q must mention %s (the lexicographically-first unsupported sub-resource key in the request)", i, body, expectedFragment)
+		}
+		// Sanity check: the other keys must NOT be named, since
+		// the dispatcher returns on the first match.
+		if strings.Contains(body, otherKeys) || strings.Contains(body, `&#34;versioning&#34;`) {
+			t.Fatalf("iter %d: body %q named a non-first unsupported sub-resource key; ordering is broken", i, body)
+		}
+	}
+}

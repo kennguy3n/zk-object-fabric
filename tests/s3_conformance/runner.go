@@ -52,19 +52,30 @@ type Runner struct {
 //
 // Run is safe to call multiple times on the same Runner — each call
 // produces an independent Matrix using a fresh key namespace.
+// Concretely, Run never mutates the receiver: when KeyPrefix is
+// empty, a fresh per-call namespace is generated on a stack-local
+// copy of the runner state and threaded through every helper, so a
+// second Run() call always gets a new prefix (and never collides
+// with the first run's residual objects under the cleanup-deleted
+// prefix).
 func (r *Runner) Run(ctx context.Context) Matrix {
-	if r.KeyPrefix == "" {
-		r.KeyPrefix = fmt.Sprintf("conformance-%s/", time.Now().UTC().Format("20060102-150405"))
+	// Stack-local copy. All helpers receive &local instead of r so
+	// any per-run state we set here (today: KeyPrefix; tomorrow:
+	// any retry budget or timing-window the runner needs to carry
+	// across helpers) stays scoped to this Run() invocation.
+	local := *r
+	if local.KeyPrefix == "" {
+		local.KeyPrefix = fmt.Sprintf("conformance-%s/", time.Now().UTC().Format("20060102-150405"))
 	}
 	matrix := Matrix{
 		Generated: time.Now().UTC(),
-		Endpoint:  r.Endpoint,
-		Bucket:    r.Bucket,
+		Endpoint:  local.Endpoint,
+		Bucket:    local.Bucket,
 	}
 
-	if r.CreateBucket {
-		matrix.Operations = append(matrix.Operations, r.run("bucket", "PutBucket", func(ctx context.Context) (string, OpStatus, error) {
-			_, err := r.Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(r.Bucket)})
+	if local.CreateBucket {
+		matrix.Operations = append(matrix.Operations, local.run("bucket", "PutBucket", func(ctx context.Context) (string, OpStatus, error) {
+			_, err := local.Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(local.Bucket)})
 			if err == nil {
 				return "201 / bucket created", OpPassed, nil
 			}
@@ -79,16 +90,16 @@ func (r *Runner) Run(ctx context.Context) Matrix {
 		})(ctx))
 	}
 
-	matrix.Operations = append(matrix.Operations, r.coreOps(ctx)...)
-	matrix.Operations = append(matrix.Operations, r.listingOps(ctx)...)
-	matrix.Operations = append(matrix.Operations, r.rangeOps(ctx)...)
-	matrix.Operations = append(matrix.Operations, r.multipartOps(ctx)...)
-	matrix.Operations = append(matrix.Operations, r.copyOps(ctx)...)
-	matrix.Operations = append(matrix.Operations, r.versioningOps(ctx)...)
-	matrix.Operations = append(matrix.Operations, r.unsupportedOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.coreOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.listingOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.rangeOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.multipartOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.copyOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.versioningOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.unsupportedOps(ctx)...)
 
-	if r.Cleanup {
-		matrix.Operations = append(matrix.Operations, r.cleanup(ctx))
+	if local.Cleanup {
+		matrix.Operations = append(matrix.Operations, local.cleanup(ctx))
 	}
 
 	matrix.Sort()

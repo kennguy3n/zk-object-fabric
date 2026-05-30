@@ -131,41 +131,75 @@ func (m *Matrix) WriteMarkdown(w io.Writer) error {
 	m.Sort()
 	counts := m.Counts()
 
-	fmt.Fprintf(w, "# S3 Conformance Matrix\n\n")
-	fmt.Fprintf(w, "| Field | Value |\n|---|---|\n")
-	fmt.Fprintf(w, "| Generated | %s |\n", m.Generated.UTC().Format(time.RFC3339))
-	fmt.Fprintf(w, "| Endpoint | %s |\n", escapeMD(m.Endpoint))
-	fmt.Fprintf(w, "| Bucket | %s |\n", escapeMD(m.Bucket))
-	fmt.Fprintf(w, "| Passed | %d |\n", counts[OpPassed])
-	fmt.Fprintf(w, "| Failed | %d |\n", counts[OpFailed])
-	fmt.Fprintf(w, "| Unsupported | %d |\n", counts[OpUnsupported])
-	fmt.Fprintf(w, "| Errored | %d |\n", counts[OpErrored])
-	fmt.Fprintln(w)
+	// errWriter holds the first error returned by any fmt.Fprintf
+	// call and short-circuits subsequent writes once it is non-nil.
+	// We use this instead of inline `if _, err := ...; err != nil`
+	// boilerplate at every line so the rendering logic stays
+	// readable while still propagating disk-full / broken-pipe
+	// failures up to the caller — symmetric with WriteJSON's
+	// encoder error propagation. The final ew.err is returned at
+	// the bottom of the function.
+	ew := &errWriter{w: w}
+
+	ew.printf("# S3 Conformance Matrix\n\n")
+	ew.printf("| Field | Value |\n|---|---|\n")
+	ew.printf("| Generated | %s |\n", m.Generated.UTC().Format(time.RFC3339))
+	ew.printf("| Endpoint | %s |\n", escapeMD(m.Endpoint))
+	ew.printf("| Bucket | %s |\n", escapeMD(m.Bucket))
+	ew.printf("| Passed | %d |\n", counts[OpPassed])
+	ew.printf("| Failed | %d |\n", counts[OpFailed])
+	ew.printf("| Unsupported | %d |\n", counts[OpUnsupported])
+	ew.printf("| Errored | %d |\n", counts[OpErrored])
+	ew.println()
 
 	if counts[OpFailed] > 0 || counts[OpErrored] > 0 {
-		fmt.Fprintln(w, "> **Gate status: REGRESSION.** At least one operation is")
-		fmt.Fprintln(w, "> Failed or Errored. Triage these before merging.")
-		fmt.Fprintln(w)
+		ew.println("> **Gate status: REGRESSION.** At least one operation is")
+		ew.println("> Failed or Errored. Triage these before merging.")
+		ew.println()
 	} else {
-		fmt.Fprintln(w, "> **Gate status: PASS.** Every implemented operation")
-		fmt.Fprintln(w, "> returned the expected AWS S3 reference behaviour;")
-		fmt.Fprintln(w, "> Unsupported entries are the documented gateway gaps.")
-		fmt.Fprintln(w)
+		ew.println("> **Gate status: PASS.** Every implemented operation")
+		ew.println("> returned the expected AWS S3 reference behaviour;")
+		ew.println("> Unsupported entries are the documented gateway gaps.")
+		ew.println()
 	}
 
 	cat := ""
 	for _, r := range m.Operations {
 		if r.Category != cat {
 			cat = r.Category
-			fmt.Fprintf(w, "## %s\n\n", categoryTitle(cat))
-			fmt.Fprintln(w, "| Operation | Status | Detail | Duration |")
-			fmt.Fprintln(w, "|---|---|---|---|")
+			ew.printf("## %s\n\n", categoryTitle(cat))
+			ew.println("| Operation | Status | Detail | Duration |")
+			ew.println("|---|---|---|---|")
 		}
-		fmt.Fprintf(w, "| `%s` | %s | %s | %s |\n",
+		ew.printf("| `%s` | %s | %s | %s |\n",
 			r.Op, statusBadge(r.Status), escapeMD(r.Detail), r.Duration.Round(time.Microsecond))
 	}
-	fmt.Fprintln(w)
-	return nil
+	ew.println()
+	return ew.err
+}
+
+// errWriter is a tiny sticky-error wrapper around io.Writer used by
+// WriteMarkdown so we don't have to thread an error check through
+// every formatted line of the report. Once err is non-nil, all
+// subsequent printf / println calls become no-ops; the final err is
+// returned to the caller.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) printf(format string, args ...interface{}) {
+	if e.err != nil {
+		return
+	}
+	_, e.err = fmt.Fprintf(e.w, format, args...)
+}
+
+func (e *errWriter) println(args ...interface{}) {
+	if e.err != nil {
+		return
+	}
+	_, e.err = fmt.Fprintln(e.w, args...)
 }
 
 // categoryTitle renders an internal category id (e.g. "core") as a

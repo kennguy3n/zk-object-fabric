@@ -20,6 +20,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -493,6 +494,11 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // entry here returns 4xx (specifically 501); a future implementation
 // that wires up (say) tagging should remove the `tagging` key from
 // this map and add tagging routing in the dispatch switch below.
+//
+// `delete` is intentionally NOT in this map: it is the
+// POST DeleteObjects (bulk delete) endpoint, which the dispatcher's
+// POST arm routes explicitly. Adding `delete` here would
+// incorrectly reject bulk-delete requests as unsupported.
 var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
 	"tagging":             "NotImplemented",
@@ -518,22 +524,37 @@ var unsupportedSubresources = map[string]string{
 	"intelligent-tiering": "NotImplemented",
 }
 
+// unsupportedSubresourceKeys is the lexicographically-sorted view of
+// unsupportedSubresources's keys. We precompute it once at package
+// init so the per-request rejection path can iterate in a stable
+// order. Without this, `for key := range unsupportedSubresources`
+// picks whichever key Go's randomised map iteration hits first,
+// which makes error messages non-deterministic when a request
+// carries multiple unsupported keys (e.g. `?acl&tagging`). Stable
+// ordering also lets the conformance harness snapshot error bodies.
+var unsupportedSubresourceKeys = func() []string {
+	out := make([]string, 0, len(unsupportedSubresources))
+	for k := range unsupportedSubresources {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}()
+
 // rejectUnsupportedSubresource returns true (and emits a 501 response)
 // if the request carries any sub-resource we have not implemented.
 // The check is intentionally before authentication: a 501 is more
 // useful to the SDK than a 403, and we never inspect request body
-// or headers beyond the URL when deciding.
+// or headers beyond the URL when deciding. When a request carries
+// multiple unsupported sub-resource keys, the error names the
+// lexicographically-first matching key so the response body is
+// deterministic for snapshot testing.
 func (h *Handler) rejectUnsupportedSubresource(w http.ResponseWriter, r *http.Request, q url.Values) bool {
-	for key, s3Code := range unsupportedSubresources {
+	for _, key := range unsupportedSubresourceKeys {
 		if !q.Has(key) {
 			continue
 		}
-		// The `delete` sub-resource is a special case: it is the
-		// POST DeleteObjects (bulk delete) endpoint. We route it
-		// through the dispatch's POST arm so it can return a
-		// distinct MethodNotAllowed/NotImplemented response. The
-		// dispatch handles it explicitly.
-		writeError(w, http.StatusNotImplemented, s3Code,
+		writeError(w, http.StatusNotImplemented, unsupportedSubresources[key],
 			fmt.Sprintf("the %q sub-resource is not implemented by this gateway", key),
 			r.URL.Path)
 		return true

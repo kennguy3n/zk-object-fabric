@@ -172,8 +172,18 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 			t.Errorf("missing matrix entry for %q", op)
 			continue
 		}
-		if entry.Status == conformance.OpFailed {
-			t.Errorf("op %q: status=Failed (gateway accepted an op we expect refused) — detail=%s", op, entry.Detail)
+		// We assert the exact OpUnsupported status (not just
+		// "not OpFailed") because OpErrored — the harness's
+		// own error path (network teardown, marshalling
+		// failure) — would otherwise pass this check silently
+		// and let an infrastructure regression slip through
+		// looking like a healthy "Unsupported" entry. The
+		// SLA we want is positive: the gateway responded, and
+		// the response was an explicit 4xx/501 we classified
+		// as Unsupported.
+		if entry.Status != conformance.OpUnsupported {
+			t.Errorf("op %q: status=%s (expected OpUnsupported) — detail=%s",
+				op, entry.Status, entry.Detail)
 		}
 	}
 
@@ -300,4 +310,70 @@ func indexByOp(ops []conformance.OpResult) map[string]conformance.OpResult {
 		out[op.Op] = op
 	}
 	return out
+}
+
+// TestRunner_RunDoesNotMutateReceiver asserts the contract documented
+// on Runner.Run: a second call on the same Runner instance is
+// independent of the first. Concretely, when KeyPrefix is left empty
+// the runner derives a fresh per-call namespace; if Run mutated the
+// receiver, the second call would inherit the first call's stale
+// prefix (and would also collide with the first call's cleanup pass,
+// since both runs would write to and then delete the same namespace).
+//
+// We also assert the inverse: when KeyPrefix is set explicitly, Run
+// honours it for every call and never overwrites it on the receiver
+// (operator-supplied prefixes must round-trip).
+func TestRunner_RunDoesNotMutateReceiver(t *testing.T) {
+	client, endpoint, bucket := newLocalFSGateway(t)
+	ctx := context.Background()
+
+	// Case 1: empty KeyPrefix — two Run() calls must each generate
+	// a distinct timestamped prefix without mutating the receiver.
+	r := &conformance.Runner{
+		Client:       client,
+		Endpoint:     endpoint,
+		Bucket:       bucket,
+		CreateBucket: true,
+		Cleanup:      true,
+	}
+	if r.KeyPrefix != "" {
+		t.Fatalf("precondition: KeyPrefix should be empty, got %q", r.KeyPrefix)
+	}
+	m1 := r.Run(ctx)
+	if r.KeyPrefix != "" {
+		t.Errorf("Run() mutated receiver KeyPrefix to %q; expected empty (contract: Runner is reusable)", r.KeyPrefix)
+	}
+	// Sleep one second so the second run's timestamp differs from
+	// the first — otherwise both runs would happen to pick the
+	// same fresh prefix purely because they ran in the same wall
+	// clock second, and the assertion below would be ambiguous.
+	time.Sleep(1100 * time.Millisecond)
+	m2 := r.Run(ctx)
+	if r.KeyPrefix != "" {
+		t.Errorf("second Run() also mutated receiver KeyPrefix to %q", r.KeyPrefix)
+	}
+	// Both matrices should be fully populated (no carry-over
+	// failures from collision).
+	if c := m1.Counts()[conformance.OpFailed] + m1.Counts()[conformance.OpErrored]; c > 0 {
+		t.Errorf("first run produced %d Failed/Errored ops", c)
+	}
+	if c := m2.Counts()[conformance.OpFailed] + m2.Counts()[conformance.OpErrored]; c > 0 {
+		t.Errorf("second run produced %d Failed/Errored ops", c)
+	}
+
+	// Case 2: caller-set KeyPrefix — Run must use it verbatim and
+	// must not overwrite it.
+	explicit := "fixed-prefix-test/"
+	r2 := &conformance.Runner{
+		Client:       client,
+		Endpoint:     endpoint,
+		Bucket:       bucket,
+		CreateBucket: true,
+		Cleanup:      true,
+		KeyPrefix:    explicit,
+	}
+	_ = r2.Run(ctx)
+	if r2.KeyPrefix != explicit {
+		t.Errorf("Run() altered caller-supplied KeyPrefix: got %q want %q", r2.KeyPrefix, explicit)
+	}
 }
