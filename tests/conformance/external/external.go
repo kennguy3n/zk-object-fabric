@@ -50,9 +50,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // OpStatus is the normalised per-operation outcome. The value
@@ -172,21 +174,29 @@ func (m Matrix) Counts() Counts {
 	return c
 }
 
-// AllPassed returns true iff there are zero Failed and zero
-// Errored entries. Unsupported entries are expected (they're the
-// documented gap set).
+// AllPassed returns true iff the matrix has at least one entry and
+// every entry is either Passed or Unsupported (i.e. zero Failed AND
+// zero Errored). The Total > 0 precondition matters because this
+// gate decides whether to publish an audit matrix: an operator who
+// accidentally points the aggregator at an empty directory must not
+// receive a silent audit-pass. Callers that legitimately accept a
+// zero-entry matrix (e.g. partial-harness re-aggregations during
+// incident triage) should inspect Counts() directly.
 func (m Matrix) AllPassed() bool {
 	c := m.Counts()
-	return c.Failed == 0 && c.Errored == 0
+	return c.Total > 0 && c.Failed == 0 && c.Errored == 0
 }
 
-// WriteJSON writes m as deterministic, indented JSON.
+// WriteJSON writes m as deterministic, indented JSON. It sorts a
+// local copy of Entries rather than the caller's underlying slice
+// — a value receiver in Go conventionally signals no mutation, so
+// sorting m.Entries in place would silently reorder a slice the
+// caller still holds a reference to. The copy is cheap (entry
+// structs are small and the matrix is at most a few thousand rows).
 func (m Matrix) WriteJSON(w io.Writer) error {
-	// Sort entries before serialising so two runs against the
-	// same gateway with the same outcomes produce byte-identical
-	// JSON.
-	sort.SliceStable(m.Entries, func(i, j int) bool {
-		a, b := m.Entries[i], m.Entries[j]
+	sorted := slices.Clone(m.Entries)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		a, b := sorted[i], sorted[j]
 		if a.Source != b.Source {
 			return a.Source < b.Source
 		}
@@ -198,9 +208,15 @@ func (m Matrix) WriteJSON(w io.Writer) error {
 		}
 		return a.Op < b.Op
 	})
+	out := Matrix{
+		GatewayEndpoint: m.GatewayEndpoint,
+		GatewaySHA:      m.GatewaySHA,
+		GeneratedAt:     m.GeneratedAt,
+		Entries:         sorted,
+	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(m)
+	return enc.Encode(out)
 }
 
 // ParseS3TestsXUnit parses a Ceph s3-tests --with-xunit XML file
@@ -345,17 +361,38 @@ func ParseMintLog(r io.Reader) ([]MatrixEntry, error) {
 }
 
 // ParseMintLogDir walks a mint-logs/{date}/ directory and parses
-// every per-SDK log.json beneath it. Directories without a
-// log.json (e.g. an empty SDK folder produced by a partial run)
-// are silently skipped — the caller can check the returned entry
-// count if they expect a specific number of SDKs.
+// every per-SDK log.json beneath it. mint writes two flavours of
+// log file when it runs:
+//
+//   - {root}/log.json — an aggregated copy that mint.sh produces
+//     by `cat`-ing every per-SDK log into a single file at the
+//     top of the bind-mount target.
+//   - {root}/{sdk}/log.json — the per-SDK source files.
+//
+// Parsing both would double-count every entry, so we only parse
+// files at exactly one subdirectory deep — i.e. {root}/{sdk}/log.json.
+// The top-level aggregated log is intentionally skipped because
+// the per-SDK files are the authoritative source (the aggregated
+// log is just a redundant view, and skipping it makes the entry
+// count match an operator's intuition of "one row per real test").
+//
+// Directories without a log.json (e.g. an empty SDK folder produced
+// by a partial run) are silently skipped — the caller can check
+// the returned entry count if they expect a specific number of SDKs.
 func ParseMintLogDir(root string) ([]MatrixEntry, error) {
 	var out []MatrixEntry
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	cleanRoot := filepath.Clean(root)
+	err := filepath.WalkDir(cleanRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() || d.Name() != "log.json" {
+			return nil
+		}
+		// Skip the aggregated top-level log.json: its parent
+		// directory IS the walk root, so it would duplicate every
+		// per-SDK entry.
+		if filepath.Dir(path) == cleanRoot {
 			return nil
 		}
 		f, err := os.Open(path)
@@ -415,8 +452,14 @@ func mintCategory(sdk string) string {
 
 // compactDetail collapses up to three optional fragments into a
 // single short line suitable for the matrix Detail column. Long
-// stack traces are truncated to 240 chars so the rendered
-// matrix stays readable.
+// stack traces are truncated to 240 bytes so the rendered
+// matrix stays readable. Truncation is rune-aware: if the byte
+// slice [:237] would land in the middle of a multi-byte UTF-8
+// sequence (possible when a harness emits a non-ASCII error
+// message — e.g. a localised exception text or a file path with
+// Unicode), we back off to the previous rune boundary so the
+// truncated string remains valid UTF-8 and renders cleanly in
+// the JSON matrix.
 func compactDetail(parts ...string) string {
 	var nonEmpty []string
 	for _, p := range parts {
@@ -430,7 +473,11 @@ func compactDetail(parts ...string) string {
 	}
 	joined := strings.Join(nonEmpty, "; ")
 	if len(joined) > 240 {
-		joined = joined[:237] + "..."
+		cut := 237
+		for cut > 0 && !utf8.RuneStart(joined[cut]) {
+			cut--
+		}
+		joined = joined[:cut] + "..."
 	}
 	// Collapse newlines for single-line matrix cells.
 	joined = strings.ReplaceAll(joined, "\n", " ")

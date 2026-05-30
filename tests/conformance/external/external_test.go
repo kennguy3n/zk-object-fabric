@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestParseS3TestsXUnit_SingleSuite(t *testing.T) {
@@ -203,6 +204,63 @@ func TestParseMintLogDir(t *testing.T) {
 	}
 }
 
+// Regression: mint's entrypoint script writes BOTH a per-SDK
+// log.json (under {sdk}/log.json) AND an aggregated log.json at
+// the top of the bind-mount target. ParseMintLogDir must skip the
+// top-level aggregated file to avoid double-counting every entry.
+// See https://github.com/minio/mint/blob/master/mint.sh — the
+// `cat "$test_log_file" >>"$BASE_LOG_DIR/$LOG_FILE"` line is what
+// produces the aggregated copy.
+func TestParseMintLogDir_SkipsAggregatedTopLevelLog(t *testing.T) {
+	root := t.TempDir()
+	perSDK := []byte(`{"name":"aws-sdk-go","function":"PutObject","duration":12,"status":"PASS"}` + "\n" +
+		`{"name":"aws-sdk-go","function":"GetObject","duration":8,"status":"PASS"}` + "\n")
+	if err := os.MkdirAll(filepath.Join(root, "aws-sdk-go"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "aws-sdk-go", "log.json"), perSDK, 0o644); err != nil {
+		t.Fatalf("write per-sdk: %v", err)
+	}
+	// Aggregated top-level log mint produces: same content as
+	// the per-SDK file (just `cat`ed). If we parse it too, we'd
+	// double-count.
+	if err := os.WriteFile(filepath.Join(root, "log.json"), perSDK, 0o644); err != nil {
+		t.Fatalf("write aggregated: %v", err)
+	}
+	entries, err := ParseMintLogDir(root)
+	if err != nil {
+		t.Fatalf("ParseMintLogDir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("entries = %d, want 2 (aggregated top-level log must be skipped)", len(entries))
+	}
+}
+
+// Regression: trailing-slash root path must work (operators often
+// pass paths with trailing slashes). The top-level aggregated log
+// skip relies on filepath.Dir(path) == cleanRoot, which only holds
+// if we canonicalise the input via filepath.Clean.
+func TestParseMintLogDir_RootWithTrailingSlash(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "aws-sdk-go"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	perSDK := []byte(`{"name":"aws-sdk-go","function":"PutObject","duration":12,"status":"PASS"}` + "\n")
+	if err := os.WriteFile(filepath.Join(root, "aws-sdk-go", "log.json"), perSDK, 0o644); err != nil {
+		t.Fatalf("write per-sdk: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "log.json"), perSDK, 0o644); err != nil {
+		t.Fatalf("write aggregated: %v", err)
+	}
+	entries, err := ParseMintLogDir(root + string(filepath.Separator))
+	if err != nil {
+		t.Fatalf("ParseMintLogDir with trailing slash: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("entries = %d, want 1 (trailing slash on root must not defeat aggregated-log skip)", len(entries))
+	}
+}
+
 func TestAggregate_DeterministicJSON(t *testing.T) {
 	t0 := time.Date(2026, 5, 30, 14, 0, 0, 0, time.UTC)
 	parts1 := []MatrixEntry{
@@ -278,6 +336,60 @@ func TestMatrix_Counts_AllPassed(t *testing.T) {
 	}
 }
 
+// Regression test: an empty matrix must NOT report AllPassed. An
+// operator who points the aggregator at an empty directory must
+// not receive a silent audit-pass.
+func TestMatrix_AllPassed_EmptyMatrixIsNotPass(t *testing.T) {
+	empty := Matrix{}
+	if empty.AllPassed() {
+		t.Errorf("AllPassed() = true on empty matrix; want false (no entries means no evidence of pass)")
+	}
+	nilEntries := Matrix{Entries: nil}
+	if nilEntries.AllPassed() {
+		t.Errorf("AllPassed() = true on nil-entries matrix; want false")
+	}
+	zero := Matrix{Entries: []MatrixEntry{}}
+	if zero.AllPassed() {
+		t.Errorf("AllPassed() = true on zero-length-entries matrix; want false")
+	}
+	// Boundary: a single passing entry must pass.
+	one := Matrix{Entries: []MatrixEntry{{Op: "a", Status: OpPassed}}}
+	if !one.AllPassed() {
+		t.Errorf("AllPassed() = false on single-pass matrix; want true")
+	}
+}
+
+// Regression test: WriteJSON must NOT mutate the caller's Entries
+// slice. The value receiver in Go conventionally signals no
+// mutation, but sort.SliceStable on m.Entries would silently sort
+// the underlying array shared with the caller.
+func TestMatrix_WriteJSON_DoesNotMutateCallerEntries(t *testing.T) {
+	original := []MatrixEntry{
+		{Op: "PutObject", Source: SourceMinioMint, SDK: "aws-sdk-go", Status: OpPassed},
+		{Op: "test_object_put_acl", Source: SourceCephS3Tests, Status: OpFailed, Detail: "ACL not applied"},
+		{Op: "GetObject", Source: SourceMinioMint, SDK: "aws-sdk-go", Status: OpPassed},
+	}
+	snapshot := slicesCloneEntries(original)
+	m := Matrix{Entries: original}
+	if err := m.WriteJSON(&bytes.Buffer{}); err != nil {
+		t.Fatalf("WriteJSON: %v", err)
+	}
+	if len(original) != len(snapshot) {
+		t.Fatalf("length changed: %d → %d", len(snapshot), len(original))
+	}
+	for i := range original {
+		if original[i] != snapshot[i] {
+			t.Errorf("original[%d] mutated by WriteJSON: %+v → %+v", i, snapshot[i], original[i])
+		}
+	}
+}
+
+func slicesCloneEntries(in []MatrixEntry) []MatrixEntry {
+	out := make([]MatrixEntry, len(in))
+	copy(out, in)
+	return out
+}
+
 func TestCompactDetail_Truncates(t *testing.T) {
 	long := strings.Repeat("x", 500)
 	got := compactDetail("alert", "msg", long)
@@ -287,6 +399,48 @@ func TestCompactDetail_Truncates(t *testing.T) {
 	if !strings.HasSuffix(got, "...") {
 		t.Errorf("compactDetail truncation does not end with '...': %q", got[len(got)-10:])
 	}
+}
+
+// Regression: compactDetail must back off to a valid UTF-8 rune
+// boundary when truncating. A naive [:237] slice can split a
+// multi-byte rune (e.g. when a harness emits a localised error
+// message or a Unicode file path).
+func TestCompactDetail_TruncatesAtRuneBoundary(t *testing.T) {
+	// Build a string where byte 237 lands inside a multi-byte
+	// rune. "你好" is 6 bytes (3 each), so a prefix of 235 ASCII
+	// bytes + "你好" places the second multi-byte rune across
+	// byte 238-240. The naive slice [:237] would land inside
+	// the second rune.
+	head := strings.Repeat("a", 235)
+	input := head + "你好" + strings.Repeat("b", 200)
+	got := compactDetail(input)
+	if !utf8.ValidString(got) {
+		t.Errorf("compactDetail produced invalid UTF-8 for input with multi-byte rune at truncation boundary; got bytes: %x", []byte(got))
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("compactDetail truncation does not end with '...': %q", got)
+	}
+	if len(got) > 240 {
+		t.Errorf("compactDetail length = %d, expected ≤ 240", len(got))
+	}
+	// Round-trip through encoding/json to confirm the JSON
+	// encoder doesn't have to escape any invalid bytes.
+	b, err := jsonMarshal(struct{ D string }{D: got})
+	if err != nil {
+		t.Errorf("json.Marshal failed on truncated string: %v", err)
+	}
+	if strings.Contains(string(b), `\ufffd`) {
+		t.Errorf("json.Marshal produced replacement char in output, indicating invalid UTF-8: %s", b)
+	}
+}
+
+func jsonMarshal(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func TestCompactDetail_StripsNewlines(t *testing.T) {

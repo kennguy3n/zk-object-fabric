@@ -133,3 +133,24 @@ func TestCLI_OnlyMint_AllPassedExitsZero(t *testing.T) {
 		t.Errorf("matrix missing passed entries; got: %s", body)
 	}
 }
+
+// Regression: an operator who points the aggregator at an empty
+// mint-logs directory must not get a silent audit-pass. The CLI
+// should exit non-zero (1) because zero entries fails the
+// "at-least-one-entry" precondition of AllPassed().
+func TestCLI_EmptyMintDirExitsNonZero(t *testing.T) {
+	bin := buildCLI(t)
+	emptyRoot := t.TempDir()
+	outPath := filepath.Join(t.TempDir(), "matrix.json")
+	cmd := exec.Command(bin, "-mint-logs-dir", emptyRoot, "-out", outPath)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-zero exit on empty mint dir; output: %s", out)
+	}
+	if cmd.ProcessState.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (empty matrix must not pass the audit gate); output: %s", cmd.ProcessState.ExitCode(), out)
+	}
+	if !strings.Contains(string(out), "total=0") {
+		t.Errorf("stderr summary missing total=0; got: %s", out)
+	}
+}

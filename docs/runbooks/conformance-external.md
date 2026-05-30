@@ -88,7 +88,8 @@ external/
 │   └── 20260530T143000Z.log      # Full stdout/stderr of the run
 ├── mint/
 │   └── 20260530T144500Z/         # Per-mint-run dir
-│       ├── aws-sdk-go/log.json
+│       ├── log.json               # mint's aggregated copy (skipped by aggregator)
+│       ├── aws-sdk-go/log.json    # Per-SDK source files (the authoritative input)
 │       ├── aws-sdk-java/log.json
 │       └── ...                    # One subdir per SDK mint exercised
 └── matrix-20260530T150000Z.json   # Aggregated normalised matrix
@@ -178,8 +179,11 @@ conformance-aggregate \
   [-out OUT_PATH]
 
 Exit codes:
-  0  audit-pass (all entries pass or unsupported)
-  1  one or more failed or errored entries
+  0  audit-pass (at least one entry AND all entries pass or unsupported)
+  1  one or more failed or errored entries, OR zero entries (empty matrix
+     never silently passes the audit gate — if the aggregator finds no
+     test outcomes it returns non-zero so an operator who points it at
+     the wrong directory does not get a false green light)
   64 invalid CLI usage
   65 input file could not be parsed
 ```
