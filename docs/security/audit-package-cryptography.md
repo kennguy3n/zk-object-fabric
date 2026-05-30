@@ -733,18 +733,43 @@ Non-exhaustive list to seed the audit's threat-modelling session:
      values produce the same ciphertext bytes paired with
      different 16-byte Poly1305 tags. Each tag verifies only
      under its caller's AAD.
-   - **The footgun is operational, not cryptographic.** A
-     storage backend that dedups on the ciphertext-bytes prefix
-     (the natural shape — tags are per-recipient) would point
-     both tenants at the same physical block, then fail to
-     verify whichever tenant's tag was not the one persisted.
-     Worse, a backend that dedups and stores only one tag would
-     leave the *other* tenant's chunks silently undecryptable
-     on read-back — `EncryptObject` returned success, the
-     bytes round-tripped through storage, but `DecryptObject`
-     returns a Poly1305 MAC failure.
+   - **The operational footgun.** A storage backend that dedups
+     on the ciphertext-bytes prefix (the natural shape — tags
+     are per-recipient) would point both tenants at the same
+     physical block, then fail to verify whichever tenant's
+     tag was not the one persisted. Worse, a backend that
+     dedups and stores only one tag would leave the *other*
+     tenant's chunks silently undecryptable on read-back —
+     `EncryptObject` returned success, the bytes round-tripped
+     through storage, but `DecryptObject` returns a Poly1305
+     MAC failure.
+   - **The cryptographic risk: Poly1305 one-time-key recovery
+     and tag forgery.** Beyond the operational footgun, the
+     same (DEK, nonce) reused across two valid (ciphertext,
+     AAD) pairs is the textbook precondition for Poly1305
+     one-time-key recovery. Poly1305 evaluates a polynomial
+     in `r` (the upper half of the per-(key, nonce) one-time
+     key) over the message blocks and adds `s` (the lower
+     half), all mod 2^130 − 5. Two valid tags computed under
+     the same `(r, s)` over messages that differ in their AAD
+     blocks form a linear system that an attacker can solve
+     for `r` (up to its 4 clamped low-bit candidates), then
+     recover `s = tag − Σ blocks·r^… mod p`. With `(r, s)` in
+     hand the attacker can forge a Poly1305 tag for *any*
+     chosen `(AAD, ciphertext)` pair under that one-time key.
+     The keystream itself — and therefore plaintext
+     confidentiality — is unaffected (XChaCha20 keystream is
+     a function of `(key, nonce)` only and stays sealed), but
+     authentication is broken: an attacker who has captured
+     two such (tag, AAD) pairs can craft a third (tag, AAD,
+     ciphertext) triple that `DecryptObject` would accept.
+     This is precisely the threat the EncryptObject guard
+     prevents — by refusing to *produce* a second valid tag
+     under the same (key, nonce), the SDK ensures the linear
+     system the attack needs can never be assembled from the
+     gateway's outputs.
 
-   **Defence (added 2026-05-30, this PR):** the SDK refuses the
+   **Defence (this PR):** the SDK refuses the
    combination at the entry point. `EncryptObject` in
    `encryption/client_sdk/sdk.go:118-182` returns
    `"client_sdk: ConvergentNonce and ChunkAAD are mutually
@@ -783,3 +808,24 @@ Non-exhaustive list to seed the audit's threat-modelling session:
      wire frame either way and verifies the Poly1305 tag
      against the caller-supplied `ChunkAAD`, so the security
      posture on the read path is unchanged by the guard.
+   - No other production call site can reach the (key, nonce)
+     reuse precondition. A repo-wide grep for `.Seal(` finds
+     exactly three production callsites:
+     `encryption/client_sdk/sdk.go:431` inside
+     `encryptReader.nextFrame` (the *only* path that consumes
+     a convergent-derived nonce, and the path the guard sits
+     in front of), `encryption/client_sdk/wrap.go:80` for the
+     CMK envelope wrap, and
+     `metadata/manifest_store/postgres/body_encryptor.go:126`
+     for the manifest-row body seal. The latter two both
+     generate a fresh random 24-byte nonce per call
+     (`rand.Read` from `crypto/rand`) and never derive a nonce
+     from content, so even an attacker who can force two
+     manifest-row writes for the same logical key produces
+     two distinct nonces and the linear system never
+     materialises. The auditor should re-run the
+     `grep -nR '\.Seal('` against the bundle's source-of-truth
+     snapshot and flag any additional Seal callsite that
+     either derives a nonce from content or threads
+     `ChunkAAD` into its AAD — even one such callsite would
+     defeat the SDK-level guard.
