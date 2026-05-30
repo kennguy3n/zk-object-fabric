@@ -78,6 +78,18 @@ type SustainedRunner struct {
 	// context.WithTimeout, which is wall-clock based regardless of
 	// this field; a mock clock here will not shorten or lengthen the
 	// drive phase. Optional.
+	//
+	// Consequence for callers: elapsed-time–derived metrics —
+	// MetricSustainedRPS, MetricRPSEfficiency, and anything
+	// reported in buildResults that divides by
+	// (finishedAt - startedAt) — are computed from r.nowFn().
+	// A mock that returns a frozen instant therefore collapses
+	// elapsed to 0 and renders those metrics meaningless (the
+	// implementation guards against the divide-by-zero, so the
+	// reported value is simply 0). Tests using a mock clock
+	// should restrict their assertions to latency percentiles
+	// and counter-based metrics; assertions on RPS / efficiency
+	// require the real wall clock.
 	Now func() time.Time
 
 	// RNGSeed seeds the deterministic op-choice RNG so two runs

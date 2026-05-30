@@ -94,8 +94,18 @@ func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 		case MetricListP95:
 			res.Value = percentileMS(listLats, 95)
 		case MetricCacheHitRatioHot:
-			total := hits + misses
-			if total > 0 {
+			// Symmetric with SustainedRunner (sustained.go:465).
+			// When no HotObjectCache is wired, every GET in
+			// generateLoad is reported as a miss, so the
+			// computed ratio collapses to 0.0 — which silently
+			// trips any Min-bounded SLA gate (e.g.
+			// cache-hit-ratio-hot with Min=0.9). Mark Pending
+			// in that case so the operator sees "cache not
+			// wired" instead of "your hot cache is broken".
+			if r.Cache == nil {
+				res.Pending = true
+				res.PendingReason = "benchmark: ProviderRunner.Cache not wired; cache hit ratio is only measurable when a HotObjectCache is attached"
+			} else if total := hits + misses; total > 0 {
 				res.Value = float64(hits) / float64(total)
 			}
 		case MetricWasabiOriginEgressRatio:

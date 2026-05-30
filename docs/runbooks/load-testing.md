@@ -58,9 +58,13 @@ go build ./cmd/benchmark-runner
   -out=load-smoke.json
 ```
 
-The CI job uses `-scenario=put-cache-hit,get-l0-cache-hit,...` filters
-to keep wall-clock under 60 seconds while still exercising every code
-path in the runner.
+The `-scenario` flag is a **single substring filter**, not a
+comma-separated list (see `cmd/benchmark-runner/main.go:selectSuite`).
+To exercise more than one scenario in the smoke phase, the CI workflow
+invokes the harness once per scenario (e.g.
+`-scenario=put-cache-hit`, then `-scenario=get-l0-cache-hit`, …).
+Each invocation produces an independent JSON report that downstream
+job steps can aggregate.
 
 If `load-smoke.json.AllPassed` is `false`, CI fails. The failing
 scenarios appear in the JSON under `scenarios[].failures`.

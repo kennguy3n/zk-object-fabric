@@ -990,3 +990,68 @@ func TestBucketIndex_NoNegativeShift(t *testing.T) {
 		}
 	}
 }
+
+// TestProviderRunner_CacheHitRatioPendingWhenCacheNil verifies the
+// symmetry fix for Devin Review finding
+// ANALYSIS_pr-review-job-eb8f953de8bb4b3fa597cbeca1b7f59a_0004:
+// when ProviderRunner.Cache is nil, every GET in generateLoad is
+// counted as a miss, so the computed cache_hit_ratio collapses
+// to 0.0 and silently breaches any Min-bounded SLA gate (e.g.
+// the cache-hit-ratio-hot scenario, Min=0.9). The runner must
+// mark MetricCacheHitRatioHot as Pending in that case — exactly
+// the same shape SustainedRunner already uses (sustained.go:465).
+func TestProviderRunner_CacheHitRatioPendingWhenCacheNil(t *testing.T) {
+	prov := newFakeProvider()
+	// Deliberately do NOT wire a Cache.
+	runner := NewProviderRunner(prov)
+	if runner.Cache != nil {
+		t.Fatalf("precondition: ProviderRunner.Cache must be nil")
+	}
+
+	sc := Scenario{
+		Name: "cache-hit-ratio-pending",
+		Workload: Workload{
+			// Mix includes some GETs so generateLoad records cache
+			// hit/miss counters. The expectation is that the
+			// reporter sees Cache==nil and marks Pending BEFORE
+			// looking at those counters.
+			RequestMix:      map[string]float64{"PUT": 0.5, "GET": 0.5},
+			ObjectSizeBytes: 128,
+			DurationSeconds: 1,
+			TargetRPS:       1,
+		},
+		Targets: []Target{
+			{Metric: MetricCacheHitRatioHot, Min: 0.9, Unit: "ratio"},
+		},
+	}
+
+	results, err := runner.Run(sc)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Run returned %d results, want 1", len(results))
+	}
+	r := results[0]
+	if !r.Pending {
+		t.Fatalf("MetricCacheHitRatioHot should be Pending when Cache is "+
+			"nil (got value=%v). A 0.0 reading from a nil cache must NOT "+
+			"trip the Min gate — that would tell the operator the cache "+
+			"is broken when really the runner just isn't wired up.",
+			r.Value)
+	}
+	if r.PendingReason == "" {
+		t.Errorf("PendingReason empty; report consumers must be able to "+
+			"distinguish 'cache not wired' from 'cache measured 0%% hits'")
+	}
+
+	rep, err := RunSuite(Suite{Name: "test", Scenarios: []Scenario{sc}}, runner)
+	if err != nil {
+		t.Fatalf("RunSuite: %v", err)
+	}
+	if !rep.AllPassed {
+		t.Errorf("RunSuite.AllPassed = false; Pending metric must not be "+
+			"treated as a Min-gate breach. Failures=%v",
+			rep.Scenarios[0].Failures)
+	}
+}
