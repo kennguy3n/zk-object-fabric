@@ -555,26 +555,134 @@ Non-exhaustive list to seed the audit's threat-modelling session:
    with a different `signingKey`. The chain must break at
    chunk 2's verification.
 6. **Body-AAD downgrade**: a Postgres admin rewrites a sealed
-   row to look like a legacy unsealed row. The `Decrypt` path
-   first attempts the modern AAD-bound open; only on failure
-   does it fall back to legacy. The auditor should confirm the
-   fallback path is gated on the row's stored format marker,
-   not on a content check that an attacker can spoof. (Current
-   code: the wrapper always tries the modern path first; legacy
-   compat is opt-in via the empty `BodyContext` test path. The
-   auditor should verify this is not user-reachable in
-   production.)
+   row to make it open under a legacy (AAD=nil) decryption path
+   instead of the modern AAD-bound path. The relevant code is
+   `AEADBodyEncryptor.Decrypt` in
+   `metadata/manifest_store/postgres/body_encryptor.go:138-160`,
+   which implements a *try-then-fallback* pattern:
+
+   1. Compute `aad = bodyContextAAD(ctx)` — the canonical
+      pipe-separated `tenant_id|bucket|object_key_hash` form
+      (or `nil` when `ctx` is the zero value).
+   2. Attempt `aead.Open(nil, nonce, body, aad)`. If it
+      succeeds, return the plaintext — this is the modern
+      AAD-bound path.
+   3. If step 2 fails AND `aad == nil`, return the error
+      immediately. There is no fallback when the caller already
+      asked for the AAD-nil path — a MAC failure there is a
+      genuine MAC failure, not a format-version question.
+   4. If step 2 fails AND `aad != nil`, retry once with
+      `aead.Open(nil, nonce, body, nil)`. This handles rows
+      written by the pre-AAD layout (which sealed with AAD=nil)
+      so a deployment can roll forward without an up-front
+      re-encryption pass. The store re-encrypts the row with
+      the modern AAD on its next `Put`, so a deployment
+      converges to fully AAD-bound ciphertext over time without
+      operator intervention.
+
+   The auditor should verify:
+
+   - The fallback retry is *only* reachable on MAC failure of
+     the modern path with a non-nil AAD. An attacker who
+     rewrites a modern-AAD ciphertext to an arbitrary blob
+     cannot reach the fallback path with a successful Open —
+     the Poly1305 tag still has to verify under *some* AAD
+     value, and the only two values tried are the caller's
+     (`bodyContextAAD(ctx)`) and `nil`. Both verify the same
+     ciphertext+nonce against the same gateway-held key, so
+     forging the body still requires the key.
+   - The fallback path is **not** gated on a stored
+     format-version byte or a content-sniff heuristic — it is
+     gated purely on the AEAD's authentication outcome. This
+     is intentional: any format marker outside the AAD would
+     be attacker-controlled and a downgrade vector.
+   - Once the row is re-written by the next `Put`, the
+     fallback path is no longer reachable for that row — the
+     legacy-format window is per-row, not per-deployment, and
+     closes monotonically.
+   - The corresponding test
+     `TestAEADBodyEncryptor_LegacyCiphertext_DecryptsWithoutAAD` in
+     `metadata/manifest_store/postgres/body_encryptor_test.go`
+     exercises the fallback explicitly so a future refactor
+     cannot silently delete it.
 7. **EncryptedSize overflow**: send a chunked PUT with a hostile
    `Content-Length: 9223372036854775000`. Confirm
    `ErrEncryptedSizeOverflow` is returned and the request is
    rejected before any bytes hit the backend.
-8. **Nonce-reuse under convergent mode**: write two objects with
-   identical `contentHash` and DIFFERENT `Options.ChunkAAD`
-   under the same tenant. They share a DEK (same convergent
-   derivation) and share per-chunk nonces (deterministic from
-   DEK + chunkIndex). The AAD differs. AEAD ciphertext will
-   differ; both can decrypt under their respective AADs. There
-   is no nonce-reuse vulnerability because the AAD is part of
-   the AEAD authenticator, not the keystream. Confirm this
-   reasoning matches `chacha20poly1305.NewX`'s documented
-   behaviour.
+8. **Convergent + ChunkAAD combination is refused at the API
+   boundary, but the underlying nonce-reuse subtlety is worth
+   spelling out.** A naïve threat model says: "if two callers
+   set `ConvergentNonce=true` with the same content-derived DEK
+   but different `ChunkAAD` values, they'll share key+nonce on
+   the same plaintext — is that a nonce-reuse vulnerability?"
+   The careful answer:
+
+   - **Keystream is identical, not reused.** XChaCha20-Poly1305
+     is a stream cipher under the AEAD construction; the
+     keystream is a function of (key, nonce, *plaintext length*)
+     and is XORed against plaintext to produce ciphertext. With
+     same DEK and same convergent-nonce derivation
+     (`HKDF(DEK, chunkIndex)`, see `deriveConvergentNonce` in
+     `encryption/client_sdk/sdk.go:202-213`), two callers
+     sealing the *same plaintext* produce *identical
+     ciphertext bytes*. This is not classical nonce reuse
+     (different plaintexts under the same key+nonce, which
+     leaks plaintext XOR) — it's the *intended* deterministic
+     output of convergent mode.
+   - **The tags diverge.** `ChunkAAD` is mixed into the
+     Poly1305 tag input (see `chunkAADBytes` in
+     `encryption/client_sdk/sdk.go:183-195`) but NOT into the
+     nonce derivation. Two callers with different `ChunkAAD`
+     values produce the same ciphertext bytes paired with
+     different 16-byte Poly1305 tags. Each tag verifies only
+     under its caller's AAD.
+   - **The footgun is operational, not cryptographic.** A
+     storage backend that dedups on the ciphertext-bytes prefix
+     (the natural shape — tags are per-recipient) would point
+     both tenants at the same physical block, then fail to
+     verify whichever tenant's tag was not the one persisted.
+     Worse, a backend that dedups and stores only one tag would
+     leave the *other* tenant's chunks silently undecryptable
+     on read-back — `EncryptObject` returned success, the
+     bytes round-tripped through storage, but `DecryptObject`
+     returns a Poly1305 MAC failure.
+
+   **Defence (added 2026-05-30, this PR):** the SDK refuses the
+   combination at the entry point. `EncryptObject` in
+   `encryption/client_sdk/sdk.go:118-162` returns
+   `"client_sdk: ConvergentNonce and ChunkAAD are mutually
+   exclusive: …"` when both are set, so the operator is forced
+   to pick a single mode at integration time rather than
+   discover the silent-corruption mode in production. Each
+   flag individually is still supported: `ChunkAAD` without
+   `ConvergentNonce` is the Strict-ZK / Pattern B path,
+   `ConvergentNonce` without `ChunkAAD` is the convergent-dedup
+   / Pattern C path. The guard test
+   `TestEncryptObject_RejectsConvergentNonceWithChunkAAD` in
+   `encryption/client_sdk/sdk_test.go` exercises (a) the
+   rejection of the forbidden combination, (b) each flag
+   individually still being accepted, and (c) that an empty-
+   but-non-nil `ChunkAAD` slice is treated the same as `nil`.
+
+   The auditor should verify:
+
+   - The guard fires at construction time (from
+     `EncryptObject` itself), not on the first `Read` of the
+     returned reader — so a caller that ignores the
+     construction error cannot accidentally race past it.
+   - The guard's condition is exactly `len(opts.ChunkAAD) > 0`,
+     not `opts.ChunkAAD != nil`. The two would behave
+     identically in Go (`len(nil)` is 0), but using the
+     length check makes the intent unambiguous: an explicit
+     `ChunkAAD: []byte{}` from a caller that sets the field
+     defensively must NOT trip the guard.
+   - `DecryptObject` does NOT add the same guard. This is
+     intentional: existing objects sealed under the
+     pre-guard SDK could in principle exist (no production
+     path enabled the combination, but defence-in-depth
+     requires assuming it was reachable), and refusing to
+     decrypt them would convert silent corruption into hard
+     unavailability. The decryptor reads the nonce off the
+     wire frame either way and verifies the Poly1305 tag
+     against the caller-supplied `ChunkAAD`, so the security
+     posture on the read path is unchanged by the guard.

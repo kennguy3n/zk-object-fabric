@@ -13,6 +13,17 @@ SHELL     := /usr/bin/env bash
 COMMIT    := $(shell $(GIT) rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE      := $(shell date -u +%Y%m%d)
 BUILD_DIR := build/audit
+
+# Pick a SHA-256 hasher that exists on this box. GNU coreutils
+# ships `sha256sum` (Linux + many CI images); macOS / BSD ship
+# `shasum -a 256`. Both emit the same `<hex>  <path>` line so the
+# downstream MANIFEST.txt format is identical either way. Detect at
+# make-time rather than at recipe-time so the recipe stays readable
+# and we fail loudly if neither is on PATH.
+SHA256    := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || (command -v shasum >/dev/null 2>&1 && echo "shasum -a 256"))
+ifeq ($(strip $(SHA256)),)
+$(error neither sha256sum nor shasum is on PATH; install GNU coreutils (Linux: sudo apt install coreutils; macOS: brew install coreutils) or perl-shasum)
+endif
 # Go's ./... walker ignores directories whose name starts with `_`
 # or `.`, so the staging tree is deliberately prefixed with `_` to
 # keep `go build ./...` / `go vet ./...` from re-discovering the
@@ -124,17 +135,34 @@ audit-bundle: audit-verify
 	@# Embed the static-analysis reports produced by audit-verify.
 	@mkdir -p $(STAGING)/reports
 	@cp $(BUILD_DIR)/reports/*.txt $(STAGING)/reports/
-	@# MANIFEST records SHA-256 of every file shipped plus the commit
-	@# SHA. An auditor can verify integrity against this file alone.
+	@# MANIFEST.txt records SHA-256 of every file shipped plus the
+	@# commit SHA. An auditor can verify integrity against this file
+	@# alone (e.g. `cd unpacked && shasum -a 256 -c MANIFEST.txt`).
+	@#
+	@# The hashing pipeline uses null-separated paths end-to-end
+	@# (find -print0 -> sort -z -> xargs -0 $(SHA256)) rather than
+	@# the older `find | sort | xargs -I{} sh -c '... {}'` pattern,
+	@# which substituted the filename literally into a shell command
+	@# and so broke -- or worse, allowed command injection -- on any
+	@# path containing a space, a single quote, a `$$`, a backtick,
+	@# or a newline. The audit bundle filenames are controlled today
+	@# (Go sources under repo-controlled paths) but the safe pattern
+	@# costs nothing and removes a class of future foot-gun. The
+	@# hasher ($(SHA256), either `sha256sum` or `shasum -a 256`)
+	@# emits `<hex>  <path>` lines directly, so no manual printf-
+	@# rebuilding is needed and the format stays identical across
+	@# Linux and macOS.
 	@( cd $(STAGING) && \
-	    echo "zk-object-fabric audit bundle" > MANIFEST.txt && \
-	    echo "commit: $(COMMIT)" >> MANIFEST.txt && \
-	    echo "built:  $$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> MANIFEST.txt && \
-	    echo "" >> MANIFEST.txt && \
-	    echo "sha256  path" >> MANIFEST.txt && \
-	    find . -type f ! -name MANIFEST.txt | LC_ALL=C sort | \
-	      xargs -I{} sh -c 'printf "%s  %s\n" "$$(sha256sum {} | cut -d" " -f1)" "{}"' \
-	      >> MANIFEST.txt )
+	    { \
+	        echo "zk-object-fabric audit bundle"; \
+	        echo "commit: $(COMMIT)"; \
+	        echo "built:  $$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	        echo ""; \
+	        echo "sha256  path"; \
+	        find . -type f ! -name MANIFEST.txt -print0 \
+	          | LC_ALL=C sort -z \
+	          | xargs -0 $(SHA256); \
+	    } > MANIFEST.txt )
 	@tar -czf $(BUNDLE) -C $(STAGING) .
 	@echo "==> Wrote $(BUNDLE)"
 	@ls -lh $(BUNDLE)
