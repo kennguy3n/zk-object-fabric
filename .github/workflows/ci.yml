@@ -143,3 +143,58 @@ jobs:
             VERSION=${{ steps.version.outputs.version }}
             GIT_COMMIT=${{ steps.version.outputs.git_commit }}
             BUILD_DATE=${{ steps.version.outputs.build_date }}
+
+  load-test-smoke:
+    name: load-test-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: Build benchmark-runner
+        run: go build -o benchmark-runner ./cmd/benchmark-runner
+
+      # Smoke-only: short duration, low RPS, small objects,
+      # local_fs_dev backend. This validates that the sustained
+      # runner, rate limiter, and HDR histograms still wire up
+      # end-to-end and that the suite's declared targets are
+      # populated. It does NOT validate the production SLA -- that
+      # is the Tier-3 Linode+Wasabi run documented in
+      # docs/runbooks/load-testing.md.
+      - name: Run load-test smoke (put-cache-hit)
+        run: |
+          ./benchmark-runner \
+            -provider=local_fs_dev \
+            -scenario=put-cache-hit \
+            -duration=1s \
+            -rps=100 \
+            -seed-objects=16 \
+            -max-object-bytes=4096 \
+            -out=load-smoke-put.json
+
+      - name: Run load-test smoke (get-l0-cache-hit)
+        run: |
+          ./benchmark-runner \
+            -provider=local_fs_dev \
+            -scenario=get-l0-cache-hit \
+            -duration=1s \
+            -rps=100 \
+            -seed-objects=32 \
+            -max-object-bytes=4096 \
+            -out=load-smoke-get.json
+
+      - name: Upload smoke reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-smoke-reports
+          path: load-smoke-*.json
+          retention-days: 14
