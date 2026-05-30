@@ -19,6 +19,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -449,9 +450,103 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// unsupportedSubresources lists S3 sub-resource query keys (the part
+// after `?`) that the gateway does not implement yet. When a request
+// carries one of these keys, the dispatcher rejects it with
+// 501 NotImplemented + the canonical AWS error code (so SDKs surface
+// it cleanly) BEFORE routing — otherwise a request like
+// `PUT /bucket/key?acl` would fall through to the regular PUT handler
+// and silently overwrite the object body with the caller's ACL XML.
+//
+// The map value is the S3 error code AWS uses for the same operation,
+// so an SDK that receives the error sees a familiar surface
+// (NotImplemented + Resource=request path) and can report it as a
+// gap rather than as a generic 5xx. Operation names map 1:1 to the
+// AWS API:
+//
+//   acl                ACL operations (GetObjectAcl, PutObjectAcl,
+//                      GetBucketAcl, PutBucketAcl)
+//   tagging            Object and bucket tagging
+//   lifecycle          Bucket lifecycle configuration
+//   versioning         Bucket versioning toggle (note: this is the
+//                      ?versioning *subresource*, not the ?versions
+//                      LIST query which is handled by the GET path
+//                      via ListObjectVersions)
+//   policy             Bucket policy document
+//   cors               Bucket CORS configuration
+//   encryption         Bucket-level SSE configuration
+//   logging            Bucket logging configuration
+//   notification       Bucket event notification configuration
+//   replication        Cross-region replication configuration
+//   accelerate         Transfer-acceleration toggle
+//   requestPayment     Requester-pays configuration
+//   website            Static-website hosting configuration
+//   inventory          Bucket inventory configuration
+//   metrics            Bucket metrics configuration
+//   analytics          Bucket analytics configuration
+//   intelligent-tiering, object-lock, retention, legal-hold:
+//                      Object Lock surface (immutability)
+//   publicAccessBlock  Block-public-access settings
+//   ownershipControls  Object Ownership settings
+//
+// The conformance harness in `tests/s3_conformance` asserts every
+// entry here returns 4xx (specifically 501); a future implementation
+// that wires up (say) tagging should remove the `tagging` key from
+// this map and add tagging routing in the dispatch switch below.
+var unsupportedSubresources = map[string]string{
+	"acl":                 "NotImplemented",
+	"tagging":             "NotImplemented",
+	"lifecycle":           "NotImplemented",
+	"versioning":          "NotImplemented",
+	"policy":              "NotImplemented",
+	"cors":                "NotImplemented",
+	"encryption":          "NotImplemented",
+	"logging":             "NotImplemented",
+	"notification":        "NotImplemented",
+	"replication":         "NotImplemented",
+	"accelerate":          "NotImplemented",
+	"requestPayment":      "NotImplemented",
+	"website":             "NotImplemented",
+	"inventory":           "NotImplemented",
+	"metrics":             "NotImplemented",
+	"analytics":           "NotImplemented",
+	"object-lock":         "NotImplemented",
+	"retention":           "NotImplemented",
+	"legal-hold":          "NotImplemented",
+	"publicAccessBlock":   "NotImplemented",
+	"ownershipControls":   "NotImplemented",
+	"intelligent-tiering": "NotImplemented",
+}
+
+// rejectUnsupportedSubresource returns true (and emits a 501 response)
+// if the request carries any sub-resource we have not implemented.
+// The check is intentionally before authentication: a 501 is more
+// useful to the SDK than a 403, and we never inspect request body
+// or headers beyond the URL when deciding.
+func (h *Handler) rejectUnsupportedSubresource(w http.ResponseWriter, r *http.Request, q url.Values) bool {
+	for key, s3Code := range unsupportedSubresources {
+		if !q.Has(key) {
+			continue
+		}
+		// The `delete` sub-resource is a special case: it is the
+		// POST DeleteObjects (bulk delete) endpoint. We route it
+		// through the dispatch's POST arm so it can return a
+		// distinct MethodNotAllowed/NotImplemented response. The
+		// dispatch handles it explicitly.
+		writeError(w, http.StatusNotImplemented, s3Code,
+			fmt.Sprintf("the %q sub-resource is not implemented by this gateway", key),
+			r.URL.Path)
+		return true
+	}
+	return false
+}
+
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	h.capRequestBody(w, r)
+	if h.rejectUnsupportedSubresource(w, r, q) {
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		if q.Get("uploadId") != "" && q.Get("partNumber") != "" {

@@ -1,0 +1,5 @@
+# Audit bundle staging / output (per `make audit-bundle`).
+build/
+
+# Local Go binaries.
+/bin/
