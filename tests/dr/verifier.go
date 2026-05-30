@@ -312,11 +312,23 @@ func (v *Verifier) nowFn() func() time.Time {
 // seededObject pairs the manifest's stable key with the body
 // the verifier PUT into the source cell, so the recovery phase
 // can compare bytes without re-deriving them.
+//
+// wantPieces is the number of pieces the source-side fixture was
+// assembled from. seedRange always produces single-piece manifests,
+// so it sets wantPieces=1. Direct-call tests that exercise multi-
+// piece dest manifests (e.g. TestVerifier_MultiPieceManifestFull-
+// BodyVerified) set wantPieces to the number of pieces in their
+// reassembled fixture body. The field is only used by the body-
+// mismatch diagnostic in verifyRecovery so the error message is
+// truthful about both sides of the comparison instead of
+// hardcoding "across 1 piece" on the want side regardless of how
+// the seed was assembled.
 type seededObject struct {
 	manifestKey manifest_store.ManifestKey
 	pieceID     string
 	body        []byte
 	objectKey   string
+	wantPieces  int
 }
 
 func (v *Verifier) seedSteady(ctx context.Context) ([]seededObject, error) {
@@ -380,6 +392,7 @@ func (v *Verifier) seedRange(ctx context.Context, start, end int, tag string) ([
 			pieceID:     pieceID,
 			body:        body,
 			objectKey:   objKey,
+			wantPieces:  1,
 		})
 	}
 	return out, nil
@@ -638,9 +651,20 @@ func (v *Verifier) verifyRecovery(
 			body = append(body, part...)
 		}
 		if !bytes.Equal(body, obj.body) {
+			wantPieces := obj.wantPieces
+			if wantPieces <= 0 {
+				// Defensive: a seededObject that forgot to set
+				// wantPieces is structurally a single-piece fixture
+				// (every seededObject's body is one contiguous blob;
+				// the field exists only to report the piece-count of
+				// the seed). Defaulting to 1 keeps the diagnostic
+				// truthful for ad-hoc seededObject literals while
+				// still allowing multi-piece fixtures to override.
+				wantPieces = 1
+			}
 			mismatches = append(mismatches, fmt.Sprintf(
-				"%s: body mismatch (want %d bytes across 1 piece, got %d bytes across %d pieces; hash want=%s got=%s)",
-				obj.objectKey, len(obj.body), len(body), len(m.Pieces),
+				"%s: body mismatch (want %d bytes across %d piece(s), got %d bytes across %d piece(s); hash want=%s got=%s)",
+				obj.objectKey, len(obj.body), wantPieces, len(body), len(m.Pieces),
 				sha256Hex(string(obj.body))[:12], sha256Hex(string(body))[:12],
 			))
 			continue

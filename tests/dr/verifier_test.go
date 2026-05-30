@@ -427,6 +427,7 @@ func TestVerifier_MultiPieceManifestFullBodyVerified(t *testing.T) {
 		pieceID:     pieces[0].PieceID,
 		body:        fullBody,
 		objectKey:   objKey,
+		wantPieces:  numPieces,
 	}}
 	err := v.verifyRecovery(ctx, &rpt, steady, time.Now)
 	if err == nil {
@@ -435,8 +436,18 @@ func TestVerifier_MultiPieceManifestFullBodyVerified(t *testing.T) {
 	if !strings.Contains(err.Error(), "body mismatch") {
 		t.Errorf("error %q does not mention body mismatch; first-piece-only regression?", err)
 	}
-	if !strings.Contains(err.Error(), "across 3 pieces") {
-		t.Errorf("error %q does not surface the piece count; verifier may not be iterating all pieces", err)
+	// The diagnostic must surface the GOT-side piece count (the
+	// dest-cell manifest had 3 pieces) so a CI failure points
+	// straight at multi-piece iteration. Also pin the WANT-side
+	// piece count to lock in the wantPieces seededObject field —
+	// a regression that drops wantPieces from the diagnostic
+	// would silently make this test pass with "want ... across 1
+	// piece(s)" again.
+	if !strings.Contains(err.Error(), "got 192 bytes across 3 piece(s)") {
+		t.Errorf("error %q does not surface the GOT piece count; verifier may not be iterating all pieces", err)
+	}
+	if !strings.Contains(err.Error(), "want 192 bytes across 3 piece(s)") {
+		t.Errorf("error %q does not surface the WANT piece count; seededObject.wantPieces may not be threaded into the diagnostic", err)
 	}
 	if rpt.RecoveredObjects != 0 {
 		t.Errorf("RecoveredObjects = %d, want 0 (multi-piece corruption must NOT count as recovered)",
