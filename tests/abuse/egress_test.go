@@ -17,7 +17,7 @@ import (
 // AbuseBudgetExhausted UsageEvent on the configured AlertSink.
 //
 // The harness wires the production middleware chain end to end
-// (limiter -> abuse guard -> SigV4 authenticator echo). A
+// (abuse guard -> limiter -> SigV4 authenticator echo). A
 // regression that drops the AllowEgress gate (or stops emitting
 // the alert) would be visible here as either an OK response on
 // the second request or a missing dimension on the sink.

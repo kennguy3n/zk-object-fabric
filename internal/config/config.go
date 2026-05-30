@@ -302,7 +302,32 @@ type ConsoleConfig struct {
 	ListenAddr   string   `json:"listen_addr"`
 	ReadTimeout  Duration `json:"read_timeout"`
 	WriteTimeout Duration `json:"write_timeout"`
-	AdminToken   string   `json:"admin_token"`
+
+	// ReadHeaderTimeout caps how long the console server waits
+	// for request headers to arrive. Like the gateway's same-named
+	// knob, this is the production Slowloris guard: a connected
+	// client that dribbles header bytes is forcibly closed when
+	// the timeout fires. The default (see Default()) is 10s,
+	// matching the gateway's posture so a misconfigured ingress
+	// that accidentally exposes the console API to the internet
+	// is not silently exploitable. Operators who terminate TLS
+	// upstream of the console server and rely on the proxy's own
+	// timeouts can lower this — but it should never be 0.
+	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+
+	// IdleTimeout bounds the lifetime of a keep-alive connection
+	// between requests. Used to evict idle slowloris connections
+	// holding sockets open with no in-flight request. Default 120s.
+	IdleTimeout Duration `json:"idle_timeout"`
+
+	// MaxHeaderBytes caps total header size for a single request.
+	// Zero means "use Go's default" (1 MiB) which is far larger
+	// than any well-formed console request needs and gives an
+	// attacker more memory to exhaust per connection; pin a tight
+	// 64 KiB ceiling by default. Matches the gateway knob.
+	MaxHeaderBytes int `json:"max_header_bytes"`
+
+	AdminToken string `json:"admin_token"`
 
 	// TLS configures the console API's HTTPS listener. Same
 	// semantics as GatewayConfig.TLS — empty CertPath / KeyPath
@@ -880,9 +905,12 @@ func Default() Config {
 		// (":8081" is the conventional port) alongside an admin
 		// authenticator at the reverse-proxy layer.
 		Console: ConsoleConfig{
-			ListenAddr:   "",
-			ReadTimeout:  Duration(30 * time.Second),
-			WriteTimeout: Duration(30 * time.Second),
+			ListenAddr:        "",
+			ReadTimeout:       Duration(30 * time.Second),
+			WriteTimeout:      Duration(30 * time.Second),
+			ReadHeaderTimeout: Duration(10 * time.Second),
+			IdleTimeout:       Duration(120 * time.Second),
+			MaxHeaderBytes:    64 * 1024,
 		},
 	}
 }

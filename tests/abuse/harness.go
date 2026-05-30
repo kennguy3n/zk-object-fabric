@@ -204,9 +204,14 @@ type Harness struct {
 }
 
 // NewHarness boots an http.Server backed by the real production
-// middleware chain (rate limiter -> abuse guard -> SigV4
-// authenticator echo). The server listens on an ephemeral port;
-// the URL is exposed as h.URL for tests to dial.
+// middleware chain (abuse guard -> rate limiter -> SigV4
+// authenticator echo) matching cmd/gateway/main.go's
+// `ag.Middleware(rl.Middleware(handler))` wiring. With this order
+// AbuseGuard.Observe() sees every inbound request (including the
+// ones the rate limiter rejects with 429), so its anomaly tracker
+// and egress budget reflect actual offered load rather than only
+// the slice that passes the token bucket. The server listens on
+// an ephemeral port; the URL is exposed as h.URL for tests to dial.
 //
 // The caller is responsible for calling Close in a t.Cleanup or
 // defer so the server's goroutines exit cleanly.
@@ -323,7 +328,14 @@ func NewHarness(t *testing.T, cfg HarnessConfig) *Harness {
 	abuse.ThrottleOnAnomaly = cfg.ThrottleOnAnomaly
 
 	terminal := &echoHandler{auth: authenticator, bodySize: cfg.BodySize}
-	chain := limiter.Middleware(abuse.Middleware(terminal))
+	// Order MUST mirror cmd/gateway/main.go:320
+	// (ag.Middleware(rl.Middleware(handler))): AbuseGuard is
+	// outermost so its anomaly + budget counters observe every
+	// inbound request, including ones the rate limiter throws away
+	// with 429. Flipping these around silently weakens both
+	// detectors and would make production abuse-control regressions
+	// invisible to this suite.
+	chain := abuse.Middleware(limiter.Middleware(terminal))
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

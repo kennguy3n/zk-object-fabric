@@ -28,7 +28,7 @@ import (
 // invariant is "rejections >= 100" rather than an exact split.
 //
 // The test runs against the production middleware chain:
-// SigV4 verify (resolver) -> token-bucket Allow -> AbuseGuard
+// AbuseGuard -> token-bucket Allow -> SigV4 verify (resolver)
 // -> echo handler. A regression that bypasses the limiter
 // (e.g. forgetting to wire the resolver) would let the entire
 // 200-request flood through, which would fail the assertion

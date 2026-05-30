@@ -1581,11 +1581,25 @@ func startConsoleAPI(
 	mux := http.NewServeMux()
 	h.Register(mux)
 
+	// Slowloris hardening: ReadHeaderTimeout / IdleTimeout /
+	// MaxHeaderBytes mirror the gateway's posture so a
+	// misconfigured ingress that accidentally exposes the console
+	// API to the internet is not silently exploitable. The
+	// defaults are set in config.Default(); we use
+	// http.DefaultMaxHeaderBytes as the floor if an operator left
+	// the value at zero in a hand-rolled config file.
+	consoleMaxHdr := cfg.Console.MaxHeaderBytes
+	if consoleMaxHdr <= 0 {
+		consoleMaxHdr = http.DefaultMaxHeaderBytes
+	}
 	srv := &http.Server{
-		Addr:         cfg.Console.ListenAddr,
-		Handler:      mux,
-		ReadTimeout:  cfg.Console.ReadTimeout.ToDuration(),
-		WriteTimeout: cfg.Console.WriteTimeout.ToDuration(),
+		Addr:              cfg.Console.ListenAddr,
+		Handler:           mux,
+		ReadTimeout:       cfg.Console.ReadTimeout.ToDuration(),
+		WriteTimeout:      cfg.Console.WriteTimeout.ToDuration(),
+		ReadHeaderTimeout: cfg.Console.ReadHeaderTimeout.ToDuration(),
+		IdleTimeout:       cfg.Console.IdleTimeout.ToDuration(),
+		MaxHeaderBytes:    consoleMaxHdr,
 	}
 	go func() {
 		log.Printf("gateway: console API on %s", cfg.Console.ListenAddr)
