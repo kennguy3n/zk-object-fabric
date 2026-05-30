@@ -61,7 +61,7 @@ var RequiredScenarios = []string{
 }
 
 // Threshold is the directional bound applied to a single metric.
-// Min > 0 means the measured value must be at least Min; Max > 0
+// Min != 0 means the measured value must be at least Min; Max != 0
 // means it must be at most Max. Exactly one of the two is set
 // for any given (scenario, metric) pair in the Tier 3 contract.
 type Threshold struct {
@@ -75,9 +75,9 @@ type Threshold struct {
 // the verifier itself always checks both Min and Max when set.
 func (t Threshold) Direction() string {
 	switch {
-	case t.Min > 0:
+	case t.Min != 0:
 		return "min"
-	case t.Max > 0:
+	case t.Max != 0:
 		return "max"
 	default:
 		return "unset"
@@ -279,7 +279,7 @@ func verifyScenario(name string, byName map[string]benchmark.ReportScenario, thr
 			sv.Metrics = append(sv.Metrics, mv)
 			continue
 		}
-		if th.Max > 0 && r.Value > th.Max {
+		if th.Max != 0 && r.Value > th.Max {
 			mv.Pass = false
 			mv.Reason = fmt.Sprintf("measured %g %s exceeds max threshold %g %s", r.Value, th.Unit, th.Max, th.Unit)
 			sv.Pass = false
@@ -287,7 +287,7 @@ func verifyScenario(name string, byName map[string]benchmark.ReportScenario, thr
 			sv.Metrics = append(sv.Metrics, mv)
 			continue
 		}
-		if th.Min > 0 && r.Value < th.Min {
+		if th.Min != 0 && r.Value < th.Min {
 			mv.Pass = false
 			mv.Reason = fmt.Sprintf("measured %g %s below min threshold %g %s", r.Value, th.Unit, th.Min, th.Unit)
 			sv.Pass = false
@@ -311,7 +311,7 @@ func verifyScenario(name string, byName map[string]benchmark.ReportScenario, thr
 }
 
 func thresholdValue(t Threshold) float64 {
-	if t.Min > 0 {
+	if t.Min != 0 {
 		return t.Min
 	}
 	return t.Max

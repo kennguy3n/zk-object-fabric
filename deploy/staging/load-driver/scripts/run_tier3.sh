@@ -108,7 +108,6 @@ set +e
   -seed-objects="$TIER3_SEED_OBJECTS" \
   -out="$report_path" 2>&1 | tee "$run_log"
 runner_status=${PIPESTATUS[0]}
-set -e
 
 if [ "$runner_status" -ne 0 ]; then
   echo "run_tier3: benchmark-runner exited $runner_status; report at $report_path (may be partial)" >&2
@@ -122,6 +121,7 @@ echo "==> Running tier3-verify"
   -build-sha "$GATEWAY_SHA" \
   -env "$ENV_LABEL"
 verify_status=$?
+set -e
 
 echo "==> Done."
 echo "    benchmark-runner exit: $runner_status"
