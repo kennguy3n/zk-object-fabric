@@ -6,41 +6,62 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/tests/benchmark"
 )
 
-// These tests are deliberately literal: they pin every dossier
-// constant to its expected numeric value. The point is NOT to
-// duplicate the const declarations (Go's type system already does
-// that); it is to make any value change land in this file as part of
-// the same PR. A reviewer who sees the dossier-test diff has the
-// numeric change in their face and can decide whether the change is
-// intended.
+// These tests pin every dossier constant to its expected numeric
+// value. The point is NOT to duplicate the const declarations (Go's
+// type system already does that); it is to make any value change
+// land in this file as part of the same PR. A reviewer who sees the
+// dossier-test diff has the numeric change in their face and can
+// decide whether the change is intended.
 //
-// Equally important, the re-export aliases at the top of targets.go
-// are pinned against benchmark.Target* directly so that a rename of
-// the upstream constant in tests/benchmark/suite.go would break this
-// test instead of silently producing a stale dossier value.
+// Drift-detection responsibilities split as follows:
+//
+//   - Rename safety for benchmark.Target* upstream constants is
+//     provided at COMPILE TIME by the alias declarations in
+//     targets.go (`PutP99CacheHitMs = benchmark.TargetPutP99CacheHitMs`).
+//     A rename of the upstream constant breaks the build of targets.go
+//     directly — no runtime test required, and a runtime equality check
+//     (`capacity.X == benchmark.X`) would be tautological because the
+//     alias makes both sides the same memory location.
+//
+//   - Value-drift safety is provided by TestPerformanceTargets_DocumentedValues
+//     below: it pins each constant to a literal (50.0, 200.0, ...) so any
+//     upstream value change in tests/benchmark/suite.go propagates
+//     through the alias and fails this test, forcing a coordinated
+//     update of docs/CAPACITY.md, the literal in this test, and the
+//     upstream constant.
+//
+//   - Structural-drift safety is provided by tests/capacity/dossier_test.go
+//     (constant-name ↔ doc grep, both directions).
+//
+// TestPerformanceTargets_DocumentedSuiteValues below is a defence-in-depth
+// belt-and-suspenders check: it asserts the benchmark.Target* values
+// themselves match the dossier-documented literals, so that even if
+// someone later replaces the alias in targets.go with an inline literal
+// (severing the compile-time link), the upstream value still gets
+// pinned. This catches the narrow but real "someone refactored away
+// the alias" failure mode that the alias itself cannot detect.
 
-func TestPerformanceTargets_PinnedToBenchmarkSuite(t *testing.T) {
+func TestPerformanceTargets_DocumentedSuiteValues(t *testing.T) {
 	cases := []struct {
 		name string
 		got  float64
 		want float64
 	}{
-		{"PutP99CacheHitMs", PutP99CacheHitMs, benchmark.TargetPutP99CacheHitMs},
-		{"PutP99OriginMs", PutP99OriginMs, benchmark.TargetPutP99OriginMs},
-		{"GetP99L0Ms", GetP99L0Ms, benchmark.TargetGetP99L0Ms},
-		{"GetP99L1Ms", GetP99L1Ms, benchmark.TargetGetP99L1Ms},
-		{"GetP99OriginMs", GetP99OriginMs, benchmark.TargetGetP99OriginMs},
-		{"SustainedRPS", SustainedRPS, benchmark.TargetSustainedRPS},
-		{"ErrorRateMax", ErrorRateMax, benchmark.TargetErrorRateMax},
-		{"RPSEfficiencyMin", RPSEfficiencyMin, benchmark.TargetRPSEfficiencyMin},
-		{"CacheHitRatioHotMin", CacheHitRatioHotMin, benchmark.TargetCacheHitRatioHotMin},
-		{"WasabiOriginEgressRatioMax", WasabiOriginEgressRatioMax, benchmark.TargetWasabiOriginEgressRatioMax},
-		{"PerGatewayNodeSustainedRPS", PerGatewayNodeSustainedRPS, benchmark.TargetSustainedRPS},
+		{"benchmark.TargetPutP99CacheHitMs", benchmark.TargetPutP99CacheHitMs, 50.0},
+		{"benchmark.TargetPutP99OriginMs", benchmark.TargetPutP99OriginMs, 200.0},
+		{"benchmark.TargetGetP99L0Ms", benchmark.TargetGetP99L0Ms, 20.0},
+		{"benchmark.TargetGetP99L1Ms", benchmark.TargetGetP99L1Ms, 100.0},
+		{"benchmark.TargetGetP99OriginMs", benchmark.TargetGetP99OriginMs, 300.0},
+		{"benchmark.TargetSustainedRPS", benchmark.TargetSustainedRPS, 10_000.0},
+		{"benchmark.TargetErrorRateMax", benchmark.TargetErrorRateMax, 1e-3},
+		{"benchmark.TargetRPSEfficiencyMin", benchmark.TargetRPSEfficiencyMin, 0.95},
+		{"benchmark.TargetCacheHitRatioHotMin", benchmark.TargetCacheHitRatioHotMin, 0.9},
+		{"benchmark.TargetWasabiOriginEgressRatioMax", benchmark.TargetWasabiOriginEgressRatioMax, 1.0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.got != tc.want {
-				t.Fatalf("dossier %s drifted from benchmark suite: dossier=%v, suite=%v — update docs/CAPACITY.md alongside the value change", tc.name, tc.got, tc.want)
+				t.Fatalf("upstream %s = %v, want %v — the benchmark suite value changed and the dossier was not updated to match; either revert the upstream change, or update both the documented literal here and docs/CAPACITY.md", tc.name, tc.got, tc.want)
 			}
 		})
 	}

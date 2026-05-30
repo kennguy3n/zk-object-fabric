@@ -121,7 +121,14 @@ const (
 	// MaxMultipartParts is the largest part-number value allowed
 	// in a multipart upload (S3 specifies the inclusive range
 	// [1, 10000]).
-	MaxMultipartParts = 10_000
+	//
+	// Declared as int (not int64) on purpose: this is a count, not
+	// a byte size. It is used as a slice index / loop bound / map
+	// capacity hint in gateway code (api/s3compat/multipart_handler.go),
+	// where int is the idiomatic Go type. The byte-size constants
+	// in this section are int64 because they index into and compare
+	// against ContentLength values, which the S3 SDK types as int64.
+	MaxMultipartParts int = 10_000
 
 	// MinMultipartPartSizeBytes is the smallest per-part size for
 	// every part EXCEPT the final part of a multipart upload.
