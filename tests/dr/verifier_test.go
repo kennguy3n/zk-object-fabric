@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -332,6 +333,205 @@ func TestVerifier_BackendMismatchFailsRecovery(t *testing.T) {
 	}
 	if rpt.MeasuredRTO != 0 {
 		t.Errorf("MeasuredRTO = %s, want 0 on failed run", rpt.MeasuredRTO)
+	}
+}
+
+// TestVerifier_MultiPieceManifestFullBodyVerified pins the
+// architectural guarantee that verifyRecovery reassembles the
+// entire object body from every piece in manifest order and
+// byte-compares against the seeded ground truth, rather than
+// validating only m.Pieces[0]. A regression that reverted the
+// loop to "GetPiece(m.Pieces[0])" would silently mark a
+// multi-piece object as recovered after byte-matching only its
+// first chunk — exactly the kind of partial-recovery hole this
+// gate exists to catch.
+//
+// The fixture stages a single steady object whose manifest has
+// THREE pieces in the dest cell. Piece 0 carries the correct
+// chunk, piece 1 carries the correct chunk, and piece 2 carries
+// CORRUPTED bytes. A first-piece-only verifier would count this
+// as recovered; the per-piece-iteration verifier must reject it.
+func TestVerifier_MultiPieceManifestFullBodyVerified(t *testing.T) {
+	src, dst := newCellPair(t)
+	v := &Verifier{
+		Source:           src,
+		Dest:             dst,
+		TenantID:         "t-multi-piece",
+		Bucket:           "dr",
+		SteadyObjects:    1,
+		InFlightObjects:  0,
+		ObjectSize:       192, // 3 chunks * 64 bytes
+		LagSettleTimeout: time.Second,
+	}
+
+	const chunkSize = 64
+	const numPieces = 3
+	objKey := "steady/obj-multipiece"
+	fullBody := deterministicBody(objKey, v.ObjectSize)
+	ctx := context.Background()
+
+	pieces := make([]metadata.Piece, 0, numPieces)
+	for i := 0; i < numPieces; i++ {
+		pieceID := fmt.Sprintf("piece-multipiece-%02d", i)
+		start := i * chunkSize
+		end := start + chunkSize
+		chunk := fullBody[start:end]
+
+		// Piece 2 (the LAST chunk) is intentionally corrupted in
+		// the dest provider; the manifest still reports the
+		// canonical SizeBytes so the per-piece-size check does
+		// not catch it. Only a full-body byte-comparison
+		// surfaces the corruption.
+		stored := chunk
+		if i == numPieces-1 {
+			stored = bytes.Repeat([]byte{0xFF}, len(chunk))
+		}
+		if _, err := dst.Provider.PutPiece(ctx, pieceID, bytes.NewReader(stored), providers.PutOptions{
+			ContentLength: int64(len(stored)),
+		}); err != nil {
+			t.Fatalf("dst.Provider.PutPiece(%s): %v", pieceID, err)
+		}
+		pieces = append(pieces, metadata.Piece{
+			PieceID:   pieceID,
+			Backend:   dst.ID,
+			SizeBytes: int64(len(stored)),
+		})
+	}
+
+	hash := sha256Hex(objKey)
+	mkey := manifest_store.ManifestKey{
+		TenantID:      v.TenantID,
+		Bucket:        v.Bucket,
+		ObjectKeyHash: hash,
+		VersionID:     "v1",
+	}
+	if err := dst.Manifests.Put(ctx, mkey, &metadata.ObjectManifest{
+		TenantID:      v.TenantID,
+		Bucket:        v.Bucket,
+		ObjectKey:     objKey,
+		ObjectKeyHash: hash,
+		VersionID:     "v1",
+		ObjectSize:    int64(len(fullBody)),
+		ChunkSize:     chunkSize,
+		Pieces:        pieces,
+	}); err != nil {
+		t.Fatalf("dst.Manifests.Put: %v", err)
+	}
+
+	rpt := Report{
+		SteadyObjects:     v.SteadyObjects,
+		FailureDetectedAt: time.Now(),
+	}
+	steady := []seededObject{{
+		manifestKey: mkey,
+		pieceID:     pieces[0].PieceID,
+		body:        fullBody,
+		objectKey:   objKey,
+	}}
+	err := v.verifyRecovery(ctx, &rpt, steady, time.Now)
+	if err == nil {
+		t.Fatalf("expected multi-piece body-mismatch failure, got nil; report=%+v", rpt)
+	}
+	if !strings.Contains(err.Error(), "body mismatch") {
+		t.Errorf("error %q does not mention body mismatch; first-piece-only regression?", err)
+	}
+	if !strings.Contains(err.Error(), "across 3 pieces") {
+		t.Errorf("error %q does not surface the piece count; verifier may not be iterating all pieces", err)
+	}
+	if rpt.RecoveredObjects != 0 {
+		t.Errorf("RecoveredObjects = %d, want 0 (multi-piece corruption must NOT count as recovered)",
+			rpt.RecoveredObjects)
+	}
+	if !rpt.RecoveryReadyAt.IsZero() {
+		t.Errorf("RecoveryReadyAt = %v, want zero on failed run", rpt.RecoveryReadyAt)
+	}
+	if rpt.MeasuredRTO != 0 {
+		t.Errorf("MeasuredRTO = %s, want 0 on failed run", rpt.MeasuredRTO)
+	}
+}
+
+// TestVerifier_MultiPieceManifestHappyPath proves that when EVERY
+// piece in a multi-piece manifest carries the correct bytes (in
+// manifest order), verifyRecovery reassembles the body and
+// counts the object as recovered. This is the positive
+// counterpart to TestVerifier_MultiPieceManifestFullBodyVerified:
+// the verifier must not penalise legitimate multi-piece objects.
+func TestVerifier_MultiPieceManifestHappyPath(t *testing.T) {
+	src, dst := newCellPair(t)
+	v := &Verifier{
+		Source:           src,
+		Dest:             dst,
+		TenantID:         "t-multi-piece-ok",
+		Bucket:           "dr",
+		SteadyObjects:    1,
+		InFlightObjects:  0,
+		ObjectSize:       192,
+		LagSettleTimeout: time.Second,
+	}
+
+	const chunkSize = 64
+	const numPieces = 3
+	objKey := "steady/obj-multipiece-ok"
+	fullBody := deterministicBody(objKey, v.ObjectSize)
+	ctx := context.Background()
+
+	pieces := make([]metadata.Piece, 0, numPieces)
+	for i := 0; i < numPieces; i++ {
+		pieceID := fmt.Sprintf("piece-multipiece-ok-%02d", i)
+		chunk := fullBody[i*chunkSize : (i+1)*chunkSize]
+		if _, err := dst.Provider.PutPiece(ctx, pieceID, bytes.NewReader(chunk), providers.PutOptions{
+			ContentLength: int64(len(chunk)),
+		}); err != nil {
+			t.Fatalf("dst.Provider.PutPiece(%s): %v", pieceID, err)
+		}
+		pieces = append(pieces, metadata.Piece{
+			PieceID:   pieceID,
+			Backend:   dst.ID,
+			SizeBytes: int64(len(chunk)),
+		})
+	}
+
+	hash := sha256Hex(objKey)
+	mkey := manifest_store.ManifestKey{
+		TenantID:      v.TenantID,
+		Bucket:        v.Bucket,
+		ObjectKeyHash: hash,
+		VersionID:     "v1",
+	}
+	if err := dst.Manifests.Put(ctx, mkey, &metadata.ObjectManifest{
+		TenantID:      v.TenantID,
+		Bucket:        v.Bucket,
+		ObjectKey:     objKey,
+		ObjectKeyHash: hash,
+		VersionID:     "v1",
+		ObjectSize:    int64(len(fullBody)),
+		ChunkSize:     chunkSize,
+		Pieces:        pieces,
+	}); err != nil {
+		t.Fatalf("dst.Manifests.Put: %v", err)
+	}
+
+	rpt := Report{
+		SteadyObjects:     v.SteadyObjects,
+		FailureDetectedAt: time.Now().Add(-time.Second),
+	}
+	steady := []seededObject{{
+		manifestKey: mkey,
+		pieceID:     pieces[0].PieceID,
+		body:        fullBody,
+		objectKey:   objKey,
+	}}
+	if err := v.verifyRecovery(ctx, &rpt, steady, time.Now); err != nil {
+		t.Fatalf("verifyRecovery on intact multi-piece manifest: %v", err)
+	}
+	if rpt.RecoveredObjects != 1 {
+		t.Errorf("RecoveredObjects = %d, want 1", rpt.RecoveredObjects)
+	}
+	if rpt.RecoveryReadyAt.IsZero() {
+		t.Errorf("RecoveryReadyAt is zero on a successful recovery")
+	}
+	if rpt.MeasuredRTO <= 0 {
+		t.Errorf("MeasuredRTO = %s, want > 0 on a successful recovery", rpt.MeasuredRTO)
 	}
 }
 

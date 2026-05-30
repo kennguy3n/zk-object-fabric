@@ -566,36 +566,81 @@ func (v *Verifier) verifyRecovery(
 			continue
 		}
 
-		rc, err := v.Dest.Provider.GetPiece(ctx, m.Pieces[0].PieceID, nil)
-		if err != nil {
-			mismatches = append(mismatches,
-				fmt.Sprintf("%s: dest GetPiece: %v", obj.objectKey, err))
+		// Reassemble the object body from EVERY piece in order,
+		// not just m.Pieces[0]. Today seedRange writes
+		// single-piece manifests so the result is identical, but
+		// the verifier is meant to be a long-lived gate: if a
+		// future test fixture (or a runbook drill that's later
+		// folded into the verifier) ever introduces multi-piece
+		// manifests (multipart upload, erasure coding, chunked
+		// replication), the first-piece-only check would silently
+		// mark such an object as recovered after byte-matching
+		// only its first chunk — exactly the kind of partial-
+		// recovery regression a DR gate exists to catch. Iterate
+		// all pieces, concatenate in manifest order, then compare
+		// the reassembled body against the seeded ground truth.
+		bodyParts := make([][]byte, 0, len(m.Pieces))
+		var (
+			totalBytes int
+			pieceErr   bool
+		)
+		for _, p := range m.Pieces {
+			rc, getErr := v.Dest.Provider.GetPiece(ctx, p.PieceID, nil)
+			if getErr != nil {
+				mismatches = append(mismatches,
+					fmt.Sprintf("%s: dest GetPiece(%s): %v", obj.objectKey, p.PieceID, getErr))
+				pieceErr = true
+				break
+			}
+			if firstGetAt.IsZero() {
+				// RTO is measured to the first successful piece
+				// OPEN across all pieces of all objects, not to
+				// the first byte-validated body. Rationale: the
+				// production-meaningful event is "the dest cell
+				// served a recovery read"; the byte-equality
+				// guards happen below per-object. The downstream
+				// gates at the bottom of this function
+				// (firstGetAt.IsZero() and RecoveredObjects <
+				// SteadyObjects) suppress MeasuredRTO whenever
+				// the run did not fully recover, so a JSON
+				// consumer can rely on MeasuredRTO > 0 meaning
+				// "every steady object was recovered".
+				firstGetAt = now()
+			}
+			pieceBody, readErr := io.ReadAll(rc)
+			_ = rc.Close()
+			if readErr != nil {
+				mismatches = append(mismatches,
+					fmt.Sprintf("%s: read piece %s: %v", obj.objectKey, p.PieceID, readErr))
+				pieceErr = true
+				break
+			}
+			// Pin per-piece size against the manifest's recorded
+			// SizeBytes so a provider that returns a truncated or
+			// padded body is caught even when the concatenated
+			// total happens to match by coincidence.
+			if p.SizeBytes > 0 && int64(len(pieceBody)) != p.SizeBytes {
+				mismatches = append(mismatches, fmt.Sprintf(
+					"%s: piece %s size=%d want %d",
+					obj.objectKey, p.PieceID, len(pieceBody), p.SizeBytes,
+				))
+				pieceErr = true
+				break
+			}
+			bodyParts = append(bodyParts, pieceBody)
+			totalBytes += len(pieceBody)
+		}
+		if pieceErr {
 			continue
 		}
-		if firstGetAt.IsZero() {
-			// RTO is measured to the first successful piece OPEN,
-			// not to the first byte-validated body. Rationale: the
-			// production-meaningful event is "the dest cell served
-			// a recovery read"; ReadAll + bytes.Equal happen below
-			// and are guarded separately. The downstream gates at
-			// the bottom of this function (firstGetAt.IsZero() and
-			// RecoveredObjects < SteadyObjects) suppress
-			// MeasuredRTO whenever the run did not fully recover,
-			// so a JSON consumer can rely on MeasuredRTO > 0
-			// meaning "every steady object was recovered".
-			firstGetAt = now()
-		}
-		body, err := io.ReadAll(rc)
-		_ = rc.Close()
-		if err != nil {
-			mismatches = append(mismatches,
-				fmt.Sprintf("%s: read recovered body: %v", obj.objectKey, err))
-			continue
+		body := make([]byte, 0, totalBytes)
+		for _, part := range bodyParts {
+			body = append(body, part...)
 		}
 		if !bytes.Equal(body, obj.body) {
 			mismatches = append(mismatches, fmt.Sprintf(
-				"%s: body mismatch (want %d bytes, got %d bytes; hash want=%s got=%s)",
-				obj.objectKey, len(obj.body), len(body),
+				"%s: body mismatch (want %d bytes across 1 piece, got %d bytes across %d pieces; hash want=%s got=%s)",
+				obj.objectKey, len(obj.body), len(body), len(m.Pieces),
 				sha256Hex(string(obj.body))[:12], sha256Hex(string(body))[:12],
 			))
 			continue
