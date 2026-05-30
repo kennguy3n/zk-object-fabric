@@ -163,10 +163,24 @@ func (m *Matrix) WriteMarkdown(w io.Writer) error {
 		ew.println()
 	}
 
+	// Emit one section per category. A blank line is printed
+	// before every new heading EXCEPT the first one — strict
+	// CommonMark parsers (e.g. pandoc with --strict, some
+	// static-site generators) require a blank line between a
+	// table's last row and the following block element. GitHub
+	// Flavored Markdown is lenient and would render correctly
+	// either way, but the matrix is also published as a CI
+	// artifact that may be ingested by other tooling, so the
+	// portable form is the safer default.
 	cat := ""
+	first := true
 	for _, r := range m.Operations {
 		if r.Category != cat {
 			cat = r.Category
+			if !first {
+				ew.println()
+			}
+			first = false
 			ew.printf("## %s\n\n", categoryTitle(cat))
 			ew.println("| Operation | Status | Detail | Duration |")
 			ew.println("|---|---|---|---|")
