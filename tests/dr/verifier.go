@@ -416,6 +416,16 @@ func (v *Verifier) waitForDrain(ctx context.Context, repl *cross_cell.Replicator
 	// them to src. Per-key Get is useless in that case, so fall
 	// back to CopiedPieces — which starts at 0 on a fresh
 	// Replicator and counts only pieces this run drained.
+	//
+	// The shared-store comparison "CopiedPieces >= len(expected)"
+	// depends on the invariant that seedRange writes exactly one
+	// piece per manifest (see seedRange's PutPiece+Manifests.Put
+	// pair above). If a future change introduces multi-piece
+	// manifests (EC, multipart), this branch must switch to
+	// counting drained manifests rather than drained pieces, or
+	// the drain check could pass before all manifests are
+	// actually present in dst. The non-shared-store branch below
+	// is immune because it queries per-manifest.
 	sharedStore := v.Source.Manifests == v.Dest.Manifests
 
 	deadline := time.NewTimer(v.LagSettleTimeout)
