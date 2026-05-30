@@ -1570,27 +1570,33 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 		// HealthConfig.ListenAddr notes "e.g. :29090"), but a
 		// misconfigured NetworkPolicy or a debug deployment that
 		// exposes the listener directly should not be silently
-		// vulnerable. Apply the same four knobs the gateway and
-		// console servers use; the defaults (ReadTimeout 30s,
+		// vulnerable. Apply the same five knobs the gateway and
+		// console servers use (ReadTimeout, WriteTimeout,
+		// ReadHeaderTimeout, IdleTimeout, MaxHeaderBytes); the
+		// defaults (ReadTimeout 30s, WriteTimeout 30s,
 		// ReadHeaderTimeout 10s, IdleTimeout 120s, MaxHeaderBytes
 		// 64 KiB) come from HealthConfig.Default() so an upgrade
 		// picks them up automatically without a config edit.
 		//
-		// ReadTimeout is included even though current /health
-		// surface is GET-only: it is defence-in-depth for any
-		// future POST/PUT health endpoint (drain control,
-		// manual quorum override) and it is the upper bound
+		// ReadTimeout and WriteTimeout are included even though
+		// the current /health surface is GET-only with tiny
+		// responses: they are defence-in-depth for any future
+		// POST/PUT health endpoint (drain control, manual quorum
+		// override) and ReadTimeout is also the upper bound
 		// validateTimeoutOrder enforces ReadHeaderTimeout to
 		// stay strictly below — a missing ReadTimeout would
 		// silently let an operator set ReadHeaderTimeout to any
 		// value, masking the misconfig the validator is meant
 		// to catch on the gateway and console. (Devin Review
-		// ANALYSIS_0004 on PR #80.)
+		// ANALYSIS_0004 on PR #80 added ReadTimeout;
+		// ANALYSIS_0001 on ef092a6 added WriteTimeout for the
+		// same symmetry.)
 		warnIfSlowlorisDisabled("health", hc.ListenAddr, hc.ReadHeaderTimeout)
 		srv := &http.Server{
 			Addr:              hc.ListenAddr,
 			Handler:           mon.ServeMux(""),
 			ReadTimeout:       hc.ReadTimeout.ToDuration(),
+			WriteTimeout:      hc.WriteTimeout.ToDuration(),
 			ReadHeaderTimeout: hc.ReadHeaderTimeout.ToDuration(),
 			IdleTimeout:       hc.IdleTimeout.ToDuration(),
 			MaxHeaderBytes:    config.EffectiveMaxHeaderBytes(hc.MaxHeaderBytes),

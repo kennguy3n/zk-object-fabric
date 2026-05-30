@@ -428,6 +428,11 @@ func TestConfig_Validate_RejectsHeaderTimeoutGreaterThanRead(t *testing.T) {
 		{
 			name: "console",
 			mutator: func(c *Config) {
+				// Enable the console listener so the timeout-
+				// order check actually fires; Default() sets
+				// ListenAddr="" which would skip it under the
+				// gating added for BUG_0001 on PR #80.
+				c.Console.ListenAddr = ":8081"
 				c.Console.ReadTimeout = Duration(15 * time.Second)
 				c.Console.ReadHeaderTimeout = Duration(20 * time.Second)
 			},
@@ -486,6 +491,66 @@ func TestConfig_Validate_ZeroTimeoutSkipsCheck(t *testing.T) {
 	cfg.Gateway.ReadHeaderTimeout = Duration(60 * time.Second)
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate rejected zero ReadTimeout: %v", err)
+	}
+}
+
+// TestConfig_Validate_ConsoleTimeoutOrderSkippedWhenListenAddrEmpty
+// pins symmetric ListenAddr gating between the console and health
+// listeners. Both are opt-in (Default() sets ListenAddr=""), and
+// startConsoleAPI / startHealthMonitor return early when ListenAddr
+// is empty, so refusing to start the gateway because an UNUSED
+// console listener has inconsistent timeouts is unnecessarily strict.
+// (Devin Review BUG_0001 on PR #80 commit ef092a6 flagged the
+// original asymmetry where the console check was unconditional
+// while the health check was gated.)
+func TestConfig_Validate_ConsoleTimeoutOrderSkippedWhenListenAddrEmpty(t *testing.T) {
+	cfg := Default()
+	cfg.Console.ListenAddr = ""
+	cfg.Console.ReadTimeout = Duration(15 * time.Second)
+	cfg.Console.ReadHeaderTimeout = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned error when console.listen_addr empty: %v", err)
+	}
+}
+
+// TestConfig_Validate_ConsoleTimeoutOrderEnforcedWhenListenAddrSet
+// pins the other half of the gated contract: once the console
+// listener is enabled, its timeout-order check fires exactly like
+// the gateway and health listeners. Without this test the gate
+// added for BUG_0001 could silently grow into a full bypass.
+func TestConfig_Validate_ConsoleTimeoutOrderEnforcedWhenListenAddrSet(t *testing.T) {
+	cfg := Default()
+	cfg.Console.ListenAddr = ":8081"
+	cfg.Console.ReadTimeout = Duration(15 * time.Second)
+	cfg.Console.ReadHeaderTimeout = Duration(30 * time.Second)
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate returned nil, want console timeout-order error")
+	}
+	if !strings.Contains(err.Error(), "console.read_header_timeout") {
+		t.Fatalf("Validate error %q does not mention console.read_header_timeout", err.Error())
+	}
+}
+
+// TestDefault_HealthHasWriteTimeout pins that HealthConfig.Default()
+// includes a non-zero WriteTimeout matching the gateway / console
+// posture. The field was omitted in ef092a6 and the bot flagged
+// the asymmetry (Devin Review ANALYSIS_0001 on PR #80 commit
+// ef092a6): the doc comment claimed "same four knobs" but the
+// gateway/console actually set five (Read + Write + ReadHeader +
+// Idle + MaxHeader). Adding WriteTimeout closes the gap so a
+// future POST/PUT health endpoint cannot inherit Go's stdlib
+// no-write-timeout default.
+func TestDefault_HealthHasWriteTimeout(t *testing.T) {
+	cfg := Default()
+	if cfg.Health.WriteTimeout <= 0 {
+		t.Fatalf("Default().Health.WriteTimeout = %s, want a positive value", cfg.Health.WriteTimeout)
+	}
+	if cfg.Health.WriteTimeout != cfg.Gateway.WriteTimeout {
+		t.Errorf(
+			"Default().Health.WriteTimeout (%s) != Gateway.WriteTimeout (%s); the comment in startHealthMonitor advertises matched defaults",
+			cfg.Health.WriteTimeout, cfg.Gateway.WriteTimeout,
+		)
 	}
 }
 

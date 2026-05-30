@@ -735,6 +735,18 @@ type HealthConfig struct {
 	// posture. Validate() refuses to start when
 	// ReadHeaderTimeout > ReadTimeout for this listener.
 	ReadTimeout Duration `json:"read_timeout"`
+
+	// WriteTimeout caps the wall-clock duration of a single
+	// health response. Today the /health surface returns tiny
+	// JSON bodies in single-digit milliseconds, but a future
+	// POST/PUT health endpoint (drain control, manual quorum
+	// override) would inherit Go's default of no write timeout
+	// without this field — letting a slow or misbehaving client
+	// hold a writer goroutine indefinitely. Default 30s matches
+	// the gateway and console posture. (Devin Review
+	// ANALYSIS_0001 on PR #80 commit ef092a6 flagged the missing
+	// knob.)
+	WriteTimeout Duration `json:"write_timeout"`
 }
 
 // HealthPeer is a single peer gateway in the cell.
@@ -997,6 +1009,7 @@ func Default() Config {
 		// (see HealthConfig.ReadHeaderTimeout doc for threat model).
 		Health: HealthConfig{
 			ReadTimeout:       Duration(30 * time.Second),
+			WriteTimeout:      Duration(30 * time.Second),
 			ReadHeaderTimeout: Duration(10 * time.Second),
 			IdleTimeout:       Duration(120 * time.Second),
 			MaxHeaderBytes:    DefaultMaxHeaderBytes,
@@ -1019,9 +1032,13 @@ func Default() Config {
 // ReadHeaderTimeout=60s with ReadTimeout=30s is almost certainly
 // confused about which knob does what, and the gateway should
 // refuse to start rather than silently degrade their Slowloris
-// defence. The health listener is only checked when its
-// ListenAddr is set (without a listener the timeouts are inert
-// configuration values that cannot harm anything).
+// defence. The console and health listeners are only checked
+// when their ListenAddr is set (without a listener the timeouts
+// are inert configuration values that cannot harm anything, and
+// refusing to start on an unused listener's misconfig would be
+// unnecessarily strict). The gateway is unconditional because it
+// is the data plane — startup without a gateway listener is not
+// a supported deployment shape.
 //
 // Validate is called by Load() after JSON unmarshaling so config
 // files exercise the checks. Callers constructing a Config
@@ -1031,13 +1048,20 @@ func (c *Config) Validate() error {
 	if err := validateTimeoutOrder("gateway", c.Gateway.ReadHeaderTimeout, c.Gateway.ReadTimeout); err != nil {
 		return err
 	}
-	if err := validateTimeoutOrder("console", c.Console.ReadHeaderTimeout, c.Console.ReadTimeout); err != nil {
-		return err
+	// Console and health both gate their timeout-order checks on
+	// ListenAddr because both listeners are opt-in: the
+	// ConsoleConfig default ListenAddr is "" and startConsoleAPI
+	// returns immediately when it is empty, and the same applies
+	// to startHealthMonitor's HTTP surface. An operator who
+	// overrides a timeout field without enabling the listener
+	// would otherwise have the gateway refuse to start for an
+	// inert misconfig that has no runtime effect. (Devin Review
+	// BUG_0001 on PR #80 flagged the original console asymmetry.)
+	if c.Console.ListenAddr != "" {
+		if err := validateTimeoutOrder("console", c.Console.ReadHeaderTimeout, c.Console.ReadTimeout); err != nil {
+			return err
+		}
 	}
-	// The health listener only enforces the timeout-order check
-	// when ListenAddr is set; an unset ListenAddr means the
-	// monitor runs as a background quorum watcher with no HTTP
-	// surface, so a misconfigured timeout cannot harm anything.
 	if c.Health.ListenAddr != "" {
 		if err := validateTimeoutOrder("health", c.Health.ReadHeaderTimeout, c.Health.ReadTimeout); err != nil {
 			return err
