@@ -1,0 +1,5 @@
+{"name":"aws-sdk-go","function":"PutObject","args":{"bucketName":"zkof-conf","objectName":"k1"},"duration":12,"status":"PASS"}
+{"name":"aws-sdk-go","function":"GetObject","args":{"bucketName":"zkof-conf","objectName":"k1"},"duration":8,"status":"PASS"}
+{"name":"aws-sdk-go","function":"PutObjectTagging","args":{"bucketName":"zkof-conf","objectName":"k1"},"duration":3,"status":"FAIL","alert":"PutObjectTagging failed","message":"tagging surface not implemented","error":"AccessDenied: ..."}
+{"name":"aws-sdk-go","function":"GetBucketVersioning","args":{},"duration":2,"status":"NA","alert":"versioning intentionally skipped"}
+{"name":"aws-sdk-go","function":"ListObjectsV2","args":{"bucketName":"zkof-conf"},"duration":15,"status":"PASS"}

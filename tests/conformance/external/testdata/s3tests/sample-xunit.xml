@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="s3tests.functional" tests="6" errors="1" failures="2" skip="2">
+  <testcase classname="s3tests.functional.test_s3" name="test_bucket_create_naming_good" time="0.412"></testcase>
+  <testcase classname="s3tests.functional.test_s3" name="test_object_put_get_range" time="0.823"></testcase>
+  <testcase classname="s3tests.functional.test_s3" name="test_object_put_acl" time="0.097">
+    <failure type="AssertionError" message="ACL not applied">Expected status 200 with grants, got 501 NotImplemented&#10;Traceback: ...</failure>
+  </testcase>
+  <testcase classname="s3tests.functional.test_s3" name="test_bucket_lifecycle_put" time="0.142">
+    <skipped type="exceptions.SkipTest">Skipped: tag !lifecycle</skipped>
+  </testcase>
+  <testcase classname="s3tests.functional.test_s3_website" name="test_website_index" time="0.056">
+    <error type="ConnectionError" message="connection refused">[Errno 111] Connection refused to gw.example.com:443</error>
+  </testcase>
+  <testcase classname="s3tests.functional.test_s3" name="test_multipart_upload" time="2.341">
+    <failure type="ETagMismatch" message="ETag mismatch">Expected ETag x, got y</failure>
+  </testcase>
+  <testcase classname="s3tests.functional.test_s3" name="test_bucket_versioning_put" time="0.085">
+    <skipped type="exceptions.SkipTest">Skipped: tag !versioning</skipped>
+  </testcase>
+</testsuite>
