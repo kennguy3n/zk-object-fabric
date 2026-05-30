@@ -194,6 +194,71 @@ func TestFaultProvider_TruncatedReadDeliversPartialBodyThenFails(t *testing.T) {
 	}
 }
 
+// TestFaultProvider_TruncatedReadWithZeroBudgetPassesThrough is the
+// regression for Devin Review finding BUG_pr-review-job-…_0001:
+// a FaultConfig with Mode=ModeTruncatedRead but TruncateAfterBytes
+// unset (or <= 0) previously hard-errored on the very first Read()
+// with 0 bytes delivered, contradicting the documented "no
+// truncation" semantics. The fix returns the inner reader
+// unwrapped in that case so the read completes against the
+// provider's natural EOF.
+func TestFaultProvider_TruncatedReadWithZeroBudgetPassesThrough(t *testing.T) {
+	t.Parallel()
+	inner := newBackingProvider(t)
+	body := []byte("zero-budget-pass-through")
+	putBytes(t, inner, "p1", body)
+
+	// Subtest 1: explicit Mode but TruncateAfterBytes left at the
+	// zero value — must NOT error, must deliver the full body.
+	t.Run("zero_budget", func(t *testing.T) {
+		fp := NewFaultProvider(inner)
+		fp.GetFault = FaultConfig{
+			Mode: ModeTruncatedRead,
+			Err:  errors.New("should never surface"),
+		}
+		rc, err := fp.GetPiece(context.Background(), "p1", nil)
+		if err != nil {
+			t.Fatalf("GetPiece returned err=%v; with TruncateAfterBytes<=0 "+
+				"the inner reader must be returned unwrapped", err)
+		}
+		defer rc.Close()
+		got, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatalf("ReadAll err=%v; want nil (no truncation budget = "+
+				"natural EOF, not synthesized failure)", err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Errorf("got %q want %q — pass-through must yield the full body", got, body)
+		}
+		if fp.Failures.Load() != 0 {
+			t.Errorf("Failures = %d; want 0 (no fault was actually "+
+				"injected because the budget was zero)", fp.Failures.Load())
+		}
+	})
+
+	// Subtest 2: negative budget — same pass-through behaviour.
+	t.Run("negative_budget", func(t *testing.T) {
+		fp := NewFaultProvider(inner)
+		fp.GetFault = FaultConfig{
+			Mode:               ModeTruncatedRead,
+			TruncateAfterBytes: -42,
+			Err:                errors.New("should never surface"),
+		}
+		rc, err := fp.GetPiece(context.Background(), "p1", nil)
+		if err != nil {
+			t.Fatalf("GetPiece err=%v with negative budget", err)
+		}
+		defer rc.Close()
+		got, err := io.ReadAll(rc)
+		if err != nil {
+			t.Errorf("ReadAll err=%v with negative budget", err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Errorf("got %q want %q", got, body)
+		}
+	})
+}
+
 func TestFaultProvider_SlowResponseInjectsLatency(t *testing.T) {
 	t.Parallel()
 	inner := newBackingProvider(t)

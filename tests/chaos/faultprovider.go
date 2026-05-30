@@ -105,13 +105,21 @@ type FaultConfig struct {
 	FailUntil time.Time
 
 	// TruncateAfterBytes is the byte budget for ModeTruncatedRead.
-	// A value <= 0 falls back to the io.EOF behavior of the
-	// underlying reader (i.e. no actual truncation).
+	// A value <= 0 disables truncation: the inner reader is returned
+	// unwrapped and the read completes against the underlying
+	// provider's natural EOF. Tests that want a deterministic
+	// truncation MUST set this > 0.
 	TruncateAfterBytes int64
 
-	// Latency is the artificial latency for ModeSlowResponse, and
-	// is also injected for every faulted call regardless of mode
-	// when non-zero. Used to model a degraded backend.
+	// Latency is the artificial latency injected on EVERY call to
+	// the wrapped method when non-zero, regardless of whether the
+	// call ends up faulted or passed through, and regardless of
+	// Mode. This deliberately models a degraded backend whose
+	// responses are slow whether they error or not (the typical
+	// Wasabi-throttled / NVMe-saturated shape). Tests asserting on
+	// latency-budget behaviour rely on this property; do not change
+	// it to a faulted-only injection without updating the chaos
+	// scenarios in scenarios_test.go.
 	Latency time.Duration
 }
 
@@ -176,11 +184,21 @@ func (p *FaultProvider) now() time.Time {
 	return time.Now()
 }
 
-// sleep blocks for d unless ctx cancels first. A real degraded
-// backend whose response is slow MUST honour the caller's deadline;
+// sleep blocks for d, honouring ctx cancellation iff the default
+// (time.NewTimer + select) path is used. A real degraded backend
+// whose response is slow MUST honour the caller's deadline;
 // otherwise the chaos suite would be more pathological than reality
-// (every gateway timeout would also leak a goroutine here). Tests
-// can override p.Sleep to skip wall-clock sleeps entirely.
+// (every gateway timeout would also leak a goroutine here).
+//
+// When p.Sleep is non-nil the caller-supplied callback is invoked
+// instead of the default timer path, and ctx is NOT consulted: the
+// callback owns its own blocking semantics. Tests that need both a
+// custom Sleep AND ctx-aware cancellation must implement that inside
+// their callback (e.g. select on ctx.Done() + a timer). The vast
+// majority of test callsites use a no-op p.Sleep that returns
+// instantly, for which ctx-awareness is moot; the production-shape
+// nil-callback path is exercised by
+// TestChaos_RepairRespectsContextCancellationUnderSlowProvider.
 func (p *FaultProvider) sleep(ctx context.Context, d time.Duration) {
 	if d <= 0 {
 		return
@@ -316,6 +334,24 @@ func (p *FaultProvider) GetPiece(ctx context.Context, pieceID string, byteRange 
 		if err != nil {
 			return nil, err
 		}
+		// TruncateAfterBytes <= 0 means "no truncation budget"
+		// per the FaultConfig doc — return the inner reader
+		// unwrapped instead of synthesizing a 0-byte error on
+		// the very first Read(). Without this guard, a test that
+		// sets Mode=ModeTruncatedRead and forgets to set
+		// TruncateAfterBytes would get a hard immediate error
+		// from every GET, which silently misrepresents what the
+		// chaos scenario is actually testing.
+		if p.GetFault.TruncateAfterBytes <= 0 {
+			return rc, nil
+		}
+		// Note: ModeTruncatedRead deliberately bypasses
+		// shouldFail (and therefore bumpCounter). A FaultConfig
+		// carries exactly one Mode, so no other mode that would
+		// consult the counter can co-exist with TruncatedRead on
+		// the same op. If that ever changes, route this path
+		// through shouldFail too so counter-driven tests stay
+		// consistent.
 		p.Failures.Add(1)
 		return &truncatedReader{
 			inner:     rc,

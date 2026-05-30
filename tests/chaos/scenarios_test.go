@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -511,10 +512,23 @@ func TestChaos_ConcurrentProviderAndManifestStoreFailureDegrades(t *testing.T) {
 // models the manifest tier coming back online after a timed outage.
 // While the tier is down, every Put errors loudly; after the
 // deadline, Puts pass through and the backlog clears.
+//
+// Uses fms.Now to drive a synthetic clock so the test is
+// deterministic under heavy CI load (no wall-clock sleeps). The
+// real ModeFailUntilTime code path consults fms.now() exactly the
+// same way it would under time.Now, so this fully exercises the
+// production code.
 func TestChaos_FaultManifestStoreEventualHealReleasesBackpressure(t *testing.T) {
 	inner := memory.New()
 	fms := NewFaultManifestStore(inner)
-	healAt := time.Now().Add(50 * time.Millisecond)
+
+	// Synthetic clock starts at t=0; heal at t=50ms.
+	clockBase := time.Unix(1700000000, 0)
+	var clockOffset atomic.Int64 // nanoseconds since clockBase
+	fms.Now = func() time.Time {
+		return clockBase.Add(time.Duration(clockOffset.Load()))
+	}
+	healAt := clockBase.Add(50 * time.Millisecond)
 	fms.PutFault = FaultConfig{
 		Mode:      ModeFailUntilTime,
 		Err:       errors.New("chaos: pg failover in progress"),
@@ -524,21 +538,26 @@ func TestChaos_FaultManifestStoreEventualHealReleasesBackpressure(t *testing.T) 
 	key := manifest_store.ManifestKey{TenantID: "T", Bucket: "b", ObjectKeyHash: "k"}
 	m := &metadata.ObjectManifest{TenantID: "T", Bucket: "b", ObjectKey: "k", ObjectKeyHash: "k"}
 
-	// During the outage window every Put must fail.
+	// During the outage window every Put must fail. Advance the
+	// synthetic clock between attempts to mimic the original
+	// wall-clock cadence (2ms per probe) without any real sleeps.
 	for i := 0; i < 5; i++ {
 		if err := fms.Put(context.Background(), key, m); err == nil {
 			t.Fatalf("Put attempt %d succeeded during outage window; "+
 				"FailUntilTime must keep failing every call before "+
-				"the deadline", i)
+				"the deadline (synthetic clock at +%dns)",
+				i, clockOffset.Load())
 		}
-		time.Sleep(2 * time.Millisecond)
+		clockOffset.Add(int64(2 * time.Millisecond))
 	}
 
-	// Sleep past the heal point, then Put must succeed.
-	time.Sleep(time.Until(healAt) + 10*time.Millisecond)
+	// Jump past the heal point — no time.Sleep needed.
+	clockOffset.Store(int64(60 * time.Millisecond))
 	if err := fms.Put(context.Background(), key, m); err != nil {
 		t.Fatalf("Put after heal returned %v; want nil "+
-			"(FailUntilTime should release at the deadline)", err)
+			"(FailUntilTime should release at the deadline; "+
+			"synthetic clock at +%dns >= FailUntil)",
+			err, clockOffset.Load())
 	}
 	// And the stored manifest must be retrievable.
 	if got, err := inner.Get(context.Background(), key); err != nil || got == nil {
