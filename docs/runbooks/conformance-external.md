@@ -64,6 +64,20 @@ export GATEWAY_ENDPOINT="https://gw.staging.example.com"
 export GATEWAY_BUCKET="zkof-conf-$(date +%s)"
 export GATEWAY_ACCESS_KEY="..."
 export GATEWAY_SECRET_KEY="..."
+
+# Optional: a SECOND user for ACL / bucket-policy / cross-account
+# tests in Ceph s3-tests. If unset, [s3 alt] in the generated
+# s3tests.conf falls back to the main credentials so the suite
+# still loads and the tests that genuinely need a second account
+# fail inside the test (matrix row -> failed) instead of aborting
+# config load. Provide a real second user before publishing an
+# audit-grade matrix; otherwise note "single-credential run" in
+# the audit dossier as a known limitation.
+# export GATEWAY_ALT_ACCESS_KEY="..."
+# export GATEWAY_ALT_SECRET_KEY="..."
+# export GATEWAY_TENANT_ACCESS_KEY="..."
+# export GATEWAY_TENANT_SECRET_KEY="..."
+
 export GATEWAY_SHA="$(git rev-parse HEAD)"
 export REPORTS_DIR="/var/lib/zkof-conf/reports"
 

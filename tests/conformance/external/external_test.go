@@ -441,11 +441,14 @@ func TestCompactDetail_Truncates(t *testing.T) {
 // multi-byte rune (e.g. when a harness emits a localised error
 // message or a Unicode file path).
 func TestCompactDetail_TruncatesAtRuneBoundary(t *testing.T) {
-	// Build a string where byte 237 lands inside a multi-byte
-	// rune. "你好" is 6 bytes (3 each), so a prefix of 235 ASCII
-	// bytes + "你好" places the second multi-byte rune across
-	// byte 238-240. The naive slice [:237] would land inside
-	// the second rune.
+	// Build a string where the byte at the cut position is mid-rune.
+	// "你" and "好" are each 3 bytes in UTF-8. With a prefix of 235
+	// ASCII bytes, "你" occupies bytes 235..237 and "好" occupies
+	// bytes 238..240. The naive slice joined[:237] therefore cuts
+	// inside the FIRST multi-byte rune ("你") — joined[237] is the
+	// third byte of "你", not a rune start. The rune-aware back-off
+	// must walk left to byte 235 (the rune-start of "你") so the
+	// surviving prefix is valid UTF-8.
 	head := strings.Repeat("a", 235)
 	input := head + "你好" + strings.Repeat("b", 200)
 	got := compactDetail(input)

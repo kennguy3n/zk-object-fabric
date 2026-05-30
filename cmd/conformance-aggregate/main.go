@@ -37,6 +37,20 @@ import (
 )
 
 func main() {
+	// All work is delegated to run() so the only os.Exit call lives
+	// at the bottom of main and every deferred resource (output
+	// file Close + Sync, in particular) has a chance to fire on
+	// every exit path. The pre-refactor shape used os.Exit(1)
+	// directly after `defer f.Close()`, which skipped the close —
+	// safe in practice for unbuffered *os.File writes but a footgun
+	// the moment any caller wraps the output in a bufio.Writer.
+	os.Exit(run())
+}
+
+// run is the testable entry point: it returns the desired exit
+// code instead of calling os.Exit so all deferred resources run
+// before the process terminates.
+func run() int {
 	var (
 		xunitPath       = flag.String("s3tests-xunit", "", "path to ceph s3-tests --with-xunit XML file (optional; at least one of -s3tests-xunit / -mint-logs-dir is required)")
 		mintDir         = flag.String("mint-logs-dir", "", "path to MinIO mint logs directory (mint-logs/{date}/)")
@@ -49,7 +63,7 @@ func main() {
 	if *xunitPath == "" && *mintDir == "" {
 		fmt.Fprintln(os.Stderr, "conformance-aggregate: at least one of -s3tests-xunit / -mint-logs-dir is required")
 		flag.Usage()
-		os.Exit(64)
+		return 64
 	}
 
 	var parts [][]external.MatrixEntry
@@ -58,13 +72,13 @@ func main() {
 		f, err := os.Open(*xunitPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "conformance-aggregate: open xunit: %v\n", err)
-			os.Exit(65)
+			return 65
 		}
 		entries, err := external.ParseS3TestsXUnit(f)
 		f.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "conformance-aggregate: parse xunit %s: %v\n", *xunitPath, err)
-			os.Exit(65)
+			return 65
 		}
 		parts = append(parts, entries)
 	}
@@ -73,7 +87,7 @@ func main() {
 		entries, err := external.ParseMintLogDir(*mintDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "conformance-aggregate: parse mint dir %s: %v\n", *mintDir, err)
-			os.Exit(65)
+			return 65
 		}
 		parts = append(parts, entries)
 	}
@@ -85,15 +99,25 @@ func main() {
 		f, err := os.Create(*outPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "conformance-aggregate: open output %s: %v\n", *outPath, err)
-			os.Exit(65)
+			return 65
 		}
+		// Defer Close so it fires on every return path below
+		// (including the audit-fail return 1 at the end). Sync()
+		// is also called explicitly after WriteJSON so the matrix
+		// is on disk before the audit-pass tally is printed.
 		defer f.Close()
 		out = f
 	}
 
 	if err := m.WriteJSON(out); err != nil {
 		fmt.Fprintf(os.Stderr, "conformance-aggregate: write matrix: %v\n", err)
-		os.Exit(65)
+		return 65
+	}
+	if out != os.Stdout {
+		if err := out.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "conformance-aggregate: sync matrix: %v\n", err)
+			return 65
+		}
 	}
 
 	c := m.Counts()
@@ -101,6 +125,7 @@ func main() {
 		c.Total, c.Passed, c.Unsupported, c.Failed, c.Errored)
 
 	if !m.AllPassed() {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
