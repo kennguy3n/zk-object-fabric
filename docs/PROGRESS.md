@@ -558,6 +558,23 @@ external load is run on it:
 - **Multi-tenant abuse / quota validation** — abuse-control trip
   thresholds tested under adversarial workloads (slowloris, key-space
   flood, egress-budget exhaustion).
+- **Audit hand-off package** — single tarball an external auditor
+  receives, bundling the security + cryptography audit packages
+  (WS1.3 / WS1.4), the capacity envelope dossier (WS2.3), the S3
+  conformance matrix (WS1.5 / WS2.2), the disaster-recovery
+  runbooks + verifier (WS1.6), and the Linode + Wasabi staging
+  deploy + Tier 3 verifier (WS2.1). Hand-off pipeline lives at
+  [`cmd/audit-handoff`](../cmd/audit-handoff/) (the bundler) and
+  [`deploy/audit-handoff/`](../deploy/audit-handoff/) (the
+  manifest + auditor README); drift tests at
+  [`tests/audit/handoff_test.go`](../tests/audit/) pin the
+  invariant that every manifest component is mentioned in the
+  auditor README and resolves to a real on-disk path. The bundle
+  is anchored to a public commit SHA recorded in `MANIFEST.txt`
+  with a SHA-256 chain the auditor verifies with `sha256sum -c`.
+  **Hand-off mechanism READY**; each individual workstream's
+  source PR (#77 / #78 / #79 / #81 / #82 / #83) flips its
+  component from `optional: true` to fully required as it merges.
 
 This list will shrink as items are exercised against the codebase. When
 an item is completed, move it from this section into the relevant

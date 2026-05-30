@@ -1,0 +1,437 @@
+package main
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// newSyntheticRepo writes a small fake repo into t.TempDir() with
+// just enough structure to exercise the bundler:
+//
+//   - a go.mod (so the --repo-root check in main.run() would pass,
+//     although we exercise Build directly here)
+//   - a manifest.yaml with two components: one required, one
+//     optional with one present path and one missing path
+//   - the on-disk files referenced by the present paths
+//
+// The bundler's Build() is then called against this repo and the
+// produced tarball is unpacked + inspected. This is the only test
+// suite for Build(); it covers happy path, missing-optional path,
+// MANIFEST.txt determinism, and INDEX.md correctness.
+func newSyntheticRepo(t *testing.T) (repoRoot, manifestPath string) {
+	t.Helper()
+	repoRoot = t.TempDir()
+	mustWrite(t, filepath.Join(repoRoot, "go.mod"), "module example.com/synth\n\ngo 1.25\n")
+	mustWrite(t, filepath.Join(repoRoot, "docs", "OVERVIEW.md"), "# overview\n")
+	mustWrite(t, filepath.Join(repoRoot, "docs", "PROGRESS.md"), "# progress\n")
+	mustWrite(t, filepath.Join(repoRoot, "tests", "core", "x.go"), "package core\n")
+	// note: tests/optional/missing.go is intentionally NOT written
+	manifestPath = filepath.Join(repoRoot, "manifest.yaml")
+	mustWrite(t, manifestPath, `
+version: 1
+bundle_name: synth-bundle
+output_dir: build/out
+components:
+  - id: core
+    title: Core
+    description: required component
+    pr_origin: synthetic
+    paths:
+      - docs/OVERVIEW.md
+      - docs/PROGRESS.md
+      - tests/core
+    optional: false
+  - id: optional_partial
+    title: Optional Partial
+    description: optional with one present, one missing
+    pr_origin: "#999"
+    paths:
+      - docs/PROGRESS.md
+      - tests/optional/missing.go
+    optional: true
+`)
+	return
+}
+
+func mustWrite(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func TestBuild_HappyPath_MissingOptionalProducesPlaceholder(t *testing.T) {
+	repoRoot, manifestPath := newSyntheticRepo(t)
+	m, err := LoadManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	res, err := Build(m, BundleOptions{
+		RepoRoot:     repoRoot,
+		ManifestPath: manifestPath,
+		CommitSHA:    "deadbeefcafe",
+		BuildTime:    time.Date(2026, 5, 30, 23, 30, 0, 0, time.UTC),
+		SkipMake:     true,
+		Out:          io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if res.OutputPath == "" || !strings.HasSuffix(res.OutputPath, ".tar.gz") {
+		t.Fatalf("OutputPath = %q, want non-empty .tar.gz", res.OutputPath)
+	}
+	if !contains(res.ComponentsIncluded, "core") {
+		t.Errorf("expected `core` in ComponentsIncluded, got %v", res.ComponentsIncluded)
+	}
+	if !contains(res.ComponentsIncluded, "optional_partial") {
+		// optional_partial has docs/PROGRESS.md present, so it
+		// IS included (one real file) — the missing path is a
+		// placeholder.
+		t.Errorf("expected optional_partial in ComponentsIncluded (it has one real path); got %v", res.ComponentsIncluded)
+	}
+	if len(res.ComponentsMissing) != 0 {
+		t.Errorf("expected ComponentsMissing to be empty (optional_partial had at least one real file); got %v", res.ComponentsMissing)
+	}
+
+	// Inspect the tarball contents.
+	files := readTarball(t, res.OutputPath)
+	wantPaths := []string{
+		"INDEX.md",
+		"MANIFEST.txt",
+		"manifest.yaml",
+		"core/docs/OVERVIEW.md",
+		"core/docs/PROGRESS.md",
+		"core/tests/core/x.go",
+		"optional_partial/docs/PROGRESS.md",
+		"optional_partial/__MISSING__/tests_optional_missing.go.MISSING",
+	}
+	for _, p := range wantPaths {
+		if _, ok := files[p]; !ok {
+			t.Errorf("expected bundle entry %q not found; got keys=%v", p, keys(files))
+		}
+	}
+
+	// MANIFEST.txt header lines must start with `#` so
+	// `sha256sum -c` ignores them. Data lines must use the
+	// `<hex>  <path>` format.
+	manifestTxt := files["MANIFEST.txt"]
+	for i, line := range strings.Split(strings.TrimRight(manifestTxt, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue // header line, ok
+		}
+		fields := strings.SplitN(line, "  ", 2)
+		if len(fields) != 2 || len(fields[0]) != 64 {
+			t.Errorf("MANIFEST.txt line %d malformed: %q", i, line)
+		}
+	}
+
+	// INDEX.md must list both components with their status.
+	idx := files["INDEX.md"]
+	if !strings.Contains(idx, "core — Core") {
+		t.Errorf("INDEX.md missing core component header; got:\n%s", idx)
+	}
+	if !strings.Contains(idx, "optional_partial — Optional Partial") {
+		t.Errorf("INDEX.md missing optional_partial component header; got:\n%s", idx)
+	}
+	if !strings.Contains(idx, "Commit:  `deadbeefcafe`") {
+		t.Errorf("INDEX.md missing commit anchor")
+	}
+
+	// Deterministic build: re-run with same inputs, expect same
+	// MANIFEST.txt body byte-for-byte.
+	res2, err := Build(m, BundleOptions{
+		RepoRoot:     repoRoot,
+		ManifestPath: manifestPath,
+		CommitSHA:    "deadbeefcafe",
+		BuildTime:    time.Date(2026, 5, 30, 23, 30, 0, 0, time.UTC),
+		SkipMake:     true,
+		Out:          io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Build (rerun): %v", err)
+	}
+	files2 := readTarball(t, res2.OutputPath)
+	if files["MANIFEST.txt"] != files2["MANIFEST.txt"] {
+		t.Errorf("MANIFEST.txt is not byte-deterministic across runs:\nfirst:\n%s\nsecond:\n%s", files["MANIFEST.txt"], files2["MANIFEST.txt"])
+	}
+}
+
+func TestBuild_MissingRequiredPathIsHardError(t *testing.T) {
+	repoRoot := t.TempDir()
+	mustWrite(t, filepath.Join(repoRoot, "go.mod"), "module x\ngo 1.25\n")
+	manifestPath := filepath.Join(repoRoot, "manifest.yaml")
+	mustWrite(t, manifestPath, `
+version: 1
+bundle_name: synth
+output_dir: out
+components:
+  - id: required
+    title: Required
+    description: x
+    pr_origin: x
+    paths:
+      - does/not/exist.md
+    optional: false
+`)
+	m, err := LoadManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	_, err = Build(m, BundleOptions{
+		RepoRoot:     repoRoot,
+		ManifestPath: manifestPath,
+		CommitSHA:    "abc",
+		SkipMake:     true,
+		Out:          io.Discard,
+	})
+	if err == nil {
+		t.Fatalf("expected error for missing REQUIRED path, got nil")
+	}
+	if !strings.Contains(err.Error(), "required path") {
+		t.Errorf("expected error to mention 'required path'; got: %v", err)
+	}
+}
+
+func TestBuild_AllowMissingOptional_OmitsPlaceholder(t *testing.T) {
+	repoRoot := t.TempDir()
+	mustWrite(t, filepath.Join(repoRoot, "go.mod"), "module x\ngo 1.25\n")
+	mustWrite(t, filepath.Join(repoRoot, "real.md"), "hi\n")
+	manifestPath := filepath.Join(repoRoot, "manifest.yaml")
+	mustWrite(t, manifestPath, `
+version: 1
+bundle_name: synth
+output_dir: out
+components:
+  - id: anchor
+    title: Anchor
+    description: x
+    pr_origin: x
+    paths:
+      - real.md
+    optional: false
+  - id: opt
+    title: Opt
+    description: x
+    pr_origin: "#999"
+    paths:
+      - not/there.md
+    optional: true
+`)
+	m, err := LoadManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	res, err := Build(m, BundleOptions{
+		RepoRoot:             repoRoot,
+		ManifestPath:         manifestPath,
+		CommitSHA:            "abc",
+		SkipMake:             true,
+		AllowMissingOptional: true,
+		Out:                  io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !contains(res.ComponentsMissing, "opt") {
+		t.Errorf("expected `opt` in ComponentsMissing (AllowMissingOptional=true means no placeholder, so component contributes nothing); got %v", res.ComponentsMissing)
+	}
+	files := readTarball(t, res.OutputPath)
+	for k := range files {
+		if strings.Contains(k, "__MISSING__") {
+			t.Errorf("AllowMissingOptional=true but bundle still contains placeholder %q", k)
+		}
+	}
+}
+
+func TestLoadManifest_RejectsUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "m.yaml")
+	mustWrite(t, p, `
+version: 1
+bundle_name: x
+output_dir: out
+components:
+  - id: a
+    title: A
+    description: x
+    pr_origin: x
+    paths: [x]
+    optional: false
+    bogus_field: 42
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected error for unknown field 'bogus_field', got nil")
+	}
+	if !strings.Contains(err.Error(), "bogus_field") {
+		t.Errorf("error should name the unknown field; got: %v", err)
+	}
+}
+
+func TestLoadManifest_RejectsDuplicateIDs(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "m.yaml")
+	mustWrite(t, p, `
+version: 1
+bundle_name: x
+output_dir: out
+components:
+  - id: dup
+    title: One
+    description: x
+    pr_origin: x
+    paths: [a]
+    optional: false
+  - id: dup
+    title: Two
+    description: x
+    pr_origin: x
+    paths: [b]
+    optional: false
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected error for duplicate id, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate id") {
+		t.Errorf("error should mention duplicate id; got: %v", err)
+	}
+}
+
+func TestLoadManifest_RejectsAllOptional(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "m.yaml")
+	mustWrite(t, p, `
+version: 1
+bundle_name: x
+output_dir: out
+components:
+  - id: a
+    title: A
+    description: x
+    pr_origin: x
+    paths: [a]
+    optional: true
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected error when every component is optional, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-optional") {
+		t.Errorf("error should mention non-optional anchor requirement; got: %v", err)
+	}
+}
+
+func TestLoadManifest_RejectsInvalidID(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "m.yaml")
+	mustWrite(t, p, `
+version: 1
+bundle_name: x
+output_dir: out
+components:
+  - id: 1bad
+    title: X
+    description: x
+    pr_origin: x
+    paths: [a]
+    optional: false
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected error for id starting with digit, got nil")
+	}
+}
+
+func TestLoadManifest_RejectsUnsupportedVersion(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "m.yaml")
+	mustWrite(t, p, `
+version: 99
+bundle_name: x
+output_dir: out
+components:
+  - id: a
+    title: A
+    description: x
+    pr_origin: x
+    paths: [a]
+    optional: false
+`)
+	_, err := LoadManifest(p)
+	if err == nil {
+		t.Fatal("expected error for unsupported version, got nil")
+	}
+}
+
+// readTarball reads a gzip-compressed tarball and returns a map
+// of <name-without-bundle-prefix> -> file body. The bundle prefix
+// (e.g. `synth-bundle-2026-05-30-deadbee/`) is stripped so the
+// test asserts against logical bundle-relative paths.
+func readTarball(t *testing.T, path string) map[string]string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open tarball: %v", err)
+	}
+	defer f.Close()
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	defer gzr.Close()
+	tr := tar.NewReader(gzr)
+	out := make(map[string]string)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar.Next: %v", err)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		// strip the bundle-stem prefix
+		parts := strings.SplitN(hdr.Name, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		out[parts[1]] = string(body)
+	}
+	return out
+}
+
+func contains(s []string, x string) bool {
+	for _, v := range s {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+func keys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}

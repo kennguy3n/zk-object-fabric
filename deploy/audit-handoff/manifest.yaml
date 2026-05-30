@@ -1,0 +1,156 @@
+# audit-handoff manifest
+#
+# Single source of truth for what an external auditor receives when
+# `cmd/audit-handoff` produces the hand-off tarball.
+#
+# This file is read by:
+#
+#   1. cmd/audit-handoff (the bundler) — drives which paths get copied
+#      into the tarball and how the top-level INDEX.md / MANIFEST.txt
+#      are generated.
+#
+#   2. tests/audit/handoff_test.go (drift detection) — pins three
+#      invariants that must hold at every commit:
+#        (a) every component listed here has at least one matching
+#            path on disk (or is explicitly marked `optional: true`
+#            because its source PR has not landed yet);
+#        (b) every component listed here is mentioned by name in
+#            deploy/audit-handoff/README.md (the auditor's first read);
+#        (c) every component name in README.md resolves to a real
+#            entry in this manifest (no stale / typo'd references).
+#
+# When a new workstream lands a new deliverable that the audit firm
+# should see, the canonical procedure is:
+#
+#   1. Add a `components:` entry here.
+#   2. Add a matching section to deploy/audit-handoff/README.md.
+#   3. Run `go test ./tests/audit/... ./cmd/audit-handoff/...` —
+#      the drift tests fail with a clear message if (1) and (2)
+#      disagree.
+#
+# `optional: true` is for components whose source PR has not yet
+# merged to `main`. The bundler emits a `MISSING:` placeholder for
+# them instead of failing. As each prerequisite PR merges, flip the
+# flag to `false` (or remove it) in a follow-up commit; the drift
+# test will then hard-fail until the path actually exists.
+
+version: 1
+bundle_name: zkof-audit-handoff
+output_dir: build/audit-handoff
+
+components:
+
+  - id: audit_bundle
+    title: External security + cryptography audit packages
+    description: |
+      The WS1.3 (external security review) and WS1.4 (external
+      cryptography review) hand-off documents plus their cross-
+      referenced source files. Produced by `make audit-bundle`
+      (top-level Makefile target) as a self-contained inner tarball.
+      The auditor receives a `make`-emitted bundle nested inside the
+      hand-off tarball so the inner manifest / SHA-256 chain remains
+      intact and independently verifiable.
+    pr_origin: "#77"
+    paths:
+      - docs/security/README.md
+      - docs/security/threat-model.md
+      - docs/security/audit-package-security.md
+      - docs/security/audit-package-cryptography.md
+      - docs/security/findings/README.md
+    make_target: audit-bundle
+    optional: true
+
+  - id: capacity_dossier
+    title: Capacity envelope dossier
+    description: |
+      Single source of truth for every capacity number the auditor
+      will see referenced in benchmark plots, runbooks, and SLA
+      prose. The Go side (tests/capacity/targets.go) re-exports
+      the same constants the production benchmark suite uses, so a
+      future refactor that drifts an upstream value will fail the
+      dossier drift tests before it can land.
+    pr_origin: "#83"
+    paths:
+      - docs/CAPACITY.md
+      - tests/capacity/targets.go
+      - tests/capacity/targets_test.go
+      - tests/capacity/dossier_test.go
+    optional: true
+
+  - id: conformance_matrix
+    title: S3 protocol conformance matrix (in-process + external)
+    description: |
+      WS1.5 lands the deterministic in-process matrix runner
+      (tests/s3_conformance/) plus the runbook for wiring external
+      third-party harnesses (Ceph s3-tests, MinIO mint). WS2.2 lands
+      the orchestration scripts that drive those external harnesses
+      against a deployed gateway and aggregate their JUnit/JSON
+      output into the matrix format. The auditor receives the
+      matrix schema, the runbook, the aggregator, and a sample
+      run output (`build/conformance/`).
+    pr_origin: "#78 + #82"
+    paths:
+      - tests/s3_conformance/runner.go
+      - tests/s3_conformance/matrix.go
+      - docs/runbooks/s3-conformance.md
+      - docs/runbooks/conformance-external.md
+      - deploy/conformance/scripts/run_s3tests.sh
+      - deploy/conformance/scripts/run_mint.sh
+      - deploy/conformance/scripts/aggregate.sh
+      - cmd/conformance-aggregate/main.go
+    optional: true
+
+  - id: dr_runbooks
+    title: Disaster-recovery runbooks + verifier
+    description: |
+      Per-failure-surface recovery runbooks (Postgres restore,
+      cross-cell failover, manifest resume) with published RPO/RTO
+      targets, plus the in-process verifier that exercises the
+      cross-cell async path on every CI run and pins the
+      LostObjects == InFlightObjects invariant via deliberate
+      Phase 2 ordering. The verifier returns an error when the
+      measured RTO exceeds the published target.
+    pr_origin: "#79"
+    paths:
+      - docs/runbooks/dr.md
+      - docs/runbooks/dr-postgres-restore.md
+      - docs/runbooks/dr-cross-cell-failover.md
+      - docs/runbooks/dr-manifest-resume.md
+      - docs/runbooks/dr-verification.md
+      - tests/dr/verifier.go
+      - .github/workflows/dr-verify.yml
+    optional: true
+
+  - id: staging_deploy
+    title: Linode + Wasabi staging deploy + Tier 3 verifier
+    description: |
+      WS2.1 deliverable. Terraform + cloud-init for a load-driver
+      VM, a wrapped harness invocation (run_tier3.sh), the
+      cmd/tier3-verify in-process checker that the harness shells
+      out to, and the evidence-collection script the operator runs
+      post-burn. Closes the WS1.1 runbook's "Linode + Wasabi
+      staging run" gate.
+    pr_origin: "#81"
+    paths:
+      - deploy/staging/README.md
+      - deploy/staging/evidence/README.md
+      - deploy/staging/load-driver/scripts/run_tier3.sh
+      - deploy/staging/load-driver/terraform/main.tf
+      - deploy/staging/load-driver/terraform/cloud-init.yaml.tpl
+      - deploy/staging/scripts/collect_evidence.sh
+      - cmd/tier3-verify/main.go
+    optional: true
+
+  - id: progress_pin
+    title: WS-workstream progress / scope pin
+    description: |
+      The published validation roadmap (docs/PROGRESS.md) names
+      every workstream and pins its status. Each component above
+      cites its WS-N reference; the auditor uses PROGRESS.md to
+      cross-walk a finding back to the workstream that owns it
+      and to see what is *not yet* validated. Always included.
+    pr_origin: "always (live document)"
+    paths:
+      - docs/PROGRESS.md
+      - docs/PROPOSAL.md
+    optional: false
