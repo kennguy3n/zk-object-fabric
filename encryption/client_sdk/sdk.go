@@ -10,12 +10,14 @@
 //
 // On-disk frame for a chunk is:
 //
-//	| 24-byte nonce | ciphertext (plaintext_len + 16-byte Poly1305 tag) |
+//	| 24-byte nonce | 4-byte BE ciphertext length | ciphertext (plaintext_len + 16-byte Poly1305 tag) |
 //
-// All chunks except the last carry exactly DefaultChunkSize bytes of
-// plaintext. The last chunk may be shorter. Ciphertext chunks are
-// self-describing — the decryptor walks frames sequentially — so the
-// SDK does not need a separate manifest for framing metadata.
+// The 24+4 = 28-byte header (chunkHeaderSize) lets the decryptor
+// compute the next frame boundary without a separate manifest. All
+// chunks except the last carry exactly DefaultChunkSize bytes of
+// plaintext; the last chunk may be shorter. Ciphertext chunks are
+// self-describing — the decryptor walks frames sequentially using the
+// length prefix and verifies each AEAD tag in place.
 //
 // # Additional Authenticated Data (AAD)
 //
