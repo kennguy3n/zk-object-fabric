@@ -370,6 +370,42 @@ type GatewayConfig struct {
 	MaxRequestBytes int64    `json:"max_request_bytes"`
 	CachePath       string   `json:"cache_path"`
 
+	// ReadHeaderTimeout caps how long the gateway is willing to
+	// wait for the request headers to finish arriving before
+	// dropping the connection. A zero value here means "use
+	// ReadTimeout" (Go's default), which exposes the gateway to
+	// Slowloris-style attacks where a client opens many TCP
+	// connections and dribbles one byte of header at a time —
+	// each connection occupies a goroutine until ReadTimeout
+	// expires across the entire request body. Pinning a short
+	// ReadHeaderTimeout (default 10s) bounds the per-connection
+	// cost of header-stalling clients regardless of how long the
+	// body is.
+	//
+	// See tests/abuse/slowloris_test.go for the regression test
+	// that pins this defence.
+	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+
+	// IdleTimeout caps how long an idle keep-alive connection is
+	// kept open between requests. A zero value defaults to
+	// ReadTimeout, but mirroring Go's behaviour rather than
+	// stating it explicitly was the bug that let Slowloris-style
+	// connection-exhaustion attacks pin gateway goroutines for
+	// the full read window. Default 120s — long enough to amortise
+	// TCP+TLS handshake cost across burst-y S3 SDK requests,
+	// short enough that a client refusing to send a follow-up
+	// request loses its slot quickly.
+	IdleTimeout Duration `json:"idle_timeout"`
+
+	// MaxHeaderBytes caps the total size of request headers the
+	// gateway is willing to parse. A zero value uses Go's default
+	// of 1 MiB, which is wildly generous for an S3-compatible
+	// API where realistic SigV4 headers are under 4 KiB. The
+	// default applied here is 64 KiB — large enough for any
+	// reasonable SDK and small enough that a flood of
+	// oversized-header connections runs out of buffer quickly.
+	MaxHeaderBytes int `json:"max_header_bytes"`
+
 	// TLS configures the gateway's HTTPS listener. When both
 	// CertPath and KeyPath are set the listener runs HTTPS;
 	// otherwise it runs plain HTTP. Production deployments
@@ -797,6 +833,9 @@ func Default() Config {
 			ListenAddr:               ":8080",
 			ReadTimeout:              Duration(30 * time.Second),
 			WriteTimeout:             Duration(30 * time.Second),
+			ReadHeaderTimeout:        Duration(10 * time.Second),
+			IdleTimeout:              Duration(120 * time.Second),
+			MaxHeaderBytes:           64 * 1024,
 			MaxRequestBytes:          5 * 1024 * 1024 * 1024, // 5 GiB
 			CacheWarmingMemoryBudget: 512 * 1024 * 1024,      // 512 MiB
 			// CachePath defaults to empty so developer and test

@@ -328,11 +328,23 @@ func main() {
 	// so the client can quote it in a support ticket.
 	handler = requestid.Middleware(handler)
 
+	// ReadHeaderTimeout, IdleTimeout, and MaxHeaderBytes are the
+	// gateway's primary defences against Slowloris-style
+	// connection-exhaustion attacks. ReadTimeout alone is not
+	// sufficient because it covers the *entire* request body, so
+	// a client streaming a slow PUT can hold a goroutine open for
+	// the full window. ReadHeaderTimeout bounds the cheaper
+	// "header-stall" attack independently. See
+	// tests/abuse/slowloris_test.go for the regression test that
+	// pins these knobs.
 	srv := &http.Server{
-		Addr:         cfg.Gateway.ListenAddr,
-		Handler:      handler,
-		ReadTimeout:  cfg.Gateway.ReadTimeout.ToDuration(),
-		WriteTimeout: cfg.Gateway.WriteTimeout.ToDuration(),
+		Addr:              cfg.Gateway.ListenAddr,
+		Handler:           handler,
+		ReadTimeout:       cfg.Gateway.ReadTimeout.ToDuration(),
+		WriteTimeout:      cfg.Gateway.WriteTimeout.ToDuration(),
+		ReadHeaderTimeout: cfg.Gateway.ReadHeaderTimeout.ToDuration(),
+		IdleTimeout:       cfg.Gateway.IdleTimeout.ToDuration(),
+		MaxHeaderBytes:    cfg.Gateway.MaxHeaderBytes,
 	}
 
 	// fleetOrchestrator coordinates large multi-tenant
