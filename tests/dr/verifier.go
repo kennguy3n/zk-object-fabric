@@ -189,7 +189,7 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 	replDone := make(chan error, 1)
 	go func() { replDone <- repl.Run(replCtx) }()
 
-	if err := v.waitForDrain(ctx, repl, len(steadyObjects)); err != nil {
+	if err := v.waitForDrain(ctx, repl, steadyObjects); err != nil {
 		cancelRepl()
 		<-replDone
 		return rpt, fmt.Errorf("wait for steady drain: %w", err)
@@ -385,16 +385,37 @@ func (v *Verifier) seedRange(ctx context.Context, start, end int, tag string) ([
 	return out, nil
 }
 
-// waitForDrain polls the destination cell until expected
-// manifests are present or LagSettleTimeout elapses. The
-// replicator may issue several ticks before draining all
-// pieces; we use the manifest count as the ground-truth signal
-// because LagNanos resets to a non-zero value every tick.
-func (v *Verifier) waitForDrain(ctx context.Context, repl *cross_cell.Replicator, expected int) error {
+// waitForDrain polls the destination cell until every manifest
+// in expected has landed (or LagSettleTimeout elapses). The
+// drain signal is per-key Get rather than a List+count for two
+// reasons:
+//
+//  1. countDestManifests counts ALL manifests in the (tenant,
+//     bucket) scope, including any manifest pre-existing in
+//     dst before Run() started. A test that pre-stages a
+//     leaked-in-flight manifest in dst (e.g.
+//     TestVerifier_LeakedInFlightFailsRun) would race against
+//     the replicator: count >= expected can become true after
+//     only (expected - prestaged) steady objects have actually
+//     been copied. Phase 2 then cancels the replicator and
+//     verifyRecovery fails with "steady-object recovery short"
+//     instead of reaching the Phase-4 leak probe. Per-key Get
+//     is immune to pre-existing dst manifests at unrelated
+//     keys.
+//
+//  2. The timeout error becomes much more diagnostic — we can
+//     report exactly which steady keys are still missing rather
+//     than a single "count short by N" number.
+//
+// LagNanos cannot be used either because it resets to a
+// non-zero value every tick.
+func (v *Verifier) waitForDrain(ctx context.Context, repl *cross_cell.Replicator, expected []seededObject) error {
 	// If Source and Dest share a manifest store the replicator
-	// intentionally skips the Put (see replicator.go:200-202),
-	// so we cannot use manifest count as the drain signal.
-	// Fall back to CopiedPieces in that case.
+	// intentionally skips the Put (see replicator.go:200-202)
+	// and the keys appear in dst the moment seedRange writes
+	// them to src. Per-key Get is useless in that case, so fall
+	// back to CopiedPieces — which starts at 0 on a fresh
+	// Replicator and counts only pieces this run drained.
 	sharedStore := v.Source.Manifests == v.Dest.Manifests
 
 	deadline := time.NewTimer(v.LagSettleTimeout)
@@ -407,47 +428,69 @@ func (v *Verifier) waitForDrain(ctx context.Context, repl *cross_cell.Replicator
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			haveManifests, _ := v.countDestManifests(ctx)
+			missing := v.missingKeys(ctx, expected)
 			return fmt.Errorf(
-				"steady drain timed out after %s: dest manifests=%d, copied=%d, expected=%d, shared_store=%v",
-				v.LagSettleTimeout, haveManifests, repl.CopiedPieces(), expected, sharedStore,
+				"steady drain timed out after %s: missing=%d/%d, copied=%d, shared_store=%v, first_missing=%s",
+				v.LagSettleTimeout, len(missing), len(expected), repl.CopiedPieces(), sharedStore,
+				firstMissingObjectKey(missing),
 			)
 		case <-tick.C:
 			if sharedStore {
-				if repl.CopiedPieces() >= int64(expected) {
+				if repl.CopiedPieces() >= int64(len(expected)) {
 					return nil
 				}
 				continue
 			}
-			n, err := v.countDestManifests(ctx)
+			done, err := v.allDestManifestsPresent(ctx, expected)
 			if err != nil {
-				return fmt.Errorf("count dest manifests: %w", err)
+				return fmt.Errorf("check dest manifests: %w", err)
 			}
-			if n >= expected {
+			if done {
 				return nil
 			}
 		}
 	}
 }
 
-// countDestManifests counts the (tenant, bucket) manifests
-// present in the destination cell's manifest store, paging
-// through cursors so a large fixture does not silently
-// truncate.
-func (v *Verifier) countDestManifests(ctx context.Context) (int, error) {
-	cursor := ""
-	total := 0
-	for {
-		page, err := v.Dest.Manifests.List(ctx, v.TenantID, v.Bucket, cursor, 1000)
-		if err != nil {
-			return 0, err
+// allDestManifestsPresent returns true once every expected
+// manifest key resolves in the destination cell. A NOT-FOUND on
+// any key fails the check by returning false with a nil error
+// (the caller's polling loop will retry on the next tick). Any
+// other error from the store surfaces immediately so a flaky
+// dest store cannot be mistaken for a slow replicator.
+func (v *Verifier) allDestManifestsPresent(ctx context.Context, expected []seededObject) (bool, error) {
+	for _, obj := range expected {
+		_, err := v.Dest.Manifests.Get(ctx, obj.manifestKey)
+		if err == nil {
+			continue
 		}
-		total += len(page.Manifests)
-		if page.NextCursor == "" {
-			return total, nil
+		if errors.Is(err, manifest_store.ErrNotFound) {
+			return false, nil
 		}
-		cursor = page.NextCursor
+		return false, fmt.Errorf("dest Manifests.Get(%s): %w", obj.objectKey, err)
 	}
+	return true, nil
+}
+
+// missingKeys returns the subset of expected keys that did NOT
+// resolve in the dest cell. Used to build a diagnostic timeout
+// message — store errors are swallowed because the timeout path
+// is purely cosmetic at that point.
+func (v *Verifier) missingKeys(ctx context.Context, expected []seededObject) []seededObject {
+	out := make([]seededObject, 0, len(expected))
+	for _, obj := range expected {
+		if _, err := v.Dest.Manifests.Get(ctx, obj.manifestKey); err != nil {
+			out = append(out, obj)
+		}
+	}
+	return out
+}
+
+func firstMissingObjectKey(missing []seededObject) string {
+	if len(missing) == 0 {
+		return ""
+	}
+	return missing[0].objectKey
 }
 
 // verifyRecovery drives the recovery phase: it GETs every
@@ -520,6 +563,16 @@ func (v *Verifier) verifyRecovery(
 			continue
 		}
 		if firstGetAt.IsZero() {
+			// RTO is measured to the first successful piece OPEN,
+			// not to the first byte-validated body. Rationale: the
+			// production-meaningful event is "the dest cell served
+			// a recovery read"; ReadAll + bytes.Equal happen below
+			// and are guarded separately. The downstream gates at
+			// the bottom of this function (firstGetAt.IsZero() and
+			// RecoveredObjects < SteadyObjects) suppress
+			// MeasuredRTO whenever the run did not fully recover,
+			// so a JSON consumer can rely on MeasuredRTO > 0
+			// meaning "every steady object was recovered".
 			firstGetAt = now()
 		}
 		body, err := io.ReadAll(rc)

@@ -28,11 +28,22 @@ import (
 // fails so a misconfigured CI run cannot silently lose the
 // report (a missing artifact would otherwise look identical to
 // "test never ran").
+//
+// The parent directory of DR_REPORT_FILE is created if it
+// doesn't already exist so the CI workflow doesn't have to
+// remember to `mkdir -p` before invoking `go test`, and so
+// operators running the verifier locally can pass any path
+// without a prerequisite step.
 func maybeEmitReport(t *testing.T, rpt Report) {
 	t.Helper()
 	path := os.Getenv("DR_REPORT_FILE")
 	if path == "" {
 		return
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir parent of dr report %q: %v", path, err)
+		}
 	}
 	buf, err := json.MarshalIndent(rpt, "", "  ")
 	if err != nil {
