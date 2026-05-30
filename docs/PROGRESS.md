@@ -551,6 +551,11 @@ external load is run on it:
 - **Disaster-recovery exercises** — restore-from-backup runbooks
   exercised end-to-end, cross-cell replication failover, manifest-DB
   restore-and-resume, and customer-visible RPO / RTO measurement.
+  *Runbooks plus an automated in-process verifier published in
+  WS1.6 (see [`docs/runbooks/dr.md`](runbooks/dr.md) and
+  [`tests/dr/verifier.go`](../tests/dr/verifier.go) — Postgres /
+  cross-cell / manifest-resume drills still require operator-led
+  external exercises against real infrastructure).*
 - **Multi-tenant abuse / quota validation** — abuse-control trip
   thresholds tested under adversarial workloads (slowloris, key-space
   flood, egress-budget exhaustion).
