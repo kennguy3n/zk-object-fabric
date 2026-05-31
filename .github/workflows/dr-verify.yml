@@ -1,0 +1,64 @@
+name: dr-verify
+
+# Continuous DR verification. Runs the in-process disaster-recovery
+# verifier (tests/dr/verifier.go) on every PR and nightly on a cron
+# schedule, then uploads the JSON report as a build artifact so the
+# operator can trend RPO / RTO numbers over time. See
+# docs/runbooks/dr-verification.md for the schema and gates.
+
+on:
+  pull_request:
+    paths:
+      - "tests/dr/**"
+      - "migration/cross_cell/**"
+      - "metadata/manifest_store/**"
+      - "providers/**"
+      - ".github/workflows/dr-verify.yml"
+  push:
+    branches:
+      - main
+  schedule:
+    # Nightly at 06:00 UTC. Catches slow regressions that only
+    # show up under day-over-day churn (e.g. a replicator hot
+    # path that gains 100us per release).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  dr-verify:
+    name: dr-verifier (cross-cell async)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go build (all)
+        run: go build ./...
+
+      # -race flushes any concurrency regressions in the
+      # replicator / verifier seam. -count=1 disables the build
+      # cache so a stale package can't mask a real failure.
+      # DR_REPORT_FILE is consumed by TestVerifier_HappyPath
+      # (see tests/dr/verifier_test.go maybeEmitReport) which
+      # writes the report JSON to that absolute path.
+      - name: dr verifier
+        env:
+          DR_REPORT_FILE: ${{ github.workspace }}/artifacts/dr-report.json
+        run: |
+          mkdir -p artifacts
+          go test -race -count=1 -v ./tests/dr/... | tee artifacts/dr-test.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dr-verifier-report
+          path: artifacts/
+          retention-days: 30

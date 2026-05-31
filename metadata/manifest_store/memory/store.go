@@ -206,6 +206,44 @@ func cloneManifest(m *metadata.ObjectManifest) *metadata.ObjectManifest {
 	if m.PlacementPolicy.AllowedBackends != nil {
 		cp.PlacementPolicy.AllowedBackends = append([]string(nil), m.PlacementPolicy.AllowedBackends...)
 	}
+	// Deep-clone the pointer-typed policy fields nested under
+	// PlacementPolicy. The shallow struct copy above (`cp := *m`)
+	// duplicates the PlacementPolicy struct value, but pointer
+	// members of that struct still alias the source's pointees —
+	// so a caller that mutates the policy after a Put would see
+	// the mutation reflected in the stored copy (and vice versa,
+	// since Get returns a clone). The memory store is the
+	// reference contract for the ManifestStore interface, so it
+	// has to honour the "stored manifests are immutable once
+	// Put-ed" invariant byte-for-byte; the Postgres store honours
+	// it via SQL round-trip serialisation. Both pointer fields
+	// are documented as nilable in metadata/manifest.go (DedupPolicy
+	// nil = no dedup, ReplicationPolicy nil = no replication), so
+	// a nil check is the correct branch for the zero value.
+	if m.PlacementPolicy.ReplicationPolicy != nil {
+		rp := *m.PlacementPolicy.ReplicationPolicy
+		cp.PlacementPolicy.ReplicationPolicy = &rp
+	}
+	if m.PlacementPolicy.DedupPolicy != nil {
+		dp := *m.PlacementPolicy.DedupPolicy
+		cp.PlacementPolicy.DedupPolicy = &dp
+	}
+	// Deep-clone the EncryptionConfig.WrappedDEK byte slice. The
+	// shallow struct copy above duplicates the EncryptionConfig
+	// struct value, but []byte is a slice header and `cp.Encryption.
+	// WrappedDEK` still aliases the source's backing array — so a
+	// caller that mutates DEK bytes after a Put would corrupt the
+	// stored copy. In practice WrappedDEK is freshly allocated on
+	// each PUT path (via KMS/Vault wrap) and unlikely to be mutated,
+	// but the "stored manifests are immutable once Put-ed"
+	// invariant the doc above commits to must hold byte-for-byte;
+	// the cost of an extra alloc per Put/Get on the in-memory store
+	// is negligible compared to the cost of a latent aliasing bug
+	// in a security-sensitive code path. The Postgres store
+	// honours the invariant via SQL round-trip serialisation.
+	if m.Encryption.WrappedDEK != nil {
+		cp.Encryption.WrappedDEK = append([]byte(nil), m.Encryption.WrappedDEK...)
+	}
 	return &cp
 }
 

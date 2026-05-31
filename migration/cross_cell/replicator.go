@@ -177,8 +177,16 @@ func (r *Replicator) scanScope(ctx context.Context, sk ScopeKey) {
 // back to the source backend and the mirrored bytes would be
 // orphaned.
 func (r *Replicator) replicateOne(ctx context.Context, m *metadata.ObjectManifest) error {
+	// cloneManifestForReplica rewrites every piece's Backend to
+	// r.Dest.ID at clone time, so the per-piece rewrite that
+	// used to live in the copy loop below was dead code. Two
+	// places mutating the same field for the same reason
+	// invites a future change to diverge — concentrating the
+	// destination-mutation surface in the clone helper makes
+	// the data flow easier to reason about. (Devin Review on
+	// PR #79 flagged the redundancy as a readability hazard.)
 	replica := cloneManifestForReplica(m, r.Dest.ID)
-	for i, p := range m.Pieces {
+	for _, p := range m.Pieces {
 		if p.Backend == r.Dest.ID {
 			// Already on the destination — skip the copy
 			// but keep the manifest write so a stale
@@ -189,7 +197,6 @@ func (r *Replicator) replicateOne(ctx context.Context, m *metadata.ObjectManifes
 		if err := r.copyPiece(ctx, p); err != nil {
 			return err
 		}
-		replica.Pieces[i].Backend = r.Dest.ID
 		r.copied.Add(1)
 	}
 	// Skip the manifest write when the source and dest share a
