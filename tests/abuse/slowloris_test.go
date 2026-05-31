@@ -180,7 +180,7 @@ func TestSlowloris_ManyConnections_DoNotExhaustGoroutines(t *testing.T) {
 			for {
 				n, err := c.Read(b)
 				if err != nil {
-					if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "reset") {
+					if errors.Is(err, io.EOF) || containsAny(err.Error(), "closed", "reset") {
 						closed = true
 					}
 					break

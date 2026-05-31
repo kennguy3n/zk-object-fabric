@@ -1083,7 +1083,7 @@ func validateTimeoutOrder(name string, readHeader, read Duration) error {
 	}
 	if readHeader.ToDuration() > read.ToDuration() {
 		return fmt.Errorf(
-			"config: %s.read_header_timeout (%s) > %s.read_timeout (%s); ReadTimeout bounds the whole request including headers and would fire first, silently nullifying the header-stall defence. Lower read_header_timeout below read_timeout or raise read_timeout.",
+			"config: %s.read_header_timeout (%s) > %s.read_timeout (%s); ReadTimeout bounds the whole request including headers and would fire first, silently nullifying the header-stall defence; lower read_header_timeout below read_timeout or raise read_timeout",
 			name, readHeader.ToDuration(), name, read.ToDuration(),
 		)
 	}
