@@ -1,4 +1,4 @@
-# Build artefacts (audit bundles, etc.)
+# Build output (audit bundles, hand-off tarballs, etc.)
 /build/
 
 # Local Go binaries
