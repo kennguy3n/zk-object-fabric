@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -172,5 +173,145 @@ func TestCloneManifest_NilPolicyPointersStayNil(t *testing.T) {
 	}
 	if got.PlacementPolicy.DedupPolicy != nil {
 		t.Errorf("DedupPolicy = %+v, want nil", got.PlacementPolicy.DedupPolicy)
+	}
+}
+
+// TestCloneManifest_DeepClonesWrappedDEK pins that the
+// EncryptionConfig.WrappedDEK byte slice is deep-cloned across
+// Put/Get round-trips.
+//
+// Devin Review on PR #79 flagged that the original deep-clone
+// fix only covered the pointer fields under PlacementPolicy and
+// missed EncryptionConfig.WrappedDEK — a []byte that the shallow
+// `cp := *m` copies as a slice header still aliasing the
+// source's backing array. A caller that mutates the DEK bytes
+// after Put would corrupt the stored copy and (worse) any
+// concurrent reader's Get-returned copy, since both share the
+// backing array. WrappedDEK is freshly allocated on the production
+// PUT path so the aliasing window is narrow in practice, but the
+// "stored manifests are immutable once Put-ed" invariant must
+// hold byte-for-byte for security-sensitive code paths.
+//
+// The test does the full bidirectional round trip:
+//
+//  1. PUT a manifest with WrappedDEK populated.
+//  2. Mutate the caller's DEK bytes after Put.
+//  3. GET back and assert the stored DEK is still the original
+//     bytes, AND the GET-returned slice is a different backing
+//     array (not the caller's, not the store's).
+//  4. Mutate the GET-returned slice and re-GET; the stored copy
+//     must still hold the original bytes.
+func TestCloneManifest_DeepClonesWrappedDEK(t *testing.T) {
+	t.Parallel()
+
+	store := New()
+	ctx := context.Background()
+	key := manifest_store.ManifestKey{
+		TenantID:      "t1",
+		Bucket:        "b1",
+		ObjectKeyHash: "h1",
+		VersionID:     "v1",
+	}
+	originalDEK := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+	callerDEK := append([]byte(nil), originalDEK...)
+
+	manifest := &metadata.ObjectManifest{
+		TenantID:      "t1",
+		Bucket:        "b1",
+		ObjectKey:     "k1",
+		ObjectKeyHash: "h1",
+		VersionID:     "v1",
+		Encryption: metadata.EncryptionConfig{
+			Mode:          "managed",
+			Algorithm:     "xchacha20-poly1305",
+			KeyID:         "kms-key-1",
+			WrappedDEK:    callerDEK,
+			WrapAlgorithm: "aes-256-gcm",
+		},
+	}
+
+	if err := store.Put(ctx, key, manifest); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Mutate the caller's DEK bytes AFTER the Put. The store's
+	// stored clone must not observe these mutations.
+	for i := range callerDEK {
+		callerDEK[i] = 0xFF
+	}
+
+	got, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(got.Encryption.WrappedDEK, originalDEK) {
+		t.Errorf("WrappedDEK after caller-side mutation = %x, want %x (caller mutation leaked into stored copy)",
+			got.Encryption.WrappedDEK, originalDEK)
+	}
+	// The GET-returned slice must not share a backing array with
+	// the caller's mutated slice. Comparing the first byte of each
+	// is a sufficient check because the caller-side loop above
+	// overwrote every byte to 0xFF.
+	if len(got.Encryption.WrappedDEK) > 0 && len(callerDEK) > 0 &&
+		&got.Encryption.WrappedDEK[0] == &callerDEK[0] {
+		t.Fatal("WrappedDEK shares backing array with caller's slice — clone is shallow")
+	}
+
+	// The inverse path: mutate the GET-returned DEK and re-GET.
+	// The stored copy must still hold the original bytes.
+	for i := range got.Encryption.WrappedDEK {
+		got.Encryption.WrappedDEK[i] = 0xAA
+	}
+	got2, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get (re-read): %v", err)
+	}
+	if !bytes.Equal(got2.Encryption.WrappedDEK, originalDEK) {
+		t.Errorf("WrappedDEK after Get-side mutation = %x, want %x (Get-returned slice aliases stored copy)",
+			got2.Encryption.WrappedDEK, originalDEK)
+	}
+}
+
+// TestCloneManifest_NilWrappedDEKStaysNil pins that the
+// deep-clone path does not turn a legitimately-nil WrappedDEK
+// into a non-nil empty slice. The `omitempty` JSON tag on
+// WrappedDEK depends on nil == "no DEK" (i.e. client-side
+// encryption where the gateway never sees the key), so a clone
+// that materialised an empty slice would corrupt the serialised
+// representation.
+func TestCloneManifest_NilWrappedDEKStaysNil(t *testing.T) {
+	t.Parallel()
+
+	store := New()
+	ctx := context.Background()
+	key := manifest_store.ManifestKey{
+		TenantID:      "t1",
+		Bucket:        "b1",
+		ObjectKeyHash: "h1",
+		VersionID:     "v1",
+	}
+	manifest := &metadata.ObjectManifest{
+		TenantID:      "t1",
+		Bucket:        "b1",
+		ObjectKey:     "k1",
+		ObjectKeyHash: "h1",
+		VersionID:     "v1",
+		Encryption: metadata.EncryptionConfig{
+			Mode:      "client_side",
+			Algorithm: "xchacha20-poly1305",
+			// WrappedDEK left nil: client holds the DEK.
+		},
+	}
+
+	if err := store.Put(ctx, key, manifest); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Encryption.WrappedDEK != nil {
+		t.Errorf("WrappedDEK = %x, want nil (client_side mode must not materialise an empty DEK)",
+			got.Encryption.WrappedDEK)
 	}
 }

@@ -228,6 +228,22 @@ func cloneManifest(m *metadata.ObjectManifest) *metadata.ObjectManifest {
 		dp := *m.PlacementPolicy.DedupPolicy
 		cp.PlacementPolicy.DedupPolicy = &dp
 	}
+	// Deep-clone the EncryptionConfig.WrappedDEK byte slice. The
+	// shallow struct copy above duplicates the EncryptionConfig
+	// struct value, but []byte is a slice header and `cp.Encryption.
+	// WrappedDEK` still aliases the source's backing array — so a
+	// caller that mutates DEK bytes after a Put would corrupt the
+	// stored copy. In practice WrappedDEK is freshly allocated on
+	// each PUT path (via KMS/Vault wrap) and unlikely to be mutated,
+	// but the "stored manifests are immutable once Put-ed"
+	// invariant the doc above commits to must hold byte-for-byte;
+	// the cost of an extra alloc per Put/Get on the in-memory store
+	// is negligible compared to the cost of a latent aliasing bug
+	// in a security-sensitive code path. The Postgres store
+	// honours the invariant via SQL round-trip serialisation.
+	if m.Encryption.WrappedDEK != nil {
+		cp.Encryption.WrappedDEK = append([]byte(nil), m.Encryption.WrappedDEK...)
+	}
 	return &cp
 }
 
