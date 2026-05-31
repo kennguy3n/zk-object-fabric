@@ -95,6 +95,21 @@ func main() {
 		cfg.Encryption.AllowLocalCMK = true
 	}
 
+	// Cross-field config validation runs AFTER CLI overrides so
+	// the error message reflects the effective configuration the
+	// gateway is actually about to use (a flag that overrode a
+	// JSON value into an inconsistent state would otherwise slip
+	// past). The current checks catch operational footguns the
+	// type system cannot — e.g. read_header_timeout >
+	// read_timeout would silently nullify the Slowloris defence
+	// because ReadTimeout fires first. Refusing to start is the
+	// right failure mode here; a degraded edge defence is worse
+	// than no edge defence because it gives a false sense of
+	// security in the runbook.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
+
 	// Open exactly one *sql.DB for the metadata DSN and share it
 	// across every Postgres-backed store. This keeps
 	// ControlPlaneConfig.MaxOpenConns as a single
@@ -328,11 +343,35 @@ func main() {
 	// so the client can quote it in a support ticket.
 	handler = requestid.Middleware(handler)
 
+	// ReadHeaderTimeout, IdleTimeout, and MaxHeaderBytes are the
+	// gateway's primary defences against Slowloris-style
+	// connection-exhaustion attacks. ReadTimeout alone is not
+	// sufficient because it covers the *entire* request body, so
+	// a client streaming a slow PUT can hold a goroutine open for
+	// the full window. ReadHeaderTimeout bounds the cheaper
+	// "header-stall" attack independently. See
+	// tests/abuse/slowloris_test.go for the regression test that
+	// pins these knobs.
+	//
+	// MaxHeaderBytes routes through config.EffectiveMaxHeaderBytes
+	// so a hand-rolled config explicitly setting the field to 0
+	// re-floors to config.DefaultMaxHeaderBytes (64 KiB) instead
+	// of falling through to Go's stdlib 1 MiB default. This
+	// collapses the explicit-0 and omitted-field paths so the
+	// operator's diff is the only way to land at a different
+	// effective ceiling. (Devin Review ANALYSIS_0001 on PR #80
+	// flagged the prior 1-MiB fallback inconsistency.)
+	warnIfSlowlorisDisabled("gateway", cfg.Gateway.ListenAddr, cfg.Gateway.ReadHeaderTimeout)
+	gatewayMaxHeaderBytes := config.EffectiveMaxHeaderBytes(cfg.Gateway.MaxHeaderBytes)
+	logEffectiveMaxHeaderBytes("gateway", cfg.Gateway.ListenAddr, gatewayMaxHeaderBytes)
 	srv := &http.Server{
-		Addr:         cfg.Gateway.ListenAddr,
-		Handler:      handler,
-		ReadTimeout:  cfg.Gateway.ReadTimeout.ToDuration(),
-		WriteTimeout: cfg.Gateway.WriteTimeout.ToDuration(),
+		Addr:              cfg.Gateway.ListenAddr,
+		Handler:           handler,
+		ReadTimeout:       cfg.Gateway.ReadTimeout.ToDuration(),
+		WriteTimeout:      cfg.Gateway.WriteTimeout.ToDuration(),
+		ReadHeaderTimeout: cfg.Gateway.ReadHeaderTimeout.ToDuration(),
+		IdleTimeout:       cfg.Gateway.IdleTimeout.ToDuration(),
+		MaxHeaderBytes:    gatewayMaxHeaderBytes,
 	}
 
 	// fleetOrchestrator coordinates large multi-tenant
@@ -426,6 +465,61 @@ func tlsVersionLabel(v uint16) string {
 	default:
 		return fmt.Sprintf("0x%04x", v)
 	}
+}
+
+// warnIfSlowlorisDisabled emits a structured WARN log line at
+// startup when the named listener is enabled (ListenAddr non-
+// empty) but its ReadHeaderTimeout is zero or negative. Zero
+// ReadHeaderTimeout is a legitimate operator opt-out (the field
+// docs document this and Validate() accepts it), but it disables
+// the cheaper header-stall Slowloris defence entirely, so the
+// fleet observability signal is what operators rely on to notice
+// the misconfiguration. Logging at startup rather than refusing
+// to start preserves the opt-out while making it auditable: a
+// log scraper match on "slowloris-defence-disabled" surfaces
+// every node running with the protection off. (Devin Review
+// ANALYSIS_0003 on PR #80 flagged the silent-opt-out path.)
+func warnIfSlowlorisDisabled(name, listenAddr string, readHeader config.Duration) {
+	if listenAddr == "" {
+		return
+	}
+	if readHeader > 0 {
+		return
+	}
+	log.Printf(
+		"gateway: %s listener WARN slowloris-defence-disabled: read_header_timeout=%s on %s; Slowloris header-stall protection is OFF (zero ReadHeaderTimeout means the entire ReadTimeout window must elapse before a slow-header attacker is dropped). Set %s.read_header_timeout to a non-zero duration (default 10s) unless you have a deliberate reason to disable.",
+		name, readHeader.ToDuration(), listenAddr, name,
+	)
+}
+
+// logEffectiveMaxHeaderBytes records the effective MaxHeaderBytes
+// ceiling at startup for the named listener. Sibling of
+// warnIfSlowlorisDisabled — both surface security-critical effective
+// configuration in the startup log so operators auditing a node have
+// a single regex (`gateway: %s listener …`) that captures the whole
+// surface.
+//
+// PR #80 lowered the default effective ceiling from Go stdlib's
+// 1 MiB to 64 KiB (DefaultMaxHeaderBytes in internal/config) as a
+// header-size Slowloris defence — an attacker mass-spraying enormous
+// header blobs is rejected with HTTP 431 instead of being allowed to
+// allocate a megabyte per connection. The reduction is intentional
+// (Devin Review ANALYSIS_0003 on PR #80 flagged the upgrade hazard
+// for deployments running heavy JWT auth or many `x-amz-meta-*`
+// custom metadata headers), and the structured startup log line
+// here is the operator-facing audit trail: a log-scraper grep on
+// `effective_max_header_bytes=` surfaces the deployed value across
+// every node so a deployment hitting unexpected 431s can verify the
+// ceiling without re-reading config. Operators can raise it per
+// listener via `<name>.max_header_bytes`.
+func logEffectiveMaxHeaderBytes(name, listenAddr string, maxBytes int) {
+	if listenAddr == "" {
+		return
+	}
+	log.Printf(
+		"gateway: %s listener effective_max_header_bytes=%d on %s (raise %s.max_header_bytes if your deployment uses unusually large request headers, e.g. heavy JWT auth or many x-amz-meta-* custom metadata keys; pre-PR-#80 Go stdlib default was 1048576)",
+		name, maxBytes, listenAddr, name,
+	)
 }
 
 // startListener picks ListenAndServeTLS vs ListenAndServe based on
@@ -1501,7 +1595,45 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 	}
 	go func() { _ = mon.Run(ctx) }()
 	if hc.ListenAddr != "" {
-		srv := &http.Server{Addr: hc.ListenAddr, Handler: mon.ServeMux("")}
+		// Slowloris hardening for the health endpoints: the
+		// internal /health surface is normally fronted by a
+		// cluster-internal listener (the comment block on
+		// HealthConfig.ListenAddr notes "e.g. :29090"), but a
+		// misconfigured NetworkPolicy or a debug deployment that
+		// exposes the listener directly should not be silently
+		// vulnerable. Apply the same five knobs the gateway and
+		// console servers use (ReadTimeout, WriteTimeout,
+		// ReadHeaderTimeout, IdleTimeout, MaxHeaderBytes); the
+		// defaults (ReadTimeout 30s, WriteTimeout 30s,
+		// ReadHeaderTimeout 10s, IdleTimeout 120s, MaxHeaderBytes
+		// 64 KiB) come from HealthConfig.Default() so an upgrade
+		// picks them up automatically without a config edit.
+		//
+		// ReadTimeout and WriteTimeout are included even though
+		// the current /health surface is GET-only with tiny
+		// responses: they are defence-in-depth for any future
+		// POST/PUT health endpoint (drain control, manual quorum
+		// override) and ReadTimeout is also the upper bound
+		// validateTimeoutOrder enforces ReadHeaderTimeout to
+		// stay strictly below — a missing ReadTimeout would
+		// silently let an operator set ReadHeaderTimeout to any
+		// value, masking the misconfig the validator is meant
+		// to catch on the gateway and console. (Devin Review
+		// ANALYSIS_0004 on PR #80 added ReadTimeout;
+		// ANALYSIS_0001 on ef092a6 added WriteTimeout for the
+		// same symmetry.)
+		warnIfSlowlorisDisabled("health", hc.ListenAddr, hc.ReadHeaderTimeout)
+		healthMaxHeaderBytes := config.EffectiveMaxHeaderBytes(hc.MaxHeaderBytes)
+		logEffectiveMaxHeaderBytes("health", hc.ListenAddr, healthMaxHeaderBytes)
+		srv := &http.Server{
+			Addr:              hc.ListenAddr,
+			Handler:           mon.ServeMux(""),
+			ReadTimeout:       hc.ReadTimeout.ToDuration(),
+			WriteTimeout:      hc.WriteTimeout.ToDuration(),
+			ReadHeaderTimeout: hc.ReadHeaderTimeout.ToDuration(),
+			IdleTimeout:       hc.IdleTimeout.ToDuration(),
+			MaxHeaderBytes:    healthMaxHeaderBytes,
+		}
 		go func() {
 			log.Printf("gateway: health endpoints on %s", hc.ListenAddr)
 			if err := startListener(srv, hc.TLS, env, "health"); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1569,11 +1701,27 @@ func startConsoleAPI(
 	mux := http.NewServeMux()
 	h.Register(mux)
 
+	// Slowloris hardening: ReadHeaderTimeout / IdleTimeout /
+	// MaxHeaderBytes mirror the gateway's posture so a
+	// misconfigured ingress that accidentally exposes the console
+	// API to the internet is not silently exploitable. The
+	// defaults are set in config.Default(); MaxHeaderBytes routes
+	// through config.EffectiveMaxHeaderBytes so an explicit-0 in
+	// the JSON config re-floors to config.DefaultMaxHeaderBytes
+	// (64 KiB) instead of falling through to Go's 1 MiB stdlib
+	// default (matches gateway and health; Devin Review
+	// ANALYSIS_0001 on PR #80).
+	warnIfSlowlorisDisabled("console", cfg.Console.ListenAddr, cfg.Console.ReadHeaderTimeout)
+	consoleMaxHeaderBytes := config.EffectiveMaxHeaderBytes(cfg.Console.MaxHeaderBytes)
+	logEffectiveMaxHeaderBytes("console", cfg.Console.ListenAddr, consoleMaxHeaderBytes)
 	srv := &http.Server{
-		Addr:         cfg.Console.ListenAddr,
-		Handler:      mux,
-		ReadTimeout:  cfg.Console.ReadTimeout.ToDuration(),
-		WriteTimeout: cfg.Console.WriteTimeout.ToDuration(),
+		Addr:              cfg.Console.ListenAddr,
+		Handler:           mux,
+		ReadTimeout:       cfg.Console.ReadTimeout.ToDuration(),
+		WriteTimeout:      cfg.Console.WriteTimeout.ToDuration(),
+		ReadHeaderTimeout: cfg.Console.ReadHeaderTimeout.ToDuration(),
+		IdleTimeout:       cfg.Console.IdleTimeout.ToDuration(),
+		MaxHeaderBytes:    consoleMaxHeaderBytes,
 	}
 	go func() {
 		log.Printf("gateway: console API on %s", cfg.Console.ListenAddr)

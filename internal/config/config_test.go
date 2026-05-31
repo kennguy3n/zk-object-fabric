@@ -402,3 +402,284 @@ func TestGatewayConfig_CacheWarmingMemoryBudget_NegativeDisablesGuard(t *testing
 		t.Fatalf("CacheWarmingMemoryBudget = %d, want -1 (disabled)", got)
 	}
 }
+
+// TestConfig_Validate_RejectsHeaderTimeoutGreaterThanRead pins the
+// cross-field check that surfaces the Slowloris-defence footgun:
+// when ReadHeaderTimeout > ReadTimeout, ReadTimeout (which bounds
+// the entire request lifecycle including headers and body) fires
+// first and the cheaper header-stall timeout is never reached.
+// Devin Review on PR #80 flagged this as an unguarded operational
+// pitfall; this test pins the guard so a future refactor that
+// drops the check fails loudly here rather than in production.
+func TestConfig_Validate_RejectsHeaderTimeoutGreaterThanRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutator func(c *Config)
+		wantErr string
+	}{
+		{
+			name: "gateway",
+			mutator: func(c *Config) {
+				c.Gateway.ReadTimeout = Duration(30 * time.Second)
+				c.Gateway.ReadHeaderTimeout = Duration(60 * time.Second)
+			},
+			wantErr: "gateway.read_header_timeout",
+		},
+		{
+			name: "console",
+			mutator: func(c *Config) {
+				// Enable the console listener so the timeout-
+				// order check actually fires; Default() sets
+				// ListenAddr="" which would skip it under the
+				// gating added for BUG_0001 on PR #80.
+				c.Console.ListenAddr = ":8081"
+				c.Console.ReadTimeout = Duration(15 * time.Second)
+				c.Console.ReadHeaderTimeout = Duration(20 * time.Second)
+			},
+			wantErr: "console.read_header_timeout",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutator(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate returned nil, want error mentioning %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestConfig_Validate_AcceptsDefault locks in the invariant that
+// Default() returns a Config that Validate() accepts. A future
+// change that lowers the gateway ReadTimeout below the
+// ReadHeaderTimeout default (10s) would break this test before
+// any deployment does the same thing accidentally.
+func TestConfig_Validate_AcceptsDefault(t *testing.T) {
+	cfg := Default()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Default() failed Validate: %v", err)
+	}
+}
+
+// TestConfig_Validate_EqualHeaderAndReadTimeoutsAllowed allows the
+// operator to set ReadHeaderTimeout == ReadTimeout — there is no
+// silent nullification at the boundary (both fire at the same
+// moment) and an operator who pins them equal has explicitly
+// chosen a single timeout window. The guard is a strict
+// less-than-or-equal check, not a less-than check.
+func TestConfig_Validate_EqualHeaderAndReadTimeoutsAllowed(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.ReadTimeout = Duration(30 * time.Second)
+	cfg.Gateway.ReadHeaderTimeout = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected equal timeouts: %v", err)
+	}
+}
+
+// TestConfig_Validate_ZeroTimeoutSkipsCheck pins that the guard
+// no-ops when either ReadTimeout or ReadHeaderTimeout is zero so
+// deployments that intentionally leave one unset (e.g. only
+// ReadTimeout configured, ReadHeaderTimeout left to Go's
+// default) are not blocked.
+func TestConfig_Validate_ZeroTimeoutSkipsCheck(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.ReadTimeout = 0
+	cfg.Gateway.ReadHeaderTimeout = Duration(60 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected zero ReadTimeout: %v", err)
+	}
+}
+
+// TestConfig_Validate_ConsoleTimeoutOrderSkippedWhenListenAddrEmpty
+// pins symmetric ListenAddr gating between the console and health
+// listeners. Both are opt-in (Default() sets ListenAddr=""), and
+// startConsoleAPI / startHealthMonitor return early when ListenAddr
+// is empty, so refusing to start the gateway because an UNUSED
+// console listener has inconsistent timeouts is unnecessarily strict.
+// (Devin Review BUG_0001 on PR #80 commit ef092a6 flagged the
+// original asymmetry where the console check was unconditional
+// while the health check was gated.)
+func TestConfig_Validate_ConsoleTimeoutOrderSkippedWhenListenAddrEmpty(t *testing.T) {
+	cfg := Default()
+	cfg.Console.ListenAddr = ""
+	cfg.Console.ReadTimeout = Duration(15 * time.Second)
+	cfg.Console.ReadHeaderTimeout = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned error when console.listen_addr empty: %v", err)
+	}
+}
+
+// TestConfig_Validate_ConsoleTimeoutOrderEnforcedWhenListenAddrSet
+// pins the other half of the gated contract: once the console
+// listener is enabled, its timeout-order check fires exactly like
+// the gateway and health listeners. Without this test the gate
+// added for BUG_0001 could silently grow into a full bypass.
+func TestConfig_Validate_ConsoleTimeoutOrderEnforcedWhenListenAddrSet(t *testing.T) {
+	cfg := Default()
+	cfg.Console.ListenAddr = ":8081"
+	cfg.Console.ReadTimeout = Duration(15 * time.Second)
+	cfg.Console.ReadHeaderTimeout = Duration(30 * time.Second)
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate returned nil, want console timeout-order error")
+	}
+	if !strings.Contains(err.Error(), "console.read_header_timeout") {
+		t.Fatalf("Validate error %q does not mention console.read_header_timeout", err.Error())
+	}
+}
+
+// TestDefault_HealthHasWriteTimeout pins that HealthConfig.Default()
+// includes a non-zero WriteTimeout matching the gateway / console
+// posture. The field was omitted in ef092a6 and the bot flagged
+// the asymmetry (Devin Review ANALYSIS_0001 on PR #80 commit
+// ef092a6): the doc comment claimed "same four knobs" but the
+// gateway/console actually set five (Read + Write + ReadHeader +
+// Idle + MaxHeader). Adding WriteTimeout closes the gap so a
+// future POST/PUT health endpoint cannot inherit Go's stdlib
+// no-write-timeout default.
+func TestDefault_HealthHasWriteTimeout(t *testing.T) {
+	cfg := Default()
+	if cfg.Health.WriteTimeout <= 0 {
+		t.Fatalf("Default().Health.WriteTimeout = %s, want a positive value", cfg.Health.WriteTimeout)
+	}
+	if cfg.Health.WriteTimeout != cfg.Gateway.WriteTimeout {
+		t.Errorf(
+			"Default().Health.WriteTimeout (%s) != Gateway.WriteTimeout (%s); the comment in startHealthMonitor advertises matched defaults",
+			cfg.Health.WriteTimeout, cfg.Gateway.WriteTimeout,
+		)
+	}
+}
+
+// TestConfig_Validate_HealthTimeoutOrderEnforcedWhenListenAddrSet
+// pins that Validate() now extends the gateway/console timeout-
+// order check to the health listener as well, but ONLY when its
+// ListenAddr is set. The health monitor still runs as a quorum
+// watcher when ListenAddr is empty, but the timeout knobs are
+// inert in that mode and a misconfig there cannot harm anything,
+// so blocking startup on it would be unnecessarily strict.
+//
+// The validator catches the ReadHeaderTimeout > ReadTimeout
+// footgun on the health listener exactly as it does on the
+// gateway and console — Devin Review ANALYSIS_0004 on PR #80
+// observed the health server omitted the bound, and this test
+// pins the symmetric guard going forward.
+func TestConfig_Validate_HealthTimeoutOrderEnforcedWhenListenAddrSet(t *testing.T) {
+	cfg := Default()
+	cfg.Health.ListenAddr = ":29090"
+	cfg.Health.ReadTimeout = Duration(15 * time.Second)
+	cfg.Health.ReadHeaderTimeout = Duration(30 * time.Second)
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate returned nil, want health timeout-order error")
+	}
+	if !strings.Contains(err.Error(), "health.read_header_timeout") {
+		t.Fatalf("Validate error %q does not mention health.read_header_timeout", err.Error())
+	}
+}
+
+// TestConfig_Validate_HealthTimeoutOrderSkippedWhenListenAddrEmpty
+// pins the other half of the contract: the health listener
+// timeout-order check is suppressed when ListenAddr == "" because
+// the monitor only runs as a background quorum watcher and the
+// HTTP timeout knobs are inert. Operators who do not expose the
+// health surface as HTTP can leave the timeout fields at any
+// value (including misconfigured ones) without blocking gateway
+// startup.
+func TestConfig_Validate_HealthTimeoutOrderSkippedWhenListenAddrEmpty(t *testing.T) {
+	cfg := Default()
+	cfg.Health.ListenAddr = ""
+	cfg.Health.ReadTimeout = Duration(15 * time.Second)
+	cfg.Health.ReadHeaderTimeout = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned error when health.listen_addr empty: %v", err)
+	}
+}
+
+// TestEffectiveMaxHeaderBytes_FloorsExplicitZero pins the contract
+// from EffectiveMaxHeaderBytes's doc: explicit-0 and omitted-field
+// must produce the same effective MaxHeaderBytes (our 64 KiB
+// DefaultMaxHeaderBytes), NOT Go's stdlib 1 MiB fallback. This is
+// the structural fix for Devin Review ANALYSIS_0001 on PR #80 —
+// the prior http.Server construction sites used an inline
+//
+//	if v <= 0 { v = http.DefaultMaxHeaderBytes }
+//
+// pattern that re-floored explicit-0 to 1 MiB while
+// HealthConfig.Default() / GatewayConfig.Default() /
+// ConsoleConfig.Default() floored omitted-field to 64 KiB,
+// creating a 16x ceiling asymmetry between two operationally
+// equivalent config inputs. Routing every site through this
+// helper collapses the two paths so the only way to reach 1 MiB
+// is to explicitly set the field to >= 1 MiB.
+func TestEffectiveMaxHeaderBytes_FloorsExplicitZero(t *testing.T) {
+	cases := map[string]struct {
+		input int
+		want  int
+	}{
+		"positive":          {input: 4096, want: 4096},
+		"default-64-KiB":    {input: DefaultMaxHeaderBytes, want: DefaultMaxHeaderBytes},
+		"explicit-zero":     {input: 0, want: DefaultMaxHeaderBytes},
+		"explicit-negative": {input: -1, want: DefaultMaxHeaderBytes},
+		"large-positive":    {input: 1 << 20, want: 1 << 20},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := EffectiveMaxHeaderBytes(tc.input)
+			if got != tc.want {
+				t.Fatalf("EffectiveMaxHeaderBytes(%d) = %d, want %d", tc.input, got, tc.want)
+			}
+		})
+	}
+	if DefaultMaxHeaderBytes != 64*1024 {
+		t.Errorf("DefaultMaxHeaderBytes = %d, want 64*1024 (64 KiB)", DefaultMaxHeaderBytes)
+	}
+}
+
+// TestDefault_HealthHasReadTimeout pins that HealthConfig.Default()
+// includes a non-zero ReadTimeout. The field was omitted in the
+// original WS1.7 PR #80 hardening and the bot (Devin Review
+// ANALYSIS_0004) flagged the asymmetry vs gateway/console. With
+// the field added, this test guards against a regression that
+// reverts to the missing-ReadTimeout state, which would silently
+// nullify the health-listener timeout-order Validate() check
+// (validateTimeoutOrder returns nil when either side is zero).
+func TestDefault_HealthHasReadTimeout(t *testing.T) {
+	cfg := Default()
+	if cfg.Health.ReadTimeout <= 0 {
+		t.Fatalf("Default().Health.ReadTimeout = %s, want a positive value", cfg.Health.ReadTimeout)
+	}
+	if cfg.Health.ReadTimeout < cfg.Health.ReadHeaderTimeout {
+		t.Fatalf(
+			"Default().Health: ReadHeaderTimeout (%s) > ReadTimeout (%s) \u2014 a self-validation failure on Default() should be impossible",
+			cfg.Health.ReadHeaderTimeout, cfg.Health.ReadTimeout,
+		)
+	}
+}
+
+// TestDefault_AllMaxHeaderBytesRouteThroughConstant pins that the
+// Default() values for the three listener MaxHeaderBytes fields
+// match DefaultMaxHeaderBytes. Without this, a future contributor
+// who lowers (or raises) DefaultMaxHeaderBytes for one listener
+// could create the same asymmetry between explicit-0 and
+// omitted-field that ANALYSIS_0001 originally flagged. The
+// constant is the single source of truth: every listener's
+// Default() must use it.
+func TestDefault_AllMaxHeaderBytesRouteThroughConstant(t *testing.T) {
+	cfg := Default()
+	if cfg.Gateway.MaxHeaderBytes != DefaultMaxHeaderBytes {
+		t.Errorf("Gateway.MaxHeaderBytes default = %d, want DefaultMaxHeaderBytes (%d)",
+			cfg.Gateway.MaxHeaderBytes, DefaultMaxHeaderBytes)
+	}
+	if cfg.Console.MaxHeaderBytes != DefaultMaxHeaderBytes {
+		t.Errorf("Console.MaxHeaderBytes default = %d, want DefaultMaxHeaderBytes (%d)",
+			cfg.Console.MaxHeaderBytes, DefaultMaxHeaderBytes)
+	}
+	if cfg.Health.MaxHeaderBytes != DefaultMaxHeaderBytes {
+		t.Errorf("Health.MaxHeaderBytes default = %d, want DefaultMaxHeaderBytes (%d)",
+			cfg.Health.MaxHeaderBytes, DefaultMaxHeaderBytes)
+	}
+}
