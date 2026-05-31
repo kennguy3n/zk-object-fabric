@@ -502,34 +502,79 @@ func TestHMACAuthenticator_ChunkedSeedSignature(t *testing.T) {
 		t.Fatalf("Timestamp = %q, want %q", res.Timestamp, stamp)
 	}
 
-	// VerifyChunkSignature should be deterministic given the seed
+	// ComputeChunkSignature should be deterministic given the seed
 	// signature, signing key, and chunk bytes; running it twice on
 	// the same input must produce the same output.
 	chunk := []byte("hello, chunked!\n")
-	first, err := VerifyChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope)
+	first, err := ComputeChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope)
 	if err != nil {
-		t.Fatalf("VerifyChunkSignature: %v", err)
+		t.Fatalf("ComputeChunkSignature: %v", err)
 	}
-	second, err := VerifyChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope)
+	second, err := ComputeChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope)
 	if err != nil {
-		t.Fatalf("VerifyChunkSignature (second call): %v", err)
+		t.Fatalf("ComputeChunkSignature (second call): %v", err)
 	}
 	if first != second {
-		t.Fatalf("VerifyChunkSignature is not deterministic: %q vs %q", first, second)
+		t.Fatalf("ComputeChunkSignature is not deterministic: %q vs %q", first, second)
 	}
 	if len(first) != 64 {
-		t.Fatalf("VerifyChunkSignature returned %d hex chars, want 64", len(first))
+		t.Fatalf("ComputeChunkSignature returned %d hex chars, want 64", len(first))
+	}
+
+	// VerifyChunkSignature accepts the correctly-recomputed
+	// signature and rejects anything else.
+	verified, err := VerifyChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope, first)
+	if err != nil {
+		t.Fatalf("VerifyChunkSignature with correct sig: %v", err)
+	}
+	if verified != first {
+		t.Fatalf("VerifyChunkSignature returned %q, want %q", verified, first)
+	}
+	// Flip a single hex nibble in the middle of the signature to
+	// produce a still-well-formed but wrong signature.
+	badBytes := []byte(first)
+	if badBytes[len(badBytes)/2] == '0' {
+		badBytes[len(badBytes)/2] = '1'
+	} else {
+		badBytes[len(badBytes)/2] = '0'
+	}
+	if _, err := VerifyChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope, string(badBytes)); err == nil {
+		t.Fatal("VerifyChunkSignature with mutated sig: want error, got nil")
+	}
+	// Empty receivedSig must never authenticate.
+	if _, err := VerifyChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope, ""); err == nil {
+		t.Fatal("VerifyChunkSignature with empty receivedSig: want error, got nil")
+	}
+	// Truncated receivedSig (different length) must never authenticate.
+	if _, err := VerifyChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope, first[:32]); err == nil {
+		t.Fatal("VerifyChunkSignature with truncated receivedSig: want error, got nil")
+	}
+	// Even a single trailing whitespace difference must fail.
+	if _, err := VerifyChunkSignature(res.SeedSig, chunk, res.SigningKey, res.Timestamp, res.Scope, first+" "); err == nil {
+		t.Fatal("VerifyChunkSignature with trailing-space receivedSig: want error, got nil")
+	}
+}
+
+func TestComputeChunkSignature_RequiresKeyAndScope(t *testing.T) {
+	if _, err := ComputeChunkSignature("seed", []byte("data"), nil, "ts", "scope"); err == nil {
+		t.Fatal("ComputeChunkSignature with nil key: want error, got nil")
+	}
+	if _, err := ComputeChunkSignature("seed", []byte("data"), []byte("k"), "", "scope"); err == nil {
+		t.Fatal("ComputeChunkSignature with empty timestamp: want error, got nil")
+	}
+	if _, err := ComputeChunkSignature("seed", []byte("data"), []byte("k"), "ts", ""); err == nil {
+		t.Fatal("ComputeChunkSignature with empty scope: want error, got nil")
 	}
 }
 
 func TestVerifyChunkSignature_RequiresKeyAndScope(t *testing.T) {
-	if _, err := VerifyChunkSignature("seed", []byte("data"), nil, "ts", "scope"); err == nil {
+	if _, err := VerifyChunkSignature("seed", []byte("data"), nil, "ts", "scope", "sig"); err == nil {
 		t.Fatal("VerifyChunkSignature with nil key: want error, got nil")
 	}
-	if _, err := VerifyChunkSignature("seed", []byte("data"), []byte("k"), "", "scope"); err == nil {
+	if _, err := VerifyChunkSignature("seed", []byte("data"), []byte("k"), "", "scope", "sig"); err == nil {
 		t.Fatal("VerifyChunkSignature with empty timestamp: want error, got nil")
 	}
-	if _, err := VerifyChunkSignature("seed", []byte("data"), []byte("k"), "ts", ""); err == nil {
+	if _, err := VerifyChunkSignature("seed", []byte("data"), []byte("k"), "ts", "", "sig"); err == nil {
 		t.Fatal("VerifyChunkSignature with empty scope: want error, got nil")
 	}
 }
