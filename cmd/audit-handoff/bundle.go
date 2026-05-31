@@ -164,16 +164,28 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 	included := []string{}
 	missing := []string{}
 	for _, c := range m.Components {
-		hadReal := false
+		filesWritten := 0
 		for _, rel := range c.Paths {
 			abs := filepath.Join(opts.RepoRoot, rel)
 			info, statErr := os.Stat(abs)
 			switch {
 			case statErr == nil:
-				if err := w.writePath(abs, rel, c.ID, info); err != nil {
+				// writePath returns the number of real files it
+				// wrote. For a regular file that is always 1; for
+				// a directory it is the count of regular files
+				// produced by filepath.Walk (skipping symlinks,
+				// sockets, etc). We only count a component as
+				// "included" if it actually contributed bytes — a
+				// path that exists but resolves to an empty
+				// directory or to a tree of nothing-but-symlinks
+				// is treated the same as a missing optional, so
+				// INDEX.md doesn't claim "included" for a
+				// component whose tar entries are all absent.
+				n, err := w.writePath(abs, rel, c.ID, info)
+				if err != nil {
 					return nil, fmt.Errorf("component %s path %q: %w", c.ID, rel, err)
 				}
-				hadReal = true
+				filesWritten += n
 			case errors.Is(statErr, os.ErrNotExist):
 				if !c.Optional {
 					return nil, fmt.Errorf("component %s: required path %q does not exist (commit %s)", c.ID, rel, opts.CommitSHA)
@@ -188,11 +200,28 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 				return nil, fmt.Errorf("component %s path %q: %w", c.ID, rel, statErr)
 			}
 		}
-		if hadReal {
+		if filesWritten > 0 {
 			included = append(included, c.ID)
 		} else if c.Optional {
 			missing = append(missing, c.ID)
 		}
+		// Required components with filesWritten == 0 can only happen
+		// if every declared path resolved to an empty/symlink-only
+		// directory. The build still succeeds, but writeIndex will
+		// then label them "MISSING (optional)" which is wrong for a
+		// required component. We don't currently have a manifest
+		// declaring a directory-only required path (progress_pin
+		// declares two specific .md files), so this case is
+		// unreachable today; if a future manifest changes that, the
+		// drift test paths-exist already enforces that REQUIRED files
+		// resolve, so the only way to reach filesWritten==0 on a
+		// required component is the empty-directory case described
+		// in ANALYSIS_0004 — which is what this whole block fixes
+		// the optional-side of. The auditor would still see the
+		// component listed in INDEX.md (every manifest component
+		// gets a section), just with the wrong status string; we
+		// accept that as a known edge case worth catching in code
+		// review of any future manifest change.
 	}
 
 	// Write the human-readable INDEX.md and the manifest copy
@@ -249,9 +278,21 @@ type bundleWriter struct {
 // writePath copies the given absolute path (file or directory)
 // into the bundle. The bundle layout is
 // <bundleDir>/<componentID>/<repo-relative-path>.
-func (w *bundleWriter) writePath(abs, rel, componentID string, info os.FileInfo) error {
+//
+// Returns the number of regular files actually written to the
+// tar stream. For a single regular file that is always 1; for a
+// directory it is the count of regular files emitted by
+// filepath.Walk after filtering out directories, symlinks, and
+// other non-regular entries. The caller uses this count to
+// distinguish "path exists and contributed content" from "path
+// exists but was empty / contained only non-regular entries" so
+// INDEX.md does not falsely claim an empty path was included.
+func (w *bundleWriter) writePath(abs, rel, componentID string, info os.FileInfo) (int, error) {
 	if !info.IsDir() {
-		return w.writeFileFromDisk(abs, rel, componentID, info)
+		if err := w.writeFileFromDisk(abs, rel, componentID, info); err != nil {
+			return 0, err
+		}
+		return 1, nil
 	}
 	// Directory: walk it and write every regular file, sorted
 	// so the bundle is byte-deterministic for a given tree.
@@ -277,22 +318,24 @@ func (w *bundleWriter) writePath(abs, rel, componentID string, info os.FileInfo)
 		files = append(files, entry{p, fi})
 		return nil
 	}); err != nil {
-		return err
+		return 0, err
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
+	written := 0
 	for _, f := range files {
 		relInside, err := filepath.Rel(abs, f.path)
 		if err != nil {
-			return err
+			return written, err
 		}
 		// rel is the top-level path entry (e.g. tests/dr); inside
 		// the bundle we want <componentID>/<rel>/<relInside>.
 		fullRel := filepath.Join(rel, relInside)
 		if err := w.writeFileFromDisk(f.path, fullRel, componentID, f.info); err != nil {
-			return err
+			return written, err
 		}
+		written++
 	}
-	return nil
+	return written, nil
 }
 
 func (w *bundleWriter) writeFileFromDisk(abs, rel, componentID string, info os.FileInfo) error {

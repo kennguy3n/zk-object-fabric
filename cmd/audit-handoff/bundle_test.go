@@ -284,6 +284,85 @@ components:
 	}
 }
 
+// TestBuild_EmptyOptionalDirNotCountedAsIncluded pins the
+// fix for the ANALYSIS_0004 finding: a component whose declared
+// path resolves to a directory that exists but contains zero
+// regular files (symlinks/sockets only, or genuinely empty) must
+// be reported as ComponentsMissing, not ComponentsIncluded.
+// Before the fix, `hadReal = true` was set whenever os.Stat
+// succeeded, so the component falsely appeared in INDEX.md as
+// "included" despite contributing nothing to the tar stream.
+func TestBuild_EmptyOptionalDirNotCountedAsIncluded(t *testing.T) {
+	repoRoot := t.TempDir()
+	mustWrite(t, filepath.Join(repoRoot, "go.mod"), "module x\ngo 1.25\n")
+	mustWrite(t, filepath.Join(repoRoot, "anchor.md"), "anchor\n")
+
+	// Make an empty directory that the manifest's optional
+	// component will point at. The directory exists (stat
+	// succeeds) but writePath's filepath.Walk produces zero
+	// regular-file entries.
+	if err := os.MkdirAll(filepath.Join(repoRoot, "empty_optional_dir"), 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+
+	manifestPath := filepath.Join(repoRoot, "manifest.yaml")
+	mustWrite(t, manifestPath, `
+version: 1
+bundle_name: synth
+output_dir: out
+components:
+  - id: anchor
+    title: Anchor
+    description: x
+    pr_origin: x
+    paths:
+      - anchor.md
+    optional: false
+  - id: empty_opt
+    title: Empty Optional
+    description: x
+    pr_origin: "#999"
+    paths:
+      - empty_optional_dir
+    optional: true
+`)
+	m, err := LoadManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	res, err := Build(m, BundleOptions{
+		RepoRoot:     repoRoot,
+		ManifestPath: manifestPath,
+		CommitSHA:    "abc",
+		SkipMake:     true,
+		Out:          io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if contains(res.ComponentsIncluded, "empty_opt") {
+		t.Errorf("empty optional dir was wrongly counted as included; res.ComponentsIncluded=%v, res.ComponentsMissing=%v", res.ComponentsIncluded, res.ComponentsMissing)
+	}
+	if !contains(res.ComponentsMissing, "empty_opt") {
+		t.Errorf("empty optional dir should be in ComponentsMissing; got included=%v missing=%v", res.ComponentsIncluded, res.ComponentsMissing)
+	}
+	// INDEX.md must label this component as MISSING (optional),
+	// not "included", so an auditor isn't told to look for files
+	// that aren't there.
+	files := readTarball(t, res.OutputPath)
+	idx := files["INDEX.md"]
+	// The component header line is "## empty_opt — Empty Optional";
+	// the next status line is "Status: **MISSING (optional)**".
+	if !strings.Contains(idx, "empty_opt — Empty Optional") {
+		t.Errorf("INDEX.md missing component header; got:\n%s", idx)
+	}
+	// Find the status line for empty_opt: it must be MISSING,
+	// not "included".
+	if strings.Contains(idx, "## empty_opt — Empty Optional\n\nStatus: **included**") {
+		t.Errorf("INDEX.md falsely reports empty optional dir as included:\n%s", idx)
+	}
+}
+
 func TestLoadManifest_RejectsUnknownFields(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "m.yaml")
