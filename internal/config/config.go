@@ -13,6 +13,37 @@ import (
 	"time"
 )
 
+// DefaultMaxHeaderBytes is the floor applied by Default() to every
+// HTTP listener config (gateway, console, health). It is exported
+// so http.Server construction sites can apply the same floor when
+// a hand-rolled JSON config explicitly sets the field to zero —
+// matching the effective behavior of an omitted field (which
+// Default() populates) rather than falling through to Go's stdlib
+// http.DefaultMaxHeaderBytes (1 MiB).
+//
+// The bot's review observation (ANALYSIS_0001 on PR #80) called
+// out the surprise: omitted-field → 64 KiB, explicit-0 → 1 MiB.
+// Routing both through this constant collapses the two paths so
+// the only way to get the larger 1 MiB ceiling is to explicitly
+// set the field to that value (which an attentive operator would
+// then see in their config diff).
+const DefaultMaxHeaderBytes = 64 * 1024
+
+// EffectiveMaxHeaderBytes returns v when v > 0, otherwise
+// DefaultMaxHeaderBytes. Use this at every http.Server
+// construction site in place of an inline
+//
+//	if v <= 0 { v = http.DefaultMaxHeaderBytes }
+//
+// pattern so explicit-0 and omitted-field produce the same
+// effective MaxHeaderBytes ceiling.
+func EffectiveMaxHeaderBytes(v int) int {
+	if v > 0 {
+		return v
+	}
+	return DefaultMaxHeaderBytes
+}
+
 // Duration is a time.Duration that (un)marshals through JSON using
 // the human-readable syntax accepted by time.ParseDuration
 // (e.g. "30s", "5m", "250ms"). Bare JSON numbers are rejected to
@@ -302,7 +333,37 @@ type ConsoleConfig struct {
 	ListenAddr   string   `json:"listen_addr"`
 	ReadTimeout  Duration `json:"read_timeout"`
 	WriteTimeout Duration `json:"write_timeout"`
-	AdminToken   string   `json:"admin_token"`
+
+	// ReadHeaderTimeout caps how long the console server waits
+	// for request headers to arrive. Like the gateway's same-named
+	// knob, this is the production Slowloris guard: a connected
+	// client that dribbles header bytes is forcibly closed when
+	// the timeout fires. The default (see Default()) is 10s,
+	// matching the gateway's posture so a misconfigured ingress
+	// that accidentally exposes the console API to the internet
+	// is not silently exploitable. Operators who terminate TLS
+	// upstream of the console server and rely on the proxy's own
+	// timeouts can lower this — but it should never be 0.
+	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+
+	// IdleTimeout bounds the lifetime of a keep-alive connection
+	// between requests. Used to evict idle slowloris connections
+	// holding sockets open with no in-flight request. Default 120s.
+	IdleTimeout Duration `json:"idle_timeout"`
+
+	// MaxHeaderBytes caps total header size for a single request.
+	// Default 64 KiB — large enough for any realistic console
+	// payload, small enough to bound the memory cost of a flood
+	// of oversized-header connections. A hand-rolled config that
+	// explicitly sets this to 0 (or any non-positive value) is
+	// re-floored to DefaultMaxHeaderBytes (64 KiB) at server
+	// construction via EffectiveMaxHeaderBytes; the operator must
+	// set the field to an explicit larger value to relax the
+	// ceiling, so the only way to silently land at Go's stdlib
+	// 1 MiB fallback is to do so deliberately.
+	MaxHeaderBytes int `json:"max_header_bytes"`
+
+	AdminToken string `json:"admin_token"`
 
 	// TLS configures the console API's HTTPS listener. Same
 	// semantics as GatewayConfig.TLS — empty CertPath / KeyPath
@@ -369,6 +430,44 @@ type GatewayConfig struct {
 	WriteTimeout    Duration `json:"write_timeout"`
 	MaxRequestBytes int64    `json:"max_request_bytes"`
 	CachePath       string   `json:"cache_path"`
+
+	// ReadHeaderTimeout caps how long the gateway is willing to
+	// wait for the request headers to finish arriving before
+	// dropping the connection. A zero value here means "use
+	// ReadTimeout" (Go's default), which exposes the gateway to
+	// Slowloris-style attacks where a client opens many TCP
+	// connections and dribbles one byte of header at a time —
+	// each connection occupies a goroutine until ReadTimeout
+	// expires across the entire request body. Pinning a short
+	// ReadHeaderTimeout (default 10s) bounds the per-connection
+	// cost of header-stalling clients regardless of how long the
+	// body is.
+	//
+	// See tests/abuse/slowloris_test.go for the regression test
+	// that pins this defence.
+	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+
+	// IdleTimeout caps how long an idle keep-alive connection is
+	// kept open between requests. A zero value defaults to
+	// ReadTimeout, but mirroring Go's behaviour rather than
+	// stating it explicitly was the bug that let Slowloris-style
+	// connection-exhaustion attacks pin gateway goroutines for
+	// the full read window. Default 120s — long enough to amortise
+	// TCP+TLS handshake cost across burst-y S3 SDK requests,
+	// short enough that a client refusing to send a follow-up
+	// request loses its slot quickly.
+	IdleTimeout Duration `json:"idle_timeout"`
+
+	// MaxHeaderBytes caps the total size of request headers the
+	// gateway is willing to parse. Default 64 KiB — large enough
+	// for any reasonable SDK (realistic SigV4 headers are under
+	// 4 KiB) and small enough that a flood of oversized-header
+	// connections runs out of buffer quickly. A hand-rolled config
+	// that explicitly sets this to 0 (or any non-positive value)
+	// is re-floored to DefaultMaxHeaderBytes (64 KiB) at server
+	// construction via EffectiveMaxHeaderBytes so explicit-0 and
+	// omitted-field produce the same effective ceiling.
+	MaxHeaderBytes int `json:"max_header_bytes"`
 
 	// TLS configures the gateway's HTTPS listener. When both
 	// CertPath and KeyPath are set the listener runs HTTPS;
@@ -594,6 +693,60 @@ type HealthConfig struct {
 	// TLS at a load balancer typically leave this empty even in
 	// production.
 	TLS TLSConfig `json:"tls"`
+
+	// ReadHeaderTimeout caps how long the health endpoint server
+	// waits for request headers to arrive. The internal health
+	// endpoints are normally fronted by a cluster-internal
+	// listener that NetworkPolicy hides from the public internet,
+	// but a misconfigured NetworkPolicy or a debug deployment
+	// that exposes the listener directly would otherwise be
+	// silently vulnerable to Slowloris-style header-stalling.
+	// Mirror the gateway / console posture (10s default, see
+	// Default()) so the hardening is defence-in-depth, not
+	// opt-in.
+	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+
+	// IdleTimeout caps the lifetime of an idle keep-alive
+	// connection between requests. Default 120s. The health
+	// monitor's primary client is the peer-quorum poller which
+	// reuses TCP across PollInterval ticks; the 120s ceiling is
+	// well above the conventional PollInterval (default 2s) so
+	// reused connections are not churned, but bounded so an
+	// abandoned client cannot pin a goroutine indefinitely.
+	IdleTimeout Duration `json:"idle_timeout"`
+
+	// MaxHeaderBytes caps total header size for a single health
+	// request. Default 64 KiB — far larger than any realistic
+	// /health request needs but bounded so an attacker cannot
+	// trivially exhaust memory per connection. Like the gateway
+	// and console knobs, explicit-0 is re-floored to
+	// DefaultMaxHeaderBytes (64 KiB) at server construction via
+	// EffectiveMaxHeaderBytes.
+	MaxHeaderBytes int `json:"max_header_bytes"`
+
+	// ReadTimeout caps the wall-clock duration of a single health
+	// request (headers + body). The internal /health surface is
+	// GET-only with no request body, so this primarily serves as
+	// defence-in-depth for a future POST/PUT health surface (e.g.
+	// drain control, manual quorum override) and as the upper
+	// bound that ReadHeaderTimeout must stay strictly below to
+	// avoid the silent-nullification footgun documented on
+	// ReadHeaderTimeout. Default 30s matches the gateway / console
+	// posture. Validate() refuses to start when
+	// ReadHeaderTimeout > ReadTimeout for this listener.
+	ReadTimeout Duration `json:"read_timeout"`
+
+	// WriteTimeout caps the wall-clock duration of a single
+	// health response. Today the /health surface returns tiny
+	// JSON bodies in single-digit milliseconds, but a future
+	// POST/PUT health endpoint (drain control, manual quorum
+	// override) would inherit Go's default of no write timeout
+	// without this field — letting a slow or misbehaving client
+	// hold a writer goroutine indefinitely. Default 30s matches
+	// the gateway and console posture. (Devin Review
+	// ANALYSIS_0001 on PR #80 commit ef092a6 flagged the missing
+	// knob.)
+	WriteTimeout Duration `json:"write_timeout"`
 }
 
 // HealthPeer is a single peer gateway in the cell.
@@ -797,6 +950,9 @@ func Default() Config {
 			ListenAddr:               ":8080",
 			ReadTimeout:              Duration(30 * time.Second),
 			WriteTimeout:             Duration(30 * time.Second),
+			ReadHeaderTimeout:        Duration(10 * time.Second),
+			IdleTimeout:              Duration(120 * time.Second),
+			MaxHeaderBytes:           DefaultMaxHeaderBytes,
 			MaxRequestBytes:          5 * 1024 * 1024 * 1024, // 5 GiB
 			CacheWarmingMemoryBudget: 512 * 1024 * 1024,      // 512 MiB
 			// CachePath defaults to empty so developer and test
@@ -841,11 +997,97 @@ func Default() Config {
 		// (":8081" is the conventional port) alongside an admin
 		// authenticator at the reverse-proxy layer.
 		Console: ConsoleConfig{
-			ListenAddr:   "",
-			ReadTimeout:  Duration(30 * time.Second),
-			WriteTimeout: Duration(30 * time.Second),
+			ListenAddr:        "",
+			ReadTimeout:       Duration(30 * time.Second),
+			WriteTimeout:      Duration(30 * time.Second),
+			ReadHeaderTimeout: Duration(10 * time.Second),
+			IdleTimeout:       Duration(120 * time.Second),
+			MaxHeaderBytes:    DefaultMaxHeaderBytes,
+		},
+		// Health endpoint Slowloris defaults match the gateway and
+		// console posture so an upgrade picks them up automatically
+		// (see HealthConfig.ReadHeaderTimeout doc for threat model).
+		Health: HealthConfig{
+			ReadTimeout:       Duration(30 * time.Second),
+			WriteTimeout:      Duration(30 * time.Second),
+			ReadHeaderTimeout: Duration(10 * time.Second),
+			IdleTimeout:       Duration(120 * time.Second),
+			MaxHeaderBytes:    DefaultMaxHeaderBytes,
 		},
 	}
+}
+
+// Validate performs cross-field sanity checks that cannot be
+// expressed structurally. The intent is to surface operational
+// footguns at startup with a clear error message rather than
+// silently letting the http.Server use a configuration that
+// undermines the security knobs the operator thought they were
+// setting.
+//
+// Today the only checks are on the gateway, console, and health
+// listener timeouts: ReadHeaderTimeout > ReadTimeout would mean
+// ReadTimeout (which bounds the *entire* request lifecycle
+// including headers + body) fires first and the cheaper
+// header-stall timeout is never reached. An operator setting
+// ReadHeaderTimeout=60s with ReadTimeout=30s is almost certainly
+// confused about which knob does what, and the gateway should
+// refuse to start rather than silently degrade their Slowloris
+// defence. The console and health listeners are only checked
+// when their ListenAddr is set (without a listener the timeouts
+// are inert configuration values that cannot harm anything, and
+// refusing to start on an unused listener's misconfig would be
+// unnecessarily strict). The gateway is unconditional because it
+// is the data plane — startup without a gateway listener is not
+// a supported deployment shape.
+//
+// Validate is called by Load() after JSON unmarshaling so config
+// files exercise the checks. Callers constructing a Config
+// programmatically (tests, fixtures) should also call Validate
+// before passing the value to a server constructor.
+func (c *Config) Validate() error {
+	if err := validateTimeoutOrder("gateway", c.Gateway.ReadHeaderTimeout, c.Gateway.ReadTimeout); err != nil {
+		return err
+	}
+	// Console and health both gate their timeout-order checks on
+	// ListenAddr because both listeners are opt-in: the
+	// ConsoleConfig default ListenAddr is "" and startConsoleAPI
+	// returns immediately when it is empty, and the same applies
+	// to startHealthMonitor's HTTP surface. An operator who
+	// overrides a timeout field without enabling the listener
+	// would otherwise have the gateway refuse to start for an
+	// inert misconfig that has no runtime effect. (Devin Review
+	// BUG_0001 on PR #80 flagged the original console asymmetry.)
+	if c.Console.ListenAddr != "" {
+		if err := validateTimeoutOrder("console", c.Console.ReadHeaderTimeout, c.Console.ReadTimeout); err != nil {
+			return err
+		}
+	}
+	if c.Health.ListenAddr != "" {
+		if err := validateTimeoutOrder("health", c.Health.ReadHeaderTimeout, c.Health.ReadTimeout); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateTimeoutOrder enforces ReadHeaderTimeout < ReadTimeout
+// on a listener whose config exposes both. Equal values are
+// accepted because they are an explicit operator choice (the
+// listener degrades to a single timeout window without any
+// hidden silent-nullification — both knobs fire at the same
+// moment). Returns nil when either timeout is zero so deployments
+// that intentionally leave one unset are not blocked.
+func validateTimeoutOrder(name string, readHeader, read Duration) error {
+	if readHeader <= 0 || read <= 0 {
+		return nil
+	}
+	if readHeader.ToDuration() > read.ToDuration() {
+		return fmt.Errorf(
+			"config: %s.read_header_timeout (%s) > %s.read_timeout (%s); ReadTimeout bounds the whole request including headers and would fire first, silently nullifying the header-stall defence; lower read_header_timeout below read_timeout or raise read_timeout",
+			name, readHeader.ToDuration(), name, read.ToDuration(),
+		)
+	}
+	return nil
 }
 
 // Load reads a JSON configuration file from path and returns a fully
@@ -858,6 +1100,9 @@ func Load(path string) (Config, error) {
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("config: validate %s: %w", path, err)
 	}
 	return cfg, nil
 }

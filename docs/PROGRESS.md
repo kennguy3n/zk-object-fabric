@@ -569,6 +569,11 @@ external load is run on it:
 - **Disaster-recovery exercises** — restore-from-backup runbooks
   exercised end-to-end, cross-cell replication failover, manifest-DB
   restore-and-resume, and customer-visible RPO / RTO measurement.
+  *Runbooks plus an automated in-process verifier published in
+  WS1.6 (see [`docs/runbooks/dr.md`](runbooks/dr.md) and
+  [`tests/dr/verifier.go`](../tests/dr/verifier.go) — Postgres /
+  cross-cell / manifest-resume drills still require operator-led
+  external exercises against real infrastructure).*
 - **Multi-tenant abuse / quota validation** — abuse-control trip
   thresholds tested under adversarial workloads (slowloris, key-space
   flood, egress-budget exhaustion).
@@ -622,6 +627,17 @@ machine-enforced gates in [`tests/benchmark/suite.go`](../tests/benchmark/suite.
 `TargetErrorRateMax`, `TargetRPSEfficiencyMin`). They are gated by
 [`cmd/benchmark-runner`](../cmd/benchmark-runner/) and by the
 `load-test-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+
+For the full numeric envelope — including the S3 protocol limits
+(max object size, multipart parts/sizes), the per-cell sizing range
+(2–20 PiB usable), the availability target derived from the error-rate
+ceiling, and the explicit enumeration of open operational targets (the
+three TBDs above plus the audit-bundle cross-reference map) — see
+[`docs/CAPACITY.md`](CAPACITY.md). That document is sourced from a
+single Go module ([`tests/capacity`](../tests/capacity/)) so any
+constant change breaks a pinned test until the doc, the gate, and the
+audit-bundle cross-reference all move together.
+
 See [`docs/runbooks/load-testing.md`](runbooks/load-testing.md) for the
 end-to-end procedure (local CI smoke → Ceph RGW demo → Linode + Wasabi
 staging) and the schema of the JSON reports the harness emits.
