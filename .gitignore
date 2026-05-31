@@ -1,5 +1,15 @@
-# Audit bundle staging / output (per `make audit-bundle`).
-build/
+# Build artefacts (audit bundles, etc.)
+/build/
 
-# Local Go binaries.
+# Local Go binaries
 /bin/
+
+# Local Go test scratch
+*.test
+*.out
+coverage.txt
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
