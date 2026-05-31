@@ -58,7 +58,7 @@ components:
       - docs/security/audit-package-cryptography.md
       - docs/security/findings/README.md
     make_target: audit-bundle
-    optional: true
+    optional: false
 
   - id: capacity_dossier
     title: Capacity envelope dossier

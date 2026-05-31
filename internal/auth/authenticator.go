@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -82,7 +83,8 @@ func sigV4PercentEncode(s string) string {
 //     (Authorization: AWS4-HMAC-SHA256 ...). Also handles
 //     aws-chunked streaming uploads by validating the seed
 //     signature and returning the signing key so the handler can
-//     verify per-chunk signatures (see VerifyChunkSignature).
+//     verify per-chunk signatures (see ComputeChunkSignature /
+//     VerifyChunkSignature).
 //
 // Future strategies (STS temporary credentials, SigV4A multi-region)
 // can be added without modifying the dispatch by appending to
@@ -111,7 +113,8 @@ type AuthResult struct {
 
 	// SigningKey is the derived SigV4 signing key. Non-nil only
 	// for chunked requests; chunk verifiers feed this key to
-	// VerifyChunkSignature to validate the chunk chain.
+	// ComputeChunkSignature / VerifyChunkSignature to validate
+	// the chunk chain.
 	SigningKey []byte
 
 	// SeedSig is the seed signature reported in the Authorization
@@ -226,7 +229,8 @@ func (a *HMACAuthenticator) AuthenticateEx(r *http.Request) (AuthResult, error) 
 // "aws-chunked" the seed signature is validated using the
 // STREAMING-AWS4-HMAC-SHA256-PAYLOAD payload hash and the
 // AuthResult carries the signing key so the handler can run
-// per-chunk signature verification via VerifyChunkSignature.
+// per-chunk signature verification via
+// ComputeChunkSignature / VerifyChunkSignature.
 type HeaderV4Strategy struct{}
 
 // Name returns the strategy's stable identifier.
@@ -463,7 +467,7 @@ func isChunkedRequest(r *http.Request) bool {
 	return false
 }
 
-// VerifyChunkSignature recomputes and compares the signature for a
+// ComputeChunkSignature derives the expected SigV4 signature for a
 // single aws-chunked chunk. The chunk-string-to-sign is:
 //
 //	"AWS4-HMAC-SHA256-PAYLOAD\n" +
@@ -473,20 +477,25 @@ func isChunkedRequest(r *http.Request) bool {
 //	hex(sha256("")) + "\n" +
 //	hex(sha256(chunkData))
 //
-// On success the returned signature is the value the next chunk
-// must chain off of in its own prevSig field.
+// The returned signature is the expected value for the chunk and
+// also the value the next chunk must chain off of in its own
+// prevSig field. Callers that need to authenticate a received
+// chunk-signature header against the expected value must use
+// VerifyChunkSignature, which wraps ComputeChunkSignature plus a
+// subtle.ConstantTimeCompare so the comparison cannot accidentally
+// degrade to a timing-vulnerable `==` / `strings.EqualFold`.
 //
 // This function is a building block for the chunked-upload handler;
 // the strategy layer only validates the seed signature in the
 // Authorization header. It is exported so the multipart/streaming
 // path can call it once per chunk without needing to depend on the
 // internal SigV4 helpers.
-func VerifyChunkSignature(prevSig string, chunkData []byte, signingKey []byte, timestamp, scope string) (string, error) {
+func ComputeChunkSignature(prevSig string, chunkData []byte, signingKey []byte, timestamp, scope string) (string, error) {
 	if len(signingKey) == 0 {
-		return "", errors.New("auth: chunk verification requires a signing key")
+		return "", errors.New("auth: chunk signature computation requires a signing key")
 	}
 	if timestamp == "" || scope == "" {
-		return "", errors.New("auth: chunk verification requires timestamp and scope")
+		return "", errors.New("auth: chunk signature computation requires timestamp and scope")
 	}
 	emptyHash := sha256.Sum256(nil)
 	chunkHash := sha256.Sum256(chunkData)
@@ -499,6 +508,35 @@ func VerifyChunkSignature(prevSig string, chunkData []byte, signingKey []byte, t
 		hex.EncodeToString(chunkHash[:]),
 	}, "\n")
 	return hex.EncodeToString(hmacSHA256(signingKey, stringToSign)), nil
+}
+
+// VerifyChunkSignature authenticates a received chunk-signature
+// header against the expected SigV4 chunk signature derived from
+// the previous chain link, the chunk bytes, and the SigV4 signing
+// scope. On a successful match it returns the expected signature
+// so the caller can use it as the prevSig anchor for the next
+// chunk in the chain.
+//
+// The comparison uses subtle.ConstantTimeCompare to avoid leaking
+// timing information about which prefix of the signature matched.
+// receivedSig and the expected signature are both hex-encoded
+// lower-case (per the AWS SigV4 spec); the comparison is performed
+// on the raw hex bytes, which is safe because hex encoding is
+// canonical for a given byte string. Callers should pass
+// receivedSig exactly as it appeared in the chunk header without
+// case normalisation.
+//
+// A nil or empty receivedSig also produces a mismatch error —
+// the function never reports success for an absent signature.
+func VerifyChunkSignature(prevSig string, chunkData []byte, signingKey []byte, timestamp, scope, receivedSig string) (string, error) {
+	expected, err := ComputeChunkSignature(prevSig, chunkData, signingKey, timestamp, scope)
+	if err != nil {
+		return "", err
+	}
+	if len(receivedSig) != len(expected) || subtle.ConstantTimeCompare([]byte(receivedSig), []byte(expected)) != 1 {
+		return "", errors.New("auth: chunk signature mismatch")
+	}
+	return expected, nil
 }
 
 // stripQueryParam removes every occurrence of the given parameter

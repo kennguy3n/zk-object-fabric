@@ -10,12 +10,14 @@
 //
 // On-disk frame for a chunk is:
 //
-//	| 24-byte nonce | ciphertext (plaintext_len + 16-byte Poly1305 tag) |
+//	| 24-byte nonce | 4-byte BE ciphertext length | ciphertext (plaintext_len + 16-byte Poly1305 tag) |
 //
-// All chunks except the last carry exactly DefaultChunkSize bytes of
-// plaintext. The last chunk may be shorter. Ciphertext chunks are
-// self-describing — the decryptor walks frames sequentially — so the
-// SDK does not need a separate manifest for framing metadata.
+// The 24+4 = 28-byte header (chunkHeaderSize) lets the decryptor
+// compute the next frame boundary without a separate manifest. All
+// chunks except the last carry exactly DefaultChunkSize bytes of
+// plaintext; the last chunk may be shorter. Ciphertext chunks are
+// self-describing — the decryptor walks frames sequentially using the
+// length prefix and verifies each AEAD tag in place.
 //
 // # Additional Authenticated Data (AAD)
 //
@@ -118,6 +120,47 @@ const ConvergentNonceInfo = "zkof-nonce-v1"
 func EncryptObject(plaintext io.Reader, dek DataEncryptionKey, opts Options) (io.Reader, error) {
 	if plaintext == nil {
 		return nil, errors.New("client_sdk: plaintext is required")
+	}
+	// Reject ConvergentNonce + ChunkAAD as a footgun. The two
+	// options pursue *contradictory* goals and combining them
+	// produces silently-broken output that *looks* successful:
+	//
+	//   * ConvergentNonce derives the per-chunk nonce from
+	//     (DEK, chunkIndex) so that identical plaintext sealed
+	//     under a content-derived DEK (see DeriveConvergentDEK
+	//     in keygen.go) yields byte-identical ciphertext across
+	//     tenants and uploads — the foundation of Pattern C
+	//     cross-context client-side deduplication.
+	//
+	//   * ChunkAAD binds every chunk's Poly1305 tag to operator-
+	//     supplied context (tenant_id, object_id, ...). Two
+	//     callers with different ChunkAAD values, sealing the
+	//     same plaintext under the same convergent DEK, produce
+	//     identical *ciphertext bytes* (same key, same nonce,
+	//     same plaintext) but *different* MAC tags. A storage
+	//     backend that dedups on ciphertext bytes alone (which
+	//     is the natural shape — tags are per-recipient) would
+	//     point both tenants at the same physical block, then
+	//     fail authentication for whichever tenant's tag was
+	//     not the one persisted. Worse, if the backend dedups
+	//     and stores only one tag, the *other* tenant's chunks
+	//     become silently undecryptable on read-back even though
+	//     EncryptObject reported success.
+	//
+	// The two flags cannot both be honoured. Rather than
+	// silently winning one and breaking the other, refuse the
+	// combination at the entry point so the operator is forced
+	// to pick a single mode. ChunkAAD without ConvergentNonce
+	// (the Strict-ZK / Pattern B path) and ConvergentNonce
+	// without ChunkAAD (the convergent-dedup / Pattern C path)
+	// are both fully supported.
+	if opts.ConvergentNonce && len(opts.ChunkAAD) > 0 {
+		return nil, errors.New("client_sdk: ConvergentNonce and ChunkAAD are mutually exclusive: " +
+			"ConvergentNonce produces deterministic ciphertext for cross-tenant content dedup, " +
+			"while ChunkAAD binds the per-chunk tag to operator-supplied context; combining " +
+			"them yields identical ciphertext with diverging tags, which silently breaks " +
+			"dedup or authentication depending on backend behaviour. Pick one: " +
+			"ChunkAAD (Strict-ZK / Pattern B) OR ConvergentNonce (convergent / Pattern C)")
 	}
 	aead, err := chacha20poly1305.NewX(dek)
 	if err != nil {

@@ -1,2 +1,12 @@
 # Build output (audit bundles, hand-off tarballs, etc.)
 /build/
+
+# Local Go test scratch
+*.test
+*.out
+coverage.txt
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
