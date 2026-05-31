@@ -384,6 +384,49 @@ components:
 	}
 }
 
+func TestLoadManifest_RejectsParentTraversal(t *testing.T) {
+	// Defence-in-depth regression: the manifest is repo-controlled
+	// today, but the bundler resolves component paths with
+	// filepath.Join against the repo root. A `..` segment would
+	// escape the repo root and let the bundler copy files outside
+	// the source tree into the auditor's tarball. validate() must
+	// reject the four canonical spellings before Build() ever runs.
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"raw_parent", ".."},
+		{"parent_prefix", "../etc/passwd"},
+		{"deep_parent", "../../../etc/passwd"},
+		{"embedded_parent", "tests/../../../etc/passwd"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "m.yaml")
+			mustWrite(t, p, `
+version: 1
+bundle_name: x
+output_dir: out
+components:
+  - id: a
+    title: A
+    description: x
+    pr_origin: x
+    paths: ["`+c.path+`"]
+    optional: false
+`)
+			_, err := LoadManifest(p)
+			if err == nil {
+				t.Fatalf("expected error for path %q escaping repo root, got nil", c.path)
+			}
+			if !strings.Contains(err.Error(), "escapes the repo root") {
+				t.Errorf("error should mention repo-root escape; got: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadManifest_RejectsUnsupportedVersion(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "m.yaml")

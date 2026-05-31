@@ -188,7 +188,7 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 
 	// Write the human-readable INDEX.md and the manifest copy
 	// at the top of the bundle.
-	if err := w.writeIndex(m, opts, included, missing); err != nil {
+	if err := w.writeIndex(m, opts, included); err != nil {
 		return nil, fmt.Errorf("write INDEX.md: %w", err)
 	}
 	// Copy the manifest verbatim so the auditor sees the same
@@ -333,7 +333,13 @@ func (w *bundleWriter) writeMissingPlaceholder(c Component, rel string) error {
 	// Replace path separators so the placeholder filename is
 	// flat. e.g. "tests/dr/verifier.go" -> "tests_dr_verifier.go.MISSING".
 	flat := strings.ReplaceAll(rel, "/", "_") + ".MISSING"
-	target := filepath.Join(c.ID, "__MISSING__", flat)
+	// filepath.ToSlash is required here for parity with writeFileFromDisk
+	// (line ~296). writeFileBytes uses target verbatim as the manifestRecorder
+	// key, and the tar header name goes through filepath.ToSlash inside
+	// writeFileBytes too — so without this call, a Windows builder would
+	// record the placeholder in MANIFEST.txt with backslashes while the
+	// tar entry uses forward slashes, breaking sha256sum -c.
+	target := filepath.ToSlash(filepath.Join(c.ID, "__MISSING__", flat))
 	return w.writeFileBytes(target, []byte(body), 0o644)
 }
 
@@ -344,7 +350,15 @@ func (w *bundleWriter) writeMissingPlaceholder(c Component, rel string) error {
 // progress_pin / always-included path); INDEX.md is generated
 // per-bundle and carries the build timestamp, commit, and the
 // resolved-vs-missing component status.
-func (w *bundleWriter) writeIndex(m *Manifest, opts BundleOptions, included, missing []string) error {
+//
+// The function takes only `included` (not `missing`) because the
+// status is fully determined by the included-set: any component
+// not in `included` is necessarily a missing-optional (required
+// components hard-fail in Build before this point), and the default
+// status string already reflects that. The caller's `missing` slice
+// is still surfaced separately as Result.ComponentsMissing for
+// programmatic consumers.
+func (w *bundleWriter) writeIndex(m *Manifest, opts BundleOptions, included []string) error {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# %s — audit hand-off bundle\n\n", m.BundleName)
 	fmt.Fprintf(&sb, "Commit:  `%s`  \n", opts.CommitSHA)

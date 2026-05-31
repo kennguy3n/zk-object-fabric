@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -177,6 +178,17 @@ func (m *Manifest) validate(path string) error {
 		for j, p := range c.Paths {
 			if filepath.IsAbs(p) {
 				return fmt.Errorf("manifest %q component[%d] (%s) path[%d]: must be relative to the repo root (got %q)", path, i, c.ID, j, p)
+			}
+			// Defence-in-depth: reject any ".." segment. The manifest
+			// is repo-controlled today (not user-supplied input), but
+			// the bundler resolves these paths with filepath.Join
+			// against RepoRoot and a "../../../etc/passwd"-style entry
+			// would escape the repo root. Cleaning to a relative path
+			// that starts with ".." or equals ".." is the canonical
+			// way to catch all spellings (raw "..", "a/../b/..", etc.).
+			cleaned := filepath.ToSlash(filepath.Clean(p))
+			if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+				return fmt.Errorf("manifest %q component[%d] (%s) path[%d]: path %q escapes the repo root (resolves to %q)", path, i, c.ID, j, p, cleaned)
 			}
 		}
 		if !c.Optional {
