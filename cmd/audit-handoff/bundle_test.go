@@ -47,6 +47,16 @@ components:
       - docs/PROGRESS.md
       - tests/core
     optional: false
+  # Intentional duplicate of docs/PROGRESS.md (also declared by
+  # the core component above): the synthetic-only duplication
+  # lets these tests exercise Build's hadReal/included/missing
+  # accounting -- optional_partial has one present path and one
+  # absent path, and we want to confirm it lands in
+  # ComponentsIncluded (not ComponentsMissing) because the
+  # present path resolves. The real manifest is constrained by
+  # the TestHandoffManifest_NoDuplicatePaths drift test in
+  # tests/audit/handoff_test.go, which runs only against
+  # deploy/audit-handoff/manifest.yaml and never sees this.
   - id: optional_partial
     title: Optional Partial
     description: optional with one present, one missing
