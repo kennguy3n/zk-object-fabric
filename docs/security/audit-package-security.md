@@ -164,17 +164,29 @@ Specific failure modes the audit should attempt:
 4. Strips `X-Amz-Signature` from the canonical query
    (`stripQueryParam`, line 507-523), rebuilds the canonical
    request, recomputes the signature, and compares.
-5. Enforces the expiry: the request is rejected if
-   `a.Clock().Sub(signedAt) > X-Amz-Expires` even if `MaxClockSkew`
-   would otherwise permit it. **This is independent of
-   `MaxClockSkew`** — `MaxClockSkew` governs the spread between
-   the signing host and the gateway host, `X-Amz-Expires` governs
-   the URL's own lifetime.
+5. Enforces the expiry. The exact predicate at
+   `internal/auth/authenticator.go:368` is
+   `now.After(reqTime.Add(time.Duration(expiresSec)*time.Second + skew))`.
+   That means the effective lifetime of a presigned URL is
+   `X-Amz-Expires + MaxClockSkew`, **not** `X-Amz-Expires` alone
+   — a `X-Amz-Expires=60` URL is rejected only when `now` is more
+   than `60s + MaxClockSkew` (default `75s`) after the signing
+   timestamp. This is intentional: `MaxClockSkew` accounts for the
+   spread between signing-host clock and gateway-host clock, and
+   applying it symmetrically on both bounds (future-dated and
+   past-expiry) prevents legitimate URLs from being prematurely
+   rejected when the gateway runs slightly fast. The auditor should
+   confirm this is the desired contract and that callers building
+   short-lived URLs (e.g. `X-Amz-Expires=10`) are aware their URLs
+   may be honoured for up to `10s + MaxClockSkew`.
 
 Specific failure modes the audit should attempt:
 
-- **Expiry bypass**: present a URL whose `X-Amz-Expires` is 60s
-  past expiry. Must reject independent of skew.
+- **Expiry bypass**: present a URL whose elapsed lifetime is
+  `X-Amz-Expires + MaxClockSkew + 1s` past the signing timestamp.
+  Must reject. Presenting one only `X-Amz-Expires + 1s` past must
+  STILL ACCEPT — that is by design (see point 5 above) and a 60s URL
+  presented at 61s is inside the skew window.
 - **Path swap**: take a URL signed for `/tenantA/secret`, change
   the request path to `/tenantB/secret`, keep the same signature.
   The canonical URI is part of the signed string; must reject.
