@@ -547,6 +547,112 @@ components:
 	}
 }
 
+func TestLoadManifest_RejectsBundleNameWithPathSeparators(t *testing.T) {
+	// Defence-in-depth regression: bundle_name is interpolated into
+	// the output filename (filepath.Join(outDir, bundleStem+".tar.gz"))
+	// and into the in-tar entry prefix (filepath.Join(w.bundleDir, …)).
+	// A value containing a path separator or a ".." segment would
+	// escape the output directory on disk and produce zip-slip tar
+	// entries on extraction. validate() must reject both spellings
+	// at load time so Build() never sees a path-bearing bundle_name.
+	// YAML quoting note: double-quoted scalars process backslash
+	// escapes (e.g. \e -> ESC), so the backslash variant must use
+	// single-quoted YAML scalars to preserve the literal backslash.
+	cases := []struct {
+		name       string
+		bundleName string
+		wantMsg    string
+	}{
+		{"forward_slash", "../evil", "path separators"},
+		{"backslash", `..\evil`, "path separators"},
+		{"slash_only", "a/b", "path separators"},
+		{"parent_only", "..", "valid filename stem"},
+		{"dot_only", ".", "valid filename stem"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "m.yaml")
+			mustWrite(t, p, `
+version: 1
+bundle_name: '`+c.bundleName+`'
+output_dir: out
+components:
+  - id: a
+    title: A
+    description: x
+    pr_origin: x
+    paths: [a]
+    optional: false
+`)
+			_, err := LoadManifest(p)
+			if err == nil {
+				t.Fatalf("expected error for bundle_name %q, got nil", c.bundleName)
+			}
+			if !strings.Contains(err.Error(), "bundle_name") || !strings.Contains(err.Error(), c.wantMsg) {
+				t.Errorf("error should mention bundle_name + %q; got: %v", c.wantMsg, err)
+			}
+		})
+	}
+}
+
+func TestBuild_RequiredComponentEmptyDirHardFails(t *testing.T) {
+	// Defence-in-depth regression: a required component whose
+	// declared path resolves to an empty / symlink-only directory
+	// (stat succeeds, but filepath.Walk yields zero regular files)
+	// must hard-fail Build(). Without this guard, the component
+	// would be silently absent from the tarball AND mislabeled
+	// "MISSING (optional)" in INDEX.md, both of which are wrong
+	// for a required component.
+	repoRoot := t.TempDir()
+	mustWrite(t, filepath.Join(repoRoot, "anchor.md"), "anchor\n")
+
+	// Create an empty directory that the required component will
+	// point at. The directory exists (stat succeeds) but contains
+	// zero regular files.
+	if err := os.MkdirAll(filepath.Join(repoRoot, "empty_required_dir"), 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+
+	mp := filepath.Join(repoRoot, "m.yaml")
+	mustWrite(t, mp, `
+version: 1
+bundle_name: synth
+output_dir: out
+components:
+  - id: anchor
+    title: Anchor
+    description: x
+    pr_origin: "#1"
+    paths:
+      - anchor.md
+    optional: false
+  - id: empty_req
+    title: Empty Required
+    description: x
+    pr_origin: "#2"
+    paths:
+      - empty_required_dir
+    optional: false
+`)
+	m, err := LoadManifest(mp)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	_, err = Build(m, BundleOptions{
+		RepoRoot:     repoRoot,
+		ManifestPath: mp,
+		CommitSHA:    "deadbeef",
+		SkipMake:     true,
+	})
+	if err == nil {
+		t.Fatal("expected error when required component contributes zero files, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty_req") || !strings.Contains(err.Error(), "zero files") {
+		t.Errorf("error should mention component id + zero-files; got: %v", err)
+	}
+}
+
 func TestLoadManifest_RejectsUnsupportedVersion(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "m.yaml")

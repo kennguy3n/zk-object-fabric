@@ -121,11 +121,23 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 	// reached, which would leak the file descriptor and leave
 	// tmpPath on disk. These defers ensure both are cleaned up
 	// even if a writePath/writeIndex/writeFileBytes call fails.
-	// On the success path they are no-ops:
-	//   - tw / gzw / tmpFile have already been explicitly closed
-	//     in order (tar -> gzip -> file). tar.Writer.Close and
-	//     gzip.Writer.Close are idempotent; os.File.Close on an
-	//     already-closed file returns an error we discard.
+	//
+	// On the success path, the explicit close chain at the bottom
+	// of Build (tar -> gzip -> file -> rename) runs first; these
+	// defers then run in reverse order on already-closed writers.
+	// Behaviour per writer:
+	//   - tar.Writer.Close is strictly idempotent: after a
+	//     successful first Close it sets an internal "already
+	//     closed" sentinel and a second Close early-returns nil.
+	//   - gzip.Writer.Close is NOT strictly idempotent: a second
+	//     Close re-attempts the footer write, which then fails
+	//     because the underlying tmpFile is already closed. The
+	//     error is discarded; no corruption is possible because
+	//     tmpFile has already been renamed to outPath at this
+	//     point, so the failed footer write hits a closed handle,
+	//     not the destination file.
+	//   - os.File.Close on an already-closed file returns
+	//     os.ErrClosed, also discarded.
 	//   - os.Remove(tmpPath) hits ErrNotExist after the rename,
 	//     also discarded.
 	gzw := gzip.NewWriter(tmpFile)
@@ -200,28 +212,33 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 				return nil, fmt.Errorf("component %s path %q: %w", c.ID, rel, statErr)
 			}
 		}
-		if filesWritten > 0 {
+		switch {
+		case filesWritten > 0:
 			included = append(included, c.ID)
-		} else if c.Optional {
+		case c.Optional:
 			missing = append(missing, c.ID)
+		default:
+			// Required component with filesWritten == 0: every
+			// declared path stat-succeeded but resolved to an
+			// empty/symlink-only tree, so the component would
+			// produce zero entries in the tarball. Without this
+			// hard-fail, writeIndex would label it "MISSING
+			// (optional)" — factually wrong for a required
+			// component — and the bundle would silently lack
+			// auditor-mandated content. Fail loudly so the
+			// manifest author sees the mistake at build time,
+			// not at audit time.
+			//
+			// Today this is unreachable: every required
+			// component (progress_pin) declares specific files
+			// and TestHandoffManifest_PathsResolveOrAreOptional
+			// enforces required-path existence. If a future
+			// manifest points a required component at a
+			// directory that turns out to be empty, this guard
+			// surfaces the gap immediately rather than letting
+			// INDEX.md mislabel the component.
+			return nil, fmt.Errorf("component %s: required component contributed zero files (every declared path resolved to an empty or symlink-only tree); manifest must declare paths that contain regular files", c.ID)
 		}
-		// Required components with filesWritten == 0 can only happen
-		// if every declared path resolved to an empty/symlink-only
-		// directory. The build still succeeds, but writeIndex will
-		// then label them "MISSING (optional)" which is wrong for a
-		// required component. We don't currently have a manifest
-		// declaring a directory-only required path (progress_pin
-		// declares two specific .md files), so this case is
-		// unreachable today; if a future manifest changes that, the
-		// drift test paths-exist already enforces that REQUIRED files
-		// resolve, so the only way to reach filesWritten==0 on a
-		// required component is the empty-directory case described
-		// in ANALYSIS_0004 — which is what this whole block fixes
-		// the optional-side of. The auditor would still see the
-		// component listed in INDEX.md (every manifest component
-		// gets a section), just with the wrong status string; we
-		// accept that as a known edge case worth catching in code
-		// review of any future manifest change.
 	}
 
 	// Write the human-readable INDEX.md and the manifest copy

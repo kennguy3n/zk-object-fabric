@@ -146,6 +146,23 @@ func (m *Manifest) validate(path string) error {
 	if m.BundleName == "" {
 		return fmt.Errorf("manifest %q: bundle_name is required", path)
 	}
+	// Defence-in-depth: bundle_name is interpolated into both the
+	// output filename (bundle.go:~100 — filepath.Join(outDir,
+	// bundleStem+".tar.gz")) and the in-tar entry prefix
+	// (bundle.go:~354 — filepath.Join(w.bundleDir, …)). A value
+	// containing path separators or ".." segments would escape the
+	// output directory on disk and produce zip-slip entries on
+	// extraction. Require a plain slug here so it stays a stem,
+	// not a path. The manifest is repo-controlled today but the
+	// other path-bearing fields (output_dir, component paths)
+	// already enforce the same predicate, so this closes the gap.
+	if strings.ContainsAny(m.BundleName, `/\`) {
+		return fmt.Errorf("manifest %q: bundle_name %q must not contain path separators (it is a filename stem, not a path)", path, m.BundleName)
+	}
+	cleanedBundleName := filepath.ToSlash(filepath.Clean(m.BundleName))
+	if cleanedBundleName == ".." || strings.HasPrefix(cleanedBundleName, "../") || cleanedBundleName == "." {
+		return fmt.Errorf("manifest %q: bundle_name %q is not a valid filename stem (resolves to %q)", path, m.BundleName, cleanedBundleName)
+	}
 	// OutputDir defaults to build/audit-handoff when empty.
 	if m.OutputDir == "" {
 		m.OutputDir = "build/audit-handoff"
