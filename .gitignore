@@ -1,6 +1,9 @@
 # Build artefacts (audit bundles, etc.)
 /build/
 
+# Local Go binaries
+/bin/
+
 # Local Go test scratch
 *.test
 *.out
