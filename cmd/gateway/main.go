@@ -362,6 +362,8 @@ func main() {
 	// effective ceiling. (Devin Review ANALYSIS_0001 on PR #80
 	// flagged the prior 1-MiB fallback inconsistency.)
 	warnIfSlowlorisDisabled("gateway", cfg.Gateway.ListenAddr, cfg.Gateway.ReadHeaderTimeout)
+	gatewayMaxHeaderBytes := config.EffectiveMaxHeaderBytes(cfg.Gateway.MaxHeaderBytes)
+	logEffectiveMaxHeaderBytes("gateway", cfg.Gateway.ListenAddr, gatewayMaxHeaderBytes)
 	srv := &http.Server{
 		Addr:              cfg.Gateway.ListenAddr,
 		Handler:           handler,
@@ -369,7 +371,7 @@ func main() {
 		WriteTimeout:      cfg.Gateway.WriteTimeout.ToDuration(),
 		ReadHeaderTimeout: cfg.Gateway.ReadHeaderTimeout.ToDuration(),
 		IdleTimeout:       cfg.Gateway.IdleTimeout.ToDuration(),
-		MaxHeaderBytes:    config.EffectiveMaxHeaderBytes(cfg.Gateway.MaxHeaderBytes),
+		MaxHeaderBytes:    gatewayMaxHeaderBytes,
 	}
 
 	// fleetOrchestrator coordinates large multi-tenant
@@ -465,27 +467,6 @@ func tlsVersionLabel(v uint16) string {
 	}
 }
 
-// startListener picks ListenAndServeTLS vs ListenAndServe based on
-// the supplied TLS config. It first runs t.Validate so a partial
-// config (exactly one of cert_path or key_path set) surfaces as a
-// startup error instead of silently downgrading to plain HTTP —
-// the wrong failure mode for a production deployment that
-// configured TLS but typoed one of the paths.
-//
-// When TLS is enabled it parses the MinVersion from cfg and
-// applies it to srv.TLSConfig before handing the cert / key paths
-// to ListenAndServeTLS. When TLS is disabled and env ==
-// "production" it logs a WARNING so operators terminating TLS at
-// an upstream load balancer can ignore the signal while
-// deployments serving clients directly notice it.
-//
-// name labels the listener in log lines ("gateway", "console",
-// "health") so operators with multiple listeners on the same
-// process can tell them apart. Both the TLS-enabled and the
-// production-warning log lines share the "gateway: %s …" prefix
-// (where %s is the per-listener name) so log scrapers can match
-// every gateway-process line with one regex.
-//
 // warnIfSlowlorisDisabled emits a structured WARN log line at
 // startup when the named listener is enabled (ListenAddr non-
 // empty) but its ReadHeaderTimeout is zero or negative. Zero
@@ -511,6 +492,56 @@ func warnIfSlowlorisDisabled(name, listenAddr string, readHeader config.Duration
 	)
 }
 
+// logEffectiveMaxHeaderBytes records the effective MaxHeaderBytes
+// ceiling at startup for the named listener. Sibling of
+// warnIfSlowlorisDisabled — both surface security-critical effective
+// configuration in the startup log so operators auditing a node have
+// a single regex (`gateway: %s listener …`) that captures the whole
+// surface.
+//
+// PR #80 lowered the default effective ceiling from Go stdlib's
+// 1 MiB to 64 KiB (DefaultMaxHeaderBytes in internal/config) as a
+// header-size Slowloris defence — an attacker mass-spraying enormous
+// header blobs is rejected with HTTP 431 instead of being allowed to
+// allocate a megabyte per connection. The reduction is intentional
+// (Devin Review ANALYSIS_0003 on PR #80 flagged the upgrade hazard
+// for deployments running heavy JWT auth or many `x-amz-meta-*`
+// custom metadata headers), and the structured startup log line
+// here is the operator-facing audit trail: a log-scraper grep on
+// `effective_max_header_bytes=` surfaces the deployed value across
+// every node so a deployment hitting unexpected 431s can verify the
+// ceiling without re-reading config. Operators can raise it per
+// listener via `<name>.max_header_bytes`.
+func logEffectiveMaxHeaderBytes(name, listenAddr string, maxBytes int) {
+	if listenAddr == "" {
+		return
+	}
+	log.Printf(
+		"gateway: %s listener effective_max_header_bytes=%d on %s (raise %s.max_header_bytes if your deployment uses unusually large request headers, e.g. heavy JWT auth or many x-amz-meta-* custom metadata keys; pre-PR-#80 Go stdlib default was 1048576)",
+		name, maxBytes, listenAddr, name,
+	)
+}
+
+// startListener picks ListenAndServeTLS vs ListenAndServe based on
+// the supplied TLS config. It first runs t.Validate so a partial
+// config (exactly one of cert_path or key_path set) surfaces as a
+// startup error instead of silently downgrading to plain HTTP —
+// the wrong failure mode for a production deployment that
+// configured TLS but typoed one of the paths.
+//
+// When TLS is enabled it parses the MinVersion from cfg and
+// applies it to srv.TLSConfig before handing the cert / key paths
+// to ListenAndServeTLS. When TLS is disabled and env ==
+// "production" it logs a WARNING so operators terminating TLS at
+// an upstream load balancer can ignore the signal while
+// deployments serving clients directly notice it.
+//
+// name labels the listener in log lines ("gateway", "console",
+// "health") so operators with multiple listeners on the same
+// process can tell them apart. Both the TLS-enabled and the
+// production-warning log lines share the "gateway: %s …" prefix
+// (where %s is the per-listener name) so log scrapers can match
+// every gateway-process line with one regex.
 func startListener(srv *http.Server, t config.TLSConfig, env, name string) error {
 	if err := t.Validate(name); err != nil {
 		return err
@@ -1592,6 +1623,8 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 		// ANALYSIS_0001 on ef092a6 added WriteTimeout for the
 		// same symmetry.)
 		warnIfSlowlorisDisabled("health", hc.ListenAddr, hc.ReadHeaderTimeout)
+		healthMaxHeaderBytes := config.EffectiveMaxHeaderBytes(hc.MaxHeaderBytes)
+		logEffectiveMaxHeaderBytes("health", hc.ListenAddr, healthMaxHeaderBytes)
 		srv := &http.Server{
 			Addr:              hc.ListenAddr,
 			Handler:           mon.ServeMux(""),
@@ -1599,7 +1632,7 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 			WriteTimeout:      hc.WriteTimeout.ToDuration(),
 			ReadHeaderTimeout: hc.ReadHeaderTimeout.ToDuration(),
 			IdleTimeout:       hc.IdleTimeout.ToDuration(),
-			MaxHeaderBytes:    config.EffectiveMaxHeaderBytes(hc.MaxHeaderBytes),
+			MaxHeaderBytes:    healthMaxHeaderBytes,
 		}
 		go func() {
 			log.Printf("gateway: health endpoints on %s", hc.ListenAddr)
@@ -1679,6 +1712,8 @@ func startConsoleAPI(
 	// default (matches gateway and health; Devin Review
 	// ANALYSIS_0001 on PR #80).
 	warnIfSlowlorisDisabled("console", cfg.Console.ListenAddr, cfg.Console.ReadHeaderTimeout)
+	consoleMaxHeaderBytes := config.EffectiveMaxHeaderBytes(cfg.Console.MaxHeaderBytes)
+	logEffectiveMaxHeaderBytes("console", cfg.Console.ListenAddr, consoleMaxHeaderBytes)
 	srv := &http.Server{
 		Addr:              cfg.Console.ListenAddr,
 		Handler:           mux,
@@ -1686,7 +1721,7 @@ func startConsoleAPI(
 		WriteTimeout:      cfg.Console.WriteTimeout.ToDuration(),
 		ReadHeaderTimeout: cfg.Console.ReadHeaderTimeout.ToDuration(),
 		IdleTimeout:       cfg.Console.IdleTimeout.ToDuration(),
-		MaxHeaderBytes:    config.EffectiveMaxHeaderBytes(cfg.Console.MaxHeaderBytes),
+		MaxHeaderBytes:    consoleMaxHeaderBytes,
 	}
 	go func() {
 		log.Printf("gateway: console API on %s", cfg.Console.ListenAddr)
