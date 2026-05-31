@@ -134,6 +134,29 @@ If any criterion fails, **do not promote** the gateway build. File an
 incident, attach the failed report, and triage from the per-scenario
 histograms in the JSON.
 
+### 4.1 Deployment artifacts (WS2.1)
+
+The staging infrastructure is codified in
+[`deploy/staging/`](../../deploy/staging/README.md):
+
+- **Load driver Terraform** — `deploy/staging/load-driver/terraform/`
+  provisions a Linode VM in the same region as the gateway fleet.
+- **Run script** — `deploy/staging/load-driver/scripts/run_tier3.sh`
+  executes the canonical invocation above and feeds the report to the
+  Tier 3 verifier (`cmd/tier3-verify`).
+- **Evidence collector** — `deploy/staging/scripts/collect_evidence.sh`
+  pulls the report, verdict, gateway journals, Wasabi access logs, and
+  health snapshots into a SHA-anchored evidence dossier for the audit
+  package.
+- **Verifier** — `cmd/tier3-verify` re-applies the acceptance criteria
+  independently of the runner. It reads a benchmark-runner JSON report
+  and produces a structured `Verdict` JSON (package `tests/tier3verify`)
+  where `all_passed: true` is the gate.
+
+The full runbook — prerequisites, step-by-step deployment, and
+teardown — is in
+[`deploy/staging/README.md`](../../deploy/staging/README.md).
+
 ---
 
 ## 5. Report schema
