@@ -153,6 +153,17 @@ func (m *Manifest) validate(path string) error {
 	if filepath.IsAbs(m.OutputDir) {
 		return fmt.Errorf("manifest %q: output_dir must be relative to the repo root (got %q)", path, m.OutputDir)
 	}
+	// Same defence-in-depth check as the component paths below:
+	// the bundler does `filepath.Join(opts.RepoRoot, m.OutputDir)`
+	// and `os.MkdirAll(outDir, 0o755)` in Build (bundle.go:~90), so
+	// a value like "../../tmp" would create directories and write
+	// the tarball outside the repo root. Catch all spellings via
+	// filepath.Clean + the same ".."/"../"-prefix predicate used
+	// for component paths.
+	cleanedOut := filepath.ToSlash(filepath.Clean(m.OutputDir))
+	if cleanedOut == ".." || strings.HasPrefix(cleanedOut, "../") {
+		return fmt.Errorf("manifest %q: output_dir %q escapes the repo root (resolves to %q)", path, m.OutputDir, cleanedOut)
+	}
 	if len(m.Components) == 0 {
 		return fmt.Errorf("manifest %q: at least one component is required", path)
 	}

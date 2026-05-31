@@ -384,6 +384,47 @@ components:
 	}
 }
 
+func TestLoadManifest_RejectsParentTraversalOutputDir(t *testing.T) {
+	// Defence-in-depth regression: parallel to the component-paths
+	// check below. The bundler does filepath.Join(RepoRoot, OutputDir)
+	// + os.MkdirAll, so an "../../tmp"-style output_dir would write
+	// the tarball (and create directories) outside the repo root.
+	cases := []struct {
+		name      string
+		outputDir string
+	}{
+		{"raw_parent", ".."},
+		{"parent_prefix", "../tmp"},
+		{"deep_parent", "../../../tmp"},
+		{"embedded_parent", "build/../../tmp"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "m.yaml")
+			mustWrite(t, p, `
+version: 1
+bundle_name: x
+output_dir: "`+c.outputDir+`"
+components:
+  - id: a
+    title: A
+    description: x
+    pr_origin: x
+    paths: [a]
+    optional: false
+`)
+			_, err := LoadManifest(p)
+			if err == nil {
+				t.Fatalf("expected error for output_dir %q escaping repo root, got nil", c.outputDir)
+			}
+			if !strings.Contains(err.Error(), "output_dir") || !strings.Contains(err.Error(), "escapes the repo root") {
+				t.Errorf("error should mention output_dir + repo-root escape; got: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadManifest_RejectsParentTraversal(t *testing.T) {
 	// Defence-in-depth regression: the manifest is repo-controlled
 	// today, but the bundler resolves component paths with
