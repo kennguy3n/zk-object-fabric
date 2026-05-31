@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -650,5 +651,88 @@ func TestChaCha20Poly1305NewXCopiesKey(t *testing.T) {
 	}
 	if _, err := mutated.Open(nil, nonce, ciphertext, nil); err == nil {
 		t.Fatalf("AEAD constructed from mutated key unexpectedly decrypted the ciphertext; the test is no longer probing the copy-on-construct invariant")
+	}
+}
+
+// TestEncryptObject_RejectsConvergentNonceWithChunkAAD asserts the
+// SDK refuses the (ConvergentNonce=true, ChunkAAD!=nil) combination
+// at the EncryptObject entry point. The two flags pursue
+// contradictory goals (cross-context content dedup vs. per-context
+// tag binding) and combining them would silently produce identical
+// ciphertext bytes with diverging Poly1305 tags — a footgun the SDK
+// must surface as an error rather than honour partially.
+//
+// The test also confirms each flag individually is still accepted
+// (regression guard against an over-broad guard rejecting legitimate
+// single-flag configurations).
+func TestEncryptObject_RejectsConvergentNonceWithChunkAAD(t *testing.T) {
+	dek := make([]byte, chacha20poly1305.KeySize)
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		t.Fatalf("rand dek: %v", err)
+	}
+	plain := []byte("anything")
+
+	// The forbidden combination must be rejected at construction
+	// time. We do NOT consume the returned reader — the error
+	// must surface from EncryptObject itself, not from the first
+	// Read on the returned stream, so callers cannot accidentally
+	// race past the guard by ignoring the construction error.
+	_, err := EncryptObject(bytes.NewReader(plain), dek, Options{
+		ChunkSize:       64,
+		ConvergentNonce: true,
+		ChunkAAD:        []byte("tnt_a|bkt|0xabc|v1"),
+	})
+	if err == nil {
+		t.Fatal("EncryptObject(ConvergentNonce + ChunkAAD): want error, got nil")
+	}
+	// Error message must name BOTH flags so the operator can act
+	// on it without grepping source. The exact prefix is not
+	// asserted (to allow future rewording), but the two field
+	// names must be present.
+	msg := err.Error()
+	for _, want := range []string{"ConvergentNonce", "ChunkAAD"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q: %s", want, msg)
+		}
+	}
+
+	// Each flag individually must STILL be accepted — the guard
+	// is for the cross-flag combination, not for either flag on
+	// its own. Convergent-without-AAD is the Pattern C path; AAD-
+	// without-convergent is the Pattern B / Strict-ZK path.
+	if _, err := EncryptObject(bytes.NewReader(plain), dek, Options{
+		ChunkSize:       64,
+		ConvergentNonce: true,
+	}); err != nil {
+		t.Fatalf("EncryptObject(ConvergentNonce only): unexpected error: %v", err)
+	}
+	if _, err := EncryptObject(bytes.NewReader(plain), dek, Options{
+		ChunkSize: 64,
+		ChunkAAD:  []byte("tnt_a|bkt|0xabc|v1"),
+	}); err != nil {
+		t.Fatalf("EncryptObject(ChunkAAD only): unexpected error: %v", err)
+	}
+
+	// Zero-value Options (the default-everything path) must also
+	// keep working — the guard's len(opts.ChunkAAD) > 0 condition
+	// must NOT trip on a nil ChunkAAD slice even if ConvergentNonce
+	// is set.
+	if _, err := EncryptObject(bytes.NewReader(plain), dek, Options{
+		ChunkSize:       64,
+		ConvergentNonce: true,
+		ChunkAAD:        nil,
+	}); err != nil {
+		t.Fatalf("EncryptObject(ConvergentNonce + nil ChunkAAD): unexpected error: %v", err)
+	}
+
+	// An empty (non-nil, zero-length) ChunkAAD must be treated
+	// the same as nil — there is no operator-supplied context to
+	// bind, so the guard should not fire.
+	if _, err := EncryptObject(bytes.NewReader(plain), dek, Options{
+		ChunkSize:       64,
+		ConvergentNonce: true,
+		ChunkAAD:        []byte{},
+	}); err != nil {
+		t.Fatalf("EncryptObject(ConvergentNonce + empty ChunkAAD): unexpected error: %v", err)
 	}
 }

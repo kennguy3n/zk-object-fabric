@@ -533,17 +533,35 @@ not production validation. The following items are explicitly **not yet
 validated** against this codebase and should be completed before any
 external load is run on it:
 
-- **Load testing** — sustained PUT/GET throughput at target tenant
-  counts, p99 latency under sustained load, and degradation behaviour at
-  cache eviction / repair pressure.
+- **Load testing** — harness wired ([`tests/benchmark`](../tests/benchmark/),
+  CLI at [`cmd/benchmark-runner`](../cmd/benchmark-runner/), runbook at
+  [`docs/runbooks/load-testing.md`](runbooks/load-testing.md)). Numeric
+  targets published below. **Real-deployment runs** against the
+  Linode + Wasabi staging gateway are still pending and must be
+  attached as JSON reports under `docs/reports/load/` before this
+  item closes.
 - **Chaos / failure-injection testing** — single-node loss, zone loss,
   metadata-DB failover, provider-side outages, cache partition.
 - **External security review** — independent review of the auth path
   (HMAC, presigned URLs, IAM-style policies), the encryption envelope,
   manifest sealing, and DEK handling.
+  - **Hand-off package READY** —
+    [`docs/security/audit-package-security.md`](security/audit-package-security.md)
+    is a complete review package cross-referenced to the source files
+    (`internal/auth/`, `api/s3compat/`, `metadata/manifest_store/postgres/`,
+    `cmd/gateway/main.go`). Bundle for the auditor via
+    `make audit-bundle`. Vendor engagement (e.g. Trail of Bits / Cure53 /
+    NCC Group) still TBD; findings will land in
+    [`docs/security/findings/<vendor>-<YYYY-MM-DD>/`](security/findings/).
 - **External cryptography review** — review of the AEAD bindings
   (per-chunk AAD, manifest body AAD), the KEK / CMK hierarchy, and the
   HMAC SigV4 implementation.
+  - **Hand-off package READY** —
+    [`docs/security/audit-package-cryptography.md`](security/audit-package-cryptography.md)
+    is a complete crypto review package cross-referenced to
+    `encryption/client_sdk/`, `encryption/envelope.go`, and
+    `metadata/manifest_store/postgres/body_encryptor.go`. Same bundle
+    target as above; specialist crypto auditor engagement still TBD.
 - **S3 conformance report** — a published conformance matrix against
   the AWS S3 API surface (PUT, GET, HEAD, DELETE, LIST, multipart,
   range, ACL, versioning, lifecycle) using an external conformance
@@ -565,12 +583,28 @@ phase's checklist with a link to the report or runbook.
 
 | Metric                                       | Target                          | Phase     |
 | -------------------------------------------- | ------------------------------- | --------- |
-| PUT p99 latency (client → Linode → Wasabi)   | TBD                             | Phase 2   |
-| GET p99 latency (Linode cache hit)           | TBD                             | Phase 2   |
-| GET p99 latency (Wasabi origin miss)         | TBD                             | Phase 2   |
+| PUT p99 latency (cache hit)                  | ≤ 50 ms                         | Phase 2   |
+| PUT p99 latency (Wasabi origin)              | ≤ 200 ms                        | Phase 2   |
+| GET p99 latency (L0 / memory cache)          | ≤ 20 ms                         | Phase 2   |
+| GET p99 latency (L1 / NVMe disk cache)       | ≤ 100 ms                        | Phase 2   |
+| GET p99 latency (Wasabi origin miss)         | ≤ 300 ms                        | Phase 2   |
+| Sustained throughput / gateway node          | ≥ 10 000 req/s                  | Phase 2   |
+| Per-request error rate (sustained load)      | ≤ 1e-3                          | Phase 2   |
+| Offered-load efficiency (attained / target)  | ≥ 0.95                          | Phase 2   |
 | Linode cache hit ratio (Hot tier)            | > 90%                           | Phase 3   |
 | Wasabi origin egress ratio (egress ÷ stored) | ≤ 1.0 per tenant                | Phase 2–3 |
 | Repair time (single node loss, Phase 2+)     | TBD                             | Phase 2   |
 | Storage COGS / TB-month (local DC)           | TBD                             | Phase 3   |
 | Erasure overhead (Phase 2+)                  | 1.375× (8+3) or 1.4× (10+4)     | Phase 2   |
 | Migration throughput (Wasabi → local cell)   | TBD                             | Phase 3   |
+
+The latency, throughput, and error-rate targets above are the
+machine-enforced gates in [`tests/benchmark/suite.go`](../tests/benchmark/suite.go)
+(`TargetPutP99CacheHitMs`, `TargetPutP99OriginMs`, `TargetGetP99L0Ms`,
+`TargetGetP99L1Ms`, `TargetGetP99OriginMs`, `TargetSustainedRPS`,
+`TargetErrorRateMax`, `TargetRPSEfficiencyMin`). They are gated by
+[`cmd/benchmark-runner`](../cmd/benchmark-runner/) and by the
+`load-test-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+See [`docs/runbooks/load-testing.md`](runbooks/load-testing.md) for the
+end-to-end procedure (local CI smoke → Ceph RGW demo → Linode + Wasabi
+staging) and the schema of the JSON reports the harness emits.

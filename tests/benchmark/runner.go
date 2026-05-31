@@ -54,8 +54,10 @@ func NewProviderRunner(provider providers.StorageProvider) *ProviderRunner {
 
 // Run executes one scenario and returns a Result for every Target
 // declared on the scenario plus one labelled Result per scenario-
-// level counter (e.g. total_requests). Unknown metrics return a
-// zeroed Result so CI can pick them up as "not yet measured".
+// level counter (e.g. total_requests). Metrics that ProviderRunner
+// cannot measure (sustained-load metrics, cache-tier-segmented
+// latency, etc.) are returned with Pending=true so SLA gates skip
+// them instead of treating the zero value as an SLA breach.
 func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 	if r.Provider == nil {
 		return nil, errors.New("benchmark: ProviderRunner.Provider is required")
@@ -92,8 +94,18 @@ func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 		case MetricListP95:
 			res.Value = percentileMS(listLats, 95)
 		case MetricCacheHitRatioHot:
-			total := hits + misses
-			if total > 0 {
+			// Symmetric with SustainedRunner (sustained.go:465).
+			// When no HotObjectCache is wired, every GET in
+			// generateLoad is reported as a miss, so the
+			// computed ratio collapses to 0.0 — which silently
+			// trips any Min-bounded SLA gate (e.g.
+			// cache-hit-ratio-hot with Min=0.9). Mark Pending
+			// in that case so the operator sees "cache not
+			// wired" instead of "your hot cache is broken".
+			if r.Cache == nil {
+				res.Pending = true
+				res.PendingReason = "benchmark: ProviderRunner.Cache not wired; cache hit ratio is only measurable when a HotObjectCache is attached"
+			} else if total := hits + misses; total > 0 {
 				res.Value = float64(hits) / float64(total)
 			}
 		case MetricWasabiOriginEgressRatio:
@@ -101,8 +113,34 @@ func (r *ProviderRunner) Run(scenario Scenario) ([]Result, error) {
 				res.Value = float64(r.WasabiEgressBytes) / float64(r.WasabiStoredBytes)
 			}
 		case MetricMigrationThroughput, MetricRepairTimeSeconds, MetricNetworkCostUSDPerTB:
-			// Reported as zero-valued placeholders for CI to track
-			// until the control-plane driver wires them in.
+			// Control-plane metrics; ProviderRunner has no driver
+			// wired in. Mark Pending so SLA evaluation skips them.
+			res.Pending = true
+			res.PendingReason = "benchmark: ProviderRunner does not drive control-plane signals; use SustainedRunner with a wired control plane"
+		case MetricSustainedRPS, MetricRPSEfficiency, MetricErrorRate,
+			MetricSkippedOpFraction,
+			MetricPutP99CacheHit, MetricPutP99Origin,
+			MetricGetP99L0CacheHit, MetricGetP99L1CacheHit, MetricGetP99Origin:
+			// Sustained-load + cache-tier-segmented metrics require
+			// the SustainedRunner: rate-limited token bucket, per-
+			// worker concurrency, HDR histograms tagged by tier.
+			// ProviderRunner is a synchronous unit-test driver and
+			// cannot measure them; report Pending so SLA gates skip.
+			// MetricSkippedOpFraction also belongs here because
+			// the precondition-not-met skip path only exists in
+			// SustainedRunner (where ops are drawn from a mix
+			// against a possibly-empty shared working set);
+			// ProviderRunner walks scenario.Steps deterministically
+			// and never produces a skip.
+			res.Pending = true
+			res.PendingReason = "benchmark: ProviderRunner cannot measure sustained-load, tier-segmented, or skip-fraction metrics; use SustainedRunner"
+		default:
+			// Defensive default: any metric ProviderRunner does not
+			// know about must NOT silently report 0 and fail an SLA
+			// Min gate. Mark Pending so the asymmetry between Runner
+			// implementations cannot produce a false SLA breach.
+			res.Pending = true
+			res.PendingReason = "benchmark: ProviderRunner has no measurement path for this metric"
 		}
 		results = append(results, res)
 	}
@@ -293,6 +331,11 @@ type ReportScenario struct {
 	Results   []Result `json:"results"`
 	Pass      bool     `json:"pass"`
 	Failures  []string `json:"failures,omitempty"`
+	// Pending lists metric names the runner could not yet measure
+	// (Result.Pending=true). These do not fail the scenario but
+	// are surfaced in the report so CI artifacts make it obvious
+	// which targets are still un-wired.
+	Pending []string `json:"pending,omitempty"`
 }
 
 // Report is the top-level JSON emitted by RunSuite. The shape is
@@ -333,6 +376,10 @@ func RunSuite(suite Suite, runner Runner) (*Report, error) {
 		for i, t := range sc.Targets {
 			if i >= len(results) {
 				break
+			}
+			if results[i].Pending {
+				reportSc.Pending = append(reportSc.Pending, string(t.Metric))
+				continue
 			}
 			if msg := EvaluateTarget(t, results[i].Value); msg != "" {
 				reportSc.Pass = false

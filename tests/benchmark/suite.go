@@ -166,6 +166,64 @@ const (
 	// latency the content_index lookup adds compared to a dedup-
 	// off baseline. Phase 3.5 cap is 5 ms.
 	MetricDedupPutLatencyOverheadP95 Metric = "dedup_put_latency_overhead_p95"
+
+	// MetricSustainedRPS is the attained aggregate request rate
+	// (across all operations) during the steady-state run window.
+	// The Workstream 1.1 target is >= 10,000 req/s per gateway
+	// node for the canonical mixed scenario.
+	MetricSustainedRPS Metric = "sustained_rps"
+
+	// MetricRPSEfficiency is attained_rps / target_rps. A value
+	// below 1.0 indicates the gateway could not keep up with the
+	// declared offered load; values close to 1.0 indicate the
+	// runner reached the rate ceiling.
+	MetricRPSEfficiency Metric = "rps_efficiency"
+
+	// MetricErrorRate is errored_requests / total_requests over
+	// the steady-state window. Workstream 1.1 caps it at 1e-3.
+	MetricErrorRate Metric = "error_rate"
+
+	// MetricSkippedOpFraction is skipped_ops / (attempts + skipped),
+	// where a skipped op is one drawn from the request mix but
+	// not actually executed because its precondition was not met
+	// (currently: GET / HEAD / DELETE drawn while the working
+	// set is empty). It is an informational signal — typically
+	// non-zero only in the brief ramp window before PUTs have
+	// seeded the working set, or in mis-configured scenarios
+	// that draw reads against a never-seeded provider. A high
+	// value means the reported attempted-RPS is far below the
+	// configured TargetRPS (rate-limiter tokens were spent on
+	// no-ops) and the histograms were built from a smaller
+	// success sample than expected. The harness reports this
+	// value as informational; scenarios may set Max if they
+	// want a hard gate.
+	MetricSkippedOpFraction Metric = "skipped_op_fraction"
+
+	// MetricPutP99CacheHit is the 99th-percentile PUT latency
+	// when the gateway's hot-tier cache is warm. Workstream 1.1
+	// caps it at 50 ms. The harness selects this metric for
+	// scenarios that pre-warm the cache before measuring.
+	MetricPutP99CacheHit Metric = "put_latency_p99_cache_hit"
+
+	// MetricPutP99Origin is the 99th-percentile PUT latency when
+	// the gateway must round-trip to the Wasabi origin (cold
+	// cache). Workstream 1.1 caps it at 200 ms.
+	MetricPutP99Origin Metric = "put_latency_p99_origin"
+
+	// MetricGetP99L0CacheHit is the 99th-percentile GET latency
+	// when the L0 (process-local) cache serves the read.
+	// Workstream 1.1 caps it at 20 ms.
+	MetricGetP99L0CacheHit Metric = "get_latency_p99_l0_cache_hit"
+
+	// MetricGetP99L1CacheHit is the 99th-percentile GET latency
+	// when the L1 (NVMe disk) cache serves the read. Workstream
+	// 1.1 caps it at 100 ms.
+	MetricGetP99L1CacheHit Metric = "get_latency_p99_l1_cache_hit"
+
+	// MetricGetP99Origin is the 99th-percentile GET latency when
+	// the gateway misses both caches and round-trips to Wasabi.
+	// Workstream 1.1 caps it at 300 ms.
+	MetricGetP99Origin Metric = "get_latency_p99_origin"
 )
 
 // Target values drawn from docs/PROPOSAL.md §3.11 and
@@ -184,6 +242,45 @@ const (
 	// tenant per month.
 	TargetWasabiOriginEgressRatioMax = 1.0
 
+	// TargetPutP99CacheHitMs is the Workstream 1.1 cap on PUT
+	// 99th-percentile latency when the destination cell is the
+	// hot tier (cache hit on the way out).
+	TargetPutP99CacheHitMs = 50.0
+
+	// TargetPutP99OriginMs is the Workstream 1.1 cap on PUT
+	// 99th-percentile latency when the destination cell is the
+	// Wasabi origin (cache miss on the way out).
+	TargetPutP99OriginMs = 200.0
+
+	// TargetGetP99L0Ms is the Workstream 1.1 cap on GET 99th-
+	// percentile latency for L0 (process-local memory) cache
+	// hits.
+	TargetGetP99L0Ms = 20.0
+
+	// TargetGetP99L1Ms is the Workstream 1.1 cap on GET 99th-
+	// percentile latency for L1 (NVMe disk) cache hits.
+	TargetGetP99L1Ms = 100.0
+
+	// TargetGetP99OriginMs is the Workstream 1.1 cap on GET
+	// 99th-percentile latency when the gateway must reach
+	// Wasabi.
+	TargetGetP99OriginMs = 300.0
+
+	// TargetSustainedRPS is the Workstream 1.1 floor on
+	// sustained aggregate request rate per gateway node.
+	TargetSustainedRPS = 10_000.0
+
+	// TargetErrorRateMax is the Workstream 1.1 ceiling on the
+	// per-request error rate during a sustained-load run.
+	TargetErrorRateMax = 1e-3
+
+	// TargetRPSEfficiencyMin is the Workstream 1.1 floor on
+	// rps_efficiency. A run that attains less than this
+	// fraction of its declared TargetRPS is reported as a fail
+	// even if all latency targets passed, because it means the
+	// gateway could not keep up with the offered load.
+	TargetRPSEfficiencyMin = 0.95
+
 	// ListSize10M is the list scenario size for 10M objects.
 	ListSize10M int64 = 10_000_000
 
@@ -197,10 +294,31 @@ const (
 // Result is one measured point that the driver reports back for later
 // comparison against a Target.
 type Result struct {
-	Metric   Metric
-	Value    float64
-	Duration time.Duration
-	Labels   map[string]string
+	Metric   Metric            `json:"metric"`
+	Value    float64           `json:"value"`
+	Duration time.Duration     `json:"duration_ns"`
+	Labels   map[string]string `json:"labels,omitempty"`
+	// Histogram is the per-operation latency distribution the
+	// metric was computed from. Latency-shaped metrics populate
+	// it; counters (RPS, ratios, error rate) leave it nil.
+	Histogram *HistogramSummary `json:"histogram,omitempty"`
+	// Pending is set by a runner when it cannot yet measure the
+	// requested metric — e.g. SustainedRunner asked to measure a
+	// dedup hit ratio against a raw StorageProvider, where dedup
+	// is enforced one layer up in the gateway and is structurally
+	// invisible to the provider interface. RunSuite skips
+	// EvaluateTarget for Pending=true results and tallies them in
+	// ReportScenario.Pending rather than failing the scenario.
+	// Zero value (false) means "measured normally" so existing
+	// runners stay correct without a code change.
+	Pending bool `json:"pending,omitempty"`
+	// PendingReason is an optional human-readable explanation of
+	// why the runner could not measure this metric. Populated by
+	// runners that mark a result Pending so report consumers can
+	// distinguish "not wired in yet" from "not applicable to this
+	// runner" without re-reading the runner source. Empty when
+	// Pending is false.
+	PendingReason string `json:"pending_reason,omitempty"`
 }
 
 // Runner executes a Suite against a single StorageProvider and
@@ -292,17 +410,19 @@ func (sc Scenario) validate() error {
 	return nil
 }
 
-// DefaultSuite returns the canonical Phase 2 benchmark suite. Target
-// values that are still TBD per docs/PROGRESS.md are left at zero
-// (meaning "record but do not gate"). Ratios and list counts use the
-// specified values.
+// DefaultSuite returns the canonical benchmark suite. Targets that
+// are still under negotiation (LIST p95 against 10M/100M/1B object
+// catalogues, dedup ratios) are recorded without gates so the
+// harness publishes a number even when the run-time SLA has not
+// been set. The latency, throughput and error-rate targets
+// referenced by Workstream 1.1 are gated.
 func DefaultSuite() Suite {
 	return Suite{
 		Name: "zk-object-fabric-phase2",
 		Scenarios: []Scenario{
 			{
 				Name:        "put-get-latency",
-				Description: "Steady-state PUT/GET mix, recording p50/p95/p99 latency.",
+				Description: "Steady-state mixed PUT/GET, gating the production p99 targets defined in Workstream 1.1.",
 				Workload: Workload{
 					RequestMix:      map[string]float64{"PUT": 0.3, "GET": 0.7},
 					ObjectSizeBytes: 1024 * 1024, // 1 MiB
@@ -313,10 +433,106 @@ func DefaultSuite() Suite {
 				Targets: []Target{
 					{Metric: MetricPutP50, Unit: "ms"},
 					{Metric: MetricPutP95, Unit: "ms"},
-					{Metric: MetricPutP99, Unit: "ms"},
+					{Metric: MetricPutP99, Max: TargetPutP99OriginMs, Unit: "ms"},
 					{Metric: MetricGetP50, Unit: "ms"},
 					{Metric: MetricGetP95, Unit: "ms"},
-					{Metric: MetricGetP99, Unit: "ms"},
+					{Metric: MetricGetP99, Max: TargetGetP99OriginMs, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "put-cache-hit",
+				Description: "Hot-tier-warm PUT workload: gates PUT p99 at the cache-hit SLA from Workstream 1.1.",
+				Workload: Workload{
+					RequestMix:      map[string]float64{"PUT": 1.0},
+					ObjectSizeBytes: 512 * 1024, // 512 KiB
+					TenantCount:     2,
+					DurationSeconds: 600,
+					TargetRPS:       1000,
+				},
+				Targets: []Target{
+					{Metric: MetricPutP99CacheHit, Max: TargetPutP99CacheHitMs, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "put-origin",
+				Description: "Cold-cache PUT workload that round-trips to the Wasabi origin: gates PUT p99 at the origin SLA.",
+				Workload: Workload{
+					RequestMix:      map[string]float64{"PUT": 1.0},
+					ObjectSizeBytes: 4 * 1024 * 1024, // 4 MiB
+					TenantCount:     4,
+					DurationSeconds: 600,
+					TargetRPS:       500,
+				},
+				Targets: []Target{
+					{Metric: MetricPutP99Origin, Max: TargetPutP99OriginMs, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "get-l0-cache-hit",
+				Description: "GET workload served exclusively from the L0 (memory) cache: gates GET p99 at the L0 SLA.",
+				Workload: Workload{
+					RequestMix:      map[string]float64{"GET": 1.0},
+					ObjectSizeBytes: 256 * 1024, // 256 KiB
+					TenantCount:     2,
+					DurationSeconds: 600,
+					TargetRPS:       2000,
+				},
+				Targets: []Target{
+					{Metric: MetricGetP99L0CacheHit, Max: TargetGetP99L0Ms, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "get-l1-cache-hit",
+				Description: "GET workload served from the L1 (NVMe disk) cache: gates GET p99 at the L1 SLA.",
+				Workload: Workload{
+					RequestMix:      map[string]float64{"GET": 1.0},
+					ObjectSizeBytes: 1024 * 1024, // 1 MiB
+					TenantCount:     2,
+					DurationSeconds: 600,
+					TargetRPS:       1500,
+				},
+				Targets: []Target{
+					{Metric: MetricGetP99L1CacheHit, Max: TargetGetP99L1Ms, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "get-origin",
+				Description: "Cold-cache GET workload that round-trips to the Wasabi origin: gates GET p99 at the origin SLA.",
+				Workload: Workload{
+					RequestMix:      map[string]float64{"GET": 1.0},
+					ObjectSizeBytes: 4 * 1024 * 1024, // 4 MiB
+					TenantCount:     4,
+					DurationSeconds: 600,
+					TargetRPS:       500,
+				},
+				Targets: []Target{
+					{Metric: MetricGetP99Origin, Max: TargetGetP99OriginMs, Unit: "ms"},
+				},
+			},
+			{
+				Name:        "sustained-throughput-10k-rps",
+				Description: "Sustained mixed workload at 10K req/s per gateway node: gates throughput floor, efficiency, and error rate per Workstream 1.1.",
+				Workload: Workload{
+					RequestMix:      map[string]float64{"PUT": 0.2, "GET": 0.7, "HEAD": 0.1},
+					ObjectSizeBytes: 64 * 1024, // 64 KiB
+					TenantCount:     8,
+					DurationSeconds: 600,
+					TargetRPS:       10000,
+				},
+				Targets: []Target{
+					{Metric: MetricSustainedRPS, Min: TargetSustainedRPS, Unit: "req/s"},
+					{Metric: MetricRPSEfficiency, Min: TargetRPSEfficiencyMin, Unit: "ratio"},
+					{Metric: MetricErrorRate, Max: TargetErrorRateMax, Unit: "ratio"},
+					// Hard gate the no-op skip fraction at 5% for
+					// the 10K-RPS scenario. The seeded working set
+					// (SeedObjects defaults to max(64, TargetRPS/10)
+					// = 1000 keys at 10K RPS) plus the 20% PUT
+					// share should keep skips well under that bar;
+					// a higher value would indicate the early-ramp
+					// PUTs are not seeding fast enough and the GET
+					// histograms are being built from a smaller
+					// sample than expected (see MetricSkippedOpFraction).
+					{Metric: MetricSkippedOpFraction, Max: 0.05, Unit: "ratio"},
 				},
 			},
 			{
