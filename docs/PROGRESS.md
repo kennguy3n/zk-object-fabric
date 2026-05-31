@@ -545,9 +545,23 @@ external load is run on it:
 - **External security review** — independent review of the auth path
   (HMAC, presigned URLs, IAM-style policies), the encryption envelope,
   manifest sealing, and DEK handling.
+  - **Hand-off package READY** —
+    [`docs/security/audit-package-security.md`](security/audit-package-security.md)
+    is a complete review package cross-referenced to the source files
+    (`internal/auth/`, `api/s3compat/`, `metadata/manifest_store/postgres/`,
+    `cmd/gateway/main.go`). Bundle for the auditor via
+    `make audit-bundle`. Vendor engagement (e.g. Trail of Bits / Cure53 /
+    NCC Group) still TBD; findings will land in
+    [`docs/security/findings/<vendor>-<YYYY-MM-DD>/`](security/findings/).
 - **External cryptography review** — review of the AEAD bindings
   (per-chunk AAD, manifest body AAD), the KEK / CMK hierarchy, and the
   HMAC SigV4 implementation.
+  - **Hand-off package READY** —
+    [`docs/security/audit-package-cryptography.md`](security/audit-package-cryptography.md)
+    is a complete crypto review package cross-referenced to
+    `encryption/client_sdk/`, `encryption/envelope.go`, and
+    `metadata/manifest_store/postgres/body_encryptor.go`. Same bundle
+    target as above; specialist crypto auditor engagement still TBD.
 - **S3 conformance report** — a published conformance matrix against
   the AWS S3 API surface (PUT, GET, HEAD, DELETE, LIST, multipart,
   range, ACL, versioning, lifecycle) using an external conformance
