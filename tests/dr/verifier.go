@@ -451,6 +451,22 @@ func (v *Verifier) waitForDrain(ctx context.Context, repl *cross_cell.Replicator
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
+			// The deadline channel and the tick channel can
+			// fire on the same scheduler turn. Go's select
+			// then picks one at random: if the deadline wins
+			// but the drain condition is satisfied right now,
+			// the previous version of this code reported a
+			// spurious timeout. Do one final drain check
+			// against current state before declaring failure
+			// so a race between the deadline and the last
+			// tick can't manufacture a flaky CI artifact.
+			// (Devin Review on PR #79 flagged the select
+			// non-determinism explicitly.)
+			if done, err := v.drainSatisfied(ctx, repl, expected, sharedStore); err != nil {
+				return fmt.Errorf("check dest manifests on deadline: %w", err)
+			} else if done {
+				return nil
+			}
 			missing := v.missingKeys(ctx, expected)
 			return fmt.Errorf(
 				"steady drain timed out after %s: missing=%d/%d, copied=%d, shared_store=%v, first_missing=%s",
@@ -458,13 +474,7 @@ func (v *Verifier) waitForDrain(ctx context.Context, repl *cross_cell.Replicator
 				firstMissingObjectKey(missing),
 			)
 		case <-tick.C:
-			if sharedStore {
-				if repl.CopiedPieces() >= int64(len(expected)) {
-					return nil
-				}
-				continue
-			}
-			done, err := v.allDestManifestsPresent(ctx, expected)
+			done, err := v.drainSatisfied(ctx, repl, expected, sharedStore)
 			if err != nil {
 				return fmt.Errorf("check dest manifests: %w", err)
 			}
@@ -473,6 +483,22 @@ func (v *Verifier) waitForDrain(ctx context.Context, repl *cross_cell.Replicator
 			}
 		}
 	}
+}
+
+// drainSatisfied returns true if every expected manifest is
+// observable in the destination cell as of this call. Extracted
+// from waitForDrain so both the per-tick path and the deadline
+// path can run the same predicate — without the helper, the
+// deadline branch could race against a satisfied state that the
+// tick branch would have observed had Go's select picked the
+// tick channel instead. The shared-store and per-key branches
+// match the documentation at waitForDrain's top of body
+// (CopiedPieces piece-count vs. per-manifest Get probes).
+func (v *Verifier) drainSatisfied(ctx context.Context, repl *cross_cell.Replicator, expected []seededObject, sharedStore bool) (bool, error) {
+	if sharedStore {
+		return repl.CopiedPieces() >= int64(len(expected)), nil
+	}
+	return v.allDestManifestsPresent(ctx, expected)
 }
 
 // allDestManifestsPresent returns true once every expected
