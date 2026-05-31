@@ -102,11 +102,20 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 
 	// Build into a temp file then rename so the bundle never
 	// appears half-written under its final name.
-	tmpPath := outPath + ".tmp"
-	tmpFile, err := os.Create(tmpPath)
+	//
+	// os.CreateTemp (rather than os.Create on a deterministic
+	// `outPath+".tmp"`) gives a unique-per-invocation name so two
+	// bundler runs in the same outDir (e.g. a CI run and a manual
+	// rerun on the same commit, or a parallel build of two manifests)
+	// cannot trample each other's tmp file. We keep the `.tmp` suffix
+	// at the end of the pattern so the regression test that scans
+	// outDir for stray `*.tmp` files (bundle_test.go ~line 215) still
+	// matches.
+	tmpFile, err := os.CreateTemp(outDir, bundleStem+".*.tmp")
 	if err != nil {
-		return nil, fmt.Errorf("create %q: %w", tmpPath, err)
+		return nil, fmt.Errorf("create temp file in %q: %w", outDir, err)
 	}
+	tmpPath := tmpFile.Name()
 	// Safety-net cleanup: on the error return paths below, the
 	// explicit close chain that runs before os.Rename is never
 	// reached, which would leak the file descriptor and leave
@@ -364,8 +373,15 @@ func (w *bundleWriter) writeIndex(m *Manifest, opts BundleOptions, included []st
 	fmt.Fprintf(&sb, "Commit:  `%s`  \n", opts.CommitSHA)
 	fmt.Fprintf(&sb, "Built:   `%s`  \n", opts.BuildTime.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&sb, "Source:  https://github.com/kennguy3n/zk-object-fabric/commit/%s\n\n", opts.CommitSHA)
-	fmt.Fprintf(&sb, "Start by reading `progress_pin/docs/README` (system overview) and then\n")
-	fmt.Fprintf(&sb, "`docs/security/README.md` if this bundle has the audit_bundle component.\n\n")
+	// Reference the actual files the auditor will find inside the bundle.
+	// The bundle layout is <bundle-stem>/<componentID>/<rel-path>, so the
+	// system overview lives at progress_pin/docs/PROPOSAL.md (always
+	// shipped — progress_pin is the only required component) and the
+	// security README at audit_bundle/docs/security/README.md (shipped
+	// when the audit_bundle make target succeeds and the optional source
+	// files are present on the branch).
+	fmt.Fprintf(&sb, "Start by reading `progress_pin/docs/PROPOSAL.md` (system overview) and then\n")
+	fmt.Fprintf(&sb, "`audit_bundle/docs/security/README.md` if this bundle has the audit_bundle component.\n\n")
 	fmt.Fprintf(&sb, "Components\n----------\n\n")
 	for _, c := range m.Components {
 		// Default is "MISSING (optional)" because in practice every
