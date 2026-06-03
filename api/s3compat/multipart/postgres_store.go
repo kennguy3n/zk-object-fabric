@@ -856,6 +856,16 @@ func (s *PostgresStore) expireOne(tenantID, uploadID string) {
 		s.logf("expire load %s: %v", uploadID, err)
 		return
 	}
+	// Defence-in-depth: mirror Get's app-layer tenant check so the sweep
+	// stays fail-closed even on a superuser/unarmed dev DB where RLS is
+	// bypassed. tenantID came from this row's own tenant_id in the sweep
+	// scan, so a mismatch means the row was re-tenanted between scan and
+	// load — skip it rather than delete (or run cleanup) under the wrong
+	// tenant binding.
+	if upload.TenantID != tenantID {
+		s.logf("expire skip %s: tenant mismatch", uploadID)
+		return
+	}
 	if s.cleanup != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		parts := make([]Part, 0, len(upload.parts))
