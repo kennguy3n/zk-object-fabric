@@ -70,6 +70,11 @@ func TestMemoryLegalHoldStore_CreateReleaseList(t *testing.T) {
 	if len(got2) != 0 {
 		t.Errorf("released hold must be inactive, got %v", got2)
 	}
+	// Releasing an unknown id reports the shared not-found sentinel, so
+	// errors.Is works uniformly across the memory/Postgres/SQLite stores.
+	if err := s.Release(ctx, "missing"); !errors.Is(err, ErrLegalHoldNotFound) {
+		t.Errorf("Release(unknown) = %v, want ErrLegalHoldNotFound", err)
+	}
 }
 
 func TestCheckDelete_ReturnsErrLegalHoldActive(t *testing.T) {
