@@ -357,6 +357,13 @@ func (m *AADMigrator) migrateOne(ctx context.Context, key manifest_store.Manifes
 		State:        "active",
 		SizeBytes:    putRes.SizeBytes,
 	}
+	// Re-derive ChunkSize from the freshly stored ciphertext, exactly
+	// as the live single-piece PUT path does (handler.go records
+	// putRes.SizeBytes). v1 AAD does not change ciphertext length so
+	// this equals the old value today, but pinning it to the new
+	// piece keeps ChunkSize and Pieces[0].SizeBytes consistent rather
+	// than carrying a stale inherited value if SDK framing ever shifts.
+	updated.ChunkSize = putRes.SizeBytes
 	// Preserve Mode and ManifestEncrypted; everything else describing
 	// the seal comes from the fresh v1 re-encrypt above.
 	updated.Encryption = metadata.EncryptionConfig{

@@ -142,6 +142,11 @@ func TestAADMigrator_MigratesLegacySinglePiece(t *testing.T) {
 	if len(got.Pieces) != 1 || got.Pieces[0].PieceID == oldPieceID {
 		t.Fatalf("piece not rewritten under a new id: %+v (old=%s)", got.Pieces, oldPieceID)
 	}
+	// ChunkSize must track the freshly stored piece, not the inherited
+	// pre-migration value (mirrors the live PUT path).
+	if got.ChunkSize != got.Pieces[0].SizeBytes {
+		t.Fatalf("ChunkSize=%d not pinned to new piece SizeBytes=%d", got.ChunkSize, got.Pieces[0].SizeBytes)
+	}
 
 	// Old piece reclaimed.
 	if _, ok := fake.pieceBytes(oldPieceID); ok {
