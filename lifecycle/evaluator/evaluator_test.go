@@ -925,3 +925,45 @@ func TestAudit_RecordErrorIsLogged(t *testing.T) {
 		t.Errorf("audit failure must be logged; got %q", logged)
 	}
 }
+
+// TestAudit_PieceLessExpirationSkipsAudit verifies a piece-less
+// manifest expiration (e.g. a zero-byte object) is still metered but
+// produces no audit entry, matching the interactive DELETE path which
+// only audits when len(manifest.Pieces) > 0.
+func TestAudit_PieceLessExpirationSkipsAudit(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	mf := &metadata.ObjectManifest{
+		TenantID: tnt, Bucket: bkt,
+		ObjectKey: "logs/empty.txt", ObjectKeyHash: "h1", VersionID: "v1",
+		CreatedAt: now.AddDate(0, 0, -40),
+		// No Pieces: a zero-byte object.
+	}
+	mans := newMockManifests()
+	mans.latest[vkey(tnt, bkt)] = []*metadata.ObjectManifest{mf}
+	prov := &fakeProvider{}
+	src := &mockSource{entries: []bucket_config.LifecycleEntry{entry(enabledExpireRule("logs/", 30))}}
+	aud := &mockAudit{}
+	bill := &mockBilling{}
+
+	e := New(Config{
+		Source:    src,
+		Manifests: mans,
+		Providers: map[string]providers.StorageProvider{"test": prov},
+		Clock:     fixedClock(now),
+		Audit:     aud,
+		Billing:   bill,
+	})
+	stats, err := e.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.ObjectsExpired != 1 {
+		t.Fatalf("piece-less object must still expire; got %+v", stats)
+	}
+	if len(aud.entries) != 0 {
+		t.Errorf("piece-less expiration must not audit; got %+v", aud.entries)
+	}
+	if bill.countOf(billing.LifecycleExpirations) != 1 {
+		t.Errorf("piece-less expiration must still meter LifecycleExpirations; got %+v", bill.events)
+	}
+}
