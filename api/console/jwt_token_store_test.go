@@ -92,10 +92,16 @@ func TestJWTTokenStore_Expiry(t *testing.T) {
 	if _, ok := store.ResolveToken(token); !ok {
 		t.Fatal("token should still be valid before expiry")
 	}
-	// Expired just after TTL.
-	clock = base.Add(61 * time.Second)
+	// Within the clock-skew leeway window just past TTL the token is
+	// intentionally still accepted (absorbs replica clock skew).
+	clock = base.Add(time.Minute + 30*time.Second)
+	if _, ok := store.ResolveToken(token); !ok {
+		t.Fatal("token should still be valid within the clock-skew leeway window")
+	}
+	// Well past TTL + leeway it must be rejected.
+	clock = base.Add(time.Minute + jwtClockSkewLeeway + 10*time.Second)
 	if _, ok := store.ResolveToken(token); ok {
-		t.Fatal("token should be rejected after expiry")
+		t.Fatal("token should be rejected after expiry + leeway")
 	}
 }
 
@@ -106,8 +112,22 @@ func TestJWTTokenStore_NotYetValidClockSkew(t *testing.T) {
 		c.Now = func() time.Time { return issueClock }
 	})
 	token, _ := store.IssueToken("t-nbf")
-	// A verifier whose clock is well before the token's nbf must
-	// reject it (jwt enforces nbf with no default leeway here).
+
+	// A verifier whose clock lags within the leeway window must still
+	// accept the token — this is the multi-replica skew case the
+	// leeway exists for.
+	withinSkew := base.Add(-(jwtClockSkewLeeway - 5*time.Second))
+	tolerant, _ := NewJWTTokenStore(JWTConfig{
+		SigningKey: storeKey(store),
+		Issuer:     "test-issuer",
+		Now:        func() time.Time { return withinSkew },
+	})
+	if _, ok := tolerant.ResolveToken(token); !ok {
+		t.Fatal("token used within the clock-skew leeway window should be accepted")
+	}
+
+	// A verifier whose clock is well before nbf (beyond leeway) must
+	// reject it.
 	verifyClock := base.Add(-time.Hour)
 	skewed, _ := NewJWTTokenStore(JWTConfig{
 		SigningKey: storeKey(store),

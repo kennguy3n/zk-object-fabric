@@ -24,6 +24,20 @@ import (
 // deployments should not.
 const DefaultJWTTokenTTL = time.Hour
 
+// jwtClockSkewLeeway is the tolerance applied to the time-based
+// claims (nbf and exp) during verification. The whole point of a
+// stateless token is that any replica behind a load balancer can
+// validate it, but those replicas do not share a clock: a verifier
+// whose wall clock lags the issuer by a few milliseconds would
+// otherwise reject a token it just received as "not yet valid"
+// (nbf in the future), and a verifier that runs slightly ahead would
+// expire tokens early. A small symmetric leeway absorbs realistic
+// NTP-bounded skew without meaningfully extending a token's usable
+// life (60s against a 1h TTL is ~1.6%). This is the conventional
+// mitigation; it is deliberately small so it cannot mask a grossly
+// wrong clock.
+const jwtClockSkewLeeway = 60 * time.Second
+
 // jwtSigningMethod pins the algorithm JWTTokenStore signs and accepts.
 // It is referenced both when minting (so issued tokens advertise
 // RS256) and when verifying (so the parser rejects any token whose
@@ -198,6 +212,7 @@ func (s *JWTTokenStore) ResolveToken(token string) (string, bool) {
 		jwt.WithIssuer(s.issuer),
 		jwt.WithAudience(s.audience),
 		jwt.WithExpirationRequired(),
+		jwt.WithLeeway(jwtClockSkewLeeway),
 		jwt.WithTimeFunc(s.now),
 	)
 	if err != nil || !parsed.Valid {
