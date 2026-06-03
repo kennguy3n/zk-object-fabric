@@ -1519,10 +1519,14 @@ func jobStoreLabel(s migration.JobStore) string {
 // os.Hostname() (the usual container / pod name) is used, and a
 // "gateway-unknown" fallback only fires when Hostname errors (rare,
 // but defended against because some consumers — e.g. the rebalancer
-// orchestrator — refuse an empty NodeID). Shared by every subsystem
-// that stamps a node identity (billing/audit SourceNodeID via the
-// s3 handler and lifecycle evaluator, and claim ownership via the
-// rebalancer) so resolution is uniform across the gateway.
+// orchestrator — refuse an empty NodeID). Every subsystem that stamps
+// a node identity (billing/audit SourceNodeID via the s3 handler and
+// lifecycle evaluator, and claim ownership via the rebalancer) shares
+// this one resolution path; the resolved value is identical across
+// them only when their overrides are (e.g. both empty → the same
+// os.Hostname()). gateway.node_id and rebalancer.node_id remain
+// independent overrides, so setting just one can intentionally yield
+// distinct identities for billing/audit vs. claim ownership.
 func resolveGatewayNodeID(override string) string {
 	if override != "" {
 		return override
