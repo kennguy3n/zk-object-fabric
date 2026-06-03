@@ -62,6 +62,29 @@ type EncryptionConfig struct {
 	WrappedDEK        []byte `json:"wrapped_dek,omitempty"`
 	WrapAlgorithm     string `json:"wrap_algorithm,omitempty"`
 	ManifestEncrypted bool   `json:"manifest_encrypted"`
+
+	// AADVersion records which per-chunk Additional Authenticated
+	// Data scheme the object's ciphertext was sealed with, so the
+	// GET path can reproduce the exact AAD the seal used:
+	//
+	//   - "":   legacy / pre-AAD object. The SDK was invoked with
+	//           AAD = nil (see encryption/client_sdk Options.ChunkAAD).
+	//           Objects written before this field existed, and every
+	//           convergent-dedup object (ConvergentNonce is mutually
+	//           exclusive with ChunkAAD), carry "".
+	//   - "v1": ciphertext sealed with ChunkAAD bound to the canonical
+	//           object identity tenant_id|bucket|object_key_hash|
+	//           version_id (the format documented in client_sdk). The
+	//           decrypt path MUST rebuild the identical AAD from the
+	//           manifest's own identity fields or every chunk's
+	//           Poly1305 tag fails to open.
+	//
+	// Only gateway-encrypted, non-convergent writes set "v1"; the
+	// field is empty for client_side and legacy objects. Because v1
+	// binds the ciphertext to the object identity, any operation that
+	// relocates ciphertext to a new identity (e.g. server-side copy)
+	// must re-encrypt rather than copy bytes verbatim.
+	AADVersion string `json:"aad_version,omitempty"`
 }
 
 // Piece is a single backend-stored chunk of ciphertext.

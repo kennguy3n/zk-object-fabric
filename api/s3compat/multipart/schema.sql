@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     tenant_id         TEXT        NOT NULL,
     bucket            TEXT        NOT NULL,
     object_key        TEXT        NOT NULL,
+    -- version_id is the object version assigned at Create and
+    -- recorded on the final manifest at Complete. It is fixed
+    -- up-front because the managed AAD v1 binding seals each part's
+    -- chunks against tenant_id|bucket|object_key_hash|version_id at
+    -- UploadPart time, and the GET path rebuilds the identical AAD.
+    version_id        TEXT,
     backend           TEXT,
     -- policy is the resolved metadata.PlacementPolicy captured at
     -- CreateMultipartUpload time so each UploadPart applies the
@@ -44,6 +50,21 @@ CREATE INDEX IF NOT EXISTS multipart_uploads_by_tenant_bucket
 -- "uploads past UploadTTL" query without a full table scan.
 CREATE INDEX IF NOT EXISTS multipart_uploads_by_created_at
     ON multipart_uploads (created_at);
+
+-- Backfill for deployments whose multipart_uploads table predates
+-- the managed AAD v1 binding: CREATE TABLE IF NOT EXISTS above is a
+-- no-op on an existing table, so it would NOT add version_id. This
+-- idempotent ALTER does, making a plain re-apply of schema.sql the
+-- complete migration step (no separately hand-written ALTER needed).
+-- It is a no-op on a fresh DB (the column already exists from the
+-- CREATE TABLE) and on an already-migrated DB. The column is
+-- nullable, so adding it is an instant metadata-only change with no
+-- table rewrite, and pre-existing rows read back NULL -> "" ->
+-- unbound (legacy) AAD, exactly matching parts those sessions sealed.
+-- Applying this before rolling out the new gateway code avoids the
+-- deploy-before-migrate window where Create/Get would 500 on a
+-- missing column.
+ALTER TABLE multipart_uploads ADD COLUMN IF NOT EXISTS version_id TEXT;
 
 CREATE TABLE IF NOT EXISTS multipart_parts (
     upload_id           TEXT        NOT NULL

@@ -22,6 +22,54 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 )
 
+// AADVersionV1 is the current per-chunk Additional Authenticated Data
+// scheme: every chunk's AEAD tag is bound to the canonical object
+// identity (see aadIdentity). It is recorded on
+// metadata.EncryptionConfig.AADVersion at seal time so the GET path
+// can reproduce the identical AAD. The empty string denotes a legacy
+// / pre-AAD object (or a convergent-dedup object, which cannot use
+// AAD) sealed with AAD = nil.
+const AADVersionV1 = "v1"
+
+// aadIdentity is the canonical object identity bound into every v1
+// per-chunk AEAD AAD. Its byte form is
+//
+//	tenant_id|bucket|object_key_hash|version_id
+//
+// which MUST match the format documented in
+// encryption/client_sdk/sdk.go byte-for-byte: the encrypt and decrypt
+// sides build it independently (encrypt from the live object identity,
+// decrypt from the manifest's recorded identity) and any divergence
+// surfaces as an AEAD MAC failure on GET rather than silent
+// corruption. object_key_hash is used rather than the raw key so the
+// binding is stable across key-formatting differences (see the SDK
+// package doc).
+type aadIdentity struct {
+	TenantID      string
+	Bucket        string
+	ObjectKeyHash string
+	VersionID     string
+}
+
+// chunkAAD returns the canonical pipe-separated identity bytes mixed
+// into every chunk's AAD. Returns a non-empty slice so the SDK binds
+// the tag (an empty ChunkAAD would silently fall back to AAD = nil).
+func (id aadIdentity) chunkAAD() []byte {
+	return []byte(id.TenantID + "|" + id.Bucket + "|" + id.ObjectKeyHash + "|" + id.VersionID)
+}
+
+// aadIdentityOf builds the identity from a manifest's recorded fields.
+// Used on the decrypt path; the same fields the encrypt path bound at
+// seal time.
+func aadIdentityOf(m *metadata.ObjectManifest) aadIdentity {
+	return aadIdentity{
+		TenantID:      m.TenantID,
+		Bucket:        m.Bucket,
+		ObjectKeyHash: m.ObjectKeyHash,
+		VersionID:     m.VersionID,
+	}
+}
+
 // IsGatewayEncrypted reports whether the given encryption mode needs
 // the gateway to seal / open object bytes on behalf of the tenant.
 // "client_side" is intentionally excluded: in Strict ZK mode the
@@ -59,9 +107,33 @@ func IsGatewayEncrypted(mode string) bool {
 // use this helper because they require the convergent-nonce
 // derivation — but those paths also do not call EncryptedSize, so
 // the size-prediction coupling does not apply.
-func gatewayEncryptOptions() client_sdk.Options {
+//
+// enc selects the AAD shape and MUST equal the EncryptionConfig
+// that will be recorded on the manifest, making this the exact
+// encrypt-side mirror of gatewayDecryptOptions: for AADVersion
+// "v1" every chunk's AEAD tag is bound to the object identity id;
+// for "" (legacy / convergent / pre-version multipart session) the
+// SDK is invoked with AAD = nil. The same id reconstructed from the
+// manifest MUST be passed to gatewayDecryptOptions or Open returns a
+// MAC failure. Keeping the seal/open decision keyed off the same
+// recorded AADVersion is what prevents a bind-on-seal / nil-on-open
+// mismatch. ChunkAAD does not change ciphertext length, so
+// EncryptedSize is unaffected by the bound identity and the
+// size-prediction coupling above still holds.
+func gatewayEncryptOptions(enc metadata.EncryptionConfig, id aadIdentity) client_sdk.Options {
+	if enc.AADVersion == AADVersionV1 {
+		return client_sdk.Options{ChunkAAD: id.chunkAAD()}
+	}
 	return client_sdk.Options{}
 }
+
+// v1EncryptionConfig is the EncryptionConfig literal passed to
+// gatewayEncryptOptions by the always-bound encrypt paths
+// (single-piece buffered + streaming, erasure-coded). These paths
+// unconditionally seal new objects as v1; only the multipart path
+// can seal a legacy (unbound) object, and it passes
+// partsEncryptionConfig(upload) instead.
+var v1EncryptionConfig = metadata.EncryptionConfig{AADVersion: AADVersionV1}
 
 // gatewayDecryptOptions returns the canonical client_sdk.Options
 // used by every gateway decrypt path: decryptFromStorage,
@@ -81,12 +153,19 @@ func gatewayEncryptOptions() client_sdk.Options {
 //
 // Funnelling every decrypt callsite through this helper closes
 // the symmetric coupling noted in PR #74 review (3299218446).
-// Today the helper returns the same value as
-// gatewayEncryptOptions (both Options{}), so behaviour is
-// unchanged; the point is that any future change to encrypt-side
-// chunking forces an explicit, type-level decision about whether
-// the decrypt side must match.
-func gatewayDecryptOptions() client_sdk.Options {
+//
+// AAD: the shape MUST match what the encrypt path sealed with, as
+// recorded on enc.AADVersion. For "v1" the per-chunk AAD is bound
+// to id (the canonical object identity rebuilt from the manifest);
+// for "" (legacy / pre-AAD, and every convergent-dedup object) the
+// SDK is invoked with AAD = nil so pre-AAD ciphertext still opens.
+// Passing the wrong shape — e.g. binding id to a legacy object, or
+// nil to a v1 object — fails every chunk's Poly1305 tag, so the
+// version gate here is load-bearing, not cosmetic.
+func gatewayDecryptOptions(enc metadata.EncryptionConfig, id aadIdentity) client_sdk.Options {
+	if enc.AADVersion == AADVersionV1 {
+		return client_sdk.Options{ChunkAAD: id.chunkAAD()}
+	}
 	return client_sdk.Options{}
 }
 
@@ -106,7 +185,7 @@ func gatewayDecryptOptions() client_sdk.Options {
 // remains in use for the erasure-coded path (which always buffers
 // because the EC encoder shards a fully-formed byte slice) and the
 // chunked / unknown-length single-piece fallback.
-func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.WrappedDEK, error) {
+func (h *Handler) encryptForStorage(plaintext []byte, id aadIdentity) ([]byte, client_sdk.WrappedDEK, error) {
 	if h.cfg.Encryption == nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: gateway encryption is not configured")
 	}
@@ -128,7 +207,7 @@ func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.Wrappe
 	// convergent-nonce modes without corrupting the in-flight
 	// stream.
 	defer clear(dek)
-	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, gatewayEncryptOptions())
+	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, gatewayEncryptOptions(v1EncryptionConfig, id))
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: encrypt object: %w", err)
 	}
@@ -163,7 +242,7 @@ func (h *Handler) encryptForStorage(plaintext []byte) ([]byte, client_sdk.Wrappe
 // not on this function returning, so the caller MUST drain the
 // reader to EOF (or propagate any returned error) to learn whether
 // the stream was valid.
-func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, client_sdk.WrappedDEK, error) {
+func (h *Handler) streamEncryptForStorage(plaintext io.Reader, id aadIdentity) (io.Reader, client_sdk.WrappedDEK, error) {
 	if h.cfg.Encryption == nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: gateway encryption is not configured")
 	}
@@ -185,7 +264,7 @@ func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, clien
 	// for streaming, the AEAD inside it is keyed off an internal
 	// copy.
 	defer clear(dek)
-	encReader, err := client_sdk.EncryptObject(plaintext, dek, gatewayEncryptOptions())
+	encReader, err := client_sdk.EncryptObject(plaintext, dek, gatewayEncryptOptions(v1EncryptionConfig, id))
 	if err != nil {
 		return nil, client_sdk.WrappedDEK{}, fmt.Errorf("s3compat: encrypt object: %w", err)
 	}
@@ -200,8 +279,23 @@ func (h *Handler) streamEncryptForStorage(plaintext io.Reader) (io.Reader, clien
 // is used by the multipart path so every part of a single upload
 // shares the same key: the DEK is generated at CreateMultipartUpload
 // time, wrapped once, and then handed to every UploadPart call.
-func (h *Handler) encryptWithDEK(plaintext []byte, dek client_sdk.DataEncryptionKey) ([]byte, error) {
-	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, gatewayEncryptOptions())
+//
+// It is the exact mirror of decryptWithDEK: enc selects the AAD
+// shape via gatewayEncryptOptions, so the seal binds the per-chunk
+// AAD to id only when the object is being recorded as v1. This
+// symmetry is load-bearing for legacy multipart sessions — a
+// session created before version_id existed loads with an empty
+// upload.VersionID, so partsEncryptionConfig returns AADVersion ""
+// and the parts MUST seal with nil AAD. The manifest written at
+// CompleteMultipartUpload also records AADVersion "" for such a
+// session, and the GET path opens with nil AAD; binding here
+// regardless would leave every part permanently undecryptable
+// (Seal with non-nil AAD vs Open with nil AAD is a Poly1305
+// mismatch). The decrypt-side guard alone (partsEncryptionConfig
+// on the consolidate path) is insufficient because the regular
+// multipart GET reads AADVersion from the manifest.
+func (h *Handler) encryptWithDEK(plaintext []byte, dek client_sdk.DataEncryptionKey, enc metadata.EncryptionConfig, id aadIdentity) ([]byte, error) {
+	encReader, err := client_sdk.EncryptObject(bytes.NewReader(plaintext), dek, gatewayEncryptOptions(enc, id))
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: encrypt object: %w", err)
 	}
@@ -224,7 +318,7 @@ func (h *Handler) encryptWithDEK(plaintext []byte, dek client_sdk.DataEncryption
 // range out of the materialised plaintext) and the multipart /
 // EC GET paths (assemble per-part plaintext blobs before stitching
 // them together).
-func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionConfig) ([]byte, error) {
+func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionConfig, id aadIdentity) ([]byte, error) {
 	if h.cfg.Encryption == nil {
 		return nil, fmt.Errorf("s3compat: gateway encryption is not configured")
 	}
@@ -241,8 +335,9 @@ func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionC
 	// decryptWithDEK funnels through gatewayDecryptOptions; the
 	// raw Options{} previously used here is now routed through
 	// the helper so encrypt / decrypt option coupling stays
-	// explicit (see gatewayDecryptOptions docs, 3299218446).
-	plaintext, derr := h.decryptWithDEK(ciphertext, dek)
+	// explicit (see gatewayDecryptOptions docs, 3299218446). enc
+	// + id select the AAD shape (v1 bound vs legacy nil).
+	plaintext, derr := h.decryptWithDEK(ciphertext, dek, enc, id)
 	// DEK scrubbing on the read side mirrors the encrypt path:
 	// once decryptWithDEK has built its chacha20poly1305 AEAD (which
 	// holds its own key schedule) and drained the ciphertext into
@@ -257,8 +352,8 @@ func (h *Handler) decryptFromStorage(ciphertext []byte, enc metadata.EncryptionC
 // decryptWithDEK runs the SDK decrypt reader against an already-
 // unwrapped DEK. Used by the multipart GET path so parts that
 // share a key are decrypted without repeated unwraps.
-func (h *Handler) decryptWithDEK(ciphertext []byte, dek client_sdk.DataEncryptionKey) ([]byte, error) {
-	decReader, err := client_sdk.DecryptObject(bytes.NewReader(ciphertext), dek, gatewayDecryptOptions())
+func (h *Handler) decryptWithDEK(ciphertext []byte, dek client_sdk.DataEncryptionKey, enc metadata.EncryptionConfig, id aadIdentity) ([]byte, error) {
+	decReader, err := client_sdk.DecryptObject(bytes.NewReader(ciphertext), dek, gatewayDecryptOptions(enc, id))
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: decrypt object: %w", err)
 	}
@@ -288,7 +383,7 @@ func (h *Handler) decryptWithDEK(ciphertext []byte, dek client_sdk.DataEncryptio
 // surface on the first Read call, not on this returning function,
 // so the caller MUST drain to EOF (or close) to learn whether the
 // stream was valid.
-func (h *Handler) streamDecryptFromStorage(ciphertext io.Reader, enc metadata.EncryptionConfig) (io.Reader, error) {
+func (h *Handler) streamDecryptFromStorage(ciphertext io.Reader, enc metadata.EncryptionConfig, id aadIdentity) (io.Reader, error) {
 	if h.cfg.Encryption == nil {
 		return nil, fmt.Errorf("s3compat: gateway encryption is not configured")
 	}
@@ -302,7 +397,7 @@ func (h *Handler) streamDecryptFromStorage(ciphertext io.Reader, enc metadata.En
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: unwrap dek: %w", err)
 	}
-	decReader, err := client_sdk.DecryptObject(ciphertext, dek, gatewayDecryptOptions())
+	decReader, err := client_sdk.DecryptObject(ciphertext, dek, gatewayDecryptOptions(enc, id))
 	if err != nil {
 		return nil, fmt.Errorf("s3compat: decrypt object: %w", err)
 	}
@@ -379,6 +474,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 	w http.ResponseWriter,
 	r *http.Request,
 	encMode string,
+	id aadIdentity,
 ) (metadata.EncryptionConfig, io.Reader, int64, func() int64, bool) {
 	switch encMode {
 	case string(encryption.ManagedEncrypted), string(encryption.PublicDistribution):
@@ -418,7 +514,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 			// size cannot drift from streamEncryptForStorage's
 			// emitted size if SDK options grow new size-affecting
 			// fields. See gatewayEncryptOptions docs (3299180226).
-			ciphertextSize, err := client_sdk.EncryptedSize(plaintextSize, gatewayEncryptOptions())
+			ciphertextSize, err := client_sdk.EncryptedSize(plaintextSize, gatewayEncryptOptions(v1EncryptionConfig, id))
 			if err != nil {
 				switch {
 				case errors.Is(err, client_sdk.ErrEncryptedSizeOverflow):
@@ -450,7 +546,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 			// manifest pointing at a backend object whose size
 			// does not match the manifest's ObjectSize.
 			counter := &byteCountingReader{R: r.Body}
-			encReader, wrapped, err := h.streamEncryptForStorage(counter)
+			encReader, wrapped, err := h.streamEncryptForStorage(counter, id)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
 				return metadata.EncryptionConfig{}, nil, 0, nil, false
@@ -461,6 +557,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 				KeyID:         wrapped.KeyID,
 				WrappedDEK:    wrapped.WrappedKey,
 				WrapAlgorithm: wrapped.WrapAlgorithm,
+				AADVersion:    AADVersionV1,
 			}
 			return cfg, encReader, ciphertextSize, counter.BytesRead, true
 		}
@@ -477,7 +574,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 			writeBodyReadError(w, r, err)
 			return metadata.EncryptionConfig{}, nil, 0, nil, false
 		}
-		ciphertext, wrapped, err := h.encryptForStorage(plaintext)
+		ciphertext, wrapped, err := h.encryptForStorage(plaintext, id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, 0, nil, false
@@ -494,6 +591,7 @@ func (h *Handler) prepareSinglePieceEncryption(
 			KeyID:         wrapped.KeyID,
 			WrappedDEK:    wrapped.WrappedKey,
 			WrapAlgorithm: wrapped.WrapAlgorithm,
+			AADVersion:    AADVersionV1,
 		}
 		// Buffered path: plaintextSize captured here IS ground
 		// truth (io.ReadAll consumed the body to EOF), so the
@@ -545,6 +643,7 @@ func (h *Handler) prepareErasureCodedEncryption(
 	r *http.Request,
 	encMode string,
 	plaintext []byte,
+	id aadIdentity,
 ) (metadata.EncryptionConfig, []byte, bool) {
 	switch encMode {
 	case string(encryption.ManagedEncrypted), string(encryption.PublicDistribution):
@@ -553,7 +652,7 @@ func (h *Handler) prepareErasureCodedEncryption(
 				"tenant policy requires managed encryption but no gateway encryption is configured", r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, false
 		}
-		ciphertext, wrapped, err := h.encryptForStorage(plaintext)
+		ciphertext, wrapped, err := h.encryptForStorage(plaintext, id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", err.Error(), r.URL.Path)
 			return metadata.EncryptionConfig{}, nil, false
@@ -573,6 +672,7 @@ func (h *Handler) prepareErasureCodedEncryption(
 			KeyID:         wrapped.KeyID,
 			WrappedDEK:    wrapped.WrappedKey,
 			WrapAlgorithm: wrapped.WrapAlgorithm,
+			AADVersion:    AADVersionV1,
 		}, ciphertext, true
 
 	case string(encryption.StrictZK):

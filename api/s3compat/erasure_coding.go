@@ -168,7 +168,17 @@ func (h *Handler) putErasureCoded(
 	// ciphertext (the tenant encrypted before PUT); the gateway
 	// erasure-codes the opaque bytes verbatim.
 	encMode := policy.EncryptionMode
-	encCfg, prepared, prepareOK := h.prepareErasureCodedEncryption(w, r, encMode, body)
+	// Generate the version BEFORE encryption so the AAD v1 binding
+	// can fix it into every chunk's tag; the manifest records the
+	// same VersionID so the GET path rebuilds the identical AAD.
+	versionID := newPieceID(tenantID, bucket, key, h.cfg.Now())
+	encID := aadIdentity{
+		TenantID:      tenantID,
+		Bucket:        bucket,
+		ObjectKeyHash: hashObjectKey(key),
+		VersionID:     versionID,
+	}
+	encCfg, prepared, prepareOK := h.prepareErasureCodedEncryption(w, r, encMode, body, encID)
 	if !prepareOK {
 		return
 	}
@@ -180,7 +190,6 @@ func (h *Handler) putErasureCoded(
 		return
 	}
 
-	versionID := newPieceID(tenantID, bucket, key, h.cfg.Now())
 	pieces := make([]metadata.Piece, 0, len(shards))
 	written := make([]string, 0, len(shards))
 	for _, shard := range shards {
@@ -419,7 +428,7 @@ func (h *Handler) getErasureCoded(
 	// it back. client_side objects stay opaque.
 	plaintext := decoded
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
-		decrypted, derr := h.decryptFromStorage(decoded, manifest.Encryption)
+		decrypted, derr := h.decryptFromStorage(decoded, manifest.Encryption, aadIdentityOf(manifest))
 		if derr != nil {
 			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
 			return
@@ -614,7 +623,7 @@ func (h *Handler) getMultipart(
 		plaintexts := make([][]byte, len(bodies))
 		var newTotal int64
 		for i, b := range bodies {
-			pt, derr := h.decryptWithDEK(b, dek)
+			pt, derr := h.decryptWithDEK(b, dek, manifest.Encryption, aadIdentityOf(manifest))
 			if derr != nil {
 				writeError(w, http.StatusInternalServerError, "DecryptionFailed", derr.Error(), r.URL.Path)
 				return

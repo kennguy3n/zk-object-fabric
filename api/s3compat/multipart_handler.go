@@ -41,6 +41,35 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
+// uploadAADIdentity builds the canonical AAD v1 identity that
+// binds every managed multipart part's chunk tags. It uses the
+// version fixed at CreateMultipartUpload (upload.VersionID) so the
+// seal path (UploadPart), the consolidate path
+// (assembleManagedMultipartPlaintext), and the GET path
+// (getMultipart, via the manifest) all reproduce the identical AAD.
+func uploadAADIdentity(u *multipart.Upload) aadIdentity {
+	return aadIdentity{
+		TenantID:      u.TenantID,
+		Bucket:        u.Bucket,
+		ObjectKeyHash: hashObjectKey(u.ObjectKey),
+		VersionID:     u.VersionID,
+	}
+}
+
+// partsEncryptionConfig returns the EncryptionConfig describing how
+// the upload's individual parts were sealed at UploadPart time, for
+// the consolidate decrypt path. Parts are AAD v1 only when the
+// session carried a version up-front (post-deploy sessions); legacy
+// session rows written before version_id existed sealed their parts
+// with AAD = nil and must decrypt unbound. Only AADVersion is read
+// by gatewayDecryptOptions, so that is the only field set here.
+func partsEncryptionConfig(u *multipart.Upload) metadata.EncryptionConfig {
+	if u.VersionID == "" {
+		return metadata.EncryptionConfig{}
+	}
+	return metadata.EncryptionConfig{AADVersion: AADVersionV1}
+}
+
 // multipartDedupEligible reports whether the upload is in a state
 // where CompleteMultipartUpload could run the content_index
 // lookup/register flow. It pre-screens UploadPart so we only pay
@@ -150,6 +179,12 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// One clock read for both CreatedAt and the version's timestamp
+	// component so the session's two timestamps agree exactly
+	// (mirrors the single-piece PUT, which mints its pieceID from a
+	// single Now()).
+	now := h.cfg.Now()
+
 	// Lay down the multipart session's encryption state up front:
 	// managed / public_distribution uploads generate one DEK here
 	// that every UploadPart reuses, so the frames all decrypt under
@@ -161,8 +196,13 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		ObjectKey: key,
 		Backend:   backend,
 		Policy:    policy,
-		CreatedAt: h.cfg.Now(),
+		CreatedAt: now,
 		EncMode:   policy.EncryptionMode,
+		// Fix the object version now so the managed AAD v1 binding
+		// can seal every part against the canonical identity at
+		// UploadPart time; Complete records this same value on the
+		// manifest so the GET path reproduces the identical AAD.
+		VersionID: newPieceID(tenantID, bucket, key, now),
 	}
 	if IsGatewayEncrypted(policy.EncryptionMode) {
 		if h.cfg.Encryption == nil {
@@ -268,7 +308,14 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 			upload.SetPlaintextPartHash(partNumber, ptDigest[:])
 		}
 
-		ciphertext, eerr := h.encryptWithDEK(plaintext, upload.DEKMaterial)
+		// partsEncryptionConfig gates the seal: AADVersion "v1"
+		// (session carries a version) binds the part's chunks to
+		// uploadAADIdentity; a legacy session (upload.VersionID
+		// == "") seals with nil AAD, matching the AADVersion ""
+		// that CompleteMultipartUpload records and the GET path
+		// reads back. This is the exact signal partsEncryptionConfig
+		// already feeds the consolidate decrypt path.
+		ciphertext, eerr := h.encryptWithDEK(plaintext, upload.DEKMaterial, partsEncryptionConfig(upload), uploadAADIdentity(upload))
 		if eerr != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", eerr.Error(), r.URL.Path)
 			return
@@ -448,7 +495,23 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		})
 		totalSize += p.SizeBytes
 	}
-	versionID := newPieceID(tenantID, bucket, key, h.cfg.Now())
+	// Reuse the version fixed at CreateMultipartUpload. Managed
+	// parts were sealed with AAD v1 bound to this exact version, so
+	// minting a fresh one here would make the GET path rebuild a
+	// different AAD and every part's tag would fail to open.
+	//
+	// aadBound also drives EncryptionConfig.AADVersion below:
+	// upload.VersionID is empty only for a legacy session row
+	// created before version_id was persisted — its parts were
+	// sealed by the old code path with AAD = nil, so we must record
+	// AADVersion = "" and mint a throwaway version (the empty AAD
+	// doesn't bind to it anyway). Sessions created post-deploy
+	// always carry a version and are bound.
+	aadBound := upload.VersionID != ""
+	versionID := upload.VersionID
+	if !aadBound {
+		versionID = newPieceID(tenantID, bucket, key, h.cfg.Now())
+	}
 	aggregateETag := computeMultipartETag(parts)
 
 	// Capture the session's encryption parameters on the manifest
@@ -462,6 +525,15 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		encCfg.KeyID = upload.WrappedKeyID
 		encCfg.WrappedDEK = upload.WrappedDEK
 		encCfg.WrapAlgorithm = upload.WrapAlgorithm
+		// Record AAD v1 only when the parts were actually sealed
+		// with the bound identity (see aadBound above). The
+		// deferred-convergent consolidation path overwrites this
+		// EncryptionConfig wholesale with convergentEnc
+		// (AADVersion ""), so a deduped object correctly stays
+		// unbound.
+		if aadBound {
+			encCfg.AADVersion = AADVersionV1
+		}
 	case "client_side":
 		// Pull the algorithm from the first part's declaration;
 		// the store doesn't persist headers per part, so we
@@ -1284,7 +1356,7 @@ func (h *Handler) assembleManagedMultipartPlaintext(ctx context.Context, upload 
 		if rerr != nil {
 			return nil, fmt.Errorf("s3compat: consolidate read piece %s: %w", p.PieceID, rerr)
 		}
-		pt, derr := h.decryptWithDEK(ciphertext, upload.DEKMaterial)
+		pt, derr := h.decryptWithDEK(ciphertext, upload.DEKMaterial, partsEncryptionConfig(upload), uploadAADIdentity(upload))
 		if derr != nil {
 			return nil, fmt.Errorf("s3compat: consolidate decrypt piece %s: %w", p.PieceID, derr)
 		}

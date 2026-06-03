@@ -76,6 +76,19 @@ type Upload struct {
 	Policy    metadata.PlacementPolicy
 	CreatedAt time.Time
 
+	// VersionID is the object version assigned at
+	// CreateMultipartUpload and recorded on the final manifest at
+	// Complete. It is fixed up-front (rather than minted at
+	// Complete) because the managed / public_distribution AAD v1
+	// binding seals every part's chunks against the canonical
+	// identity tenant_id|bucket|object_key_hash|version_id at
+	// UploadPart time — long before Complete runs. The consolidate
+	// and GET paths rebuild the identical AAD from this same value
+	// (via the manifest), so it MUST be durable and stable across
+	// the session: a multi-node store persists it alongside the
+	// wrapped DEK so a part sealed on one node decrypts on another.
+	VersionID string
+
 	// EncMode mirrors PlacementPolicy.EncryptionMode captured at
 	// Create time ("", "client_side", "managed", or
 	// "public_distribution").
