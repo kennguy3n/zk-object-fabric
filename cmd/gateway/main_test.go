@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -650,6 +651,91 @@ func TestCheckProductionManifestEncryption_ProductionFails(t *testing.T) {
 	// running the embedded profile recognises it applies to them.
 	if !strings.Contains(err.Error(), "embedded SQLite") {
 		t.Errorf("error message = %q; want to mention 'embedded SQLite' so embedded-profile operators know the guard applies", err.Error())
+	}
+}
+
+// TestBuildTokenStore selects between the stateless JWT store and the
+// in-memory fallback based on whether a signing-key path is set, and
+// the JWT store it returns must mint verifiable tokens.
+func TestBuildTokenStore(t *testing.T) {
+	// No key configured → in-memory fallback (issues/resolves but is
+	// process-local).
+	mem := buildTokenStore(config.Config{})
+	tok, err := mem.IssueToken("t-mem")
+	if err != nil {
+		t.Fatalf("memory IssueToken: %v", err)
+	}
+	if got, ok := mem.ResolveToken(tok); !ok || got != "t-mem" {
+		t.Fatalf("memory ResolveToken = (%q, %v), want (t-mem, true)", got, ok)
+	}
+
+	// Key configured → stateless JWT store. Write a PKCS#1 key to a
+	// temp file and point config at it.
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "jwt.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{}
+	cfg.Console.JWTSigningKeyPath = keyPath
+	cfg.ControlPlane.AuthIssuer = "test-iss"
+	jwtStore := buildTokenStore(cfg)
+	jtok, err := jwtStore.IssueToken("t-jwt")
+	if err != nil {
+		t.Fatalf("jwt IssueToken: %v", err)
+	}
+	if got, ok := jwtStore.ResolveToken(jtok); !ok || got != "t-jwt" {
+		t.Fatalf("jwt ResolveToken = (%q, %v), want (t-jwt, true)", got, ok)
+	}
+	// The issued token must be a JWT (three dot-separated segments),
+	// not the 64-hex-char opaque token MemoryTokenStore mints.
+	if strings.Count(jtok, ".") != 2 {
+		t.Fatalf("expected a JWT (2 dots), got %q", jtok)
+	}
+}
+
+// TestCheckProductionTokenStore_NonProduction: outside production the
+// guard must never fire, even with no JWT signing key — dev and
+// single-node profiles legitimately use the in-memory token store.
+func TestCheckProductionTokenStore_NonProduction(t *testing.T) {
+	for _, env := range []string{"development", "", "staging"} {
+		if err := checkProductionTokenStore(env, ""); err != nil {
+			t.Errorf("checkProductionTokenStore(%q, \"\") = %v; want nil", env, err)
+		}
+	}
+}
+
+// TestCheckProductionTokenStore_ProductionWithKey: in production with
+// a JWT signing key configured the guard must not fire — the console
+// will wire the stateless JWTTokenStore.
+func TestCheckProductionTokenStore_ProductionWithKey(t *testing.T) {
+	if err := checkProductionTokenStore("production", "/etc/zkof/jwt-signing.key"); err != nil {
+		t.Errorf("checkProductionTokenStore(production, key) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionTokenStore_ProductionFails verifies the error
+// path: production with no JWT signing key must return
+// errProductionTokenStoreRequired so the startup wrapper refuses to
+// boot rather than silently falling back to the process-local,
+// non-replica-safe MemoryTokenStore.
+func TestCheckProductionTokenStore_ProductionFails(t *testing.T) {
+	err := checkProductionTokenStore("production", "")
+	if err == nil {
+		t.Fatalf("checkProductionTokenStore(production, \"\") = nil; want errProductionTokenStoreRequired")
+	}
+	if !errors.Is(err, errProductionTokenStoreRequired) {
+		t.Fatalf("checkProductionTokenStore returned %v; want errors.Is(_, errProductionTokenStoreRequired)", err)
+	}
+	if !strings.Contains(err.Error(), "jwt_signing_key_path") {
+		t.Errorf("error message = %q; want to mention 'jwt_signing_key_path' so the operator knows the knob to set", err.Error())
+	}
+	if !strings.Contains(err.Error(), "MemoryTokenStore") {
+		t.Errorf("error message = %q; want to name 'MemoryTokenStore' so the operator understands the fallback being refused", err.Error())
 	}
 }
 
