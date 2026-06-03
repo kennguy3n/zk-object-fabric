@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
@@ -184,6 +185,24 @@ func lifecycleFilterFromXML(f lifecycleFilterXML) (lifecycle.Filter, error) {
 		}
 		return out, nil
 	}
+	// Without <And>, S3 permits at most one predicate; combining e.g.
+	// <Prefix> and <Tag> at the filter root is MalformedXML.
+	siblings := 0
+	if f.Prefix != nil {
+		siblings++
+	}
+	if f.Tag != nil {
+		siblings++
+	}
+	if f.ObjectSizeGreaterThan != nil {
+		siblings++
+	}
+	if f.ObjectSizeLessThan != nil {
+		siblings++
+	}
+	if siblings > 1 {
+		return lifecycle.Filter{}, fmt.Errorf("filter: multiple predicates require an <And> wrapper")
+	}
 	out := lifecycle.Filter{
 		ObjectSizeGreaterThan: f.ObjectSizeGreaterThan,
 		ObjectSizeLessThan:    f.ObjectSizeLessThan,
@@ -265,10 +284,23 @@ func lifecycleFilterToXML(f lifecycle.Filter) *lifecycleFilterXML {
 		ObjectSizeGreaterThan: f.ObjectSizeGreaterThan,
 		ObjectSizeLessThan:    f.ObjectSizeLessThan,
 	}
-	for k, v := range f.Tags {
-		and.Tags = append(and.Tags, lifecycleTagXML{Key: k, Value: v})
+	// Emit tags in a deterministic (key-sorted) order so the GET
+	// response is byte-stable across calls — Go map iteration is
+	// randomized, which would otherwise churn cached/compared XML.
+	for _, k := range sortedKeys(f.Tags) {
+		and.Tags = append(and.Tags, lifecycleTagXML{Key: k, Value: f.Tags[k]})
 	}
 	return &lifecycleFilterXML{And: and}
+}
+
+// sortedKeys returns the map keys in ascending order.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // ---- handlers ----

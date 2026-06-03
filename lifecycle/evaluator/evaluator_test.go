@@ -10,6 +10,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -90,6 +91,30 @@ func (m *mockUploads) List(tenantID, bucket string) []*multipart.Upload {
 func (m *mockUploads) Abort(uploadID, _ string) (*multipart.Upload, []multipart.Part, error) {
 	m.aborted = append(m.aborted, uploadID)
 	return nil, m.parts, nil
+}
+
+// mockContentIndex scripts a post-decrement count plus optional
+// DecrementRef/Delete errors and records the calls, so a test can
+// assert the evaluator's refcount-aware reclamation order.
+type mockContentIndex struct {
+	newCount    int
+	decErr      error
+	delErr      error
+	decremented []string
+	rowsDeleted []string
+}
+
+func (m *mockContentIndex) DecrementRef(_ context.Context, _, contentHash string) (int, error) {
+	m.decremented = append(m.decremented, contentHash)
+	return m.newCount, m.decErr
+}
+
+func (m *mockContentIndex) Delete(_ context.Context, _, contentHash string) error {
+	if m.delErr != nil {
+		return m.delErr
+	}
+	m.rowsDeleted = append(m.rowsDeleted, contentHash)
+	return nil
 }
 
 // fakeProvider records DeletePiece calls and stubs the rest of the
@@ -203,6 +228,98 @@ func TestRun_ExpireUnversionedPermanentDelete(t *testing.T) {
 	}
 	if len(prov.deleted) != 1 || prov.deleted[0] != "p1" {
 		t.Fatalf("expected piece p1 deleted; got %+v", prov.deleted)
+	}
+}
+
+// TestRun_ExpireDedupRefcountAware verifies the evaluator mirrors the
+// interactive DELETE path when permanently expiring a deduped object:
+// it decrements the shared content_index refcount and only removes the
+// canonical backend piece (after dropping the index row) on the final
+// reference — never deleting a piece another object still shares.
+func TestRun_ExpireDedupRefcountAware(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	created := now.AddDate(0, 0, -40) // 40 days old, rule = 30
+
+	newManifest := func() *metadata.ObjectManifest {
+		return &metadata.ObjectManifest{
+			TenantID: tnt, Bucket: bkt,
+			ObjectKey: "logs/a.txt", ObjectKeyHash: "h1", VersionID: "v1",
+			CreatedAt:   created,
+			ContentHash: "blake3:abc",
+			Pieces:      []metadata.Piece{{PieceID: "p1", Backend: "test"}},
+		}
+	}
+
+	cases := []struct {
+		name         string
+		idx          *mockContentIndex
+		wantDecr     bool
+		wantRowDel   bool
+		wantPieceDel bool
+	}{
+		{
+			name:         "shared piece kept while other refs remain",
+			idx:          &mockContentIndex{newCount: 2},
+			wantDecr:     true,
+			wantRowDel:   false,
+			wantPieceDel: false,
+		},
+		{
+			name:         "last reference drops row then piece",
+			idx:          &mockContentIndex{newCount: 0},
+			wantDecr:     true,
+			wantRowDel:   true,
+			wantPieceDel: true,
+		},
+		{
+			name:         "concurrent re-ref skips piece delete",
+			idx:          &mockContentIndex{newCount: 0, delErr: content_index.ErrRefCountNonZero},
+			wantDecr:     true,
+			wantRowDel:   false,
+			wantPieceDel: false,
+		},
+		{
+			name:         "missing index row falls back to best-effort piece delete",
+			idx:          &mockContentIndex{decErr: content_index.ErrNotFound},
+			wantDecr:     true,
+			wantRowDel:   false,
+			wantPieceDel: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mf := newManifest()
+			mans := newMockManifests()
+			mans.latest[vkey(tnt, bkt)] = []*metadata.ObjectManifest{mf}
+			prov := &fakeProvider{}
+			src := &mockSource{entries: []bucket_config.LifecycleEntry{entry(enabledExpireRule("logs/", 30))}}
+
+			e := New(Config{
+				Source:       src,
+				Manifests:    mans,
+				Providers:    map[string]providers.StorageProvider{"test": prov},
+				ContentIndex: tc.idx,
+				Clock:        fixedClock(now),
+			})
+			stats, err := e.Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			// The manifest is always removed regardless of piece fate.
+			if stats.ObjectsExpired != 1 || len(mans.deletes) != 1 {
+				t.Fatalf("manifest must be deleted; ObjectsExpired=%d deletes=%+v", stats.ObjectsExpired, mans.deletes)
+			}
+			if got := len(tc.idx.decremented) > 0; got != tc.wantDecr {
+				t.Fatalf("DecrementRef called=%v, want %v", got, tc.wantDecr)
+			}
+			if got := len(tc.idx.rowsDeleted) > 0; got != tc.wantRowDel {
+				t.Fatalf("index row deleted=%v, want %v", got, tc.wantRowDel)
+			}
+			if got := len(prov.deleted) > 0; got != tc.wantPieceDel {
+				t.Fatalf("backend piece deleted=%v (%+v), want %v", got, prov.deleted, tc.wantPieceDel)
+			}
+		})
 	}
 }
 

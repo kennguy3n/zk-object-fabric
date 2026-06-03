@@ -172,6 +172,13 @@ func TestPutBucketLifecycle_Rejections(t *testing.T) {
 			body: `<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>3</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>`,
 			want: http.StatusBadRequest,
 		},
+		{
+			// Multiple predicates at the Filter root (Prefix + Tag)
+			// without an <And> wrapper is MalformedXML in S3.
+			name: "multi-predicate filter without And wrapper",
+			body: `<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Prefix>logs/</Prefix><Tag><Key>k</Key><Value>v</Value></Tag></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>`,
+			want: http.StatusBadRequest,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

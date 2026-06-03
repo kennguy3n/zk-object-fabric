@@ -39,6 +39,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -67,6 +68,17 @@ type Uploads interface {
 	Abort(uploadID, tenantID string) (*multipart.Upload, []multipart.Part, error)
 }
 
+// ContentIndex is the subset of content_index.Store the evaluator
+// needs to reclaim the bytes of a permanently-expired deduped object.
+// content_index.Store satisfies it. The contract mirrors the
+// interactive DELETE path: DecrementRef returns the post-decrement
+// count, and the caller must attempt Delete (which only succeeds at
+// RefCount==0) BEFORE removing the backend piece.
+type ContentIndex interface {
+	DecrementRef(ctx context.Context, tenantID, contentHash string) (newCount int, err error)
+	Delete(ctx context.Context, tenantID, contentHash string) error
+}
+
 // Config wires the evaluator's dependencies.
 type Config struct {
 	// Source enumerates configured buckets and resolves versioning.
@@ -86,6 +98,16 @@ type Config struct {
 	// orphan GC reclaims the bytes eventually) but manifests/uploads
 	// are still removed.
 	Providers map[string]providers.StorageProvider
+
+	// ContentIndex is the intra-tenant dedup refcount store. Optional;
+	// when nil the evaluator deletes a permanently-expired object's
+	// backend pieces directly (correct for non-deduped manifests).
+	// When wired, a manifest carrying a ContentHash decrements the
+	// shared per-(tenant, content_hash) refcount and the canonical
+	// piece is removed only on the final reference — mirroring the
+	// interactive DELETE path so an expiration can never delete a
+	// piece still shared by another object or orphan the index row.
+	ContentIndex ContentIndex
 
 	// NewVersionID mints the version ID for a delete marker inserted
 	// when expiring an object in a versioning-enabled bucket. The
@@ -382,8 +404,51 @@ func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.L
 		e.logf("lifecycle/evaluator: delete object %s/%s: %v", entry.Bucket, m.ObjectKey, err)
 		return
 	}
-	e.deletePieces(ctx, pieceBackends(m.Pieces))
+	e.reclaimPieces(ctx, entry.TenantID, m)
 	stats.ObjectsExpired++
+}
+
+// reclaimPieces removes the backend bytes backing a just-deleted
+// manifest. A deduped manifest (non-empty ContentHash) whose
+// ContentIndex is wired decrements the shared per-(tenant,
+// content_hash) refcount and removes the canonical piece only on the
+// final reference, dropping the index row FIRST and deleting the
+// piece only on a successful conditional Delete — closing the race
+// with a concurrent dedup PUT that re-increments the count between
+// our DecrementRef returning 0 and the piece deletion. This mirrors
+// the interactive DELETE path (api/s3compat/handler.go) so a
+// lifecycle expiration can never delete a piece another object still
+// references or leave a dangling index row. Non-deduped manifests, or
+// a nil ContentIndex, fall back to a direct best-effort piece delete.
+func (e *Evaluator) reclaimPieces(ctx context.Context, tenantID string, m *metadata.ObjectManifest) {
+	if m.ContentHash == "" || e.cfg.ContentIndex == nil {
+		e.deletePieces(ctx, pieceBackends(m.Pieces))
+		return
+	}
+	newCount, err := e.cfg.ContentIndex.DecrementRef(ctx, tenantID, m.ContentHash)
+	switch {
+	case errors.Is(err, content_index.ErrNotFound):
+		// The index row is already gone but the manifest still
+		// pointed at it — best-effort cleanup of the pieces.
+		e.deletePieces(ctx, pieceBackends(m.Pieces))
+	case err != nil:
+		e.logf("lifecycle/evaluator: decrement refcount %s/%s: %v", tenantID, m.ContentHash, err)
+	case newCount == 0:
+		switch delErr := e.cfg.ContentIndex.Delete(ctx, tenantID, m.ContentHash); {
+		case delErr == nil:
+			e.deletePieces(ctx, pieceBackends(m.Pieces))
+		case errors.Is(delErr, content_index.ErrNotFound),
+			errors.Is(delErr, content_index.ErrRefCountNonZero):
+			// Row vanished (e.g. orphan GC) or a concurrent uploader
+			// re-bumped the count: the piece may still be referenced,
+			// so leave it for that owner / the GC.
+		default:
+			e.logf("lifecycle/evaluator: delete index row %s/%s: %v", tenantID, m.ContentHash, delErr)
+		}
+	default:
+		// newCount > 0: the piece is still referenced by another
+		// manifest in this tenant. Leave it on the backend.
+	}
 }
 
 // objectLocked reports whether the version is protected from permanent
