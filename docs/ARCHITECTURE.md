@@ -153,8 +153,40 @@ zk-object-fabric/
     ARCHITECTURE.md       # As-built architecture overview (this file)
     INTEGRATION.md        # Dedup integration guide for external apps
     STORAGE_INFRA.md      # Deployment-model to storage mapping
+    S3_COMPATIBILITY.md   # ZKOF-vs-AWS-S3 compatibility matrix
     runbooks/             # Operational runbooks
 ```
+
+### Planned packages (Workstreams 8–9)
+
+The following packages are **planned, not yet built**. They are
+specified in [PROPOSAL.md §15](PROPOSAL.md) and tracked in
+[PROGRESS.md](PROGRESS.md); listed here so the as-built layout above
+stays the source of truth for what exists today.
+
+```
+api/s3compat/
+  tagging_handler.go      # WS8.1 Put/Get/DeleteObjectTagging
+  lifecycle_handler.go    # WS8.2 Put/Get/DeleteBucketLifecycleConfiguration
+  object_lock_handler.go  # WS8.3 lock / retention / legal-hold handlers
+  versioning_handler.go   # WS8.4 Put/GetBucketVersioning
+  cors_handler.go         # WS8.5 Put/Get/DeleteBucketCors + CORS middleware
+  notification_handler.go # WS8.6 Put/GetBucketNotificationConfiguration
+  encryption_handler.go   # WS8.7 Put/Get/DeleteBucketEncryption
+metadata/
+  lifecycle/              # WS8.2 LifecycleRule + bucket_lifecycle table
+  object_lock/            # WS8.3 LockConfig + LegalHold
+internal/
+  notifications/          # WS8.6 async webhook dispatcher + DLQ
+encryption/
+  rust_sdk/               # WS9 byte-compatible Rust client-side SDK
+```
+
+New Postgres tables (WS8): `bucket_lifecycle`, plus per-bucket CORS,
+notification, and SSE-config rows (table names finalised per slice).
+Object tags are stored as JSONB on the existing manifest row rather
+than in a new table. Bucket versioning state lives in the tenant
+metadata, not a dedicated table.
 
 ## Component overview
 

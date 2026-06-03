@@ -601,6 +601,39 @@ phase's checklist with a link to the report or runbook.
 
 ---
 
+## Roadmap Workstreams (WS8–WS9)
+
+Specified in [PROPOSAL.md §15](PROPOSAL.md). Coverage view in
+[S3_COMPATIBILITY.md](S3_COMPATIBILITY.md). Each slice is sized for an
+independent PR; check the box when the handler is wired and covered by
+`tests/s3_compat/` (and, for WS8, the key is removed from
+`unsupportedSubresources` in `api/s3compat/handler.go`).
+
+**WS8 — Richer S3 API Support**
+
+- [ ] WS8.1 Object tagging (`?tagging`) — `tagging_handler.go`, JSONB
+      tags on the manifest row.
+- [ ] WS8.2 Object lifecycle (`?lifecycle`) — `metadata/lifecycle/`,
+      `bucket_lifecycle` table, daily evaluator, console editor.
+- [ ] WS8.3 Object Lock / WORM (`?object-lock`, `?retention`,
+      `?legal-hold`) — `metadata/object_lock/`; depends on WS8.4.
+- [ ] WS8.4 Bucket versioning (`?versioning`) — config endpoints +
+      delete markers.
+- [ ] WS8.5 CORS (`?cors`) — per-bucket config + gateway middleware.
+- [ ] WS8.6 Event notifications (`?notification`) —
+      `internal/notifications/` webhook dispatcher + DLQ.
+- [ ] WS8.7 Server-side encryption config (`?encryption`) — SSE header
+      → ZKOF encryption modes.
+- [ ] WS8.8 Docs — PROPOSAL §3.2.2 + §15.1, ARCHITECTURE.md packages,
+      S3_COMPATIBILITY.md matrix. *(this slice)*
+
+**WS9 — Rust client-side encryption SDK**
+
+- [ ] WS9 Rust SDK in `encryption/rust_sdk/`, byte-compatible with the
+      Go SDK; cross-language parity test corpus in CI.
+
+---
+
 ## Appendix: Key Metrics to Track
 
 | Metric                                       | Target                          | Phase     |
