@@ -400,6 +400,24 @@ type ConsoleConfig struct {
 	// empty the signup handler falls back to the environment
 	// variable HCAPTCHA_SECRET for backwards compatibility.
 	CaptchaSecret string `json:"captcha_secret"`
+
+	// JWTSigningKeyPath points at a PEM-encoded RSA private key
+	// (PKCS#1 or PKCS#8) the console uses to mint stateless,
+	// RS256-signed session tokens. When set, the gateway wires a
+	// JWTTokenStore instead of the process-local MemoryTokenStore,
+	// so tokens survive a restart and validate identically across
+	// every replica behind a load balancer — the production posture
+	// the in-memory store cannot provide. When empty the gateway
+	// falls back to the in-memory store (dev / single-node only)
+	// and, under env=production, refuses to start (see
+	// cmd/gateway checkProductionTokenStore). The "iss" claim is
+	// taken from ControlPlaneConfig.AuthIssuer.
+	JWTSigningKeyPath string `json:"jwt_signing_key_path"`
+
+	// JWTTokenTTL bounds the lifetime of an issued session token.
+	// Zero selects the console default (one hour). It only takes
+	// effect when JWTSigningKeyPath is set.
+	JWTTokenTTL Duration `json:"jwt_token_ttl"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the

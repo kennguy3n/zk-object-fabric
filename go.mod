@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kms v1.50.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.99.1
 	github.com/aws/smithy-go v1.25.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/klauspost/reedsolomon v1.12.4
 	github.com/lib/pq v1.12.3
 	github.com/zeebo/blake3 v0.2.3
