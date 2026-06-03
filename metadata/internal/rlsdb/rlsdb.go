@@ -40,11 +40,13 @@ const (
 
 	// GUCScanAll, when set to "on" transaction-locally, opens the
 	// tenant_isolation policy to every tenant's rows. It exists for the
-	// legitimate cross-tenant readers — the global ScanManifests sweep
-	// (AAD v1 migration) and the content_index orphan-GC tenant
-	// enumeration — and is never set on a request-scoped path. The
-	// policy's WITH CHECK clause deliberately does NOT honour GUCScanAll,
-	// so even a sweep cannot write a row under a foreign tenant_id.
+	// audited cross-tenant readers — currently the global ScanManifests
+	// sweep (AAD v1 migration), the content_index orphan-GC tenant
+	// enumeration, and the bucket_config ListLifecycle sweep (background
+	// lifecycle evaluator) — and is never set on a request-scoped path.
+	// The policy's WITH CHECK clause deliberately does NOT honour
+	// GUCScanAll, so even a sweep cannot write a row under a foreign
+	// tenant_id.
 	GUCScanAll = "zkof.scan_all"
 )
 
@@ -60,7 +62,8 @@ func BeginTenant(ctx context.Context, db *sql.DB, tenantID string) (*sql.Tx, err
 // BeginScanAll opens a transaction on db that may read every tenant's
 // rows. It is the only constructor that sets GUCScanAll, and is used
 // solely by the audited global sweeps (manifest AAD migration, content
-// index orphan GC tenant enumeration).
+// index orphan-GC tenant enumeration, and bucket_config ListLifecycle
+// for the background lifecycle evaluator).
 func BeginScanAll(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
 	return beginWithScope(ctx, db, GUCScanAll, "on")
 }

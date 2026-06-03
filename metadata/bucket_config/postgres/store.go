@@ -85,8 +85,13 @@ func (s *Store) GetVersioning(ctx context.Context, tenantID, bucket string) (buc
 		return bucket_config.VersioningUnset, errors.New("postgres: tenant_id and bucket are required")
 	}
 	q := fmt.Sprintf(`SELECT state FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.table)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return bucket_config.VersioningUnset, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var state string
-	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&state); {
+	switch err := tx.QueryRowContext(ctx, q, tenantID, bucket).Scan(&state); {
 	case errors.Is(err, sql.ErrNoRows):
 		return bucket_config.VersioningUnset, nil
 	case err != nil:
@@ -109,10 +114,15 @@ func (s *Store) SetVersioning(ctx context.Context, tenantID, bucket string, stat
 		ON CONFLICT (tenant_id, bucket)
 		DO UPDATE SET state = EXCLUDED.state, updated_at = now()
 	`, s.table)
-	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, string(state)); err != nil {
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket, string(state)); err != nil {
 		return fmt.Errorf("postgres: bucket_versioning set: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // GetObjectLock returns the Object Lock config for (tenantID, bucket)
@@ -122,13 +132,18 @@ func (s *Store) GetObjectLock(ctx context.Context, tenantID, bucket string) (obj
 		return object_lock.Config{}, errors.New("postgres: tenant_id and bucket are required")
 	}
 	q := fmt.Sprintf(`SELECT enabled, default_mode, default_days, default_years FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.lockTable)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return object_lock.Config{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var (
 		enabled     bool
 		defaultMode string
 		defaultDays int
 		defaultYrs  int
 	)
-	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&enabled, &defaultMode, &defaultDays, &defaultYrs); {
+	switch err := tx.QueryRowContext(ctx, q, tenantID, bucket).Scan(&enabled, &defaultMode, &defaultDays, &defaultYrs); {
 	case errors.Is(err, sql.ErrNoRows):
 		return object_lock.Config{}, nil
 	case err != nil:
@@ -158,10 +173,15 @@ func (s *Store) SetObjectLock(ctx context.Context, tenantID, bucket string, cfg 
 			default_days = EXCLUDED.default_days, default_years = EXCLUDED.default_years,
 			updated_at = now()
 	`, s.lockTable)
-	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, cfg.Enabled, string(cfg.DefaultMode), cfg.DefaultDays, cfg.DefaultYears); err != nil {
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket, cfg.Enabled, string(cfg.DefaultMode), cfg.DefaultDays, cfg.DefaultYears); err != nil {
 		return fmt.Errorf("postgres: bucket_object_lock set: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // GetCORS returns the CORS config for (tenantID, bucket) or the zero
@@ -171,8 +191,13 @@ func (s *Store) GetCORS(ctx context.Context, tenantID, bucket string) (cors.Conf
 		return cors.Config{}, errors.New("postgres: tenant_id and bucket are required")
 	}
 	q := fmt.Sprintf(`SELECT rules FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.corsTable)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return cors.Config{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var raw []byte
-	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	switch err := tx.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
 	case errors.Is(err, sql.ErrNoRows):
 		return cors.Config{}, nil
 	case err != nil:
@@ -203,10 +228,15 @@ func (s *Store) SetCORS(ctx context.Context, tenantID, bucket string, cfg cors.C
 		ON CONFLICT (tenant_id, bucket)
 		DO UPDATE SET rules = EXCLUDED.rules, updated_at = now()
 	`, s.corsTable)
-	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
 		return fmt.Errorf("postgres: bucket_cors set: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // DeleteCORS removes the CORS config for (tenantID, bucket). Deleting
@@ -217,10 +247,15 @@ func (s *Store) DeleteCORS(ctx context.Context, tenantID, bucket string) error {
 		return errors.New("postgres: tenant_id and bucket are required")
 	}
 	q := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.corsTable)
-	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket); err != nil {
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket); err != nil {
 		return fmt.Errorf("postgres: bucket_cors delete: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // GetLifecycle returns the lifecycle config for (tenantID, bucket) or
@@ -230,8 +265,13 @@ func (s *Store) GetLifecycle(ctx context.Context, tenantID, bucket string) (life
 		return lifecycle.Config{}, errors.New("postgres: tenant_id and bucket are required")
 	}
 	q := fmt.Sprintf(`SELECT rules FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.lifecycleTable)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return lifecycle.Config{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var raw []byte
-	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	switch err := tx.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
 	case errors.Is(err, sql.ErrNoRows):
 		return lifecycle.Config{}, nil
 	case err != nil:
@@ -262,10 +302,15 @@ func (s *Store) SetLifecycle(ctx context.Context, tenantID, bucket string, cfg l
 		ON CONFLICT (tenant_id, bucket)
 		DO UPDATE SET rules = EXCLUDED.rules, updated_at = now()
 	`, s.lifecycleTable)
-	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
 		return fmt.Errorf("postgres: bucket_lifecycle set: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // DeleteLifecycle removes the lifecycle config for (tenantID, bucket).
@@ -276,10 +321,15 @@ func (s *Store) DeleteLifecycle(ctx context.Context, tenantID, bucket string) er
 		return errors.New("postgres: tenant_id and bucket are required")
 	}
 	q := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.lifecycleTable)
-	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket); err != nil {
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket); err != nil {
 		return fmt.Errorf("postgres: bucket_lifecycle delete: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // ListLifecycle returns every configured bucket lifecycle entry across
@@ -287,7 +337,14 @@ func (s *Store) DeleteLifecycle(ctx context.Context, tenantID, bucket string) er
 // (tenant_id, bucket) order so a pass is deterministic.
 func (s *Store) ListLifecycle(ctx context.Context) ([]bucket_config.LifecycleEntry, error) {
 	q := fmt.Sprintf(`SELECT tenant_id, bucket, rules FROM %s ORDER BY tenant_id, bucket`, s.lifecycleTable)
-	rows, err := s.db.QueryContext(ctx, q)
+	// ListLifecycle is the audited cross-tenant sweep the background
+	// evaluator runs, so it binds the scan_all GUC rather than a tenant.
+	tx, err := s.beginScanAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: bucket_lifecycle list: %w", err)
 	}
