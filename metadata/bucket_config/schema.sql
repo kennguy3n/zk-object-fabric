@@ -36,3 +36,18 @@ CREATE TABLE IF NOT EXISTS bucket_object_lock (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, bucket)
 );
+
+-- Per-bucket S3 CORS configuration (WS8.5). The never-configured state
+-- is the absence of a row, surfaced to callers as an empty
+-- cors.Config (no rules) and to the S3 API as 404
+-- NoSuchCORSConfiguration. The rule set is stored as a JSON document
+-- (the stable encoding owned by metadata/cors) rather than a column
+-- per field, because each rule carries variable-length lists of
+-- origins/methods/headers. DeleteBucketCors removes the row.
+CREATE TABLE IF NOT EXISTS bucket_cors (
+    tenant_id  TEXT NOT NULL,
+    bucket     TEXT NOT NULL,
+    rules      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, bucket)
+);

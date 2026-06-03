@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
@@ -12,8 +13,9 @@ import (
 // dev profile. Entries do NOT survive a restart.
 type MemoryStore struct {
 	mu         sync.RWMutex
-	versioning map[string]VersioningState   // key: tenantID + "\x00" + bucket
+	versioning map[string]VersioningState    // key: tenantID + "\x00" + bucket
 	objectLock map[string]object_lock.Config // key: tenantID + "\x00" + bucket
+	cors       map[string]cors.Config        // key: tenantID + "\x00" + bucket
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -23,6 +25,7 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		versioning: make(map[string]VersioningState),
 		objectLock: make(map[string]object_lock.Config),
+		cors:       make(map[string]cors.Config),
 	}
 }
 
@@ -76,4 +79,62 @@ func (s *MemoryStore) SetObjectLock(_ context.Context, tenantID, bucket string, 
 	defer s.mu.Unlock()
 	s.objectLock[memKey(tenantID, bucket)] = cfg
 	return nil
+}
+
+// GetCORS returns a deep copy of the stored CORS config, or the zero
+// Config when the bucket has none.
+func (s *MemoryStore) GetCORS(_ context.Context, tenantID, bucket string) (cors.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return cors.Config{}, errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneCORS(s.cors[memKey(tenantID, bucket)]), nil
+}
+
+// SetCORS upserts the CORS config for (tenantID, bucket).
+func (s *MemoryStore) SetCORS(_ context.Context, tenantID, bucket string, cfg cors.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cors[memKey(tenantID, bucket)] = cloneCORS(cfg)
+	return nil
+}
+
+// DeleteCORS removes the CORS config for (tenantID, bucket). Deleting
+// an unconfigured bucket is a no-op.
+func (s *MemoryStore) DeleteCORS(_ context.Context, tenantID, bucket string) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.cors, memKey(tenantID, bucket))
+	return nil
+}
+
+// cloneCORS deep-copies a CORS config so the store never shares slice
+// backing arrays with callers (a caller mutating its slice after Set,
+// or after Get, must not corrupt the stored copy).
+func cloneCORS(c cors.Config) cors.Config {
+	if len(c.Rules) == 0 {
+		return cors.Config{}
+	}
+	rules := make([]cors.Rule, len(c.Rules))
+	for i, r := range c.Rules {
+		rules[i] = cors.Rule{
+			ID:             r.ID,
+			AllowedOrigins: append([]string(nil), r.AllowedOrigins...),
+			AllowedMethods: append([]string(nil), r.AllowedMethods...),
+			AllowedHeaders: append([]string(nil), r.AllowedHeaders...),
+			ExposeHeaders:  append([]string(nil), r.ExposeHeaders...),
+			MaxAgeSeconds:  r.MaxAgeSeconds,
+		}
+	}
+	return cors.Config{Rules: rules}
 }

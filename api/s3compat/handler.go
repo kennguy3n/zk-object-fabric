@@ -477,7 +477,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //                      GetBucketAcl, PutBucketAcl)
 //   lifecycle          Bucket lifecycle configuration
 //   policy             Bucket policy document
-//   cors               Bucket CORS configuration
 //   encryption         Bucket-level SSE configuration
 //   logging            Bucket logging configuration
 //   notification       Bucket event notification configuration
@@ -500,7 +499,7 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // keys (`tagging`, `versioning`) were removed here and `?tagging` /
 // `?versioning` routing was added to the dispatch switch. Object
 // Lock (WS8.3) followed the same path for `object-lock`, `retention`,
-// and `legal-hold`.
+// and `legal-hold`, and bucket CORS (WS8.5) for `cors`.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -526,7 +525,6 @@ var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
 	"lifecycle":           "NotImplemented",
 	"policy":              "NotImplemented",
-	"cors":                "NotImplemented",
 	"encryption":          "NotImplemented",
 	"logging":             "NotImplemented",
 	"notification":        "NotImplemented",
@@ -548,7 +546,7 @@ var unsupportedSubresources = map[string]string{
 // order. Without this, `for key := range unsupportedSubresources`
 // picks whichever key Go's randomised map iteration hits first,
 // which makes error messages non-deterministic when a request
-// carries multiple unsupported keys (e.g. `?acl&cors`). Stable
+// carries multiple unsupported keys (e.g. `?acl&policy`). Stable
 // ordering also lets the conformance harness snapshot error bodies.
 var unsupportedSubresourceKeys = func() []string {
 	out := make([]string, 0, len(unsupportedSubresources))
@@ -588,9 +586,20 @@ func (h *Handler) rejectUnsupportedSubresource(w http.ResponseWriter, r *http.Re
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	h.capRequestBody(w, r)
+	// An OPTIONS request is a CORS preflight (WS8.5); answer it before
+	// the unsupported-subresource check and the method switch, since it
+	// is unauthenticated and never carries a real S3 operation.
+	if r.Method == http.MethodOptions {
+		h.handleCORSPreflight(w, r)
+		return
+	}
 	if h.rejectUnsupportedSubresource(w, r, q) {
 		return
 	}
+	// Attach cross-origin response headers (WS8.5) before routing so
+	// they are present on the actual request's response, including
+	// error responses. No-op when the request carries no Origin.
+	h.applyCORS(w, r)
 	switch r.Method {
 	case http.MethodPut:
 		if q.Get("uploadId") != "" && q.Get("partNumber") != "" {
@@ -618,6 +627,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// object-level (their handlers validate the path).
 		if q.Has("object-lock") {
 			h.PutObjectLockConfiguration(w, r)
+			return
+		}
+		// Bucket CORS config (PUT /{bucket}?cors) — WS8.5. Bucket-level
+		// sub-resource; must route before the implicit-CreateBucket /
+		// CopyObject / Put branches.
+		if q.Has("cors") {
+			h.PutBucketCors(w, r)
 			return
 		}
 		if q.Has("retention") {
@@ -671,6 +687,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.GetObjectLockConfiguration(w, r, bucket)
 			return
 		}
+		// Bucket CORS config (GET /{bucket}?cors) — WS8.5. Guard on
+		// key=="" so GET /{bucket}/{key}?cors falls through to the
+		// object GET rather than returning the bucket CORS document.
+		if key == "" && q.Has("cors") {
+			h.GetBucketCors(w, r, bucket)
+			return
+		}
 		if key != "" && q.Has("retention") {
 			h.GetObjectRetention(w, r)
 			return
@@ -719,6 +742,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// Object tagging (?tagging) — WS8.1.
 		if q.Has("tagging") {
 			h.DeleteObjectTagging(w, r)
+			return
+		}
+		// Bucket CORS config (DELETE /{bucket}?cors) — WS8.5.
+		if q.Has("cors") {
+			h.DeleteBucketCors(w, r)
 			return
 		}
 		h.Delete(w, r)

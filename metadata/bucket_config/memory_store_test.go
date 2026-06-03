@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
@@ -123,6 +124,102 @@ func TestMemoryStore_ObjectLockValidatesAndRequiresKeys(t *testing.T) {
 	}
 	if err := s.SetObjectLock(ctx, "t1", "", object_lock.Config{Enabled: true}); err == nil {
 		t.Fatal("SetObjectLock(empty bucket): want error")
+	}
+}
+
+func TestMemoryStore_CORSRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	// Unconfigured bucket → empty Config, nil error.
+	got, err := s.GetCORS(ctx, "t1", "b1")
+	if err != nil {
+		t.Fatalf("GetCORS: %v", err)
+	}
+	if !got.Empty() {
+		t.Fatalf("unconfigured bucket = %+v, want empty", got)
+	}
+
+	cfg := cors.Config{Rules: []cors.Rule{{
+		AllowedOrigins: []string{"https://app.example.com"},
+		AllowedMethods: []string{"GET", "PUT"},
+		AllowedHeaders: []string{"*"},
+		ExposeHeaders:  []string{"ETag"},
+		MaxAgeSeconds:  3000,
+	}}}
+	if err := s.SetCORS(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetCORS: %v", err)
+	}
+	got, _ = s.GetCORS(ctx, "t1", "b1")
+	if len(got.Rules) != 1 || got.Rules[0].MaxAgeSeconds != 3000 {
+		t.Fatalf("round-trip = %+v", got)
+	}
+
+	// Isolation.
+	if other, _ := s.GetCORS(ctx, "t1", "b2"); !other.Empty() {
+		t.Fatalf("t1/b2 leaked config: %+v", other)
+	}
+	if other, _ := s.GetCORS(ctx, "t2", "b1"); !other.Empty() {
+		t.Fatalf("t2/b1 leaked config: %+v", other)
+	}
+
+	// Delete is idempotent.
+	if err := s.DeleteCORS(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteCORS: %v", err)
+	}
+	if got, _ := s.GetCORS(ctx, "t1", "b1"); !got.Empty() {
+		t.Fatalf("after delete = %+v, want empty", got)
+	}
+	if err := s.DeleteCORS(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteCORS (no-op): %v", err)
+	}
+}
+
+func TestMemoryStore_CORSDeepCopy(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+	origins := []string{"https://app.example.com"}
+	cfg := cors.Config{Rules: []cors.Rule{{
+		AllowedOrigins: origins,
+		AllowedMethods: []string{"GET"},
+	}}}
+	if err := s.SetCORS(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetCORS: %v", err)
+	}
+	// Mutating the caller's slice after Set must not corrupt the store.
+	origins[0] = "https://evil.example.com"
+	cfg.Rules[0].AllowedMethods[0] = "DELETE"
+
+	got, _ := s.GetCORS(ctx, "t1", "b1")
+	if got.Rules[0].AllowedOrigins[0] != "https://app.example.com" {
+		t.Fatalf("stored origin was mutated by caller: %q", got.Rules[0].AllowedOrigins[0])
+	}
+	if got.Rules[0].AllowedMethods[0] != "GET" {
+		t.Fatalf("stored method was mutated by caller: %q", got.Rules[0].AllowedMethods[0])
+	}
+	// Mutating the returned copy must not corrupt the store either.
+	got.Rules[0].AllowedOrigins[0] = "https://other.example.com"
+	again, _ := s.GetCORS(ctx, "t1", "b1")
+	if again.Rules[0].AllowedOrigins[0] != "https://app.example.com" {
+		t.Fatalf("stored origin was mutated via returned copy: %q", again.Rules[0].AllowedOrigins[0])
+	}
+}
+
+func TestMemoryStore_CORSValidatesAndRequiresKeys(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+	// Invalid config (no rules) is rejected.
+	if err := s.SetCORS(ctx, "t1", "b1", cors.Config{}); err == nil {
+		t.Fatal("SetCORS(empty config): want error")
+	}
+	if _, err := s.GetCORS(ctx, "", "b1"); err == nil {
+		t.Fatal("GetCORS(empty tenant): want error")
+	}
+	if err := s.DeleteCORS(ctx, "t1", ""); err == nil {
+		t.Fatal("DeleteCORS(empty bucket): want error")
 	}
 }
 

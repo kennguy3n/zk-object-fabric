@@ -21,6 +21,9 @@ func TestNew_RejectsInvalidLockTable(t *testing.T) {
 	if _, err := New(Config{DB: db, Table: "1bad"}); err == nil {
 		t.Fatal("New(invalid Table) = nil error, want error")
 	}
+	if _, err := New(Config{DB: db, CorsTable: "bad;name"}); err == nil {
+		t.Fatal("New(invalid CorsTable) = nil error, want error")
+	}
 }
 
 func TestIsSafeIdent(t *testing.T) {

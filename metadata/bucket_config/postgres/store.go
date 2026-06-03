@@ -9,19 +9,22 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
-// Config is the store wiring. Table defaults to "bucket_versioning"
-// and LockTable to "bucket_object_lock".
+// Config is the store wiring. Table defaults to "bucket_versioning",
+// LockTable to "bucket_object_lock", and CorsTable to "bucket_cors".
 type Config struct {
 	DB        *sql.DB
 	Table     string
 	LockTable string
+	CorsTable string
 }
 
 // Store is a bucket_config.Store backed by Postgres tables.
@@ -29,6 +32,7 @@ type Store struct {
 	db        *sql.DB
 	table     string
 	lockTable string
+	corsTable string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
@@ -53,7 +57,14 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(lockTable) {
 		return nil, fmt.Errorf("postgres: invalid lock table name %q", lockTable)
 	}
-	return &Store{db: cfg.DB, table: table, lockTable: lockTable}, nil
+	corsTable := cfg.CorsTable
+	if corsTable == "" {
+		corsTable = "bucket_cors"
+	}
+	if !isSafeIdent(corsTable) {
+		return nil, fmt.Errorf("postgres: invalid cors table name %q", corsTable)
+	}
+	return &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable}, nil
 }
 
 // GetVersioning returns the state for (tenantID, bucket) or
@@ -138,6 +149,65 @@ func (s *Store) SetObjectLock(ctx context.Context, tenantID, bucket string, cfg 
 	`, s.lockTable)
 	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, cfg.Enabled, string(cfg.DefaultMode), cfg.DefaultDays, cfg.DefaultYears); err != nil {
 		return fmt.Errorf("postgres: bucket_object_lock set: %w", err)
+	}
+	return nil
+}
+
+// GetCORS returns the CORS config for (tenantID, bucket) or the zero
+// Config when no row exists.
+func (s *Store) GetCORS(ctx context.Context, tenantID, bucket string) (cors.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return cors.Config{}, errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT rules FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.corsTable)
+	var raw []byte
+	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return cors.Config{}, nil
+	case err != nil:
+		return cors.Config{}, fmt.Errorf("postgres: bucket_cors get: %w", err)
+	}
+	var cfg cors.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return cors.Config{}, fmt.Errorf("postgres: bucket_cors decode: %w", err)
+	}
+	return cfg, nil
+}
+
+// SetCORS upserts the CORS config for (tenantID, bucket).
+func (s *Store) SetCORS(ctx context.Context, tenantID, bucket string, cfg cors.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("postgres: bucket_cors encode: %w", err)
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, rules, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET rules = EXCLUDED.rules, updated_at = now()
+	`, s.corsTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+		return fmt.Errorf("postgres: bucket_cors set: %w", err)
+	}
+	return nil
+}
+
+// DeleteCORS removes the CORS config for (tenantID, bucket). Deleting
+// an unconfigured bucket is a no-op (DELETE affecting zero rows is not
+// an error), matching S3's idempotent DeleteBucketCors.
+func (s *Store) DeleteCORS(ctx context.Context, tenantID, bucket string) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.corsTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket); err != nil {
+		return fmt.Errorf("postgres: bucket_cors delete: %w", err)
 	}
 	return nil
 }

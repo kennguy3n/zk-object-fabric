@@ -10,19 +10,22 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
-// Config is the store wiring. Table defaults to "bucket_versioning"
-// and LockTable to "bucket_object_lock".
+// Config is the store wiring. Table defaults to "bucket_versioning",
+// LockTable to "bucket_object_lock", and CorsTable to "bucket_cors".
 type Config struct {
 	DB        *sql.DB
 	Table     string
 	LockTable string
+	CorsTable string
 }
 
 // Store is a bucket_config.Store backed by SQLite tables.
@@ -30,6 +33,7 @@ type Store struct {
 	db        *sql.DB
 	table     string
 	lockTable string
+	corsTable string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
@@ -54,7 +58,14 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(lockTable) {
 		return nil, fmt.Errorf("sqlite: invalid lock table name %q", lockTable)
 	}
-	s := &Store{db: cfg.DB, table: table, lockTable: lockTable}
+	corsTable := cfg.CorsTable
+	if corsTable == "" {
+		corsTable = "bucket_cors"
+	}
+	if !isSafeIdent(corsTable) {
+		return nil, fmt.Errorf("sqlite: invalid cors table name %q", corsTable)
+	}
+	s := &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
@@ -84,6 +95,16 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	)`, s.lockTable)
 	if _, err := s.db.ExecContext(ctx, lq); err != nil {
 		return fmt.Errorf("sqlite: ensure bucket_object_lock schema: %w", err)
+	}
+	cq := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		tenant_id  TEXT NOT NULL,
+		bucket     TEXT NOT NULL,
+		rules      TEXT NOT NULL,
+		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (tenant_id, bucket)
+	)`, s.corsTable)
+	if _, err := s.db.ExecContext(ctx, cq); err != nil {
+		return fmt.Errorf("sqlite: ensure bucket_cors schema: %w", err)
 	}
 	return nil
 }
@@ -170,6 +191,65 @@ func (s *Store) SetObjectLock(ctx context.Context, tenantID, bucket string, cfg 
 	`, s.lockTable)
 	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, cfg.Enabled, string(cfg.DefaultMode), cfg.DefaultDays, cfg.DefaultYears); err != nil {
 		return fmt.Errorf("sqlite: bucket_object_lock set: %w", err)
+	}
+	return nil
+}
+
+// GetCORS returns the CORS config for (tenantID, bucket) or the zero
+// Config when no row exists.
+func (s *Store) GetCORS(ctx context.Context, tenantID, bucket string) (cors.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return cors.Config{}, errors.New("sqlite: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT rules FROM %s WHERE tenant_id = ? AND bucket = ?`, s.corsTable)
+	var raw []byte
+	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return cors.Config{}, nil
+	case err != nil:
+		return cors.Config{}, fmt.Errorf("sqlite: bucket_cors get: %w", err)
+	}
+	var cfg cors.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return cors.Config{}, fmt.Errorf("sqlite: bucket_cors decode: %w", err)
+	}
+	return cfg, nil
+}
+
+// SetCORS upserts the CORS config for (tenantID, bucket).
+func (s *Store) SetCORS(ctx context.Context, tenantID, bucket string, cfg cors.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("sqlite: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("sqlite: bucket_cors encode: %w", err)
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, rules, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET rules = excluded.rules, updated_at = CURRENT_TIMESTAMP
+	`, s.corsTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+		return fmt.Errorf("sqlite: bucket_cors set: %w", err)
+	}
+	return nil
+}
+
+// DeleteCORS removes the CORS config for (tenantID, bucket). Deleting
+// an unconfigured bucket is a no-op, matching S3's idempotent
+// DeleteBucketCors.
+func (s *Store) DeleteCORS(ctx context.Context, tenantID, bucket string) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("sqlite: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = ? AND bucket = ?`, s.corsTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket); err != nil {
+		return fmt.Errorf("sqlite: bucket_cors delete: %w", err)
 	}
 	return nil
 }
