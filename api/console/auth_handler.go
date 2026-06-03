@@ -911,12 +911,15 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 		// Any other error is an infrastructure failure (DB timeout,
 		// commit error): surfacing it as 503 tells the SPA to retry the
 		// same token rather than discarding a still-live session, so a
-		// transient Postgres blip doesn't log the whole fleet out.
+		// transient Postgres blip doesn't log the whole fleet out. The
+		// detail (which may name hosts / DSNs) is logged server-side, not
+		// returned on the wire — the client only needs to know to retry.
 		if errors.Is(err, errRefreshTokenInvalid) || errors.Is(err, errRefreshTokenReuse) {
 			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 			return
 		}
-		writeError(w, http.StatusServiceUnavailable, "rotate refresh token: "+err.Error())
+		log.Printf("console: rotate refresh token failed (infrastructure): %v", err)
+		writeError(w, http.StatusServiceUnavailable, "refresh temporarily unavailable; please retry")
 		return
 	}
 	t, ok := h.cfg.Tenants.LookupTenant(rotated.TenantID)
