@@ -165,6 +165,9 @@ func TestApplyCORS_ActualRequest(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "ETag" {
 		t.Fatalf("Expose-Headers = %q, want ETag", got)
 	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("Allow-Credentials = %q, want true", got)
+	}
 	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
 		t.Fatalf("Vary = %q, want to contain Origin", got)
 	}
@@ -194,6 +197,16 @@ func TestApplyCORS_NoHeadersWhenNoMatch(t *testing.T) {
 			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 				t.Fatalf("Allow-Origin = %q, want empty (no CORS headers)", got)
 			}
+			// AWS still sets Vary: Origin when an Origin is present but no
+			// rule matches, so caches key on the origin. With no Origin
+			// (non-browser client) applyCORS returns before touching Vary.
+			gotVary := rec.Header().Get("Vary")
+			if tc.origin == "" && gotVary != "" {
+				t.Fatalf("Vary = %q, want empty for no-Origin request", gotVary)
+			}
+			if tc.origin != "" && !strings.Contains(gotVary, "Origin") {
+				t.Fatalf("Vary = %q, want to contain Origin on no-match", gotVary)
+			}
 		})
 	}
 }
@@ -218,6 +231,12 @@ func TestCORSPreflight(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "x-amz-meta-foo, x-amz-acl" {
 		t.Fatalf("Allow-Headers = %q, want echoed request headers", got)
 	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("preflight Allow-Credentials = %q, want true", got)
+	}
+	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Fatalf("preflight Vary = %q, want to contain Origin", got)
+	}
 	if got := rec.Header().Get("Access-Control-Max-Age"); got != "3000" {
 		t.Fatalf("Max-Age = %q, want 3000", got)
 	}
@@ -238,6 +257,11 @@ func TestCORSPreflight(t *testing.T) {
 	h.dispatch(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("preflight bad origin = %d, want 403", rec.Code)
+	}
+	// Even a rejected (403) preflight carries Vary: Origin so a cache
+	// never reuses it across origins (matches AWS).
+	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Fatalf("403 preflight Vary = %q, want to contain Origin", got)
 	}
 
 	// Method not allowed → 403.
@@ -367,6 +391,9 @@ func TestBucketCors_AuthenticatedTenant(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "" {
 		t.Fatalf("preflight Expose-Headers = %q, want empty", got)
 	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("authed-tenant preflight Allow-Credentials = %q, want true", got)
+	}
 
 	// A different tenant (tenant-b) has no CORS on this bucket name, so
 	// its preflight is rejected — proving tenant isolation holds.
@@ -418,6 +445,9 @@ func TestApplyCORS_AuthenticatedActualRequest(t *testing.T) {
 	}
 	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "ETag" {
 		t.Fatalf("actual-request Expose-Headers = %q, want ETag", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("actual-request Allow-Credentials = %q, want true", got)
 	}
 	// applyCORS and the Get handler both call authenticate; the
 	// per-request memo must collapse them into a single resolution.

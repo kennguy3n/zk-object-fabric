@@ -225,6 +225,12 @@ func (h *Handler) applyCORS(w http.ResponseWriter, r *http.Request) {
 	if origin == "" {
 		return
 	}
+	// AWS sets Vary: Origin on every response to a request that carries
+	// an Origin, whether or not a rule matches, so a shared cache never
+	// serves a CORS response to a different origin (or a non-CORS
+	// response to a matching one). Emit it up front, before the auth /
+	// match short-circuits below.
+	w.Header().Add("Vary", "Origin")
 	tenantID, err := h.authenticate(r)
 	if err != nil {
 		return
@@ -279,6 +285,9 @@ func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "InvalidCORSRequest", "OPTIONS preflight requires Origin and Access-Control-Request-Method headers", r.URL.Path)
 		return
 	}
+	// Vary: Origin on every Origin-bearing preflight response, including
+	// the 403s below, so caches key on the origin (matches AWS).
+	w.Header().Add("Vary", "Origin")
 	bucket, _ := parseBucketKey(r.URL.Path)
 	if h.cfg.BucketConfig == nil || bucket == "" {
 		writeCORSForbidden(w, r)
@@ -324,16 +333,19 @@ func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 
 // setCORSResponseHeaders writes the Access-Control headers common to a
 // matched simple request and a successful preflight. The request
-// Origin is echoed (rather than emitting "*") and paired with
-// Vary: Origin so the response is correct for credentialed requests
-// and cache-safe across origins. includeExpose controls
+// Origin is echoed (rather than emitting "*"), and
+// Access-Control-Allow-Credentials: true is set so credentialed
+// requests (fetch credentials:'include' / XHR withCredentials) succeed
+// — which requires a specific origin, never "*", as echoed here. AWS S3
+// emits this header on every matched response. Vary: Origin is set by
+// the callers for all Origin-bearing responses. includeExpose controls
 // Access-Control-Expose-Headers, which is meaningful only on the
 // actual response (the browser ignores it on a preflight, and AWS S3
 // does not send it there).
 func setCORSResponseHeaders(w http.ResponseWriter, origin string, rule cors.Rule, includeExpose bool) {
 	header := w.Header()
-	header.Add("Vary", "Origin")
 	header.Set("Access-Control-Allow-Origin", origin)
+	header.Set("Access-Control-Allow-Credentials", "true")
 	header.Set("Access-Control-Allow-Methods", rule.AllowedMethodsCSV())
 	if includeExpose {
 		if expose := rule.ExposeHeadersCSV(); expose != "" {
