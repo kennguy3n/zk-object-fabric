@@ -753,6 +753,71 @@ func TestCheckProductionTokenStore_ProductionFails(t *testing.T) {
 	}
 }
 
+// TestCheckProductionRefreshTokenStore_NonProduction: outside
+// production the refresh-store guard must never fire, even with no
+// persistent backend — dev and single-node profiles legitimately use
+// the in-memory refresh store.
+func TestCheckProductionRefreshTokenStore_NonProduction(t *testing.T) {
+	for _, env := range []string{"development", "", "staging"} {
+		if err := checkProductionRefreshTokenStore(env, ":9090", false, false); err != nil {
+			t.Errorf("checkProductionRefreshTokenStore(%q, \":9090\", false, false) = %v; want nil", env, err)
+		}
+	}
+}
+
+// TestCheckProductionRefreshTokenStore_ConsoleDisabled: the console API
+// is opt-in (empty ListenAddr). When it is disabled no refresh store is
+// ever built, so the guard must not fire even under env=production with
+// no persistent backend.
+func TestCheckProductionRefreshTokenStore_ConsoleDisabled(t *testing.T) {
+	if err := checkProductionRefreshTokenStore("production", "", false, false); err != nil {
+		t.Errorf("checkProductionRefreshTokenStore(production, \"\", false, false) = %v; want nil when console disabled", err)
+	}
+}
+
+// TestCheckProductionRefreshTokenStore_ProductionWithPersistent: in
+// production with a persistent backend (Postgres or embedded SQLite)
+// the guard must not fire — buildRefreshTokenStore wires a
+// replica-safe store.
+func TestCheckProductionRefreshTokenStore_ProductionWithPersistent(t *testing.T) {
+	if err := checkProductionRefreshTokenStore("production", ":9090", false, true); err != nil {
+		t.Errorf("checkProductionRefreshTokenStore(production, addr, false, true) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionRefreshTokenStore_ProductionDisabled: in
+// production with the deliberate opt-out (console.disable_refresh_tokens)
+// the guard must not fire even with no persistent backend —
+// buildRefreshTokenStore returns nil by design and /auth/refresh 503s,
+// which is an intentional stateless-JWT configuration rather than the
+// accidental memory fallback the guard exists to catch.
+func TestCheckProductionRefreshTokenStore_ProductionDisabled(t *testing.T) {
+	if err := checkProductionRefreshTokenStore("production", ":9090", true, false); err != nil {
+		t.Errorf("checkProductionRefreshTokenStore(production, addr, true, false) = %v; want nil when refresh disabled", err)
+	}
+}
+
+// TestCheckProductionRefreshTokenStore_ProductionFails verifies the
+// error path: production, console enabled, refresh not disabled, and no
+// persistent backend must return errProductionRefreshTokenStoreRequired
+// so the startup wrapper refuses to boot rather than silently falling
+// back to the process-local, non-replica-safe MemoryRefreshTokenStore.
+func TestCheckProductionRefreshTokenStore_ProductionFails(t *testing.T) {
+	err := checkProductionRefreshTokenStore("production", ":9090", false, false)
+	if err == nil {
+		t.Fatalf("checkProductionRefreshTokenStore(production, addr, false, false) = nil; want errProductionRefreshTokenStoreRequired")
+	}
+	if !errors.Is(err, errProductionRefreshTokenStoreRequired) {
+		t.Fatalf("checkProductionRefreshTokenStore returned %v; want errors.Is(_, errProductionRefreshTokenStoreRequired)", err)
+	}
+	if !strings.Contains(err.Error(), "disable_refresh_tokens") {
+		t.Errorf("error message = %q; want to mention 'disable_refresh_tokens' so the operator knows the opt-out knob", err.Error())
+	}
+	if !strings.Contains(err.Error(), "MemoryRefreshTokenStore") {
+		t.Errorf("error message = %q; want to name 'MemoryRefreshTokenStore' so the operator understands the fallback being refused", err.Error())
+	}
+}
+
 // TestCheckProductionLocalCMK pins the four-case truth table the
 // task spec lays out for the production local-file CMK guard:
 //
