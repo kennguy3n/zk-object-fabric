@@ -21,8 +21,7 @@ import (
 // the interactive handler and the lifecycle evaluator) survives a
 // gateway restart.
 type SQLiteAuditStore struct {
-	db    *sql.DB
-	table string
+	db *sql.DB
 }
 
 var _ AuditStore = (*SQLiteAuditStore)(nil)
@@ -35,7 +34,7 @@ func NewSQLiteAuditStore(db *sql.DB) (*SQLiteAuditStore, error) {
 	if db == nil {
 		return nil, errors.New("compliance: sqlite audit store requires a non-nil *sql.DB")
 	}
-	s := &SQLiteAuditStore{db: db, table: "compliance_audit"}
+	s := &SQLiteAuditStore{db: db}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
