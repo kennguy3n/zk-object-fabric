@@ -95,8 +95,8 @@ zk-object-fabric/
   metadata/
     manifest_store/       # Manifest persistence (memory + Postgres)
     bucket_config/        # Per-bucket S3 config (versioning state +
-                          # Object Lock config; memory + Postgres +
-                          # SQLite) — WS8.4 / WS8.3
+                          # Object Lock config + CORS rules; memory +
+                          # Postgres + SQLite) — WS8.4 / WS8.3 / WS8.5
     placement_policy/     # Placement engine and policy DSL
     erasure_coding/       # EC profiles, encoder, registry
     content_index/        # Dedup ContentIndex (memory + Postgres)
@@ -167,17 +167,20 @@ specified in [PROPOSAL.md §15](PROPOSAL.md) and tracked in
 [PROGRESS.md](PROGRESS.md); listed here so the as-built layout above
 stays the source of truth for what exists today.
 
+Built WS8 slices (`api/s3compat/tagging_handler.go` WS8.1,
+`object_lock_handler.go` WS8.3, `cors_handler.go` WS8.5, plus the
+`metadata/object_lock` and `metadata/cors` domain packages and the
+`metadata/bucket_config` store) have landed and are folded into the
+as-built layout above. The packages below remain **planned, not yet
+built**:
+
 ```
 api/s3compat/
-  tagging_handler.go      # WS8.1 Put/Get/DeleteObjectTagging
   lifecycle_handler.go    # WS8.2 Put/Get/DeleteBucketLifecycleConfiguration
-  object_lock_handler.go  # WS8.3 lock / retention / legal-hold handlers
-  cors_handler.go         # WS8.5 Put/Get/DeleteBucketCors + CORS middleware
   notification_handler.go # WS8.6 Put/GetBucketNotificationConfiguration
   encryption_handler.go   # WS8.7 Put/Get/DeleteBucketEncryption
 metadata/
   lifecycle/              # WS8.2 LifecycleRule + bucket_lifecycle table
-  object_lock/            # WS8.3 LockConfig + LegalHold
 internal/
   notifications/          # WS8.6 async webhook dispatcher + DLQ
 encryption/
@@ -193,7 +196,9 @@ package, keyed by `(tenant_id, bucket)`; the embedded SQLite profile
 self-creates an equivalent table. Bucket Object Lock config (WS8.3,
 built) lives in the `bucket_object_lock` table of the same package,
 while per-object-version retention mode / retain-until / legal-hold
-ride on the object manifest so they version with the object.
+ride on the object manifest so they version with the object. Bucket
+CORS rules (WS8.5, built) live in the `bucket_cors` table of the same
+package, JSON-encoded and keyed by `(tenant_id, bucket)`.
 
 ## Component overview
 

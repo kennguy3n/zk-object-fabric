@@ -46,7 +46,7 @@ deployment probe. The authoritative reject list is
 | `Put/GetBucketVersioning`                      | Supported       | Bucket-level Enabled/Suspended config; delete markers       |
 | `Put/Get/DeleteBucketLifecycleConfiguration`   | Planned (WS8.2) | Per-bucket rules + daily evaluator                          |
 | `Put/GetObjectLockConfiguration`               | Supported       | Default retention rule; requires versioning (WS8.4)         |
-| `Put/Get/DeleteBucketCors`                     | Planned (WS8.5) | Enables browser direct-upload via presigned URLs            |
+| `Put/Get/DeleteBucketCors`                     | Supported       | Per-bucket rules + preflight (OPTIONS) and response headers  |
 | `Put/GetBucketNotificationConfiguration`       | Planned (WS8.6) | Webhook transport; `ObjectCreated`/`ObjectRemoved`          |
 | `Put/Get/DeleteBucketEncryption`               | Planned (WS8.7) | Maps SSE header to ZKOF encryption modes                    |
 | `Get/PutBucketAcl`, `Get/PutObjectAcl`         | Out of scope    | Replaced by tenant IAM + placement policy                   |

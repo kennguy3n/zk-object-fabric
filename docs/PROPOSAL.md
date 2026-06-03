@@ -272,7 +272,7 @@ operations perfectly than many operations partially.
 | Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Planned | WS8.2 | WS8.2   | Per-bucket rules + daily evaluator; extends migration tiering (see §15.1) |
 | Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Shipped | WS8.3 | WS8.3 | Governance/compliance retention + legal hold enforced in DELETE/PUT-overwrite; requires versioning (see §15.1) |
 | Versioning   | `Put/GetBucketVersioning`                | Shipped   | WS8.4    | WS8.4   | Bucket-level Enabled/Suspended config + delete markers (see §15.1)      |
-| CORS         | `Put/Get/DeleteBucketCors`               | Planned   | WS8.5    | WS8.5   | Enables browser direct-upload via presigned URLs (see §15.1)            |
+| CORS         | `Put/Get/DeleteBucketCors`               | Shipped   | WS8.5    | WS8.5   | Per-bucket rules + OPTIONS preflight + response headers (see §15.1)      |
 | Notifications| `Put/GetBucketNotificationConfiguration` | Planned   | WS8.6    | WS8.6   | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events (see §15.1) |
 | SSE config   | `Put/Get/DeleteBucketEncryption`         | Planned   | WS8.7    | WS8.7   | Maps `x-amz-server-side-encryption` to ZK encryption modes (see §15.1)  |
 
@@ -1574,10 +1574,21 @@ by `tests/s3_compat/`.
 
 #### 15.1.5 CORS (`?cors`)
 
-- Handlers `PutBucketCors`, `GetBucketCors`, `DeleteBucketCors`.
-- CORS config stored per bucket in Postgres.
-- Gateway middleware reads the config and sets the appropriate
-  `Access-Control-*` response headers.
+- Handlers `PutBucketCors`, `GetBucketCors` (404 `NoSuchCORSConfiguration`
+  when unset), `DeleteBucketCors` (idempotent 204).
+- CORS config stored per bucket via `metadata/bucket_config` (the
+  `bucket_cors` table; memory + Postgres + SQLite), with the rule set
+  JSON-encoded and keyed by `(tenant_id, bucket)`. Rules and matching
+  (single-`*` origin/header wildcards) live in the `metadata/cors`
+  domain package.
+- Gateway middleware (`applyCORS`) reads the config on every request
+  carrying an `Origin` and, when a rule matches the origin + method,
+  sets the `Access-Control-*` response headers (echoing the origin
+  with `Vary: Origin`) — including on error responses, matching AWS.
+- The OPTIONS preflight (`handleCORSPreflight`) is answered
+  unauthenticated (browsers never attach credentials to a preflight)
+  and is rejected with 403 when no rule allows the requested
+  origin / method / headers.
 - Critical for browser-based direct upload using presigned URLs from
   SPAs.
 

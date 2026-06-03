@@ -629,7 +629,13 @@ independent PR; check the box when the handler is wired and covered by
       `metadata/bucket_config` store (memory + Postgres + SQLite), and
       delete-marker semantics on versioning-enabled DELETE. Covered by
       handler unit tests + s3_conformance bucket-versioning probes.
-- [ ] WS8.5 CORS (`?cors`) — per-bucket config + gateway middleware.
+- [x] WS8.5 CORS (`?cors`) — Put/Get/DeleteBucketCors config endpoints
+      (`api/s3compat/cors_handler.go`), `metadata/cors/` domain types,
+      `bucket_config` store (memory + Postgres + SQLite, `bucket_cors`
+      table), plus request-time machinery: the actual-request response
+      headers (`applyCORS`) and the unauthenticated OPTIONS preflight
+      (`handleCORSPreflight`). Covered by domain, store, and
+      handler/preflight unit tests.
 - [ ] WS8.6 Event notifications (`?notification`) —
       `internal/notifications/` webhook dispatcher + DLQ.
 - [ ] WS8.7 Server-side encryption config (`?encryption`) — SSE header
