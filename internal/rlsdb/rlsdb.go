@@ -55,7 +55,16 @@ const (
 // statement in the transaction to that tenant. Callers own the returned
 // *sql.Tx and must Commit it (or rely on a deferred Rollback). A bind
 // failure rolls the transaction back.
+//
+// An empty tenantID is rejected before any transaction is opened: binding
+// zkof.tenant_id to '' would scope the transaction to rows with an empty
+// tenant_id, which is never a real tenant. Every in-tree caller already
+// validates tenantID upstream, but BeginTenant is exported and this guard
+// fails closed for any future caller that forgets to.
 func BeginTenant(ctx context.Context, db *sql.DB, tenantID string) (*sql.Tx, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("rlsdb: refusing to bind empty tenant id")
+	}
 	return beginWithScope(ctx, db, GUCTenantID, tenantID)
 }
 

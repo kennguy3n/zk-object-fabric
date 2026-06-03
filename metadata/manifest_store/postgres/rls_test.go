@@ -11,7 +11,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
-	"github.com/kennguy3n/zk-object-fabric/metadata/internal/rlsdb"
+	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 )
 

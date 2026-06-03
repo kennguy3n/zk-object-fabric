@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/kennguy3n/zk-object-fabric/metadata/internal/rlsdb"
+	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 )
 
 // Row-Level Security (RLS) for the bucket_config tables — Workstream 3.4
@@ -12,7 +12,7 @@ import (
 // CORS, lifecycle) is keyed on (tenant_id, bucket), so a query that
 // forgot its tenant predicate must not read or write another tenant's
 // bucket configuration. The mechanism lives in the shared
-// metadata/internal/rlsdb package (GUC binding, the tenant_isolation
+// internal/rlsdb package (GUC binding, the tenant_isolation
 // policy DDL, and the superuser caveat); the helpers below are thin
 // Store-scoped adapters so the store methods read naturally.
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/kennguy3n/zk-object-fabric/metadata/internal/rlsdb"
+	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 )
 
 // Row-Level Security (RLS) for the content_index table — Workstream 3.4
@@ -12,7 +12,7 @@ import (
 // is the load-bearing isolation boundary for intra-tenant dedup, so a
 // query that forgot its tenant predicate must not be able to read or
 // write across tenants. The mechanism lives in the shared
-// metadata/internal/rlsdb package (GUC binding, the tenant_isolation
+// internal/rlsdb package (GUC binding, the tenant_isolation
 // policy DDL, and the superuser caveat); the helpers below are thin
 // Store-scoped adapters so the store methods read naturally.
 

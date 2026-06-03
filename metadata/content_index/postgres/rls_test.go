@@ -10,7 +10,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
-	"github.com/kennguy3n/zk-object-fabric/metadata/internal/rlsdb"
+	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 )
 
 // RLS enforcement is a property of Postgres, not of Go, so it can only be

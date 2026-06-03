@@ -247,7 +247,6 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		writeAuthError(w, r, err)
 		return
 	}
-	_ = tenantID
 	q := r.URL.Query()
 	uploadID := q.Get("uploadId")
 	partStr := q.Get("partNumber")
@@ -256,7 +255,10 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "InvalidArgument", "partNumber must be between 1 and 10000", r.URL.Path)
 		return
 	}
-	upload, err := h.cfg.Multipart.Get(uploadID)
+	// Get is scoped to tenantID: a cross-tenant upload_id is reported as
+	// ErrNotFound (404 NoSuchUpload), not a 403, so an unauthorised
+	// caller cannot probe for the existence of another tenant's upload.
+	upload, err := h.cfg.Multipart.Get(tenantID, uploadID)
 	if err != nil {
 		if errors.Is(err, multipart.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "NoSuchUpload", "upload "+uploadID+" not found", r.URL.Path)
@@ -266,7 +268,9 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if upload.TenantID != tenantID {
-		writeError(w, http.StatusForbidden, "AccessDenied", "tenant mismatch", r.URL.Path)
+		// Defence-in-depth: Get already scoped the lookup to tenantID, so
+		// this can only fire if a store implementation ignores the scope.
+		writeError(w, http.StatusNotFound, "NoSuchUpload", "upload "+uploadID+" not found", r.URL.Path)
 		return
 	}
 	provider, ok := h.cfg.Providers[upload.Backend]
@@ -367,7 +371,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 	if IsGatewayEncrypted(upload.EncMode) {
 		recordedSize = plaintextSize
 	}
-	if err := h.cfg.Multipart.PutPart(uploadID, multipart.Part{
+	if err := h.cfg.Multipart.PutPart(tenantID, uploadID, multipart.Part{
 		PartNumber: partNumber,
 		PieceID:    res.PieceID,
 		Backend:    upload.Backend,
