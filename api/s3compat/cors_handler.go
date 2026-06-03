@@ -238,7 +238,34 @@ func (h *Handler) applyCORS(w http.ResponseWriter, r *http.Request) {
 	if !matched {
 		return
 	}
-	setCORSResponseHeaders(w, origin, rule)
+	// The actual request is where the browser reads Expose-Headers, so
+	// include them here (unlike the preflight).
+	setCORSResponseHeaders(w, origin, rule, true)
+}
+
+// preflightTenant resolves which tenant's bucket CORS rules an
+// (unauthenticated) OPTIONS preflight should be matched against:
+//
+//   - With no Authenticator wired (dev), every request is the
+//     AnonymousTenant — the same tenant PutBucketCors stored under.
+//     A RequireAuth-without-Authenticator server is misconfigured and
+//     cannot resolve any tenant.
+//   - With an Authenticator wired (production), a browser never signs
+//     the preflight, but a presigned-URL preflight carries
+//     X-Amz-Credential naming the tenant; a TenantResolver resolves it
+//     without verifying the signature. This grants no access — the
+//     follow-up actual request is fully authenticated.
+//
+// ok is false when no tenant can be resolved, in which case the
+// preflight is rejected with 403.
+func (h *Handler) preflightTenant(r *http.Request) (string, bool) {
+	if h.cfg.Auth == nil {
+		return AnonymousTenant, !h.cfg.RequireAuth
+	}
+	if tr, ok := h.cfg.Auth.(TenantResolver); ok {
+		return tr.ResolveTenantUnverified(r)
+	}
+	return "", false
 }
 
 // handleCORSPreflight answers an OPTIONS preflight. It is
@@ -257,21 +284,13 @@ func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 		writeCORSForbidden(w, r)
 		return
 	}
-	// Preflight is unauthenticated, so resolve the bucket's CORS
-	// against the anonymous tenant binding the same way an
-	// unauthenticated GET would be scoped. When auth is wired the
-	// browser's later (authenticated) actual request is what enforces
-	// access; the preflight only answers "may the browser attempt it".
-	tenantID, err := h.authenticate(r)
-	if err != nil {
-		// An auth-misconfigured server (RequireAuth without an
-		// Authenticator) cannot resolve any tenant; surface that
-		// rather than a misleading CORS rejection.
-		if h.cfg.Auth == nil {
-			writeCORSForbidden(w, r)
-			return
-		}
-		tenantID = AnonymousTenant
+	// A preflight is unauthenticated (browsers never sign it), so the
+	// tenant whose CORS rules apply is resolved from the presigned
+	// credential the URL carries rather than a verified signature.
+	tenantID, ok := h.preflightTenant(r)
+	if !ok {
+		writeCORSForbidden(w, r)
+		return
 	}
 	cfg, lookupOK := h.bucketCORSRules(r, tenantID, bucket)
 	if !lookupOK || cfg.Empty() {
@@ -288,7 +307,10 @@ func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 		writeCORSForbidden(w, r)
 		return
 	}
-	setCORSResponseHeaders(w, origin, rule)
+	// A preflight omits Access-Control-Expose-Headers: the browser only
+	// reads it from the actual response, and AWS S3 does not emit it on
+	// preflights.
+	setCORSResponseHeaders(w, origin, rule, false)
 	// Echo the requested headers (already validated as allowed) so the
 	// browser permits them on the follow-up actual request.
 	if reqHdr := r.Header.Get("Access-Control-Request-Headers"); reqHdr != "" {
@@ -304,14 +326,19 @@ func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 // matched simple request and a successful preflight. The request
 // Origin is echoed (rather than emitting "*") and paired with
 // Vary: Origin so the response is correct for credentialed requests
-// and cache-safe across origins.
-func setCORSResponseHeaders(w http.ResponseWriter, origin string, rule cors.Rule) {
+// and cache-safe across origins. includeExpose controls
+// Access-Control-Expose-Headers, which is meaningful only on the
+// actual response (the browser ignores it on a preflight, and AWS S3
+// does not send it there).
+func setCORSResponseHeaders(w http.ResponseWriter, origin string, rule cors.Rule, includeExpose bool) {
 	header := w.Header()
 	header.Add("Vary", "Origin")
 	header.Set("Access-Control-Allow-Origin", origin)
 	header.Set("Access-Control-Allow-Methods", rule.AllowedMethodsCSV())
-	if expose := rule.ExposeHeadersCSV(); expose != "" {
-		header.Set("Access-Control-Expose-Headers", expose)
+	if includeExpose {
+		if expose := rule.ExposeHeadersCSV(); expose != "" {
+			header.Set("Access-Control-Expose-Headers", expose)
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package s3compat
 
 import (
 	"encoding/xml"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -271,6 +272,157 @@ func TestCORSPreflight_NoConfig(t *testing.T) {
 	h.dispatch(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("preflight no config = %d, want 403; body=%s", rec.Code, rec.Body)
+	}
+}
+
+// fakeAuth is a minimal Authenticator + TenantResolver for the
+// production-path CORS tests. It maps a presigned access key to a
+// tenant. Authenticate (the signature-verifying path) succeeds only
+// for a fully-signed request (one carrying X-Amz-Signature) — a
+// browser preflight, which carries no signature, always errors, just
+// like the real authenticator. ResolveTenantUnverified resolves the
+// tenant from the X-Amz-Credential alone, no signature required,
+// which is what makes a presigned-URL preflight work.
+type fakeAuth struct {
+	keys      map[string]string // accessKey -> tenantID
+	authCalls *int              // optional Authenticate call counter
+}
+
+func (f fakeAuth) tenantFor(r *http.Request) (string, bool) {
+	cred := r.URL.Query().Get("X-Amz-Credential")
+	if cred == "" {
+		return "", false
+	}
+	segs := strings.Split(cred, "/")
+	tid, ok := f.keys[segs[0]]
+	return tid, ok
+}
+
+func (f fakeAuth) Authenticate(r *http.Request) (string, error) {
+	if f.authCalls != nil {
+		*f.authCalls++
+	}
+	if r.URL.Query().Get("X-Amz-Signature") == "" {
+		return "", errors.New("auth: no signature presented")
+	}
+	tid, ok := f.tenantFor(r)
+	if !ok {
+		return "", errors.New("auth: unknown access key")
+	}
+	return tid, nil
+}
+
+func (f fakeAuth) ResolveTenantUnverified(r *http.Request) (string, bool) {
+	return f.tenantFor(r)
+}
+
+// presignedURL builds a path carrying a presigned X-Amz-Credential for
+// accessKey (and, when signed, an X-Amz-Signature) so fakeAuth can
+// resolve / authenticate it.
+func presignedURL(path, accessKey string, signed bool) string {
+	q := "X-Amz-Credential=" + accessKey + "%2F20260101%2Fus-east-1%2Fs3%2Faws4_request"
+	if signed {
+		q += "&X-Amz-Signature=deadbeef"
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + q
+}
+
+// TestBucketCors_AuthenticatedTenant exercises the production path
+// (Auth != nil): CORS rules stored by an authenticated tenant must be
+// found by that tenant's unauthenticated, presigned-URL preflight —
+// the scenario BUG-0001 broke when the preflight fell back to the
+// anonymous tenant.
+func TestBucketCors_AuthenticatedTenant(t *testing.T) {
+	h, _ := newVersioningTestHandler()
+	h.cfg.Auth = fakeAuth{keys: map[string]string{"AKIDA": "tenant-a", "AKIDB": "tenant-b"}}
+	h.cfg.RequireAuth = true
+
+	// tenant-a stores CORS through the authenticated PUT path.
+	req := httptest.NewRequest(http.MethodPut,
+		presignedURL("/bucket?cors", "AKIDA", true), strings.NewReader(sampleCORS))
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated PUT ?cors = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// tenant-a's presigned-URL preflight (unsigned, as browsers send it)
+	// resolves tenant-a from X-Amz-Credential and finds the rule → 200.
+	req = httptest.NewRequest(http.MethodOptions, presignedURL("/bucket/obj", "AKIDA", false), nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authed-tenant preflight = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("Allow-Origin = %q, want echoed origin", got)
+	}
+	// A preflight must not carry Expose-Headers (AWS omits it there).
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "" {
+		t.Fatalf("preflight Expose-Headers = %q, want empty", got)
+	}
+
+	// A different tenant (tenant-b) has no CORS on this bucket name, so
+	// its preflight is rejected — proving tenant isolation holds.
+	req = httptest.NewRequest(http.MethodOptions, presignedURL("/bucket/obj", "AKIDB", false), nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("other-tenant preflight = %d, want 403", rec.Code)
+	}
+
+	// A preflight with no credential at all cannot resolve a tenant → 403.
+	req = httptest.NewRequest(http.MethodOptions, "/bucket/obj", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("credential-less preflight = %d, want 403", rec.Code)
+	}
+}
+
+// TestApplyCORS_AuthenticatedActualRequest verifies the actual
+// (signed) cross-origin request gets CORS headers under a real
+// Authenticator, and that the tenant is authenticated only once per
+// request (applyCORS + the operation handler share the memo).
+func TestApplyCORS_AuthenticatedActualRequest(t *testing.T) {
+	h, _ := newVersioningTestHandler()
+	calls := 0
+	h.cfg.Auth = fakeAuth{keys: map[string]string{"AKIDA": "tenant-a"}, authCalls: &calls}
+	h.cfg.RequireAuth = true
+	// Store tenant-a's CORS through the authenticated PUT path.
+	req := httptest.NewRequest(http.MethodPut,
+		presignedURL("/bucket?cors", "AKIDA", true), strings.NewReader(sampleCORS))
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated PUT ?cors = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	calls = 0 // count only the cross-origin actual request below
+
+	req = httptest.NewRequest(http.MethodGet, presignedURL("/bucket/missing", "AKIDA", true), nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("Allow-Origin = %q, want echoed origin; body=%s", got, rec.Body)
+	}
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "ETag" {
+		t.Fatalf("actual-request Expose-Headers = %q, want ETag", got)
+	}
+	// applyCORS and the Get handler both call authenticate; the
+	// per-request memo must collapse them into a single resolution.
+	if calls != 1 {
+		t.Fatalf("Authenticate called %d times, want 1 (per-request memo)", calls)
 	}
 }
 
