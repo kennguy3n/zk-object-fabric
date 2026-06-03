@@ -315,8 +315,10 @@ type AuthConfig struct {
 	// the SPA exchanges for fresh access tokens at
 	// /api/v1/auth/refresh. When nil, login / signup still succeed
 	// but return no refresh token and the refresh endpoint replies
-	// 503 — the Phase 3 scaffold default for deployments that have
-	// not opted into refresh-token sessions.
+	// 503. The gateway wires a store by default and produces nil only
+	// when the operator sets Console.DisableRefreshTokens — i.e. a
+	// deliberate opt-out into pure stateless-JWT sessions, not an
+	// accidental default.
 	RefreshTokens RefreshTokenStore
 
 	// NewTenantID returns a fresh tenant ID. Defaults to a 16-byte

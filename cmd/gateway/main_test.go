@@ -988,3 +988,21 @@ func TestDefaultCacheWarmingBudget_ConfigMatchesHandlerFallback(t *testing.T) {
 		)
 	}
 }
+
+// TestBuildRefreshTokenStore_DisableOptOut verifies the documented
+// nil-contract on AuthConfig.RefreshTokens is reachable from operator
+// config: with Console.DisableRefreshTokens set, buildRefreshTokenStore
+// returns nil (refresh disabled), and otherwise it returns a non-nil
+// store so refresh is on by default.
+func TestBuildRefreshTokenStore_DisableOptOut(t *testing.T) {
+	var cfg config.Config
+	cfg.Console.DisableRefreshTokens = true
+	if got := buildRefreshTokenStore(cfg, nil, nil); got != nil {
+		t.Fatalf("DisableRefreshTokens=true: got non-nil store %T, want nil", got)
+	}
+
+	cfg.Console.DisableRefreshTokens = false
+	if got := buildRefreshTokenStore(cfg, nil, nil); got == nil {
+		t.Fatal("DisableRefreshTokens=false: got nil store, want non-nil (refresh on by default)")
+	}
+}

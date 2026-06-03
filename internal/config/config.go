@@ -411,6 +411,16 @@ type ConsoleConfig struct {
 	// when a metadata DSN is configured, and the process-local
 	// in-memory store otherwise (dev / single-node only).
 	RefreshTokenTTL Duration `json:"refresh_token_ttl"`
+
+	// DisableRefreshTokens opts the deployment out of refresh-token
+	// sessions entirely. When true the gateway wires no
+	// RefreshTokenStore, so login / signup return no refresh token and
+	// /api/v1/auth/refresh replies 503 — the stateless access token is
+	// then the only session credential. Defaults to false (refresh
+	// enabled), which is the recommended posture; this switch exists for
+	// operators who want a pure stateless-JWT deployment with no
+	// server-side session state to persist or reap.
+	DisableRefreshTokens bool `json:"disable_refresh_tokens"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the

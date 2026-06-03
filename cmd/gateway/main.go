@@ -1977,7 +1977,15 @@ func buildAuthStore(db, embeddedDB *sql.DB) console.AuthStore {
 // the in-memory store with a loud log rather than wedging startup —
 // refresh tokens are an additive session convenience, and the access
 // token continues to work without them.
+//
+// Returns nil when the operator sets Console.DisableRefreshTokens, which
+// the auth handler reads as "refresh disabled": login / signup omit the
+// refresh token and /api/v1/auth/refresh replies 503.
 func buildRefreshTokenStore(cfg config.Config, db, embeddedDB *sql.DB) console.RefreshTokenStore {
+	if cfg.Console.DisableRefreshTokens {
+		log.Printf("gateway: refresh tokens disabled by config; access token is the only session credential")
+		return nil
+	}
 	rcfg := console.RefreshConfig{TTL: cfg.Console.RefreshTokenTTL.ToDuration()}
 	if db == nil {
 		if embeddedDB != nil {
