@@ -32,10 +32,10 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/console"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
-	"github.com/kennguy3n/zk-object-fabric/encryption"
-	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
+	"github.com/kennguy3n/zk-object-fabric/encryption"
+	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 	"github.com/kennguy3n/zk-object-fabric/internal/compliance"
@@ -43,6 +43,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/embeddeddb"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
 	"github.com/kennguy3n/zk-object-fabric/internal/metrics"
+	"github.com/kennguy3n/zk-object-fabric/internal/repair"
 	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/internal/tracing"
 	"github.com/kennguy3n/zk-object-fabric/internal/version"
@@ -56,7 +57,6 @@ import (
 	sqlitestore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/sqlite"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
-	"github.com/kennguy3n/zk-object-fabric/internal/repair"
 	"github.com/kennguy3n/zk-object-fabric/migration"
 	"github.com/kennguy3n/zk-object-fabric/migration/background_rebalancer"
 	"github.com/kennguy3n/zk-object-fabric/migration/cross_cell"
@@ -177,22 +177,23 @@ func main() {
 	// production handler in place.
 	enforceProductionAuth(cfg.Env, metadataDB, tenantStore)
 	// Production safety net: refuse to start when env=production,
-	// the gateway is wired with the Postgres manifest store, and
+	// the gateway is wired with a persistent manifest store, and
 	// the BodyEncryptor key is not configured. Without this,
 	// manifest JSON (object keys, piece locators, sizes, wrapped
-	// DEKs) is persisted as plaintext JSONB and any operator or
-	// attacker with Postgres read access can enumerate tenant
-	// content. See metadata/manifest_store/postgres BodyEncryptor
-	// for the per-row sealing logic this guard refuses to skip.
+	// DEKs) is persisted as plaintext and any operator or attacker
+	// with read access to that store can enumerate tenant content.
+	// See manifest_store.BodyEncryptor for the per-row sealing logic
+	// this guard refuses to skip.
 	//
-	// The Postgres-backed store is selected when metadataDB != nil
-	// (see buildManifestStore). The in-memory dev store has no
-	// persistent backing table to leak, so the guard skips that
-	// branch — if env=production also implies the memory store,
+	// A persistent store is selected when metadataDB != nil (Postgres
+	// JSONB) or embeddedDB != nil (embedded SQLite blob on disk); see
+	// buildManifestStore. The in-memory dev store has no persistent
+	// backing table to leak, so the guard skips that branch — if
+	// env=production also implies the memory store,
 	// enforceProductionAuth above will already have failed because
 	// the in-memory tenant store cannot satisfy production auth
 	// without static --tenants bindings.
-	enforceProductionManifestEncryption(cfg.Env, metadataDB != nil, cfg.Encryption.ManifestBodyKeyPath)
+	enforceProductionManifestEncryption(cfg.Env, metadataDB != nil || embeddedDB != nil, cfg.Encryption.ManifestBodyKeyPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -636,28 +637,29 @@ func enforceProductionAuth(env string, metadataDB *sql.DB, tenantStore auth.Tena
 
 // errProductionManifestEncryptionRequired is returned by
 // checkProductionManifestEncryption when the gateway is started
-// with env=production, the Postgres manifest store is selected,
+// with env=production, a persistent manifest store is selected,
 // and the BodyEncryptor for that store has not been configured
 // (manifest_body_key_path is empty). Exposed as a sentinel so
 // cmd/gateway can log a friendly message and main_test.go can
 // errors.Is against it.
-var errProductionManifestEncryptionRequired = errors.New("gateway: env=production with Postgres manifest store but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development")
+var errProductionManifestEncryptionRequired = errors.New("gateway: env=production with a persistent manifest store (Postgres or embedded SQLite) but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext. Set encryption.manifest_body_key_path or use env=development")
 
 // checkProductionManifestEncryption refuses to start the gateway
-// when cfg.Env == "production" and the Postgres manifest store
-// would persist manifest bodies as unencrypted JSONB. Without a
+// when cfg.Env == "production" and a persistent manifest store
+// would persist manifest bodies unencrypted. Without a
 // BodyEncryptor key the manifest table leaks object keys, piece
-// locators, sizes, and the wrapped DEK to anyone with Postgres
-// read access — the exact threat model the Phase 2 manifest body
+// locators, sizes, and the wrapped DEK to anyone with read access
+// to the store — the exact threat model the Phase 2 manifest body
 // encryption was added to defend against (see
-// metadata/manifest_store/postgres BodyEncryptor and
-// docs/PROPOSAL.md §3.7).
+// manifest_store.BodyEncryptor and docs/PROPOSAL.md §3.7). Both
+// persistent backends are covered: Postgres (plaintext JSONB) and
+// the embedded SQLite store (plaintext blob on disk).
 //
-// The check is conditional on the Postgres manifest store being
+// The check is conditional on a persistent manifest store being
 // active: the in-memory dev store has no persistent backing
 // table, so a manifest body key would be ineffectual there. This
 // matches the threat model precisely — the guard fires when the
-// gateway is about to write tenant data to a long-lived table
+// gateway is about to write tenant data to a long-lived store
 // that survives the process lifetime, never when the process is
 // the only authority on the manifests.
 //
@@ -666,11 +668,11 @@ var errProductionManifestEncryptionRequired = errors.New("gateway: env=productio
 // gymnastics; the production-startup wrapper
 // enforceProductionManifestEncryption handles the fatal
 // transition.
-func checkProductionManifestEncryption(env string, manifestStoreUsesPostgres bool, manifestBodyKeyPath string) error {
+func checkProductionManifestEncryption(env string, manifestStorePersistent bool, manifestBodyKeyPath string) error {
 	if env != "production" {
 		return nil
 	}
-	if !manifestStoreUsesPostgres {
+	if !manifestStorePersistent {
 		return nil
 	}
 	if manifestBodyKeyPath != "" {
@@ -683,12 +685,13 @@ func checkProductionManifestEncryption(env string, manifestStoreUsesPostgres boo
 // checkProductionManifestEncryption at the startup callsite. A
 // non-nil error is fatal (the gateway must not boot in production
 // without manifest body encryption, otherwise tenant manifests
-// are stored as plaintext JSONB in Postgres). Tests should call
+// are stored as plaintext in the persistent store — Postgres JSONB
+// or the embedded SQLite file). Tests should call
 // checkProductionManifestEncryption directly so they can errors.Is
 // against the sentinel.
-func enforceProductionManifestEncryption(env string, manifestStoreUsesPostgres bool, manifestBodyKeyPath string) {
-	if err := checkProductionManifestEncryption(env, manifestStoreUsesPostgres, manifestBodyKeyPath); err != nil {
-		log.Fatalf("SECURITY: env=production with Postgres manifest store but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext JSONB in Postgres. Set encryption.manifest_body_key_path or use env=development.")
+func enforceProductionManifestEncryption(env string, manifestStorePersistent bool, manifestBodyKeyPath string) {
+	if err := checkProductionManifestEncryption(env, manifestStorePersistent, manifestBodyKeyPath); err != nil {
+		log.Fatalf("SECURITY: env=production with a persistent manifest store (Postgres or embedded SQLite) but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext. Set encryption.manifest_body_key_path or use env=development.")
 	}
 }
 

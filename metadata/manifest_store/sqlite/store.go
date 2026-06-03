@@ -18,12 +18,17 @@
 // than the Postgres store's object_key_hash keyset; both satisfy
 // the opaque-cursor contract.
 //
-// Concurrency: the embedded DB is opened with a single connection
-// (see internal/embeddeddb), so the read-modify-write sequences here
-// (MAX(write_seq)+1, latest-version DELETE) execute without
-// interleaving. Callers using this package against a pool with more
-// than one open connection must wrap multi-statement operations in a
-// transaction themselves.
+// Concurrency: a single open connection (see internal/embeddeddb)
+// serialises individual statements, but database/sql still returns
+// the connection to the pool between calls, so a multi-statement
+// read-modify-write is NOT implicitly atomic even on this pool. Each
+// mutating operation is therefore expressed as a single SQL
+// statement: Put is one INSERT ... ON CONFLICT DO UPDATE whose
+// write_seq is computed inline (MAX(write_seq)+1) and reused via
+// excluded.write_seq, and Delete (including the empty-VersionID
+// latest-version case) is one DELETE that resolves the target row in
+// a subquery. No operation reads a value in one statement and writes
+// it back in another, so there is no resolve-then-act window to race.
 package sqlite
 
 import (
@@ -175,33 +180,44 @@ func (s *Store) Get(ctx context.Context, key manifest_store.ManifestKey) (*metad
 	return s.decodeBody(body, key.TenantID, key.Bucket, key.ObjectKeyHash)
 }
 
-// Delete removes the manifest row. Empty VersionID deletes the
-// latest version.
+// Delete removes the manifest row. An explicit VersionID deletes
+// that exact version; an empty VersionID deletes the latest
+// version. The latest-version case resolves and deletes in a single
+// statement (DELETE ... WHERE rowid = (SELECT ... ORDER BY write_seq
+// DESC LIMIT 1)) rather than a SELECT followed by a DELETE, so a
+// concurrent Put/Delete cannot shift which version is latest between
+// the read and the write — database/sql returns the connection to
+// the pool between calls even on the single-connection embedded
+// pool, so a two-statement resolve-then-delete would not be atomic.
+// RowsAffected == 0 means no matching row existed and maps to
+// ErrNotFound.
 func (s *Store) Delete(ctx context.Context, key manifest_store.ManifestKey) error {
 	if key.TenantID == "" || key.Bucket == "" || key.ObjectKeyHash == "" {
 		return errors.New("sqlite: tenant_id, bucket, and object_key_hash are required")
 	}
-	versionID := key.VersionID
-	if versionID == "" {
-		q := fmt.Sprintf(`
-			SELECT version_id FROM %s
-			WHERE tenant_id = ? AND bucket = ? AND object_key_hash = ?
-			ORDER BY write_seq DESC
-			LIMIT 1
+	var (
+		q    string
+		args []any
+	)
+	if key.VersionID == "" {
+		q = fmt.Sprintf(`
+			DELETE FROM %s
+			WHERE rowid = (
+				SELECT rowid FROM %s
+				WHERE tenant_id = ? AND bucket = ? AND object_key_hash = ?
+				ORDER BY write_seq DESC
+				LIMIT 1
+			)
+		`, s.table, s.table)
+		args = []any{key.TenantID, key.Bucket, key.ObjectKeyHash}
+	} else {
+		q = fmt.Sprintf(`
+			DELETE FROM %s
+			WHERE tenant_id = ? AND bucket = ? AND object_key_hash = ? AND version_id = ?
 		`, s.table)
-		err := s.db.QueryRowContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash).Scan(&versionID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return manifest_store.ErrNotFound
-		}
-		if err != nil {
-			return fmt.Errorf("sqlite: delete resolve latest: %w", err)
-		}
+		args = []any{key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID}
 	}
-	q := fmt.Sprintf(`
-		DELETE FROM %s
-		WHERE tenant_id = ? AND bucket = ? AND object_key_hash = ? AND version_id = ?
-	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, versionID)
+	res, err := s.db.ExecContext(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("sqlite: delete manifest: %w", err)
 	}

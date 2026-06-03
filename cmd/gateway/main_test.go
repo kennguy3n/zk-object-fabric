@@ -606,25 +606,29 @@ func TestCheckProductionManifestEncryption_ProductionWithKey(t *testing.T) {
 }
 
 // TestCheckProductionManifestEncryption_ProductionMemoryStore: in
-// production with the in-memory manifest store selected (no
-// metadataDB), the guard must not fire even when the key path is
-// empty. There is no Postgres table to leak manifest JSON from, so
-// requiring a body encryption key would be vacuously strict. The
-// process-lifetime memory store is in any case blocked earlier by
-// enforceProductionAuth, which insists on a metadata DSN or static
-// tenant bindings before allowing production startup.
+// production with the in-memory manifest store selected (neither
+// metadataDB nor embeddedDB), the guard must not fire even when the
+// key path is empty. There is no persistent table/file to leak
+// manifest JSON from, so requiring a body encryption key would be
+// vacuously strict. The process-lifetime memory store is in any
+// case blocked earlier by enforceProductionAuth, which insists on a
+// metadata DSN or static tenant bindings before allowing production
+// startup.
 func TestCheckProductionManifestEncryption_ProductionMemoryStore(t *testing.T) {
 	if err := checkProductionManifestEncryption("production", false, ""); err != nil {
-		t.Errorf("checkProductionManifestEncryption(production, false, \"\") = %v; want nil (memory store has no Postgres to encrypt)", err)
+		t.Errorf("checkProductionManifestEncryption(production, false, \"\") = %v; want nil (memory store has nothing to encrypt)", err)
 	}
 }
 
 // TestCheckProductionManifestEncryption_ProductionFails verifies
-// the error path: production with the Postgres manifest store but
+// the error path: production with a persistent manifest store but
 // no manifest_body_key_path must return
 // errProductionManifestEncryptionRequired so the startup wrapper
 // can refuse to boot rather than persisting manifests as plaintext
-// JSONB.
+// (Postgres JSONB or the embedded SQLite file). The persistent bool
+// is true whether the store is Postgres or embedded SQLite; this
+// case covers both since the guard does not distinguish backends
+// once it knows the store is persistent.
 func TestCheckProductionManifestEncryption_ProductionFails(t *testing.T) {
 	err := checkProductionManifestEncryption("production", true, "")
 	if err == nil {
@@ -636,11 +640,16 @@ func TestCheckProductionManifestEncryption_ProductionFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "no manifest_body_key_path is configured") {
 		t.Errorf("error message = %q; want to mention 'no manifest_body_key_path is configured'", err.Error())
 	}
-	if !strings.Contains(err.Error(), "plaintext JSONB") {
-		t.Errorf("error message = %q; want to mention 'plaintext JSONB' so the operator knows the at-rest impact", err.Error())
+	if !strings.Contains(err.Error(), "plaintext") {
+		t.Errorf("error message = %q; want to mention 'plaintext' so the operator knows the at-rest impact", err.Error())
 	}
-	if !strings.Contains(err.Error(), "Postgres manifest store") {
-		t.Errorf("error message = %q; want to mention 'Postgres manifest store' so operators know which backend triggered the guard", err.Error())
+	if !strings.Contains(err.Error(), "persistent manifest store") {
+		t.Errorf("error message = %q; want to mention 'persistent manifest store' so operators know which class of backend triggered the guard", err.Error())
+	}
+	// The message must name both persistent backends so an operator
+	// running the embedded profile recognises it applies to them.
+	if !strings.Contains(err.Error(), "embedded SQLite") {
+		t.Errorf("error message = %q; want to mention 'embedded SQLite' so embedded-profile operators know the guard applies", err.Error())
 	}
 }
 
@@ -757,12 +766,12 @@ func TestWarnProductionLocalCMK_MessagesOverrideOnly(t *testing.T) {
 // check sense) trips the assertion.
 func TestEnforceProductionLocalCMK_OnlyWarnsOnExplicitOverride(t *testing.T) {
 	cases := []struct {
-		name           string
-		env            string
-		allowLocalCMK  bool
-		cmkURI         string
-		holderClass    string
-		wantWarn       bool
+		name          string
+		env           string
+		allowLocalCMK bool
+		cmkURI        string
+		holderClass   string
+		wantWarn      bool
 	}{
 		{
 			name:          "production_localCMK_override_warns",

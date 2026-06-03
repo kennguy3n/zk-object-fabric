@@ -315,19 +315,24 @@ func (s *Store) ListTenants(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// sqliteConstraintCheck is the SQLite extended result code
+// SQLITE_CONSTRAINT_CHECK (19 | (1<<8) = 275): a row violated a
+// CHECK constraint specifically. modernc.org/sqlite's Error.Code()
+// always returns the *extended* code (e.g. UNIQUE is 1555, NOT NULL
+// is 1299), never the bare primary SQLITE_CONSTRAINT (19), so we
+// match the exact CHECK code rather than the primary code — matching
+// 19 would either never fire or, if it did, misclassify every other
+// constraint class as a CHECK failure.
+const sqliteConstraintCheck = 275
+
 // isCheckViolation reports whether err is a SQLite CHECK-constraint
-// failure. modernc.org/sqlite surfaces the extended result code via
-// an *sqlite.Error; we match on the code rather than the message so
-// the classification is stable across driver versions and locales.
-// SQLITE_CONSTRAINT_CHECK (extended) is 275 (0x113), and the primary
-// SQLITE_CONSTRAINT code is 19 — accept either so a driver that
-// reports only the primary code still classifies correctly. Falls
-// back to a message match for safety.
+// failure. We match on the extended result code rather than the
+// message so the classification is stable across driver versions and
+// locales, with a message-substring fallback for safety.
 func isCheckViolation(err error) bool {
 	var serr *sqlitedriver.Error
 	if errors.As(err, &serr) {
-		code := serr.Code()
-		if code == 275 || code == 19 {
+		if serr.Code() == sqliteConstraintCheck {
 			return true
 		}
 	}
