@@ -75,6 +75,11 @@ func TestMemoryLegalHoldStore_CreateReleaseList(t *testing.T) {
 	if err := s.Release(ctx, "missing"); !errors.Is(err, ErrLegalHoldNotFound) {
 		t.Errorf("Release(unknown) = %v, want ErrLegalHoldNotFound", err)
 	}
+	// A second release of an already-released hold is guarded the same way
+	// as the SQL-backed stores (WHERE released = 0 affects 0 rows).
+	if err := s.Release(ctx, "h1"); !errors.Is(err, ErrLegalHoldNotFound) {
+		t.Errorf("second Release = %v, want ErrLegalHoldNotFound", err)
+	}
 }
 
 func TestCheckDelete_ReturnsErrLegalHoldActive(t *testing.T) {

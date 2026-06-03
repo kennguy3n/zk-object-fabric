@@ -115,7 +115,7 @@ func (s *MemoryLegalHoldStore) Release(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h, ok := s.holds[id]
-	if !ok {
+	if !ok || h.Released {
 		return ErrLegalHoldNotFound
 	}
 	h.Released = true
