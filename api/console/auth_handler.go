@@ -896,11 +896,12 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decode refresh: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.RefreshToken) == "" {
+	refreshToken := strings.TrimSpace(req.RefreshToken)
+	if refreshToken == "" {
 		writeError(w, http.StatusBadRequest, "refreshToken is required")
 		return
 	}
-	rotated, err := h.cfg.RefreshTokens.Rotate(req.RefreshToken)
+	rotated, err := h.cfg.RefreshTokens.Rotate(refreshToken)
 	if err != nil {
 		// Both "invalid/expired" and "reuse detected" collapse to a
 		// uniform 401: the client's only correct reaction to either
@@ -956,7 +957,9 @@ func (h *AuthHandler) logout(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decode logout: "+err.Error())
 		return
 	}
-	if err := h.cfg.RefreshTokens.Revoke(req.RefreshToken); err != nil {
+	// Trim like the refresh handler so a whitespace-padded copy/paste
+	// resolves to the same lookup; an empty token is a no-op Revoke.
+	if err := h.cfg.RefreshTokens.Revoke(strings.TrimSpace(req.RefreshToken)); err != nil {
 		writeError(w, http.StatusInternalServerError, "revoke refresh token: "+err.Error())
 		return
 	}
