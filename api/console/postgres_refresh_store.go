@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // PostgresRefreshTokenStore is the Postgres-backed RefreshTokenStore
@@ -19,6 +20,7 @@ import (
 type PostgresRefreshTokenStore struct {
 	db  *sql.DB
 	cfg RefreshConfig
+	now func() time.Time
 	ctx context.Context
 }
 
@@ -27,7 +29,7 @@ func NewPostgresRefreshTokenStore(db *sql.DB, cfg RefreshConfig) (*PostgresRefre
 	if db == nil {
 		return nil, errors.New("console: postgres refresh store requires a non-nil *sql.DB")
 	}
-	return &PostgresRefreshTokenStore{db: db, cfg: cfg}, nil
+	return &PostgresRefreshTokenStore{db: db, cfg: cfg, now: cfg.resolveClock()}, nil
 }
 
 // WithContext returns a copy of the store bound to ctx.
@@ -57,7 +59,7 @@ func (s *PostgresRefreshTokenStore) Issue(tenantID string) (RefreshToken, error)
 	if err != nil {
 		return RefreshToken{}, err
 	}
-	expiresAt := s.cfg.now()().Add(s.cfg.ttl())
+	expiresAt := s.now().Add(s.cfg.ttl())
 	const q = `INSERT INTO refresh_tokens (token_hash, family_id, tenant_id, expires_at, consumed)
 		VALUES ($1, $2, $3, $4, FALSE)`
 	if _, err := s.db.ExecContext(s.cx(), q, hashRefreshToken(raw), family, tenantID, expiresAt.UnixNano()); err != nil {
@@ -75,7 +77,7 @@ func (s *PostgresRefreshTokenStore) Rotate(rawToken string) (RefreshToken, error
 		return RefreshToken{}, errRefreshTokenInvalid
 	}
 	hash := hashRefreshToken(rawToken)
-	now := s.cfg.now()()
+	now := s.now()
 
 	tx, err := s.db.BeginTx(s.cx(), nil)
 	if err != nil {
