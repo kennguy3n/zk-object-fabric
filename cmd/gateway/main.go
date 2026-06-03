@@ -205,6 +205,18 @@ func main() {
 	// the console is disabled (ListenAddr empty), since no TokenStore
 	// is built then — see checkProductionTokenStore.
 	enforceProductionTokenStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.JWTSigningKeyPath)
+	// Production safety net for the refresh-token store, the sibling of
+	// the access-token guard above. buildRefreshTokenStore falls back to
+	// the process-local MemoryRefreshTokenStore when neither a metadata
+	// DSN (Postgres) nor the embedded SQLite profile is configured;
+	// that store loses every refresh token on restart and is not shared
+	// across replicas, so /api/v1/auth/refresh would 401 against any
+	// replica other than the issuer. Refuse to boot in production unless
+	// a persistent backend is wired or the operator deliberately opted
+	// out via console.disable_refresh_tokens (pure stateless-JWT
+	// sessions). Skipped when the console is disabled — see
+	// checkProductionRefreshTokenStore.
+	enforceProductionRefreshTokenStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.DisableRefreshTokens, metadataDB != nil || embeddedDB != nil)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -766,6 +778,67 @@ func checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string)
 // the sentinel without forking the test binary.
 func enforceProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string) {
 	if err := checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath); err != nil {
+		log.Fatalf("%s", err)
+	}
+}
+
+// errProductionRefreshTokenStoreRequired is returned by
+// checkProductionRefreshTokenStore when the gateway is started with
+// env=production and the console enabled but no persistent backend
+// (Postgres DSN or embedded SQLite) is configured, so
+// buildRefreshTokenStore would fall back to the process-local
+// MemoryRefreshTokenStore. Exposed as a sentinel so cmd/gateway can log
+// a friendly message and main_test.go can errors.Is against it.
+var errProductionRefreshTokenStoreRequired = errors.New("gateway: env=production but no persistent refresh-token backend is configured (no control_plane.metadata_dsn and no embedded SQLite); the console would fall back to the in-memory MemoryRefreshTokenStore, whose refresh tokens are lost on restart and are not shared across replicas behind a load balancer, so /api/v1/auth/refresh would 401 against any replica other than the issuer. Configure a metadata DSN or the embedded profile, set console.disable_refresh_tokens=true to run pure stateless-JWT sessions, or use env=development")
+
+// checkProductionRefreshTokenStore refuses to start the gateway when
+// cfg.Env == "production", the console API is enabled, the operator has
+// not explicitly disabled refresh tokens, and no persistent backend is
+// configured — i.e. buildRefreshTokenStore would select the
+// process-local MemoryRefreshTokenStore. That store is exactly as
+// production-unsafe as the access-token MemoryTokenStore the sibling
+// checkProductionTokenStore guards against: refresh tokens vanish on
+// restart and two replicas behind a load balancer cannot validate each
+// other's tokens, so a user whose refresh lands on a different replica
+// is logged out with a spurious 401.
+//
+// The guard is gated like its siblings:
+//   - consoleListenAddr == "" means the console is disabled and no
+//     refresh store is ever built, so there is nothing to be unsafe.
+//   - disableRefresh is the deliberate operator opt-out into pure
+//     stateless-JWT sessions (Console.DisableRefreshTokens), where
+//     buildRefreshTokenStore returns nil by design and the refresh
+//     endpoint replies 503 — that is an intentional configuration, not
+//     the accidental memory fallback this guard exists to catch.
+//   - persistent is metadataDB != nil || embeddedDB != nil, the same
+//     "a Postgres or SQLite store will be selected" signal the
+//     manifest-encryption guard uses.
+//
+// Returns a sentinel error rather than calling log.Fatalf so tests can
+// exercise both branches in-process.
+func checkProductionRefreshTokenStore(env, consoleListenAddr string, disableRefresh, persistent bool) error {
+	if env != "production" {
+		return nil
+	}
+	if consoleListenAddr == "" {
+		return nil
+	}
+	if disableRefresh {
+		return nil
+	}
+	if persistent {
+		return nil
+	}
+	return errProductionRefreshTokenStoreRequired
+}
+
+// enforceProductionRefreshTokenStore wraps
+// checkProductionRefreshTokenStore at the startup callsite: a non-nil
+// error is fatal. Tests should call checkProductionRefreshTokenStore
+// directly so they can errors.Is against the sentinel without forking
+// the test binary.
+func enforceProductionRefreshTokenStore(env, consoleListenAddr string, disableRefresh, persistent bool) {
+	if err := checkProductionRefreshTokenStore(env, consoleListenAddr, disableRefresh, persistent); err != nil {
 		log.Fatalf("%s", err)
 	}
 }
