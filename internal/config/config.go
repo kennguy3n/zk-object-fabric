@@ -315,6 +315,23 @@ type EncryptionConfig struct {
 	// ("transit"). Operators that mount Transit elsewhere supply
 	// the path here.
 	VaultTransitMount string `json:"vault_transit_mount"`
+
+	// AADMigrationInterval gates the background worker that
+	// re-encrypts legacy gateway-encrypted objects (manifests with
+	// EncryptionConfig.AADVersion == "") under the modern v1
+	// per-chunk AAD binding. Zero (the default) disables the
+	// worker, so existing deployments are unaffected until an
+	// operator opts in. A typical value is a few hours: the sweep
+	// walks every manifest, so running it too aggressively wastes
+	// backend I/O re-listing an already-converged fleet. The
+	// worker is rate-limited per object via AADMigrationPerObject.
+	AADMigrationInterval Duration `json:"aad_migration_interval"`
+
+	// AADMigrationPerObject throttles the migration worker by
+	// sleeping this long after each object it actually re-encrypts,
+	// bounding the backend load a fleet-wide upgrade imposes. Zero
+	// means no throttle. Ignored when AADMigrationInterval is zero.
+	AADMigrationPerObject Duration `json:"aad_migration_per_object"`
 }
 
 // ConsoleConfig configures the tenant-console HTTP surface (api/console).

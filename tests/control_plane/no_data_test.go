@@ -99,6 +99,11 @@ var sealedKeyMaterialFields = map[string]bool{
 	"ManifestStore.Get.Out[0].Encryption.WrappedDEK":            true,
 	"ManifestStore.Put.In[2].Encryption.WrappedDEK":             true,
 	"ManifestStore.List.Out[0].Manifests[*].Encryption.WrappedDEK": true,
+	// ScanManifests returns the same sealed envelope DEK as List,
+	// just wrapped in a ScannedManifest alongside the key the
+	// migration worker re-Puts under. It is the identical
+	// KMS/CMK-wrapped ciphertext, never an object body.
+	"ManifestStore.ScanManifests.Out[0].Manifests[*].Manifest.Encryption.WrappedDEK": true,
 }
 
 // fieldPathFor walks a struct recursively and reports any field

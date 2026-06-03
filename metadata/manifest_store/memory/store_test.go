@@ -315,3 +315,80 @@ func TestCloneManifest_NilWrappedDEKStaysNil(t *testing.T) {
 			got.Encryption.WrappedDEK)
 	}
 }
+
+// TestScanManifests_PaginatesEveryVersionInKeyOrder verifies that
+// ScanManifests visits every manifest version (not just the latest)
+// across all tenants and buckets exactly once, in full-primary-key
+// order, and that the cursor resumes without gaps or repeats.
+func TestScanManifests_PaginatesEveryVersionInKeyOrder(t *testing.T) {
+	t.Parallel()
+	store := New()
+	ctx := context.Background()
+
+	// Seed two tenants, two buckets, and multiple versions per
+	// object so the scan must cross every key boundary and return
+	// older versions List would hide.
+	want := map[manifest_store.ManifestKey]bool{}
+	seed := func(tenant, bucket, key, version string) {
+		mk := manifest_store.ManifestKey{TenantID: tenant, Bucket: bucket, ObjectKeyHash: key, VersionID: version}
+		if err := store.Put(ctx, mk, &metadata.ObjectManifest{
+			TenantID: tenant, Bucket: bucket, ObjectKeyHash: key, VersionID: version,
+		}); err != nil {
+			t.Fatalf("seed %v: %v", mk, err)
+		}
+		want[mk] = true
+	}
+	seed("t1", "b1", "h1", "v1")
+	seed("t1", "b1", "h1", "v2") // older version of same object
+	seed("t1", "b1", "h2", "v1")
+	seed("t1", "b2", "h1", "v1")
+	seed("t2", "b1", "h1", "v1")
+
+	got := map[manifest_store.ManifestKey]int{}
+	var prev manifest_store.ManifestKey
+	var havePrev bool
+	cursor := ""
+	pages := 0
+	for {
+		page, err := store.ScanManifests(ctx, cursor, 2)
+		if err != nil {
+			t.Fatalf("ScanManifests: %v", err)
+		}
+		pages++
+		for _, sm := range page.Manifests {
+			got[sm.Key]++
+			if havePrev && !scanKeyLess(prev, sm.Key) {
+				t.Fatalf("scan not strictly increasing: %v then %v", prev, sm.Key)
+			}
+			prev, havePrev = sm.Key, true
+			if sm.Manifest == nil {
+				t.Fatalf("nil manifest for %v", sm.Key)
+			}
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(got) != len(want) {
+		t.Fatalf("scanned %d distinct keys, want %d", len(got), len(want))
+	}
+	for k := range want {
+		if got[k] != 1 {
+			t.Fatalf("key %v visited %d times, want exactly 1", k, got[k])
+		}
+	}
+	if pages < 2 {
+		t.Fatalf("expected multiple pages with limit=2 over %d keys, got %d", len(want), pages)
+	}
+}
+
+// TestScanManifests_RejectsMalformedCursor ensures a corrupted cursor
+// is an error rather than a silent restart from the beginning.
+func TestScanManifests_RejectsMalformedCursor(t *testing.T) {
+	t.Parallel()
+	store := New()
+	if _, err := store.ScanManifests(context.Background(), "!!!not-base64!!!", 10); err == nil {
+		t.Fatal("malformed cursor: want error, got nil")
+	}
+}
