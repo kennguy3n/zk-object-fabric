@@ -479,7 +479,15 @@ func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.L
 	}
 	e.reclaimPieces(ctx, entry.TenantID, entry.Bucket, m, now)
 	stats.ObjectsExpired++
-	e.audit(ctx, auditOpExpiration, entry.TenantID, entry.Bucket, m.ObjectKey, firstBackendPiece(pieceBackends(m.Pieces)), now)
+	// Audit only a piece-backed expiration, matching the interactive
+	// DELETE path (api/s3compat/handler.go), whose audit entry is
+	// anchored on manifest.Pieces[0]. A piece-less manifest (e.g. a
+	// zero-byte object) is still metered below; the compliance trail
+	// records piece-backed deletions, mirroring the user-issued path
+	// exactly.
+	if len(m.Pieces) > 0 {
+		e.audit(ctx, auditOpExpiration, entry.TenantID, entry.Bucket, m.ObjectKey, firstBackendPiece(pieceBackends(m.Pieces)), now)
+	}
 	e.emit(entry.TenantID, entry.Bucket, billing.LifecycleExpirations, 1, now)
 }
 

@@ -2739,6 +2739,15 @@ func hashObjectKey(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// NewVersionID mints a version ID using the same scheme as the
+// interactive write path, so a delete marker inserted by the
+// background lifecycle evaluator is indistinguishable from one
+// created by an interactive DELETE. cmd/gateway wires this into the
+// evaluator's Config.NewVersionID.
+func NewVersionID(tenantID, bucket, key string, now time.Time) string {
+	return newPieceID(tenantID, bucket, key, now)
+}
+
 // newPieceID mints a deterministic-looking but unique piece ID for a
 // new object. Phase 2's client SDK will later hand the gateway a
 // BLAKE3 hash of the ciphertext; this helper unblocks the gateway

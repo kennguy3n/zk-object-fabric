@@ -50,6 +50,10 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/internal/tracing"
 	"github.com/kennguy3n/zk-object-fabric/internal/version"
+	"github.com/kennguy3n/zk-object-fabric/lifecycle/evaluator"
+	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	bcpostgres "github.com/kennguy3n/zk-object-fabric/metadata/bucket_config/postgres"
+	bcsqlite "github.com/kennguy3n/zk-object-fabric/metadata/bucket_config/sqlite"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	cipostgres "github.com/kennguy3n/zk-object-fabric/metadata/content_index/postgres"
 	cisqlite "github.com/kennguy3n/zk-object-fabric/metadata/content_index/sqlite"
@@ -160,6 +164,7 @@ func main() {
 
 	store := buildManifestStore(cfg, metadataDB, embeddedDB)
 	contentIndex := buildContentIndex(cfg, metadataDB, embeddedDB)
+	bucketConfigStore := buildBucketConfigStore(cfg, metadataDB, embeddedDB)
 	registry := buildProviderRegistry(context.Background(), cfg)
 	if lister, ok := buildDedicatedCellStore(metadataDB).(cellops.CellLister); ok {
 		registerCellProviders(context.Background(), registry, lister, cfg)
@@ -347,7 +352,13 @@ func main() {
 	mux.Handle(version.Path, version.Handler())
 	log.Printf("gateway: build version=%s commit=%s built=%s go=%s/%s",
 		version.Version, version.GitCommit, version.BuildDate, runtime.GOOS, runtime.GOARCH)
-	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB)
+	// auditStore is built once and shared between the interactive
+	// s3compat handler (via complianceHooks) and the background
+	// lifecycle evaluator so lifecycle-driven and user-issued
+	// mutations land in the same compliance trail. nil when auditing
+	// is disabled.
+	auditStore := buildAuditStore(cfg.Compliance, metadataDB)
+	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB, auditStore)
 	s3Handler := s3compat.New(s3compat.Config{
 		Manifests:                store,
 		Providers:                registry,
@@ -356,6 +367,7 @@ func main() {
 		VerifiedCheck:            verifiedCheck,
 		Billing:                  billingSink,
 		Multipart:                multipartStore,
+		BucketConfig:             bucketConfigStore,
 		ErasureCoding:            erasureRegistry,
 		Cache:                    cache,
 		CachePublisher:           signalBus,
@@ -379,6 +391,14 @@ func main() {
 	})
 	s3Handler.Register(mux)
 	aadMigratorDone := startAADMigrator(workerCtx, cfg.Encryption, s3Handler)
+	// The lifecycle evaluator shares the same stores the handler
+	// uses (bucket configs, manifests, multipart sessions, dedup
+	// index, providers) plus the shared audit store and billing
+	// sink, so lifecycle-driven expirations are recorded and metered
+	// exactly like the interactive DELETE path.
+	lifecycleDone := startLifecycleEvaluator(
+		workerCtx, cfg.Lifecycle, bucketConfigStore, store, multipartStore,
+		contentIndex, registry, auditStore, billingSink, cfg.Env)
 
 	handler := http.Handler(mux)
 	if cfg.Tracing.Enabled {
@@ -522,6 +542,9 @@ func main() {
 	}
 	if aadMigratorDone != nil {
 		<-aadMigratorDone
+	}
+	if lifecycleDone != nil {
+		<-lifecycleDone
 	}
 }
 
@@ -1313,6 +1336,83 @@ func startRebalancer(
 	return done
 }
 
+// startLifecycleEvaluator spins up the background object-lifecycle
+// evaluator (WS8.2) on a ticker when cfg.Lifecycle.Enabled. It
+// returns a channel that closes when the worker has fully drained,
+// or nil when the worker was not started. It shares ctx with the
+// other gateway workers so a SIGTERM-triggered cancelWorker() also
+// stops it.
+//
+// A nil bucketConfig disables the worker: with no store there are no
+// lifecycle configurations to enumerate. The contentIndex,
+// auditStore, and billingSink hooks are all optional — when nil the
+// corresponding behaviour (dedup-refcount reclaim, audit recording,
+// usage metering) is skipped, matching the evaluator's documented
+// no-op semantics. The evaluator mints delete-marker version IDs
+// with s3compat.NewVersionID so they are indistinguishable from
+// markers created by an interactive DELETE.
+func startLifecycleEvaluator(
+	ctx context.Context,
+	lc config.LifecycleConfig,
+	bucketConfig bucket_config.Store,
+	store manifest_store.ManifestStore,
+	uploads multipart.Store,
+	idx content_index.Store,
+	registry map[string]providers.StorageProvider,
+	auditStore compliance.AuditStore,
+	billingSink billing.BillingSink,
+	nodeID string,
+) <-chan struct{} {
+	if !lc.Enabled || bucketConfig == nil {
+		return nil
+	}
+	interval := lc.Interval.ToDuration()
+	if interval <= 0 {
+		interval = 24 * time.Hour
+	}
+	evCfg := evaluator.Config{
+		Source:       bucketConfig,
+		Manifests:    store,
+		Uploads:      uploads,
+		Providers:    registry,
+		NewVersionID: s3compat.NewVersionID,
+		NodeID:       nodeID,
+		Billing:      billingSink,
+		Logger:       log.New(os.Stdout, "lifecycle ", log.LstdFlags),
+	}
+	if idx != nil {
+		evCfg.ContentIndex = idx
+	}
+	if auditStore != nil {
+		evCfg.Audit = &lifecycleAuditAdapter{store: auditStore}
+	}
+	ev := evaluator.New(evCfg)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			stats, err := ev.Run(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("gateway: lifecycle pass: %v", err)
+			}
+			if stats.ObjectsExpired > 0 || stats.DeleteMarkersCreated > 0 ||
+				stats.DeleteMarkersRemoved > 0 || stats.UploadsAborted > 0 || stats.Errors > 0 {
+				log.Printf("gateway: lifecycle buckets=%d scanned=%d expired=%d markers_created=%d markers_removed=%d uploads_aborted=%d skipped=%d errors=%d",
+					stats.BucketsScanned, stats.ObjectsScanned, stats.ObjectsExpired, stats.DeleteMarkersCreated,
+					stats.DeleteMarkersRemoved, stats.UploadsAborted, stats.Skipped, stats.Errors)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return done
+}
+
 // buildFleetOrchestrator constructs the FleetOrchestrator used
 // for distributed migration-job coordination. The JobStore is
 // PgJobStore-backed when a metadata DB is available so two
@@ -1527,6 +1627,37 @@ func buildContentIndex(cfg config.Config, db, embeddedDB *sql.DB) content_index.
 		log.Fatalf("gateway: build postgres content_index store: %v", err)
 	}
 	log.Printf("gateway: postgres content_index store enabled (default_scope=%s default_level=%s)", cfg.Dedup.DefaultScope, cfg.Dedup.DefaultLevel)
+	return store
+}
+
+// buildBucketConfigStore returns the per-bucket S3 configuration
+// store (versioning, object-lock, CORS, lifecycle — the WS8
+// sub-resources). It follows the same backend selection as the
+// manifest and content-index stores: Postgres when a metadata DSN
+// is configured, the embedded SQLite database in the single-node
+// profile, and an in-memory store otherwise. The in-memory store is
+// process-local and loses every bucket config on restart, so it
+// MUST NOT be used in production. A non-nil store is always
+// returned; the gateway cannot serve the WS8 sub-resource handlers
+// or run the lifecycle evaluator without one.
+func buildBucketConfigStore(cfg config.Config, db, embeddedDB *sql.DB) bucket_config.Store {
+	if db == nil {
+		if embeddedDB != nil {
+			store, err := bcsqlite.New(bcsqlite.Config{DB: embeddedDB})
+			if err != nil {
+				log.Fatalf("gateway: build embedded bucket_config store: %v", err)
+			}
+			log.Printf("gateway: embedded SQLite bucket_config store enabled (versioning, object-lock, cors, lifecycle)")
+			return store
+		}
+		log.Printf("gateway: no metadata_dsn; using in-memory bucket_config store (dev only — bucket versioning/object-lock/cors/lifecycle configs do NOT survive restart)")
+		return bucket_config.NewMemoryStore()
+	}
+	store, err := bcpostgres.New(bcpostgres.Config{DB: db})
+	if err != nil {
+		log.Fatalf("gateway: build postgres bucket_config store: %v", err)
+	}
+	log.Printf("gateway: postgres bucket_config store enabled (versioning, object-lock, cors, lifecycle)")
 	return store
 }
 
@@ -2693,11 +2824,29 @@ func statusClass(code int) string {
 	}
 }
 
+// buildAuditStore constructs the compliance audit trail store shared
+// by the interactive s3compat handler and the background lifecycle
+// evaluator so both write lifecycle/interactive entries to the same
+// trail. Returns nil when auditing is disabled (the consumers treat
+// nil as "feature off"). Postgres-backed when a metadata DB is
+// configured; an in-memory store otherwise (dev only — entries do
+// not survive restart and are process-local, so the two consumers
+// only share a view within a single process).
+func buildAuditStore(cfg config.ComplianceConfig, db *sql.DB) compliance.AuditStore {
+	if !cfg.AuditEnabled {
+		return nil
+	}
+	if db != nil {
+		return compliance.NewPostgresAuditStore(db)
+	}
+	return compliance.NewMemoryAuditStore()
+}
+
 // buildComplianceHooks constructs the residency enforcer and
 // audit recorder that the s3compat handler consults. Both fields
 // of the returned ComplianceHooks may be nil; the handler treats
 // nil as "feature disabled".
-func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB) s3compat.ComplianceHooks {
+func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB, auditStore compliance.AuditStore) s3compat.ComplianceHooks {
 	hooks := s3compat.ComplianceHooks{}
 	if cfg.ResidencyEnabled {
 		var lookup compliance.AllowlistLookup
@@ -2708,14 +2857,8 @@ func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB) s3compat.Comp
 		}
 		hooks.Residency = compliance.NewResidencyEnforcer(lookup)
 	}
-	if cfg.AuditEnabled {
-		var store compliance.AuditStore
-		if db != nil {
-			store = compliance.NewPostgresAuditStore(db)
-		} else {
-			store = compliance.NewMemoryAuditStore()
-		}
-		hooks.Audit = &auditAdapter{store: store}
+	if cfg.AuditEnabled && auditStore != nil {
+		hooks.Audit = &auditAdapter{store: auditStore}
 	}
 	if cfg.LegalHoldEnabled {
 		var store auth.LegalHoldStore
@@ -2765,6 +2908,29 @@ type auditAdapter struct {
 }
 
 func (a *auditAdapter) Record(ctx context.Context, e s3compat.AuditEntry) error {
+	return a.store.Record(ctx, compliance.AuditEntry{
+		TenantID:       e.TenantID,
+		Operation:      e.Operation,
+		Bucket:         e.Bucket,
+		ObjectKey:      e.ObjectKey,
+		PieceID:        e.PieceID,
+		PieceBackend:   e.PieceBackend,
+		BackendCountry: e.BackendCountry,
+		Timestamp:      e.Timestamp,
+		RequestID:      e.RequestID,
+	})
+}
+
+// lifecycleAuditAdapter forwards the background lifecycle
+// evaluator's audit entries to the same compliance.AuditStore the
+// interactive path writes to. It mirrors auditAdapter — the
+// evaluator defines its own shape-compatible AuditEntry so it does
+// not import internal/compliance.
+type lifecycleAuditAdapter struct {
+	store compliance.AuditStore
+}
+
+func (a *lifecycleAuditAdapter) Record(ctx context.Context, e evaluator.AuditEntry) error {
 	return a.store.Record(ctx, compliance.AuditEntry{
 		TenantID:       e.TenantID,
 		Operation:      e.Operation,

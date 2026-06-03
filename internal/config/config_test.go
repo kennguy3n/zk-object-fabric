@@ -108,6 +108,53 @@ func TestRebalancerConfig_EnabledExplicitFalseDisables(t *testing.T) {
 	}
 }
 
+func TestLifecycleConfig_DefaultEnabledDaily(t *testing.T) {
+	cfg := Default()
+	if !cfg.Lifecycle.Enabled {
+		t.Fatalf("Default Lifecycle.Enabled = false, want true")
+	}
+	if cfg.Lifecycle.Interval.ToDuration() != 24*time.Hour {
+		t.Fatalf("Default Lifecycle.Interval = %v, want 24h", cfg.Lifecycle.Interval.ToDuration())
+	}
+}
+
+func TestLifecycleConfig_OmittedBlockKeepsDefaultEnabled(t *testing.T) {
+	// Load starts from Default(), so a config file with no
+	// "lifecycle" block keeps the daily evaluator enabled.
+	cfg := Default()
+	if err := json.Unmarshal([]byte(`{"env": "production"}`), &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !cfg.Lifecycle.Enabled {
+		t.Fatalf("omitted lifecycle block: Enabled = false, want true")
+	}
+}
+
+func TestLifecycleConfig_PartialBlockKeepsEnabled(t *testing.T) {
+	in := []byte(`{"lifecycle": {"interval": "1h"}}`)
+	var cfg Config
+	if err := json.Unmarshal(in, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !cfg.Lifecycle.Enabled {
+		t.Fatalf("partial lifecycle block: Enabled = false, want true (default)")
+	}
+	if cfg.Lifecycle.Interval.ToDuration() != time.Hour {
+		t.Fatalf("Interval = %v, want 1h", cfg.Lifecycle.Interval.ToDuration())
+	}
+}
+
+func TestLifecycleConfig_EnabledExplicitFalseDisables(t *testing.T) {
+	in := []byte(`{"lifecycle": {"enabled": false}}`)
+	var cfg Config
+	if err := json.Unmarshal(in, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if cfg.Lifecycle.Enabled {
+		t.Fatalf("explicit lifecycle.enabled=false: got true, want false")
+	}
+}
+
 func TestConfig_LegacyMigrationKeyFallsBackToRebalancer(t *testing.T) {
 	// Legacy configs that predate the rename must still populate
 	// Rebalancer without any change on the operator side.

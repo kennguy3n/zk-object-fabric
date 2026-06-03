@@ -2544,3 +2544,24 @@ func TestRejectUnsupportedSubresource_DeterministicErrorMessage(t *testing.T) {
 		}
 	}
 }
+
+// TestNewVersionID_MatchesInteractiveMinter verifies the exported
+// NewVersionID (wired into the lifecycle evaluator by cmd/gateway)
+// produces the same ID as the interactive write path's newPieceID,
+// so a lifecycle-inserted delete marker is indistinguishable from an
+// interactively-created one, and is deterministic for fixed inputs.
+func TestNewVersionID_MatchesInteractiveMinter(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	got := NewVersionID("tenant-1", "bucket-1", "logs/old.txt", now)
+	want := newPieceID("tenant-1", "bucket-1", "logs/old.txt", now)
+	if got != want {
+		t.Fatalf("NewVersionID = %q, want %q (must match newPieceID)", got, want)
+	}
+	if got == "" {
+		t.Fatal("NewVersionID returned empty string")
+	}
+	// Distinct inputs (here: a later timestamp) yield distinct IDs.
+	if other := NewVersionID("tenant-1", "bucket-1", "logs/old.txt", now.Add(time.Nanosecond)); other == got {
+		t.Fatal("NewVersionID collided for distinct timestamps")
+	}
+}
