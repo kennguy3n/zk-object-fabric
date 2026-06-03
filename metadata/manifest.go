@@ -40,6 +40,17 @@ type ObjectManifest struct {
 	PlacementPolicy PlacementPolicy  `json:"placement_policy"`
 	Pieces          []Piece          `json:"pieces"`
 	MigrationState  MigrationState   `json:"migration_state"`
+
+	// DeleteMarker, when true, marks this manifest version as an S3
+	// delete marker rather than a real object version. It is created
+	// by DeleteObject on a versioning-enabled bucket (WS8.4): the
+	// marker becomes the latest version, hiding older versions from
+	// GET/HEAD/ListObjectsV2 while preserving them for
+	// ListObjectVersions and versionId-addressed reads. A delete
+	// marker carries no Pieces and no payload — GET of the latest
+	// version returns 404 NoSuchKey, and GET of the marker by
+	// versionId returns 405 MethodNotAllowed, matching AWS S3.
+	DeleteMarker bool `json:"delete_marker,omitempty"`
 }
 
 // EncryptionConfig describes how the object is encrypted.

@@ -46,13 +46,17 @@ type CopyObjectResult struct {
 }
 
 // ListVersionsResult is the S3 ListObjectVersions response body.
+// Delete markers are reported in their own <DeleteMarker> elements,
+// distinct from the <Version> rows for real object versions, matching
+// the AWS S3 wire format.
 type ListVersionsResult struct {
-	XMLName     xml.Name           `xml:"ListVersionsResult"`
-	Name        string             `xml:"Name"`
-	Prefix      string             `xml:"Prefix"`
-	MaxKeys     int                `xml:"MaxKeys"`
-	IsTruncated bool               `xml:"IsTruncated"`
-	Versions    []ListVersionEntry `xml:"Version"`
+	XMLName       xml.Name                `xml:"ListVersionsResult"`
+	Name          string                  `xml:"Name"`
+	Prefix        string                  `xml:"Prefix"`
+	MaxKeys       int                     `xml:"MaxKeys"`
+	IsTruncated   bool                    `xml:"IsTruncated"`
+	Versions      []ListVersionEntry      `xml:"Version"`
+	DeleteMarkers []ListDeleteMarkerEntry `xml:"DeleteMarker"`
 }
 
 // ListVersionEntry is a single row in ListObjectVersions output.
@@ -64,6 +68,15 @@ type ListVersionEntry struct {
 	ETag         string `xml:"ETag,omitempty"`
 	Size         int64  `xml:"Size"`
 	StorageClass string `xml:"StorageClass"`
+}
+
+// ListDeleteMarkerEntry is a <DeleteMarker> row in ListObjectVersions
+// output. Delete markers carry no size, ETag, or storage class.
+type ListDeleteMarkerEntry struct {
+	Key          string `xml:"Key"`
+	VersionID    string `xml:"VersionId"`
+	IsLatest     bool   `xml:"IsLatest"`
+	LastModified string `xml:"LastModified"`
 }
 
 // Copy handles S3 CopyObject (PUT with x-amz-copy-source).
@@ -566,6 +579,18 @@ func (h *Handler) ListObjectVersions(w http.ResponseWriter, r *http.Request, buc
 			return
 		}
 		for i, v := range versions {
+			// Delete markers are reported in their own element
+			// without size/ETag, matching AWS S3. ListVersions
+			// returns newest-first, so index 0 is the latest.
+			if v.DeleteMarker {
+				out.DeleteMarkers = append(out.DeleteMarkers, ListDeleteMarkerEntry{
+					Key:          v.ObjectKey,
+					VersionID:    v.VersionID,
+					IsLatest:     i == 0,
+					LastModified: h.cfg.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+				})
+				continue
+			}
 			etag := ""
 			if len(v.Pieces) > 0 {
 				etag = quote(pieceETag(v.Pieces[0]))

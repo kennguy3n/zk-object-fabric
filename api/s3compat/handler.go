@@ -30,6 +30,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -168,6 +169,13 @@ type Config struct {
 	// CompleteMultipartUpload / AbortMultipartUpload. A nil store
 	// causes those endpoints to return 501 NotImplemented.
 	Multipart multipart.Store
+
+	// BucketConfig persists per-bucket S3 configuration
+	// sub-resources (today: versioning state — WS8.4). A nil store
+	// makes PutBucketVersioning / GetBucketVersioning return 501
+	// NotImplemented and leaves DeleteObject on its non-versioned
+	// (permanent-delete) path.
+	BucketConfig bucket_config.Store
 
 	// ErasureCoding is the registry of erasure-coding profiles the
 	// handler can use when a placement policy names an
@@ -519,7 +527,6 @@ var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
 	"tagging":             "NotImplemented",
 	"lifecycle":           "NotImplemented",
-	"versioning":          "NotImplemented",
 	"policy":              "NotImplemented",
 	"cors":                "NotImplemented",
 	"encryption":          "NotImplemented",
@@ -595,6 +602,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.UploadPart(w, r)
 			return
 		}
+		// Bucket versioning config (PUT /{bucket}?versioning) is a
+		// bucket-level sub-resource and must route before the
+		// implicit-CreateBucket branch below.
+		if q.Has("versioning") {
+			h.PutBucketVersioning(w, r)
+			return
+		}
 		// Bucket-level PUT (s3 mb / CreateBucket). Buckets in this
 		// gateway are implicit — they come into existence the first
 		// time an object is written to them — so CreateBucket is a
@@ -627,6 +641,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		bucket, key := parseBucketKey(r.URL.Path)
 		if key == "" && q.Has("uploads") {
 			h.ListMultipartUploads(w, r, bucket)
+			return
+		}
+		// Bucket versioning config (GET /{bucket}?versioning).
+		if q.Has("versioning") {
+			h.GetBucketVersioning(w, r, bucket)
 			return
 		}
 		// ListObjectVersions is bucket-level GET ?versions.
