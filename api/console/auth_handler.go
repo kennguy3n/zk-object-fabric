@@ -903,13 +903,20 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 	}
 	rotated, err := h.cfg.RefreshTokens.Rotate(refreshToken)
 	if err != nil {
-		// Both "invalid/expired" and "reuse detected" collapse to a
-		// uniform 401: the client's only correct reaction to either
-		// is to re-authenticate, and distinguishing them on the wire
-		// would tell an attacker whether a stolen token was still
-		// live. The reuse case has already revoked the family
-		// server-side inside Rotate.
-		writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
+		// Only the two auth sentinels mean "this token can never work,
+		// re-authenticate": errRefreshTokenInvalid (unknown/expired)
+		// and errRefreshTokenReuse (replay — the family is already
+		// revoked server-side inside Rotate). Both collapse to a
+		// uniform 401 so a prober cannot tell "expired" from "reused".
+		// Any other error is an infrastructure failure (DB timeout,
+		// commit error): surfacing it as 503 tells the SPA to retry the
+		// same token rather than discarding a still-live session, so a
+		// transient Postgres blip doesn't log the whole fleet out.
+		if errors.Is(err, errRefreshTokenInvalid) || errors.Is(err, errRefreshTokenReuse) {
+			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "rotate refresh token: "+err.Error())
 		return
 	}
 	t, ok := h.cfg.Tenants.LookupTenant(rotated.TenantID)

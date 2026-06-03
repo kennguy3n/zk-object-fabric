@@ -2,6 +2,7 @@ package console
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -159,5 +160,27 @@ func TestRefreshTenantGoneReturns401(t *testing.T) {
 	rec := postJSON(t, mux, authPathRefresh, `{"refreshToken":"`+signup.RefreshToken+`"}`)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("refresh for deleted tenant status = %d, want 401; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// errRotateStore is a RefreshTokenStore whose Rotate fails with a
+// non-sentinel (infrastructure-style) error, standing in for a database
+// timeout or commit failure.
+type errRotateStore struct{ err error }
+
+func (s errRotateStore) Issue(string) (RefreshToken, error)  { return RefreshToken{}, s.err }
+func (s errRotateStore) Rotate(string) (RefreshToken, error) { return RefreshToken{}, s.err }
+func (s errRotateStore) Revoke(string) error                 { return s.err }
+func (s errRotateStore) RevokeAllForTenant(string) error     { return s.err }
+
+// TestRefreshInfraErrorReturns503 verifies that an infrastructure
+// failure from Rotate (not one of the auth sentinels) surfaces as 503
+// so the SPA retries the same token rather than being logged out, while
+// the sentinel errors still collapse to 401 (covered above).
+func TestRefreshInfraErrorReturns503(t *testing.T) {
+	mux := newRefreshTestHandler(t, errRotateStore{err: errors.New("dial tcp: connection refused")})
+	rec := postJSON(t, mux, authPathRefresh, `{"refreshToken":"live-looking-token"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("refresh on infra error status = %d, want 503; body = %s", rec.Code, rec.Body.String())
 	}
 }
