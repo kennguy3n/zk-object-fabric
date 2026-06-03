@@ -217,9 +217,12 @@ func (h *Handler) bucketCORSRules(r *http.Request, tenantID, bucket string) (cor
 // attaches CORS headers regardless of the operation's outcome.
 //
 // The caller's identity is resolved with the same authenticate() the
-// handlers use; on an auth error the lookup is skipped (an
-// unauthenticated request gets no CORS headers and the downstream
-// handler returns its own 403).
+// handlers use. On an auth error the CORS headers are still attached
+// (resolving the tenant unverified from the presigned credential, the
+// same way the preflight does) so a browser SPA can read the real 403
+// the downstream handler writes instead of an opaque CORS error. This
+// grants no access — the operation handler still authenticates and
+// rejects the request itself.
 func (h *Handler) applyCORS(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -233,7 +236,15 @@ func (h *Handler) applyCORS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Vary", "Origin")
 	tenantID, err := h.authenticate(r)
 	if err != nil {
-		return
+		// The request failed signature verification, but CORS headers
+		// must still attach to the error response. Resolve the tenant
+		// from the presigned credential without verifying — identical
+		// to the preflight path, and granting no access.
+		resolved, ok := h.preflightTenant(r)
+		if !ok {
+			return
+		}
+		tenantID = resolved
 	}
 	bucket, _ := parseBucketKey(r.URL.Path)
 	cfg, ok := h.bucketCORSRules(r, tenantID, bucket)
@@ -281,13 +292,16 @@ func (h *Handler) preflightTenant(r *http.Request) (string, bool) {
 func (h *Handler) handleCORSPreflight(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	reqMethod := r.Header.Get("Access-Control-Request-Method")
+	// Vary: Origin on every Origin-bearing preflight response, including
+	// the 400 below (Origin present but Request-Method absent) and the
+	// 403s further down, so caches key on the origin (matches AWS).
+	if origin != "" {
+		w.Header().Add("Vary", "Origin")
+	}
 	if origin == "" || reqMethod == "" {
 		writeError(w, http.StatusBadRequest, "InvalidCORSRequest", "OPTIONS preflight requires Origin and Access-Control-Request-Method headers", r.URL.Path)
 		return
 	}
-	// Vary: Origin on every Origin-bearing preflight response, including
-	// the 403s below, so caches key on the origin (matches AWS).
-	w.Header().Add("Vary", "Origin")
 	bucket, _ := parseBucketKey(r.URL.Path)
 	if h.cfg.BucketConfig == nil || bucket == "" {
 		writeCORSForbidden(w, r)

@@ -249,6 +249,20 @@ func TestCORSPreflight(t *testing.T) {
 		t.Fatalf("preflight missing headers = %d, want 400", rec.Code)
 	}
 
+	// Origin present but Request-Method absent → 400, and it still
+	// carries Vary: Origin (the response varies by origin even though
+	// the preflight is malformed).
+	req = httptest.NewRequest(http.MethodOptions, "/bucket/obj", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("preflight Origin-only = %d, want 400", rec.Code)
+	}
+	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Fatalf("400 preflight Vary = %q, want to contain Origin", got)
+	}
+
 	// Origin not allowed → 403.
 	req = httptest.NewRequest(http.MethodOptions, "/bucket/obj", nil)
 	req.Header.Set("Origin", "https://evil.example.com")
@@ -453,6 +467,58 @@ func TestApplyCORS_AuthenticatedActualRequest(t *testing.T) {
 	// per-request memo must collapse them into a single resolution.
 	if calls != 1 {
 		t.Fatalf("Authenticate called %d times, want 1 (per-request memo)", calls)
+	}
+}
+
+// TestApplyCORS_AuthFailureStillSetsCORSHeaders verifies that a
+// cross-origin request that FAILS signature verification (e.g. an
+// expired presigned PUT from a browser SPA) still gets CORS headers on
+// its error response, resolving the tenant unverified from the
+// presigned credential. Without this the browser would surface an
+// opaque CORS error instead of the real 403.
+func TestApplyCORS_AuthFailureStillSetsCORSHeaders(t *testing.T) {
+	h, _ := newVersioningTestHandler()
+	h.cfg.Auth = fakeAuth{keys: map[string]string{"AKIDA": "tenant-a"}}
+	h.cfg.RequireAuth = true
+	// Store tenant-a's CORS through the authenticated (signed) PUT path.
+	req := httptest.NewRequest(http.MethodPut,
+		presignedURL("/bucket?cors", "AKIDA", true), strings.NewReader(sampleCORS))
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated PUT ?cors = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// An UNSIGNED presigned PUT (signature verification fails) carries
+	// X-Amz-Credential naming tenant-a. The operation is rejected, but
+	// the CORS headers must still attach so the SPA can read the error.
+	req = httptest.NewRequest(http.MethodPut,
+		presignedURL("/bucket/obj", "AKIDA", false), strings.NewReader("data"))
+	req.Header.Set("Origin", "https://app.example.com")
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("unsigned PUT = %d, want an auth failure (non-200)", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example.com" {
+		t.Fatalf("auth-failure Allow-Origin = %q, want echoed origin; body=%s", got, rec.Body)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("auth-failure Allow-Credentials = %q, want true", got)
+	}
+	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+		t.Fatalf("auth-failure Vary = %q, want to contain Origin", got)
+	}
+
+	// A credential we can't resolve to a tenant gets no CORS headers
+	// (we can't know which tenant's rules apply).
+	req = httptest.NewRequest(http.MethodPut,
+		presignedURL("/bucket/obj", "UNKNOWN", false), strings.NewReader("data"))
+	req.Header.Set("Origin", "https://app.example.com")
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("unresolvable-tenant Allow-Origin = %q, want empty", got)
 	}
 }
 
