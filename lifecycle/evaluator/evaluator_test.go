@@ -1,8 +1,12 @@
 package evaluator
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,12 +153,18 @@ func (f *fakeProvider) PlacementLabels() providers.PlacementLabels {
 	return providers.PlacementLabels{Country: f.country}
 }
 
-// mockAudit records every lifecycle audit entry.
+// mockAudit records every lifecycle audit entry. When err is non-nil
+// Record returns it (without recording) so the logging path can be
+// exercised.
 type mockAudit struct {
 	entries []AuditEntry
+	err     error
 }
 
 func (m *mockAudit) Record(_ context.Context, e AuditEntry) error {
+	if m.err != nil {
+		return m.err
+	}
 	m.entries = append(m.entries, e)
 	return nil
 }
@@ -875,5 +885,43 @@ func TestAudit_NilHooksNoop(t *testing.T) {
 	}
 	if stats.ObjectsExpired != 1 {
 		t.Fatalf("expiration must still run with nil hooks; got %+v", stats)
+	}
+}
+
+// TestAudit_RecordErrorIsLogged verifies a failed audit recording is
+// surfaced via the logger (not silently dropped) and the expiration
+// still completes.
+func TestAudit_RecordErrorIsLogged(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	mf := &metadata.ObjectManifest{
+		TenantID: tnt, Bucket: bkt,
+		ObjectKey: "logs/a.txt", ObjectKeyHash: "h1", VersionID: "v1",
+		CreatedAt: now.AddDate(0, 0, -40),
+		Pieces:    []metadata.Piece{{PieceID: "p1", Backend: "test"}},
+	}
+	mans := newMockManifests()
+	mans.latest[vkey(tnt, bkt)] = []*metadata.ObjectManifest{mf}
+	prov := &fakeProvider{}
+	src := &mockSource{entries: []bucket_config.LifecycleEntry{entry(enabledExpireRule("logs/", 30))}}
+
+	var logBuf bytes.Buffer
+	e := New(Config{
+		Source:    src,
+		Manifests: mans,
+		Providers: map[string]providers.StorageProvider{"test": prov},
+		Clock:     fixedClock(now),
+		Audit:     &mockAudit{err: errors.New("audit store down")},
+		Logger:    log.New(&logBuf, "", 0),
+	})
+	stats, err := e.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.ObjectsExpired != 1 {
+		t.Fatalf("expiration must still complete when audit fails; got %+v", stats)
+	}
+	logged := logBuf.String()
+	if !strings.Contains(logged, "audit") || !strings.Contains(logged, "audit store down") {
+		t.Errorf("audit failure must be logged; got %q", logged)
 	}
 }

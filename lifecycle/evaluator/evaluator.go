@@ -285,9 +285,10 @@ func (e *Evaluator) abortStaleUploads(ctx context.Context, entry bucket_config.L
 			e.logf("lifecycle/evaluator: abort upload %s (%s/%s): %v", u.ID, entry.Bucket, u.ObjectKey, err)
 			continue
 		}
-		e.deletePieces(ctx, partsBackends(parts))
+		backends := partsBackends(parts)
+		e.deletePieces(ctx, backends)
 		stats.UploadsAborted++
-		e.audit(ctx, auditOpAbortMultipart, entry.TenantID, entry.Bucket, u.ObjectKey, firstBackendPiece(partsBackends(parts)), now)
+		e.audit(ctx, auditOpAbortMultipart, entry.TenantID, entry.Bucket, u.ObjectKey, firstBackendPiece(backends), now)
 		e.emit(entry.TenantID, entry.Bucket, billing.LifecycleAbortedUploads, 1, now)
 	}
 }
@@ -476,7 +477,7 @@ func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.L
 		e.logf("lifecycle/evaluator: delete object %s/%s: %v", entry.Bucket, m.ObjectKey, err)
 		return
 	}
-	e.reclaimPieces(ctx, entry.TenantID, m, now)
+	e.reclaimPieces(ctx, entry.TenantID, entry.Bucket, m, now)
 	stats.ObjectsExpired++
 	e.audit(ctx, auditOpExpiration, entry.TenantID, entry.Bucket, m.ObjectKey, firstBackendPiece(pieceBackends(m.Pieces)), now)
 	e.emit(entry.TenantID, entry.Bucket, billing.LifecycleExpirations, 1, now)
@@ -494,7 +495,7 @@ func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.L
 // lifecycle expiration can never delete a piece another object still
 // references or leave a dangling index row. Non-deduped manifests, or
 // a nil ContentIndex, fall back to a direct best-effort piece delete.
-func (e *Evaluator) reclaimPieces(ctx context.Context, tenantID string, m *metadata.ObjectManifest, now time.Time) {
+func (e *Evaluator) reclaimPieces(ctx context.Context, tenantID, bucket string, m *metadata.ObjectManifest, now time.Time) {
 	if m.ContentHash == "" || e.cfg.ContentIndex == nil {
 		e.deletePieces(ctx, pieceBackends(m.Pieces))
 		return
@@ -525,7 +526,7 @@ func (e *Evaluator) reclaimPieces(ctx context.Context, tenantID string, m *metad
 		// the post-decrement refcount sample so the billing pipeline
 		// can track hot content — exactly as the interactive DELETE
 		// path does.
-		e.emit(m.TenantID, m.Bucket, billing.DedupRefCount, uint64(newCount), now)
+		e.emit(tenantID, bucket, billing.DedupRefCount, uint64(newCount), now)
 	}
 }
 
@@ -610,7 +611,12 @@ func (e *Evaluator) audit(ctx context.Context, op, tenantID, bucket, objectKey s
 			country = prov.PlacementLabels().Country
 		}
 	}
-	_ = e.cfg.Audit.Record(ctx, AuditEntry{
+	// A failed compliance recording is surfaced via the logger (like
+	// every other non-fatal error in the sweep) rather than silently
+	// dropped — an operator must be able to tell that a lifecycle
+	// action ran but its audit entry was lost. The sweep still
+	// proceeds; the action itself already succeeded.
+	if err := e.cfg.Audit.Record(ctx, AuditEntry{
 		TenantID:       tenantID,
 		Operation:      op,
 		Bucket:         bucket,
@@ -619,7 +625,9 @@ func (e *Evaluator) audit(ctx context.Context, op, tenantID, bucket, objectKey s
 		PieceBackend:   bp.backend,
 		BackendCountry: country,
 		Timestamp:      now,
-	})
+	}); err != nil {
+		e.logf("lifecycle/evaluator: audit %s %s/%s: %v", op, bucket, objectKey, err)
+	}
 }
 
 // emit records one lifecycle usage event. A nil Billing sink is a
