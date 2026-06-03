@@ -416,22 +416,25 @@ should attempt:
   The application layer enforces tenant scoping on every query
   (`metadata/manifest_store/postgres/store.go`); the audit should
   look for any path that bypasses the `Store` wrapper. RLS is now
-  armed as defence-in-depth on the **manifests** and **content_index**
-  tables: each tenant-scoped statement runs in a transaction that binds
+  armed as defence-in-depth on the **manifests**, **content_index**, and
+  **bucket_config** (versioning, object lock, CORS, lifecycle) tables:
+  each tenant-scoped statement runs in a transaction that binds
   a transaction-local `zkof.tenant_id` GUC, and a FORCE'd
   `tenant_isolation` policy re-checks it. The mechanism is centralised
   in `metadata/internal/rlsdb` (GUC binding + the single-source policy
   DDL), with per-table operator references in
-  `metadata/manifest_store/postgres/rls.sql` and
-  `metadata/content_index/postgres/rls.sql`. The audited cross-tenant
+  `metadata/manifest_store/postgres/rls.sql`,
+  `metadata/content_index/postgres/rls.sql`, and
+  `metadata/bucket_config/postgres/rls.sql`. The audited cross-tenant
   readers (`ScanManifests` for the AAD migration sweep, `ListTenants`
-  for orphan GC) bind a `zkof.scan_all` read-only bypass that the
+  for orphan GC, `ListLifecycle` for the background lifecycle evaluator)
+  bind a `zkof.scan_all` read-only bypass that the
   `WITH CHECK` clause deliberately omits, so no sweep can write across
   tenants. RLS only applies to a non-superuser, non-`BYPASSRLS` role,
   so the gateway refuses to boot in production on a privileged metadata
   connection (`cmd/gateway/main.go` `checkProductionRLSRole`). The
-  remaining control-plane tables (bucket_config, multipart, console
-  auth/refresh/mfa) reuse the same substrate in follow-ups.
+  remaining control-plane tables (console auth/refresh/mfa) reuse the
+  same substrate in follow-ups.
 - **CMK is held by the gateway process in `ManagedEncrypted` mode.**
   This is the documented trust model — in Strict ZK mode the
   gateway never sees the CMK; in `ManagedEncrypted` mode the
