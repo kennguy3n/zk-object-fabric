@@ -49,6 +49,20 @@ func (s *Store) Put(_ context.Context, key manifest_store.ManifestKey, m *metada
 	return nil
 }
 
+// UpdateManifest replaces an existing version's body in place without
+// touching the insertion sequence or latest pointer, so an amend to a
+// non-latest version (e.g. tagging an old version) does not promote it
+// to latest. Returns ErrNotFound if key names no stored version.
+func (s *Store) UpdateManifest(_ context.Context, key manifest_store.ManifestKey, m *metadata.ObjectManifest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.byKey[key]; !ok {
+		return manifest_store.ErrNotFound
+	}
+	s.byKey[key] = cloneManifest(m)
+	return nil
+}
+
 // Get returns the manifest at key. If VersionID is empty the most
 // recently written version for the (tenant, bucket, object_key_hash)
 // triple is returned.
@@ -299,6 +313,18 @@ func cloneManifest(m *metadata.ObjectManifest) *metadata.ObjectManifest {
 	// honours the invariant via SQL round-trip serialisation.
 	if m.Encryption.WrappedDEK != nil {
 		cp.Encryption.WrappedDEK = append([]byte(nil), m.Encryption.WrappedDEK...)
+	}
+	// Deep-clone the Tags map. The shallow struct copy above aliases
+	// the source map header, so a caller mutating tags after a Put
+	// (or after a Get) would otherwise corrupt the stored copy — the
+	// same "stored manifests are immutable once Put-ed" invariant the
+	// Pieces / DEK clones above protect. The Postgres store gets this
+	// for free via JSON round-trip serialisation.
+	if m.Tags != nil {
+		cp.Tags = make(map[string]string, len(m.Tags))
+		for k, v := range m.Tags {
+			cp.Tags[k] = v
+		}
 	}
 	return &cp
 }

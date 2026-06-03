@@ -148,6 +148,28 @@ func newTestHandler() (*Handler, *fakeProvider, *recordingBilling, manifest_stor
 	return h, fake, bill, store
 }
 
+// newAdvancingClockTestHandler is like newTestHandler but its clock
+// advances one second per Now() call, so successive PUTs of the same
+// key get distinct version ids (newPieceID mixes the timestamp).
+// Tests that need two real versions of one object use this.
+func newAdvancingClockTestHandler() (*Handler, manifest_store.ManifestStore) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	now := time.Unix(1700000000, 0)
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Now: func() time.Time {
+			t := now
+			now = now.Add(time.Second)
+			return t
+		},
+	})
+	return h, store
+}
+
 func TestPutGetHeadDelete_Roundtrip(t *testing.T) {
 	h, fake, bill, _ := newTestHandler()
 	body := []byte("hello world")

@@ -3,6 +3,7 @@ package memory
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
@@ -390,5 +391,70 @@ func TestScanManifests_RejectsMalformedCursor(t *testing.T) {
 	store := New()
 	if _, err := store.ScanManifests(context.Background(), "!!!not-base64!!!", 10); err == nil {
 		t.Fatal("malformed cursor: want error, got nil")
+	}
+}
+
+// TestUpdateManifest_PreservesLatestPointer pins the WS8.1 contract:
+// amending a NON-latest version's body (e.g. tagging an old version)
+// must not promote it to latest. After Put(v1), Put(v2),
+// UpdateManifest(v1), the empty-VersionID "latest" read must still
+// resolve to v2.
+func TestUpdateManifest_PreservesLatestPointer(t *testing.T) {
+	t.Parallel()
+	store := New()
+	ctx := context.Background()
+
+	base := manifest_store.ManifestKey{TenantID: "t1", Bucket: "b1", ObjectKeyHash: "h1"}
+	kv1 := base
+	kv1.VersionID = "v1"
+	kv2 := base
+	kv2.VersionID = "v2"
+
+	if err := store.Put(ctx, kv1, &metadata.ObjectManifest{TenantID: "t1", Bucket: "b1", VersionID: "v1"}); err != nil {
+		t.Fatalf("Put v1: %v", err)
+	}
+	if err := store.Put(ctx, kv2, &metadata.ObjectManifest{TenantID: "t1", Bucket: "b1", VersionID: "v2"}); err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+
+	// Amend the OLD version v1 in place.
+	if err := store.UpdateManifest(ctx, kv1, &metadata.ObjectManifest{
+		TenantID: "t1", Bucket: "b1", VersionID: "v1",
+		Tags: map[string]string{"env": "prod"},
+	}); err != nil {
+		t.Fatalf("UpdateManifest v1: %v", err)
+	}
+
+	// Latest must still be v2.
+	latest, err := store.Get(ctx, base)
+	if err != nil {
+		t.Fatalf("Get latest: %v", err)
+	}
+	if latest.VersionID != "v2" {
+		t.Fatalf("latest VersionID = %q, want v2 (UpdateManifest must not promote v1)", latest.VersionID)
+	}
+	if len(latest.Tags) != 0 {
+		t.Fatalf("latest Tags = %v, want none", latest.Tags)
+	}
+
+	// And v1's body was actually amended.
+	got1, err := store.Get(ctx, kv1)
+	if err != nil {
+		t.Fatalf("Get v1: %v", err)
+	}
+	if got1.Tags["env"] != "prod" {
+		t.Fatalf("v1 Tags = %v, want env=prod", got1.Tags)
+	}
+}
+
+// TestUpdateManifest_NotFound verifies an amend to a non-existent
+// version returns ErrNotFound rather than silently inserting.
+func TestUpdateManifest_NotFound(t *testing.T) {
+	t.Parallel()
+	store := New()
+	key := manifest_store.ManifestKey{TenantID: "t1", Bucket: "b1", ObjectKeyHash: "h1", VersionID: "nope"}
+	err := store.UpdateManifest(context.Background(), key, &metadata.ObjectManifest{VersionID: "nope"})
+	if !errors.Is(err, manifest_store.ErrNotFound) {
+		t.Fatalf("UpdateManifest missing key err = %v, want ErrNotFound", err)
 	}
 }

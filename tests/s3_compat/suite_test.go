@@ -135,6 +135,135 @@ func Run(t *testing.T, setup Setup) {
 	t.Run("CopyObject_CrossKey", func(t *testing.T) { testCopyObjectCrossKey(t, setup) })
 	t.Run("VersionId_Get", func(t *testing.T) { testVersionedGet(t, setup) })
 	t.Run("ListObjectVersions", func(t *testing.T) { testListObjectVersions(t, setup) })
+	t.Run("ObjectTagging", func(t *testing.T) { testObjectTagging(t, setup) })
+}
+
+// testObjectTagging exercises the WS8.1 ?tagging sub-resource:
+// Put/Get/Delete round-trip, tag-set replacement, the empty tag set on
+// an untagged object, tagging on a missing key (404), and the 10-tag
+// limit.
+func testObjectTagging(t *testing.T, setup Setup) {
+	s := newServer(t, setup)
+	ctx := context.Background()
+	key := "tagged/object.txt"
+	if _, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader([]byte("payload")),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// An untagged object reports an empty tag set.
+	got, err := s.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("GetObjectTagging (empty): %v", err)
+	}
+	if len(got.TagSet) != 0 {
+		t.Fatalf("untagged object TagSet = %d, want 0", len(got.TagSet))
+	}
+
+	// Put a tag set, then read it back.
+	if _, err := s.client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+		Tagging: &types.Tagging{TagSet: []types.Tag{
+			{Key: aws.String("env"), Value: aws.String("prod")},
+			{Key: aws.String("team"), Value: aws.String("storage")},
+		}},
+	}); err != nil {
+		t.Fatalf("PutObjectTagging: %v", err)
+	}
+	got, err = s.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		t.Fatalf("GetObjectTagging: %v", err)
+	}
+	if want := map[string]string{"env": "prod", "team": "storage"}; !sameTagSet(got.TagSet, want) {
+		t.Fatalf("TagSet = %v, want %v", got.TagSet, want)
+	}
+
+	// PutObjectTagging replaces (not merges) the whole set.
+	if _, err := s.client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+		Tagging: &types.Tagging{TagSet: []types.Tag{
+			{Key: aws.String("env"), Value: aws.String("staging")},
+		}},
+	}); err != nil {
+		t.Fatalf("PutObjectTagging (replace): %v", err)
+	}
+	got, _ = s.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+	})
+	if want := map[string]string{"env": "staging"}; !sameTagSet(got.TagSet, want) {
+		t.Fatalf("after replace TagSet = %v, want %v", got.TagSet, want)
+	}
+
+	// The tagged object's data is still intact (tags don't disturb it).
+	obj, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	if err != nil {
+		t.Fatalf("GetObject after tagging: %v", err)
+	}
+	data, _ := io.ReadAll(obj.Body)
+	obj.Body.Close()
+	if string(data) != "payload" {
+		t.Fatalf("object body after tagging = %q, want %q", data, "payload")
+	}
+
+	// DeleteObjectTagging clears the set.
+	if _, err := s.client.DeleteObjectTagging(ctx, &s3.DeleteObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+	}); err != nil {
+		t.Fatalf("DeleteObjectTagging: %v", err)
+	}
+	got, _ = s.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+	})
+	if len(got.TagSet) != 0 {
+		t.Fatalf("after delete TagSet = %d, want 0", len(got.TagSet))
+	}
+
+	// Tagging a missing key is a 404.
+	if _, err := s.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String("does/not/exist"),
+	}); err == nil {
+		t.Fatal("GetObjectTagging on missing key: want error, got nil")
+	} else {
+		var httpErr *smithyhttp.ResponseError
+		if !errors.As(err, &httpErr) {
+			t.Fatalf("GetObjectTagging missing key: want ResponseError, got %T: %v", err, err)
+		}
+		if httpErr.HTTPStatusCode() != http.StatusNotFound {
+			t.Fatalf("GetObjectTagging missing-key status = %d, want 404", httpErr.HTTPStatusCode())
+		}
+	}
+
+	// More than 10 tags is rejected.
+	tooMany := make([]types.Tag, 0, 11)
+	for i := 0; i < 11; i++ {
+		tooMany = append(tooMany, types.Tag{Key: aws.String("k" + string(rune('a'+i))), Value: aws.String("v")})
+	}
+	if _, err := s.client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+		Tagging: &types.Tagging{TagSet: tooMany},
+	}); err == nil {
+		t.Fatal("PutObjectTagging with 11 tags: want error, got nil")
+	}
+}
+
+// sameTagSet compares an SDK TagSet against an expected key→value map.
+func sameTagSet(got []types.Tag, want map[string]string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, tg := range got {
+		if want[aws.ToString(tg.Key)] != aws.ToString(tg.Value) {
+			return false
+		}
+	}
+	return true
 }
 
 func testCopyObjectSameBucket(t *testing.T, setup Setup) {

@@ -138,6 +138,9 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 		"UploadPart",
 		"CompleteMultipartUpload",
 		"CopyObject_SameBucket",
+		"PutObjectTagging",
+		"GetObjectTagging",
+		"DeleteObjectTagging",
 	}
 	byOp := indexByOp(matrix.Operations)
 	for _, op := range mustPass {
@@ -159,9 +162,6 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 	mustBeUnsupported := []string{
 		"GetObjectAcl",
 		"PutObjectAcl",
-		"PutObjectTagging",
-		"GetObjectTagging",
-		"DeleteObjectTagging",
 		"PutBucketLifecycleConfiguration",
 		"GetBucketLifecycleConfiguration",
 		"PutBucketVersioning",

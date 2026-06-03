@@ -40,6 +40,15 @@ type ObjectManifest struct {
 	PlacementPolicy PlacementPolicy  `json:"placement_policy"`
 	Pieces          []Piece          `json:"pieces"`
 	MigrationState  MigrationState   `json:"migration_state"`
+	// Tags is the S3 object tag set (PutObjectTagging). It is a flat
+	// key→value map persisted as part of the manifest JSONB body — the
+	// control plane MUST continue to treat the body as opaque (see
+	// manifest_store.ManifestStore), so tags are addressed only through
+	// the S3 tagging sub-resource, never used for placement decisions.
+	// Empty/absent when the object has no tags. S3 limits (≤10 tags,
+	// ≤128-char keys, ≤256-char values) are enforced at the API
+	// boundary in api/s3compat, not here. See docs/PROPOSAL.md §15.1.1.
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // EncryptionConfig describes how the object is encrypted.
