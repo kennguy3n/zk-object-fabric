@@ -95,12 +95,20 @@ zk-object-fabric/
   metadata/
     manifest_store/       # Manifest persistence (memory + Postgres)
     bucket_config/        # Per-bucket S3 config (versioning state +
-                          # Object Lock config + CORS rules; memory +
-                          # Postgres + SQLite) — WS8.4 / WS8.3 / WS8.5
+                          # Object Lock config + CORS rules + lifecycle
+                          # rules; memory + Postgres + SQLite) —
+                          # WS8.4 / WS8.3 / WS8.5 / WS8.2
+    lifecycle/            # WS8.2 LifecycleRule domain + validation
+    object_lock/          # WS8.3 LockConfig + retention/legal-hold
+    cors/                 # WS8.5 CORS rule domain + origin matching
     placement_policy/     # Placement engine and policy DSL
     erasure_coding/       # EC profiles, encoder, registry
     content_index/        # Dedup ContentIndex (memory + Postgres)
     tenant/               # Tenant schema, tier config
+  lifecycle/
+    evaluator/            # WS8.2 daily lifecycle sweep (expire /
+                          # delete-marker / abort), audit + billing
+                          # hooks; wired into cmd/gateway/main.go
   providers/
     s3_generic/           # Shared S3-compatible base adapter
     wasabi/               # Wasabi adapter + fair-use guardrails
@@ -167,38 +175,38 @@ specified in [PROPOSAL.md §15](PROPOSAL.md) and tracked in
 [PROGRESS.md](PROGRESS.md); listed here so the as-built layout above
 stays the source of truth for what exists today.
 
-Built WS8 slices (`api/s3compat/tagging_handler.go` WS8.1,
-`object_lock_handler.go` WS8.3, `cors_handler.go` WS8.5, plus the
-`metadata/object_lock` and `metadata/cors` domain packages and the
-`metadata/bucket_config` store) have landed and are folded into the
-as-built layout above. The packages below remain **planned, not yet
-built**:
+Workstream 8 is substantially built and folded into the as-built
+layout above: tagging (`api/s3compat/tagging_handler.go`, WS8.1),
+lifecycle (`lifecycle_handler.go` + `metadata/lifecycle` +
+`lifecycle/evaluator`, WS8.2), Object Lock / WORM
+(`object_lock_handler.go` + `metadata/object_lock`, WS8.3), bucket
+versioning (`versioning_handler.go`, WS8.4), and CORS
+(`cors_handler.go` + `metadata/cors`, WS8.5), all persisted through
+the `metadata/bucket_config` store. The packages below remain
+**planned, not yet built**:
 
 ```
 api/s3compat/
-  lifecycle_handler.go    # WS8.2 Put/Get/DeleteBucketLifecycleConfiguration
   notification_handler.go # WS8.6 Put/GetBucketNotificationConfiguration
   encryption_handler.go   # WS8.7 Put/Get/DeleteBucketEncryption
-metadata/
-  lifecycle/              # WS8.2 LifecycleRule + bucket_lifecycle table
 internal/
   notifications/          # WS8.6 async webhook dispatcher + DLQ
 encryption/
   rust_sdk/               # WS9 byte-compatible Rust client-side SDK
 ```
 
-New Postgres tables (WS8): `bucket_lifecycle`, plus per-bucket CORS,
-notification, and SSE-config rows (table names finalised per slice).
-Object tags are stored as JSONB on the existing manifest row rather
-than in a new table. Bucket versioning state (WS8.4, built) lives in
-the `bucket_versioning` table owned by the `metadata/bucket_config`
-package, keyed by `(tenant_id, bucket)`; the embedded SQLite profile
-self-creates an equivalent table. Bucket Object Lock config (WS8.3,
-built) lives in the `bucket_object_lock` table of the same package,
-while per-object-version retention mode / retain-until / legal-hold
-ride on the object manifest so they version with the object. Bucket
-CORS rules (WS8.5, built) live in the `bucket_cors` table of the same
-package, JSON-encoded and keyed by `(tenant_id, bucket)`.
+Per-bucket S3 config (WS8, built) is owned by the
+`metadata/bucket_config` package, keyed by `(tenant_id, bucket)` with
+memory + Postgres + SQLite backends — the embedded single-node profile
+self-creates equivalent tables. Bucket versioning state (WS8.4) lives
+in `bucket_versioning`, Object Lock config (WS8.3) in
+`bucket_object_lock`, CORS rules (WS8.5) in `bucket_cors`, and
+lifecycle rules (WS8.2) in `bucket_lifecycle` (rule sets JSON-encoded).
+Object tags (WS8.1) are stored as JSONB on the existing manifest row
+rather than in a new table, and per-object-version retention mode /
+retain-until / legal-hold ride on the object manifest so they version
+with the object. WS8.6 notification and WS8.7 SSE-config tables are
+finalised per slice when those slices land.
 
 ## Component overview
 
@@ -211,6 +219,13 @@ package, JSON-encoded and keyed by `(tenant_id, bucket)`.
   validation, S3-compatible XML errors.
 - SigV4 verification and per-tenant rate limiting via
   `internal/auth/`.
+- WS8 sub-resource handlers: object tagging (`tagging_handler.go`),
+  bucket lifecycle config (`lifecycle_handler.go`), Object Lock /
+  retention / legal-hold (`object_lock_handler.go`), bucket versioning
+  (`versioning_handler.go`), and CORS (`cors_handler.go` plus the
+  request-time `applyCORS` middleware and unauthenticated OPTIONS
+  preflight). The daily `lifecycle/evaluator` sweep is wired into
+  `cmd/gateway/main.go` against the same `bucket_config` store.
 - Encryption pipeline: client-side ciphertext passthrough,
   managed-mode envelope encryption (gateway derives DEK and wraps
   with the configured CMK), erasure-coding shard fan-out for the
@@ -330,8 +345,10 @@ adapter status matrix.
   single-node profile persists holds locally across restart).
 - `cellops/` — cell registry over the `dedicated_cells` table,
   manual + automated provisioner (Terraform runner stub).
-- `compliance/` — audit trail (memory + Postgres), residency
-  enforcer (`Check(...)` returns `403 DataResidencyViolation`).
+- `compliance/` — audit trail (memory + Postgres + SQLite; the
+  embedded profile persists the trail locally, and it now also
+  receives lifecycle-evaluator entries), residency enforcer
+  (`Check(...)` returns `403 DataResidencyViolation`).
 - `config/` — gateway configuration (providers, encryption,
   control plane, abuse, dedup, compliance, console).
 - `health/` — `/internal/healthz`, `/internal/ready`,

@@ -269,18 +269,24 @@ operations perfectly than many operations partially.
 | Conditional  | `If-None-Match`, `If-Modified-Since`     | Yes       | Yes      | Yes     | Evaluated against manifest metadata                                     |
 | Versioning   | `GetObject?versionId=`                   | Phase 1+  | Yes      | Yes     | Object versioning via manifest versions                                 |
 | Tagging      | `Put/Get/DeleteObjectTagging`            | Yes       | Yes      | Yes     | Tags stored as JSONB on the manifest row; 10 tags/object (see §15.1)    |
-| Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Planned | WS8.2 | WS8.2   | Per-bucket rules + daily evaluator; extends migration tiering (see §15.1) |
+| Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Shipped | WS8.2 | WS8.2   | Per-bucket rules + daily evaluator wired into the gateway (audit + billing); extends migration tiering (see §15.1) |
 | Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Shipped | WS8.3 | WS8.3 | Governance/compliance retention + legal hold enforced in DELETE/PUT-overwrite; requires versioning (see §15.1) |
 | Versioning   | `Put/GetBucketVersioning`                | Shipped   | WS8.4    | WS8.4   | Bucket-level Enabled/Suspended config + delete markers (see §15.1)      |
 | CORS         | `Put/Get/DeleteBucketCors`               | Shipped   | WS8.5    | WS8.5   | Per-bucket rules + OPTIONS preflight + response headers (see §15.1)      |
 | Notifications| `Put/GetBucketNotificationConfiguration` | Planned   | WS8.6    | WS8.6   | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events (see §15.1) |
 | SSE config   | `Put/Get/DeleteBucketEncryption`         | Planned   | WS8.7    | WS8.7   | Maps `x-amz-server-side-encryption` to ZK encryption modes (see §15.1)  |
 
-The rows marked **Planned / WS8.x** are roadmap commitments tracked in
-§15.1 (Workstream 8). They are not yet shipped; the gateway currently
-rejects their sub-resource query keys with `501 NotImplemented` (see
-`api/s3compat/handler.go` `unsupportedSubresources`). Each WS8 slice
-removes its key from that map as the handler lands.
+The rows marked **Shipped / WS8.x** have landed: tagging (WS8.1),
+lifecycle (WS8.2), Object Lock / WORM (WS8.3), bucket versioning
+(WS8.4), and CORS (WS8.5) are wired into the gateway and covered by
+`tests/s3_compat/`, and the lifecycle evaluator runs as a daily
+background sweep emitting audit + billing events. The rows still marked
+**Planned / WS8.x** — event notifications (WS8.6) and the server-side
+encryption config sub-resource (WS8.7) — are roadmap commitments
+tracked in §15.1; the gateway currently rejects their sub-resource
+query keys with `501 NotImplemented` (see `api/s3compat/handler.go`
+`unsupportedSubresources`). Each WS8 slice removes its key from that
+map as the handler lands.
 
 **Operations explicitly NOT supported** (to avoid scope creep):
 
@@ -293,14 +299,16 @@ removes its key from that map as the handler lands.
 - Cross-region replication (replaced by the ZK migration engine — see §4)
 - S3 Transfer Acceleration (replaced by the ZK cache layer — see §3.7)
 
-> **Previously deferred, now roadmapped.** Object Lock / WORM,
-> object/bucket tagging, bucket lifecycle configuration, bucket-level
-> versioning config, CORS, event notifications, and the server-side
-> encryption config sub-resource were formerly listed here as out of
-> scope. They are now planned under **Workstream 8** (§15.1) and appear
-> as *Planned* rows in the table above. The S3 compatibility matrix in
-> [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) tracks current vs planned
-> coverage against the AWS S3 surface.
+> **Previously deferred, now delivered under Workstream 8.** Object
+> Lock / WORM, object/bucket tagging, bucket lifecycle configuration,
+> bucket-level versioning config, CORS, event notifications, and the
+> server-side encryption config sub-resource were formerly listed here
+> as out of scope. They were taken up as **Workstream 8** (§15.1):
+> tagging, lifecycle, Object Lock / WORM, versioning, and CORS are now
+> *Shipped* rows in the table above, while event notifications and the
+> SSE config sub-resource remain *Planned*. The S3 compatibility matrix
+> in [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) tracks current vs
+> planned coverage against the AWS S3 surface.
 
 #### 3.2.3 S3 API behavior across backend transitions
 
@@ -1502,12 +1510,18 @@ in this document.
 
 ## 15. Roadmap Workstreams: Richer S3 API & Client SDK Parity
 
-These two workstreams extend the SaaS transformation effort. They are
-**roadmap commitments, not yet shipped**. Each numbered slice below is
-sized to land as an independent PR (matching the existing slice-based
-delivery model). The live status of each slice is tracked in
-[PROGRESS.md](PROGRESS.md); the AWS-surface coverage view lives in
-[S3_COMPATIBILITY.md](S3_COMPATIBILITY.md).
+These two workstreams extend the SaaS transformation effort. Each
+numbered slice below is sized to land as an independent PR (matching
+the existing slice-based delivery model). **Workstream 8 is
+substantially shipped**: tagging (8.1), lifecycle (8.2), Object Lock /
+WORM (8.3), bucket versioning (8.4), and CORS (8.5) are built, wired
+into the gateway, and covered by `tests/s3_compat/`; event
+notifications (8.6) and the SSE config sub-resource (8.7) remain
+roadmap commitments. **Workstream 9 (Rust SDK) is not yet started.**
+The live status of each slice is tracked in [PROGRESS.md](PROGRESS.md);
+the AWS-surface coverage view lives in
+[S3_COMPATIBILITY.md](S3_COMPATIBILITY.md). Each slice's per-section
+status is noted inline below.
 
 ### 15.1 Workstream 8 — Richer S3 API Support
 
@@ -1520,6 +1534,8 @@ by `tests/s3_compat/`.
 
 #### 15.1.1 Object Tagging (`?tagging`)
 
+**Status: Shipped (WS8.1).**
+
 - Handlers `PutObjectTagging`, `GetObjectTagging`,
   `DeleteObjectTagging` in a new `api/s3compat/tagging_handler.go`.
 - Tags stored as JSONB on the manifest row in
@@ -1531,6 +1547,13 @@ by `tests/s3_compat/`.
 
 #### 15.1.2 Object Lifecycle (`?lifecycle`) — extends WS 4.4
 
+**Status: Shipped (WS8.2).** The daily evaluator lives in the
+top-level `lifecycle/evaluator/` package and is wired into the gateway
+main loop; per-bucket rules persist via `metadata/bucket_config`
+(memory + Postgres + SQLite) rather than a standalone
+`bucket_lifecycle` table, and each evaluator action emits an audit
+entry + billing event.
+
 - New `metadata/lifecycle/` package with a `LifecycleRule` struct:
   expiration (days or date), transition (to archive tier), abort
   incomplete multipart (days), and a tag-based filter.
@@ -1538,7 +1561,9 @@ by `tests/s3_compat/`.
   `GetBucketLifecycleConfiguration`,
   `DeleteBucketLifecycleConfiguration` in
   `api/s3compat/lifecycle_handler.go`.
-- Config stored per bucket in Postgres (new `bucket_lifecycle` table).
+- Config stored per bucket via `metadata/bucket_config` (the
+  `bucket_lifecycle` table; memory + Postgres + SQLite), keyed by
+  `(tenant_id, bucket)`.
 - A background lifecycle evaluator runs daily: expire objects,
   transition tiers, and abort stale multipart uploads. Reuses the
   migration tiering machinery (§4) for transitions.
@@ -1546,6 +1571,13 @@ by `tests/s3_compat/`.
   `frontend/src/pages/BucketsPage.tsx`.
 
 #### 15.1.3 Object Lock / WORM (`?object-lock`, `?retention`, `?legal-hold`)
+
+**Status: Shipped (WS8.3).** Bucket Object Lock config lives in the
+`bucket_object_lock` table of `metadata/bucket_config` (memory +
+Postgres + SQLite); per-object-version retention / legal-hold ride on
+the manifest. The legal-hold store in `internal/auth` is backed by
+memory + Postgres + SQLite so the embedded profile persists holds
+across restart.
 
 - New `metadata/object_lock/` package: `LockConfig`
   (governance/compliance mode, retain-until-date) and `LegalHold`
@@ -1562,6 +1594,9 @@ by `tests/s3_compat/`.
 
 #### 15.1.4 Bucket Versioning (`?versioning`)
 
+**Status: Shipped (WS8.4).** State lives in the `bucket_versioning`
+table of `metadata/bucket_config` (memory + Postgres + SQLite).
+
 - Object versioning via manifest versions already exists (§3.2.2:
   `GetObject?versionId=`). What is missing is the bucket-level config
   endpoints.
@@ -1573,6 +1608,8 @@ by `tests/s3_compat/`.
   tombstoning, and `ListObjectVersions` returns all versions.
 
 #### 15.1.5 CORS (`?cors`)
+
+**Status: Shipped (WS8.5).**
 
 - Handlers `PutBucketCors`, `GetBucketCors` (404 `NoSuchCORSConfiguration`
   when unset), `DeleteBucketCors` (idempotent 204).
@@ -1594,6 +1631,8 @@ by `tests/s3_compat/`.
 
 #### 15.1.6 Event Notifications (`?notification`)
 
+**Status: Planned (WS8.6) — not yet shipped.**
+
 - Handlers `PutBucketNotificationConfiguration`,
   `GetBucketNotificationConfiguration`.
 - Initial transport: webhook destinations (HTTP POST to a
@@ -1605,6 +1644,8 @@ by `tests/s3_compat/`.
 
 #### 15.1.7 Server-Side Encryption Config (`?encryption`)
 
+**Status: Planned (WS8.7) — not yet shipped.**
+
 - Handlers `PutBucketEncryption`, `GetBucketEncryption`,
   `DeleteBucketEncryption`.
 - Maps to ZKOF encryption modes (§3.7): the
@@ -1615,10 +1656,26 @@ by `tests/s3_compat/`.
 
 #### 15.1.8 Documentation
 
-- This section and the §3.2.2 table reflect the planned operations.
-- [ARCHITECTURE.md](ARCHITECTURE.md) documents the new packages.
+**Status: Shipped (WS8.8).**
+
+- This section and the §3.2.2 table mark the shipped slices (8.1–8.5)
+  and the gateway production wiring, and flag 8.6–8.7 as the remaining
+  planned slices.
+- [ARCHITECTURE.md](ARCHITECTURE.md) folds the built WS8 packages
+  (`api/s3compat` sub-resource handlers, `metadata/lifecycle`,
+  `metadata/object_lock`, `metadata/cors`, `metadata/bucket_config`,
+  the top-level `lifecycle/evaluator`, and the embedded SQLite
+  compliance stores) into the as-built layout.
 - [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) is the ZKOF-vs-AWS-S3
-  compatibility matrix.
+  compatibility matrix, with the shipped sub-resources marked
+  Supported.
+
+Production wiring landed alongside the slices: `cmd/gateway/main.go`
+constructs the `bucket_config` store and starts the lifecycle
+evaluator ticker (audit + billing hooks, per-node `SourceNodeID` via
+`os.Hostname()`), and the embedded single-node profile persists the
+audit trail and legal holds to local SQLite so the compliance trail
+survives a restart.
 
 ### 15.2 Workstream 9 — Rust Client-Side Encryption SDK
 
