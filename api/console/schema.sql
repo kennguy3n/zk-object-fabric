@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 -- B-tree index so the sweep is a point range rather than a table scan.
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant ON refresh_tokens(tenant_id);
+-- expires_at is indexed so the operator's periodic reaper
+-- (DELETE FROM refresh_tokens WHERE expires_at < $now) is a bounded
+-- range scan rather than a full table scan. Cleanup is otherwise lazy
+-- (Rotate drops a presented-but-expired row), so a token that simply
+-- stops being used would linger until this sweep removes it.
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
 
 -- dedicated_cells persists the operator-allocated cells the B2B /
 -- sovereign console surface lists for tenants whose contract type

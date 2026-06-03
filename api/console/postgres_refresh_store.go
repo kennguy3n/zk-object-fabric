@@ -101,11 +101,15 @@ func (s *PostgresRefreshTokenStore) Rotate(rawToken string) (RefreshToken, error
 	}
 
 	if now.UnixNano() >= expiresAt {
-		if _, err := tx.ExecContext(s.cx(), `DELETE FROM refresh_tokens WHERE token_hash = $1`, hash); err != nil {
-			return RefreshToken{}, fmt.Errorf("console: delete expired refresh token: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return RefreshToken{}, fmt.Errorf("console: commit expired delete: %w", err)
+		// The token is expired and therefore invalid regardless of
+		// what happens to the row now, so we always report it invalid
+		// (401). Dropping the row is opportunistic housekeeping: if the
+		// DELETE or commit fails we let the deferred Rollback fire and
+		// still return errRefreshTokenInvalid rather than a retryable
+		// 503 — retrying an expired token can never succeed, and the
+		// operator's periodic expiry sweep reclaims the row anyway.
+		if _, err := tx.ExecContext(s.cx(), `DELETE FROM refresh_tokens WHERE token_hash = $1`, hash); err == nil {
+			_ = tx.Commit()
 		}
 		return RefreshToken{}, errRefreshTokenInvalid
 	}
