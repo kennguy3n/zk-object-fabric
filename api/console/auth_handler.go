@@ -915,9 +915,12 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 	t, ok := h.cfg.Tenants.LookupTenant(rotated.TenantID)
 	if !ok {
 		// The token resolved to a tenant that no longer exists
-		// (deleted between issue and refresh). Revoke the rotated
-		// successor we just minted so it cannot linger, and 401.
-		_ = h.cfg.RefreshTokens.Revoke(rotated.Raw)
+		// (deleted between issue and refresh). Revoke every token for
+		// the gone tenant — not just the successor we minted — so the
+		// consumed predecessor and any sibling-device tokens are swept
+		// in one call rather than lingering until they expire or are
+		// replayed. Then 401.
+		_ = h.cfg.RefreshTokens.RevokeAllForTenant(rotated.TenantID)
 		writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 		return
 	}

@@ -213,9 +213,25 @@ func (s *MemoryRefreshTokenStore) Rotate(rawToken string) (RefreshToken, error) 
 		s.revokeFamilyLocked(row.familyID)
 		return RefreshToken{}, errRefreshTokenReuse
 	}
+	// Mint the successor secret first. Only once rand.Read has
+	// succeeded do we consume the predecessor, so a (practically
+	// impossible) rand failure leaves the predecessor usable rather
+	// than stranding the family with a consumed token and no successor
+	// — matching the transactional rollback the SQLite / Postgres
+	// stores get from defer tx.Rollback().
+	raw, err := newRawRefreshToken()
+	if err != nil {
+		return RefreshToken{}, err
+	}
+	expiresAt := now.Add(s.cfg.ttl())
 	row.consumed = true
 	s.rows[hash] = row
-	return s.mintLocked(row.tenantID, row.familyID, now)
+	s.rows[hashRefreshToken(raw)] = memoryRefreshRow{
+		tenantID:  row.tenantID,
+		familyID:  row.familyID,
+		expiresAt: expiresAt,
+	}
+	return RefreshToken{Raw: raw, TenantID: row.tenantID, ExpiresAt: expiresAt}, nil
 }
 
 // Revoke implements RefreshTokenStore.
