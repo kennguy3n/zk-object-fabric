@@ -2,6 +2,7 @@ package console
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kennguy3n/zk-object-fabric/internal/embeddeddb"
@@ -34,9 +35,16 @@ func TestSQLiteAuth_CreateLookup(t *testing.T) {
 		t.Fatalf("LookupUser = (%q, %q, %v), want (hash1, tnt-1, true)", hash, tenant, ok)
 	}
 
-	// Duplicate email (any case) is rejected.
-	if err := s.CreateUser("USER@EXAMPLE.COM", "hash2", "tnt-2"); err == nil {
+	// Duplicate email (any case) is rejected and classified as a
+	// unique violation (PRIMARY KEY, extended code 1555) rather than
+	// surfacing the raw driver error — this exercises the structured
+	// isSQLiteUniqueViolation path.
+	err := s.CreateUser("USER@EXAMPLE.COM", "hash2", "tnt-2")
+	if err == nil {
 		t.Fatal("duplicate CreateUser: want error")
+	}
+	if !strings.Contains(err.Error(), "already registered") {
+		t.Fatalf("duplicate CreateUser error = %q; want it classified as 'already registered'", err.Error())
 	}
 
 	// Missing user.

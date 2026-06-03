@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	sqlitedriver "modernc.org/sqlite"
 )
 
 // SQLiteAuthStore is the SQLite-backed AuthStore for the embedded /
@@ -19,11 +21,13 @@ import (
 //
 // The store satisfies AuthStore in api/console/auth_handler.go.
 //
-// Concurrency: the embedded DB is opened with a single connection
-// (see internal/embeddeddb), so ConsumeVerificationToken's
-// scan-then-update runs without interleaving; the explicit
-// transaction is retained for durability and to match the Postgres
-// store's semantics.
+// Concurrency: ConsumeVerificationToken does a scan-then-update,
+// which is made atomic by the explicit transaction it runs in (a
+// database/sql Tx pins one connection for its whole lifetime) rather
+// than by the single-connection pool alone — outside a Tx the pool
+// returns the connection between statements, so a bare two-statement
+// sequence would not be interleave-free even on the embedded pool.
+// The other mutators here are each a single statement.
 type SQLiteAuthStore struct {
 	db  *sql.DB
 	ctx context.Context
@@ -241,12 +245,36 @@ func (s *SQLiteAuthStore) ConsumeVerificationToken(token string) (string, error)
 	return matchedTenant, nil
 }
 
-// isSQLiteUniqueViolation reports whether err is a SQLite unique-
-// constraint violation. modernc.org/sqlite surfaces these as
-// "constraint failed: UNIQUE constraint failed: ...".
+// SQLite extended result codes for the two constraint classes a
+// duplicate insert into auth_users can trip. modernc.org/sqlite's
+// Error.Code() always returns the *extended* code, so we match the
+// exact codes rather than the primary SQLITE_CONSTRAINT (19), which
+// would also cover CHECK / NOT NULL / FK. The email column is the
+// PRIMARY KEY, so a duplicate email reports SQLITE_CONSTRAINT_
+// PRIMARYKEY (1555), not SQLITE_CONSTRAINT_UNIQUE (2067) — both are
+// accepted so the helper stays correct if a plain UNIQUE index is
+// added later (verified empirically against the auth_users schema).
+const (
+	sqliteConstraintPrimaryKey = 1555
+	sqliteConstraintUnique     = 2067
+)
+
+// isSQLiteUniqueViolation reports whether err is a SQLite unique /
+// primary-key constraint violation (a duplicate email on insert).
+// It prefers the driver's structured extended result code — mirroring
+// metadata/content_index/sqlite's isCheckViolation — over message
+// matching, which is fragile across driver versions and locales, and
+// falls back to the message only if the error is not an *sqlite.Error.
 func isSQLiteUniqueViolation(err error) bool {
 	if err == nil {
 		return false
+	}
+	var serr *sqlitedriver.Error
+	if errors.As(err, &serr) {
+		switch serr.Code() {
+		case sqliteConstraintPrimaryKey, sqliteConstraintUnique:
+			return true
+		}
 	}
 	return strings.Contains(strings.ToUpper(err.Error()), "UNIQUE CONSTRAINT FAILED")
 }
