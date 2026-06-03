@@ -49,6 +49,9 @@ func (s *SQLiteRefreshTokenStore) ensureSchema(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant ON refresh_tokens(tenant_id)`,
+		// Indexed so an operator's periodic expiry sweep is a bounded
+		// range scan, matching the Postgres schema.
+		`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
@@ -123,11 +126,15 @@ func (s *SQLiteRefreshTokenStore) Rotate(rawToken string) (RefreshToken, error) 
 	}
 
 	if now.UnixNano() >= expiresAt {
-		if _, err := tx.ExecContext(s.cx(), `DELETE FROM refresh_tokens WHERE token_hash = ?`, hash); err != nil {
-			return RefreshToken{}, fmt.Errorf("console: delete expired refresh token: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return RefreshToken{}, fmt.Errorf("console: commit expired delete: %w", err)
+		// The token is expired and therefore invalid regardless of what
+		// happens to the row now, so we always report it invalid (401).
+		// Dropping the row is opportunistic housekeeping: if the DELETE
+		// or commit fails we let the deferred Rollback fire and still
+		// return errRefreshTokenInvalid rather than a retryable 503 —
+		// retrying an expired token can never succeed, and the
+		// operator's periodic expiry sweep reclaims the row anyway.
+		if _, err := tx.ExecContext(s.cx(), `DELETE FROM refresh_tokens WHERE token_hash = ?`, hash); err == nil {
+			_ = tx.Commit()
 		}
 		return RefreshToken{}, errRefreshTokenInvalid
 	}
