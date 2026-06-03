@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/kennguy3n/zk-object-fabric/internal/embeddeddb"
@@ -192,5 +193,69 @@ func TestScanAllAndListTenants(t *testing.T) {
 	}
 	if len(tenants) != 2 || tenants[0] != "t1" || tenants[1] != "t2" {
 		t.Fatalf("ListTenants = %v, want [t1 t2]", tenants)
+	}
+}
+
+// TestConcurrentDecrementRef proves DecrementRef is atomic: N
+// concurrent decrements of a row at ref_count=N must drive it to
+// exactly 0, with each call returning a distinct new count in
+// [0, N-1], exactly one of them observing 0, and none erroring.
+// A non-atomic SELECT-then-UPDATE would let two callers read the
+// same value and either skip 0 (orphaning the piece) or push
+// ref_count below the CHECK floor.
+func TestConcurrentDecrementRef(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const n = 32
+	if err := s.Register(ctx, entry("t1", "h1")); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	for i := 1; i < n; i++ { // Register set ref_count=1; bump to n.
+		if err := s.IncrementRef(ctx, "t1", "h1"); err != nil {
+			t.Fatalf("IncrementRef: %v", err)
+		}
+	}
+
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		seen  = make(map[int]int)
+		errs  []error
+		start = make(chan struct{})
+	)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := s.DecrementRef(ctx, "t1", "h1")
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			seen[got]++
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(errs) != 0 {
+		t.Fatalf("DecrementRef errors: %v", errs)
+	}
+	for v := 0; v < n; v++ {
+		if seen[v] != 1 {
+			t.Fatalf("new count %d observed %d times, want exactly 1 (seen=%v)", v, seen[v], seen)
+		}
+	}
+	got, err := s.Lookup(ctx, "t1", "h1")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if got.RefCount != 0 {
+		t.Fatalf("final RefCount = %d, want 0", got.RefCount)
 	}
 }

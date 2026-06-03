@@ -7,10 +7,16 @@
 // the same typed sentinel errors (ErrNotFound, ErrAlreadyExists,
 // ErrInvalidRefCount, ErrRefCountNonZero).
 //
-// Concurrency: the embedded DB is opened with a single connection
-// (see internal/embeddeddb), so the read-modify-write sequences here
-// (DecrementRef's select-then-update, Delete's delete-then-probe)
-// execute without interleaving and need no explicit transaction.
+// Concurrency: a single open connection (see internal/embeddeddb)
+// serialises individual statements, but database/sql still returns
+// the connection to the pool between calls, so multi-statement
+// read-modify-write sequences are NOT implicitly atomic. The
+// mutating operations are therefore each a single SQL statement:
+// IncrementRef / DecrementRef use one UPDATE (the latter with
+// RETURNING), Register uses INSERT ... ON CONFLICT DO NOTHING, and
+// Delete's destructive step is a single conditional DELETE (its
+// follow-up probe only classifies the no-op case and never races a
+// destructive action).
 package sqlite
 
 import (
@@ -19,6 +25,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+
+	sqlitedriver "modernc.org/sqlite"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 )
@@ -28,6 +37,8 @@ type Config struct {
 	DB    *sql.DB
 	Table string
 }
+
+var _ content_index.Store = (*Store)(nil)
 
 // Store is a content_index.Store backed by a SQLite table.
 type Store struct {
@@ -187,31 +198,36 @@ func (s *Store) IncrementRef(ctx context.Context, tenantID, contentHash string) 
 	return nil
 }
 
-// DecrementRef decrements RefCount and returns the new count. The
-// single-connection embedded pool serialises the SELECT + UPDATE so
-// no other writer can interleave. A row already at zero returns
-// ErrInvalidRefCount (the CHECK constraint would otherwise reject
-// the UPDATE); a missing row returns ErrNotFound.
+// DecrementRef decrements RefCount and returns the new count. Like
+// the Postgres store it uses a single UPDATE ... RETURNING so the
+// read and write are one atomic statement — a separate SELECT then
+// UPDATE would not be safe even on the single-connection embedded
+// pool, because database/sql returns the connection to the pool
+// between calls and a concurrent decrement of the same key could
+// interleave. A row already at zero trips the CHECK(ref_count >= 0)
+// constraint, which we translate to ErrInvalidRefCount; a missing
+// row returns ErrNotFound.
 func (s *Store) DecrementRef(ctx context.Context, tenantID, contentHash string) (int, error) {
 	if tenantID == "" || contentHash == "" {
 		return 0, errors.New("sqlite: tenant_id and content_hash are required")
 	}
-	var current int
-	sel := fmt.Sprintf(`SELECT ref_count FROM %s WHERE tenant_id = ? AND content_hash = ?`, s.table)
-	if err := s.db.QueryRowContext(ctx, sel, tenantID, contentHash).Scan(&current); err != nil {
+	q := fmt.Sprintf(`
+		UPDATE %s
+		SET ref_count = ref_count - 1
+		WHERE tenant_id = ? AND content_hash = ?
+		RETURNING ref_count
+	`, s.table)
+	var newCount int
+	if err := s.db.QueryRowContext(ctx, q, tenantID, contentHash).Scan(&newCount); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, content_index.ErrNotFound
 		}
-		return 0, fmt.Errorf("sqlite: content_index decrement select: %w", err)
-	}
-	if current <= 0 {
-		return 0, content_index.ErrInvalidRefCount
-	}
-	upd := fmt.Sprintf(`UPDATE %s SET ref_count = ref_count - 1 WHERE tenant_id = ? AND content_hash = ?`, s.table)
-	if _, err := s.db.ExecContext(ctx, upd, tenantID, contentHash); err != nil {
+		if isCheckViolation(err) {
+			return 0, content_index.ErrInvalidRefCount
+		}
 		return 0, fmt.Errorf("sqlite: content_index decrement: %w", err)
 	}
-	return current - 1, nil
+	return newCount, nil
 }
 
 // Delete removes the row for (tenantID, contentHash) only when
@@ -297,6 +313,25 @@ func (s *Store) ListTenants(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("sqlite: content_index list tenants iter: %w", err)
 	}
 	return out, nil
+}
+
+// isCheckViolation reports whether err is a SQLite CHECK-constraint
+// failure. modernc.org/sqlite surfaces the extended result code via
+// an *sqlite.Error; we match on the code rather than the message so
+// the classification is stable across driver versions and locales.
+// SQLITE_CONSTRAINT_CHECK (extended) is 275 (0x113), and the primary
+// SQLITE_CONSTRAINT code is 19 — accept either so a driver that
+// reports only the primary code still classifies correctly. Falls
+// back to a message match for safety.
+func isCheckViolation(err error) bool {
+	var serr *sqlitedriver.Error
+	if errors.As(err, &serr) {
+		code := serr.Code()
+		if code == 275 || code == 19 {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "CHECK constraint failed")
 }
 
 // nullableJSON returns nil for an empty/nil byte slice so the column

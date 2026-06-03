@@ -123,13 +123,18 @@ func (s *Store) Put(ctx context.Context, key manifest_store.ManifestKey, m *meta
 		}
 		body = sealed
 	}
+	// write_seq is computed once in the INSERT's VALUES clause; the
+	// conflict path reuses that same value via excluded.write_seq
+	// rather than re-evaluating the MAX(write_seq)+1 subquery (the
+	// row being upserted does not change MAX, so both forms yield an
+	// identical value).
 	q := fmt.Sprintf(`
 		INSERT INTO %s (tenant_id, bucket, object_key_hash, version_id, body, write_seq)
 		VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(write_seq), 0) + 1 FROM %s))
 		ON CONFLICT (tenant_id, bucket, object_key_hash, version_id)
 		DO UPDATE SET body = excluded.body,
-		              write_seq = (SELECT COALESCE(MAX(write_seq), 0) + 1 FROM %s)
-	`, s.table, s.table, s.table)
+		              write_seq = excluded.write_seq
+	`, s.table, s.table)
 	if _, err := s.db.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID, body); err != nil {
 		return fmt.Errorf("sqlite: put manifest: %w", err)
 	}

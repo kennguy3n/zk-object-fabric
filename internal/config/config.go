@@ -185,7 +185,6 @@ type RepairConfig struct {
 	PollInterval Duration `json:"poll_interval"`
 }
 
-
 // DedupConfig configures intra-tenant deduplication. Cross-tenant
 // dedup is permanently excluded from the fabric, so DefaultScope
 // is always "intra_tenant"; the field exists only to make the
@@ -990,9 +989,18 @@ func Default() Config {
 		// override any of these via config.control_plane.* when
 		// their RDS class can support a larger pool.
 		ControlPlane: ControlPlaneConfig{
-			// EmbeddedDBPath is wired by default so a fresh `docker
-			// compose up` (or a bare `gateway` run) gets durable
-			// control-plane state without a Postgres. Setting
+			// EmbeddedDBPath is wired by default so `docker compose
+			// up` gets durable control-plane state without a
+			// Postgres. The path mirrors LocalFSDev.RootPath below
+			// (same /var/lib parent): it is the container/production
+			// layout, created by the image (Dockerfile mkdir) and
+			// backed by a named volume. A bare local `go run
+			// ./cmd/gateway` with this default must therefore run
+			// where /var/lib/zk-object-fabric is writable (root, or a
+			// pre-created dir) — exactly as the LocalFSDev provider
+			// already required; otherwise point control_plane
+			// .embedded_db_path at a writable location (see
+			// demo/config.json, which uses /data/metadata). Setting
 			// MetadataDSN overrides this and switches every store to
 			// Postgres; see openMetadataDB in cmd/gateway.
 			EmbeddedDBPath:  "/var/lib/zk-object-fabric/embedded.db",
