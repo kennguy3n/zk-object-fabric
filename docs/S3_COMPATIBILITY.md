@@ -29,7 +29,7 @@ deployment probe. The authoritative reject list is
 | `DeleteObjects` (bulk)             | Supported       | POST bulk-delete endpoint                                          |
 | `CopyObject`                       | Supported       | Server-side copy within same tenant                                |
 | Presigned GET/PUT                  | Supported       | Phase-independent URL format                                       |
-| `Put/Get/DeleteObjectTagging`      | Planned (WS8.1) | Tags as JSONB on manifest; 10 tags/object, 128/256-char limits     |
+| `Put/Get/DeleteObjectTagging`      | Supported       | Tags as JSONB on manifest; 10 tags/object, 128/256-char limits     |
 | `Put/GetObjectRetention`           | Planned (WS8.3) | Governance/compliance retain-until-date                            |
 | `Put/GetObjectLegalHold`           | Planned (WS8.3) | On/off legal hold per object                                       |
 | `GetObjectAttributes`              | Out of scope    | Covered by `HeadObject` + tagging                                  |

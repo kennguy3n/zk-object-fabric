@@ -268,7 +268,7 @@ operations perfectly than many operations partially.
 | Bucket ops   | `HeadBucket`                             | Yes       | Yes      | Yes     |                                                                         |
 | Conditional  | `If-None-Match`, `If-Modified-Since`     | Yes       | Yes      | Yes     | Evaluated against manifest metadata                                     |
 | Versioning   | `GetObject?versionId=`                   | Phase 1+  | Yes      | Yes     | Object versioning via manifest versions                                 |
-| Tagging      | `Put/Get/DeleteObjectTagging`            | Planned   | WS8.1    | WS8.1   | Tags stored as JSONB on the manifest row; 10 tags/object (see §15.1)    |
+| Tagging      | `Put/Get/DeleteObjectTagging`            | Yes       | Yes      | Yes     | Tags stored as JSONB on the manifest row; 10 tags/object (see §15.1)    |
 | Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Planned | WS8.2 | WS8.2   | Per-bucket rules + daily evaluator; extends migration tiering (see §15.1) |
 | Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Planned | WS8.3 | WS8.3 | Governance/compliance retention + legal hold; requires versioning (see §15.1) |
 | Versioning   | `Put/GetBucketVersioning`                | Planned   | WS8.4    | WS8.4   | Bucket-level Enabled/Suspended config + delete markers (see §15.1)      |

@@ -300,6 +300,18 @@ func cloneManifest(m *metadata.ObjectManifest) *metadata.ObjectManifest {
 	if m.Encryption.WrappedDEK != nil {
 		cp.Encryption.WrappedDEK = append([]byte(nil), m.Encryption.WrappedDEK...)
 	}
+	// Deep-clone the Tags map. The shallow struct copy above aliases
+	// the source map header, so a caller mutating tags after a Put
+	// (or after a Get) would otherwise corrupt the stored copy — the
+	// same "stored manifests are immutable once Put-ed" invariant the
+	// Pieces / DEK clones above protect. The Postgres store gets this
+	// for free via JSON round-trip serialisation.
+	if m.Tags != nil {
+		cp.Tags = make(map[string]string, len(m.Tags))
+		for k, v := range m.Tags {
+			cp.Tags[k] = v
+		}
+	}
 	return &cp
 }
 

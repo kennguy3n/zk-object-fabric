@@ -517,7 +517,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // incorrectly reject bulk-delete requests as unsupported.
 var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
-	"tagging":             "NotImplemented",
 	"lifecycle":           "NotImplemented",
 	"versioning":          "NotImplemented",
 	"policy":              "NotImplemented",
@@ -595,6 +594,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.UploadPart(w, r)
 			return
 		}
+		// Object tagging (?tagging) — WS8.1. Checked before the
+		// implicit-CreateBucket and CopyObject branches because it is
+		// a distinct sub-resource operation, not an object write.
+		if q.Has("tagging") {
+			h.PutObjectTagging(w, r)
+			return
+		}
 		// Bucket-level PUT (s3 mb / CreateBucket). Buckets in this
 		// gateway are implicit — they come into existence the first
 		// time an object is written to them — so CreateBucket is a
@@ -625,6 +631,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported POST operation", r.URL.Path)
 	case http.MethodGet:
 		bucket, key := parseBucketKey(r.URL.Path)
+		// Object tagging (?tagging) — WS8.1.
+		if q.Has("tagging") {
+			h.GetObjectTagging(w, r)
+			return
+		}
 		if key == "" && q.Has("uploads") {
 			h.ListMultipartUploads(w, r, bucket)
 			return
@@ -652,6 +663,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		if q.Get("uploadId") != "" {
 			h.AbortMultipartUpload(w, r)
+			return
+		}
+		// Object tagging (?tagging) — WS8.1.
+		if q.Has("tagging") {
+			h.DeleteObjectTagging(w, r)
 			return
 		}
 		h.Delete(w, r)

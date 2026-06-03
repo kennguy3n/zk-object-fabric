@@ -96,6 +96,7 @@ func (r *Runner) Run(ctx context.Context) Matrix {
 	matrix.Operations = append(matrix.Operations, local.multipartOps(ctx)...)
 	matrix.Operations = append(matrix.Operations, local.copyOps(ctx)...)
 	matrix.Operations = append(matrix.Operations, local.versioningOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.taggingOps(ctx)...)
 	matrix.Operations = append(matrix.Operations, local.unsupportedOps(ctx)...)
 
 	if local.Cleanup {
@@ -645,6 +646,61 @@ func (r *Runner) versioningOps(ctx context.Context) []OpResult {
 	}
 }
 
+// taggingOps drives the WS8.1 object-tagging round trip
+// (Put/Get/Delete ?tagging) against a freshly-written key. Every op
+// is expected to succeed; the detail string reports the observed tag
+// set so a matrix diff shows exactly what the gateway returned.
+func (r *Runner) taggingOps(ctx context.Context) []OpResult {
+	key := r.KeyPrefix + "tagging/probe.txt"
+	if _, err := r.Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(r.Bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader([]byte("tag-me")),
+		ContentLength: aws.Int64(int64(len("tag-me"))),
+	}); err != nil {
+		return []OpResult{
+			{Op: "PutObjectTagging", Category: "tagging", Status: OpErrored, Detail: "skipped: seed PutObject failed: " + err.Error()},
+			{Op: "GetObjectTagging", Category: "tagging", Status: OpErrored, Detail: "skipped: seed PutObject failed"},
+			{Op: "DeleteObjectTagging", Category: "tagging", Status: OpErrored, Detail: "skipped: seed PutObject failed"},
+		}
+	}
+	return []OpResult{
+		r.run("tagging", "PutObjectTagging", func(ctx context.Context) (string, OpStatus, error) {
+			_, err := r.Client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+				Bucket: aws.String(r.Bucket), Key: aws.String(key),
+				Tagging: &s3types.Tagging{TagSet: []s3types.Tag{
+					{Key: aws.String("env"), Value: aws.String("test")},
+				}},
+			})
+			if err != nil {
+				return "", OpFailed, err
+			}
+			return "tag set applied", OpPassed, nil
+		})(ctx),
+		r.run("tagging", "GetObjectTagging", func(ctx context.Context) (string, OpStatus, error) {
+			out, err := r.Client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+				Bucket: aws.String(r.Bucket), Key: aws.String(key),
+			})
+			if err != nil {
+				return "", OpFailed, err
+			}
+			if len(out.TagSet) != 1 || aws.ToString(out.TagSet[0].Key) != "env" {
+				return fmt.Sprintf("unexpected tag set: %d tags", len(out.TagSet)), OpFailed, nil
+			}
+			return "returned 1 tag (env=test)", OpPassed, nil
+		})(ctx),
+		r.run("tagging", "DeleteObjectTagging", func(ctx context.Context) (string, OpStatus, error) {
+			_, err := r.Client.DeleteObjectTagging(ctx, &s3.DeleteObjectTaggingInput{
+				Bucket: aws.String(r.Bucket), Key: aws.String(key),
+			})
+			if err != nil {
+				return "", OpFailed, err
+			}
+			return "tag set cleared", OpPassed, nil
+		})(ctx),
+	}
+}
+
 // unsupportedOps drives the operations the gateway is intentionally
 // not implementing yet. Each one is expected to produce a 4xx. If
 // the gateway accidentally returns 200, the matrix records it as a
@@ -678,27 +734,6 @@ func (r *Runner) unsupportedOps(ctx context.Context) []OpResult {
 			_, err := r.Client.PutObjectAcl(ctx, &s3.PutObjectAclInput{
 				Bucket: aws.String(r.Bucket), Key: aws.String(key),
 				ACL: s3types.ObjectCannedACLPrivate,
-			})
-			return err
-		}},
-		{"tagging", "PutObjectTagging", func(ctx context.Context) error {
-			_, err := r.Client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
-				Bucket: aws.String(r.Bucket), Key: aws.String(key),
-				Tagging: &s3types.Tagging{TagSet: []s3types.Tag{
-					{Key: aws.String("env"), Value: aws.String("test")},
-				}},
-			})
-			return err
-		}},
-		{"tagging", "GetObjectTagging", func(ctx context.Context) error {
-			_, err := r.Client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
-				Bucket: aws.String(r.Bucket), Key: aws.String(key),
-			})
-			return err
-		}},
-		{"tagging", "DeleteObjectTagging", func(ctx context.Context) error {
-			_, err := r.Client.DeleteObjectTagging(ctx, &s3.DeleteObjectTaggingInput{
-				Bucket: aws.String(r.Bucket), Key: aws.String(key),
 			})
 			return err
 		}},
