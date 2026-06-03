@@ -365,6 +365,19 @@ func main() {
 	// node carry the same per-node SourceNodeID, instead of the coarse
 	// cfg.Env they used previously.
 	gatewayNodeID := resolveGatewayNodeID(cfg.Gateway.NodeID)
+	// notificationDispatcher fans bucket events out to tenant-configured
+	// webhook destinations (WS8.6). nil when notifications are disabled
+	// or no bucket-config store is available; the handler then runs with
+	// no emitter and only the configuration sub-resource is active.
+	notificationDispatcher, err := buildNotificationDispatcher(cfg.Notifications, bucketConfigStore)
+	if err != nil {
+		log.Fatalf("gateway: build notification dispatcher: %v", err)
+	}
+	var notificationEmit s3compat.NotificationEmitter
+	if notificationDispatcher != nil {
+		defer notificationDispatcher.Close()
+		notificationEmit = notificationEmitter{dispatcher: notificationDispatcher}
+	}
 	s3Handler := s3compat.New(s3compat.Config{
 		Manifests:                store,
 		Providers:                registry,
@@ -372,6 +385,7 @@ func main() {
 		Auth:                     authenticator,
 		VerifiedCheck:            verifiedCheck,
 		Billing:                  billingSink,
+		Notifications:            notificationEmit,
 		Multipart:                multipartStore,
 		BucketConfig:             bucketConfigStore,
 		ErasureCoding:            erasureRegistry,

@@ -273,20 +273,21 @@ operations perfectly than many operations partially.
 | Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Shipped | WS8.3 | WS8.3 | Governance/compliance retention + legal hold enforced in DELETE/PUT-overwrite; requires versioning (see §15.1) |
 | Versioning   | `Put/GetBucketVersioning`                | Shipped   | WS8.4    | WS8.4   | Bucket-level Enabled/Suspended config + delete markers (see §15.1)      |
 | CORS         | `Put/Get/DeleteBucketCors`               | Shipped   | WS8.5    | WS8.5   | Per-bucket rules + OPTIONS preflight + response headers (see §15.1)      |
-| Notifications| `Put/GetBucketNotificationConfiguration` | Planned   | WS8.6    | WS8.6   | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events (see §15.1) |
+| Notifications| `Put/GetBucketNotificationConfiguration` | Shipped   | WS8.6    | WS8.6   | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events via async dispatcher (see §15.1) |
 | SSE config   | `Put/Get/DeleteBucketEncryption`         | Planned   | WS8.7    | WS8.7   | Maps `x-amz-server-side-encryption` to ZK encryption modes (see §15.1)  |
 
 The rows marked **Shipped / WS8.x** have landed: tagging (WS8.1),
 lifecycle (WS8.2), Object Lock / WORM (WS8.3), bucket versioning
-(WS8.4), and CORS (WS8.5) are wired into the gateway and covered by
-`tests/s3_compat/`, and the lifecycle evaluator runs as a daily
-background sweep emitting audit + billing events. The rows still marked
-**Planned / WS8.x** — event notifications (WS8.6) and the server-side
-encryption config sub-resource (WS8.7) — are roadmap commitments
-tracked in §15.1; the gateway currently rejects their sub-resource
-query keys with `501 NotImplemented` (see `api/s3compat/handler.go`
-`unsupportedSubresources`). Each WS8 slice removes its key from that
-map as the handler lands.
+(WS8.4), CORS (WS8.5), and event notifications (WS8.6) are wired into
+the gateway and covered by `tests/s3_compat/`, and the lifecycle
+evaluator runs as a daily background sweep emitting audit + billing
+events. The one row still marked
+**Planned / WS8.x** — the server-side
+encryption config sub-resource (WS8.7) — is a roadmap commitment
+tracked in §15.1; the gateway currently rejects its `?encryption`
+sub-resource query key with `501 NotImplemented` (see
+`api/s3compat/handler.go` `unsupportedSubresources`). Each WS8 slice
+removes its key from that map as the handler lands.
 
 **Operations explicitly NOT supported** (to avoid scope creep):
 
@@ -304,9 +305,9 @@ map as the handler lands.
 > bucket-level versioning config, CORS, event notifications, and the
 > server-side encryption config sub-resource were formerly listed here
 > as out of scope. They were taken up as **Workstream 8** (§15.1):
-> tagging, lifecycle, Object Lock / WORM, versioning, and CORS are now
-> *Shipped* rows in the table above, while event notifications and the
-> SSE config sub-resource remain *Planned*. The S3 compatibility matrix
+> tagging, lifecycle, Object Lock / WORM, versioning, CORS, and event
+> notifications are now *Shipped* rows in the table above, while the
+> SSE config sub-resource remains *Planned*. The S3 compatibility matrix
 > in [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) tracks current vs
 > planned coverage against the AWS S3 surface.
 
@@ -1514,10 +1515,10 @@ These two workstreams extend the SaaS transformation effort. Each
 numbered slice below is sized to land as an independent PR (matching
 the existing slice-based delivery model). **Workstream 8 is
 substantially shipped**: tagging (8.1), lifecycle (8.2), Object Lock /
-WORM (8.3), bucket versioning (8.4), and CORS (8.5) are built, wired
-into the gateway, and covered by `tests/s3_compat/`; event
-notifications (8.6) and the SSE config sub-resource (8.7) remain
-roadmap commitments. **Workstream 9 (Rust SDK) is not yet started.**
+WORM (8.3), bucket versioning (8.4), CORS (8.5), and event
+notifications (8.6) are built, wired into the gateway, and covered by
+`tests/s3_compat/`; only the SSE config sub-resource (8.7) remains a
+roadmap commitment. **Workstream 9 (Rust SDK) is not yet started.**
 The live status of each slice is tracked in [PROGRESS.md](PROGRESS.md);
 the AWS-surface coverage view lives in
 [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md). Each slice's per-section
@@ -1631,16 +1632,29 @@ table of `metadata/bucket_config` (memory + Postgres + SQLite).
 
 #### 15.1.6 Event Notifications (`?notification`)
 
-**Status: Planned (WS8.6) — not yet shipped.**
+**Status: Shipped (WS8.6).**
 
 - Handlers `PutBucketNotificationConfiguration`,
-  `GetBucketNotificationConfiguration`.
-- Initial transport: webhook destinations (HTTP POST to a
-  tenant-configured URL) — no dependency on SNS/SQS.
-- Events emitted on `s3:ObjectCreated:*` and `s3:ObjectRemoved:*`.
-- New `internal/notifications/` package: an async event dispatcher
-  with retry and a dead-letter queue.
-- Notification configs stored per bucket in Postgres.
+  `GetBucketNotificationConfiguration`
+  (`api/s3compat/notification_handler.go`). The on-the-wire document
+  keeps AWS's `<Event>` and `<Filter><S3Key><FilterRule>` conventions
+  but uses a ZKOF `<WebhookConfiguration>` container with an
+  `<Endpoint>` element, since the transport is a plain HTTP webhook.
+- Transport: webhook destinations (HTTP POST to a tenant-configured
+  URL) — no dependency on SNS/SQS.
+- Events emitted on `s3:ObjectCreated:*` (Put, Copy,
+  CompleteMultipartUpload) and `s3:ObjectRemoved:*` (Delete,
+  DeleteMarkerCreated), on the handler success paths only.
+- `internal/notifications/` is the async event dispatcher: a bounded
+  queue feeds a worker pool that resolves the bucket config, matches
+  the event against the rules' event/prefix/suffix filters, and POSTs
+  the rendered S3-shaped JSON envelope with exponential-backoff retry
+  and a dead-letter sink. `Notify` is non-blocking, so a slow or
+  unreachable destination never adds latency to the S3 request path.
+- Notification configs are stored per bucket through
+  `metadata/bucket_config` (memory + Postgres + SQLite,
+  `bucket_notification` table), shared with the other bucket
+  sub-resources.
 
 #### 15.1.7 Server-Side Encryption Config (`?encryption`)
 

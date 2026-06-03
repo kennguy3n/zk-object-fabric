@@ -70,3 +70,20 @@ CREATE TABLE IF NOT EXISTS bucket_lifecycle (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, bucket)
 );
+
+-- Per-bucket S3 event-notification configuration (WS8.6). As with CORS
+-- and lifecycle, the never-configured state is the absence of a row,
+-- surfaced to callers as an empty notification.Config (no rules). The
+-- rule set (event classes, webhook endpoint, prefix/suffix filters) is
+-- stored as one JSON document — the stable encoding owned by
+-- metadata/notification — because each rule carries a variable-length
+-- list of subscribed events. PutBucketNotificationConfiguration with an
+-- empty body clears the configuration (the row is removed); S3 has no
+-- separate DeleteBucketNotification operation.
+CREATE TABLE IF NOT EXISTS bucket_notification (
+    tenant_id  TEXT NOT NULL,
+    bucket     TEXT NOT NULL,
+    rules      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, bucket)
+);
