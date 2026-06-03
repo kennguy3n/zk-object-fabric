@@ -926,6 +926,13 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 	}
 	token, err := h.cfg.Tokens.IssueToken(rotated.TenantID)
 	if err != nil {
+		// Rotate already committed (predecessor consumed, successor
+		// stored) but the access token we'd pair it with failed, so the
+		// successor will never reach the client. Revoke it to avoid
+		// leaving an undeliverable row in the store; the client retries
+		// with its consumed predecessor, which re-logs them in via the
+		// family-revocation path.
+		_ = h.cfg.RefreshTokens.Revoke(rotated.Raw)
 		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
 		return
 	}
