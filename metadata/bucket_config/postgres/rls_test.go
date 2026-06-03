@@ -205,22 +205,42 @@ func TestRLS_CrossTenantIsolation(t *testing.T) {
 		}
 	})
 
-	t.Run("cross-tenant write is rejected by WITH CHECK", func(t *testing.T) {
-		// Bind t1 but try to INSERT a t2 row directly. The store's own
-		// methods can't express this (they self-bind to the call's tenant),
-		// so we issue the raw statement the policy must stop.
-		tx, err := appStore.beginTenant(ctx, "t1")
-		if err != nil {
-			t.Fatalf("beginTenant t1: %v", err)
+	t.Run("cross-tenant write is rejected by WITH CHECK on every table", func(t *testing.T) {
+		// Bind t1 but try to INSERT a t2 row directly into each of the four
+		// tables. The store's own methods can't express this (they
+		// self-bind to the call's tenant), so we issue the raw statements
+		// the policy must stop. Exercising all four guards against future
+		// per-table schema drift where one table's policy is accidentally
+		// weakened. Each INSERT lists exactly the NOT NULL columns that
+		// have no default, so the row is constructible and the failure is
+		// unambiguously the RLS WITH CHECK (not a constraint violation).
+		foreignInserts := []struct {
+			table string
+			cols  string
+			vals  string
+		}{
+			{cfg.Table, "tenant_id, bucket, state", "'t2', 'evil', 'Enabled'"},
+			{cfg.LockTable, "tenant_id, bucket, enabled", "'t2', 'evil', false"},
+			{cfg.CorsTable, "tenant_id, bucket, rules", "'t2', 'evil', '{}'"},
+			{cfg.LifecycleTable, "tenant_id, bucket, rules", "'t2', 'evil', '{}'"},
 		}
-		defer func() { _ = tx.Rollback() }()
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO `+cfg.Table+` (tenant_id, bucket, state) VALUES ('t2', 'evil', 'Enabled')`)
-		if err == nil {
-			t.Fatal("cross-tenant INSERT under t1 scope succeeded; WITH CHECK should reject it")
-		}
-		if !strings.Contains(strings.ToLower(err.Error()), "row-level security") {
-			t.Fatalf("cross-tenant INSERT error = %v, want a row-level security violation", err)
+		for _, fi := range foreignInserts {
+			fi := fi
+			t.Run(fi.table, func(t *testing.T) {
+				tx, err := appStore.beginTenant(ctx, "t1")
+				if err != nil {
+					t.Fatalf("beginTenant t1: %v", err)
+				}
+				defer func() { _ = tx.Rollback() }()
+				_, err = tx.ExecContext(ctx,
+					`INSERT INTO `+fi.table+` (`+fi.cols+`) VALUES (`+fi.vals+`)`)
+				if err == nil {
+					t.Fatalf("cross-tenant INSERT into %s under t1 scope succeeded; WITH CHECK should reject it", fi.table)
+				}
+				if !strings.Contains(strings.ToLower(err.Error()), "row-level security") {
+					t.Fatalf("cross-tenant INSERT into %s error = %v, want a row-level security violation", fi.table, err)
+				}
+			})
 		}
 	})
 
