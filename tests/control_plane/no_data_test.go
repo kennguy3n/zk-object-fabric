@@ -48,6 +48,8 @@ func controlPlaneTypes() []controlPlaneType {
 		{"metadata.PlacementPolicy", metadata.PlacementPolicy{}},
 		{"manifest_store.ManifestKey", manifest_store.ManifestKey{}},
 		{"manifest_store.ListResult", manifest_store.ListResult{}},
+		{"manifest_store.ScannedManifest", manifest_store.ScannedManifest{}},
+		{"manifest_store.ScanResult", manifest_store.ScanResult{}},
 
 		// tenant — multi-tenancy configuration.
 		{"tenant.Tenant", tenant.Tenant{}},
@@ -94,11 +96,21 @@ func rawBytesTypes() []reflect.Type {
 // the field is (a) always sealed / encrypted and (b) never carries
 // object-body bytes.
 var sealedKeyMaterialFields = map[string]bool{
-	"metadata.EncryptionConfig.WrappedDEK":                      true,
-	"metadata.ObjectManifest.Encryption.WrappedDEK":             true,
-	"ManifestStore.Get.Out[0].Encryption.WrappedDEK":            true,
-	"ManifestStore.Put.In[2].Encryption.WrappedDEK":             true,
+	"metadata.EncryptionConfig.WrappedDEK":                         true,
+	"metadata.ObjectManifest.Encryption.WrappedDEK":                true,
+	"ManifestStore.Get.Out[0].Encryption.WrappedDEK":               true,
+	"ManifestStore.Put.In[2].Encryption.WrappedDEK":                true,
 	"ManifestStore.List.Out[0].Manifests[*].Encryption.WrappedDEK": true,
+	// ScanManifests returns the same sealed envelope DEK as List,
+	// just wrapped in a ScannedManifest alongside the key the
+	// migration worker re-Puts under. It is the identical
+	// KMS/CMK-wrapped ciphertext, never an object body.
+	"ManifestStore.ScanManifests.Out[0].Manifests[*].Manifest.Encryption.WrappedDEK": true,
+	// Same sealed DEK reached via the direct type-walk
+	// (TestControlPlane_NoRawObjectBytes) over the ScannedManifest /
+	// ScanResult value types, which carry a *metadata.ObjectManifest.
+	"manifest_store.ScannedManifest.Manifest.Encryption.WrappedDEK":         true,
+	"manifest_store.ScanResult.Manifests[*].Manifest.Encryption.WrappedDEK": true,
 }
 
 // fieldPathFor walks a struct recursively and reports any field

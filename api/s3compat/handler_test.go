@@ -73,6 +73,25 @@ func (f *fakeProvider) GetPiece(_ context.Context, pieceID string, r *providers.
 func (f *fakeProvider) HeadPiece(context.Context, string) (providers.PieceMetadata, error) {
 	return providers.PieceMetadata{}, nil
 }
+
+// setPiece seeds a backend piece under the same lock the provider's
+// own methods hold. Tests use it instead of writing f.pieces directly
+// so test setup stays consistent with PutPiece/GetPiece and a future
+// contributor adding concurrent setup cannot trip the race detector.
+func (f *fakeProvider) setPiece(pieceID string, b []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pieces[pieceID] = b
+}
+
+// pieceBytes returns a stored piece (and whether it exists) under
+// lock, for assertions that inspect backend state after a sweep.
+func (f *fakeProvider) pieceBytes(pieceID string) ([]byte, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.pieces[pieceID]
+	return b, ok
+}
 func (f *fakeProvider) DeletePiece(_ context.Context, pieceID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -305,6 +305,68 @@ func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit
 	return out, nil
 }
 
+// ScanManifests paginates over every manifest version in the table
+// across all tenants and buckets, ordered by the full primary key, so
+// a background worker (e.g. the AAD v1 migration sweep) can visit
+// every object exactly once. Unlike List, it is not scoped to a
+// (tenant, bucket) and returns every version rather than only the
+// latest. The cursor is keyset-based: the WHERE clause uses a
+// row-value comparison on the (tenant_id, bucket, object_key_hash,
+// version_id) tuple against the decoded cursor, matching the ORDER BY
+// so each page is served from the primary-key index without OFFSET.
+// An empty cursor decodes to the all-empty key; because every
+// persisted row has non-empty key fields the first page admits every
+// row. The cursor codec is shared with the Postgres store so a token
+// is portable across the two backends.
+func (s *Store) ScanManifests(ctx context.Context, cursor string, limit int) (manifest_store.ScanResult, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	after, err := manifest_store.DecodeScanCursor(cursor)
+	if err != nil {
+		return manifest_store.ScanResult{}, err
+	}
+	q := fmt.Sprintf(`
+SELECT tenant_id, bucket, object_key_hash, version_id, body
+FROM %s
+WHERE (tenant_id, bucket, object_key_hash, version_id) > (?, ?, ?, ?)
+ORDER BY tenant_id, bucket, object_key_hash, version_id
+LIMIT ?`, s.table)
+	rows, err := s.db.QueryContext(ctx, q, after.TenantID, after.Bucket, after.ObjectKeyHash, after.VersionID, limit+1)
+	if err != nil {
+		return manifest_store.ScanResult{}, fmt.Errorf("sqlite: scan manifests: %w", err)
+	}
+	defer rows.Close()
+
+	out := manifest_store.ScanResult{}
+	var lastKey manifest_store.ManifestKey
+	count := 0
+	for rows.Next() {
+		count++
+		if count > limit {
+			out.NextCursor = manifest_store.EncodeScanCursor(lastKey)
+			break
+		}
+		var (
+			key  manifest_store.ManifestKey
+			body []byte
+		)
+		if err := rows.Scan(&key.TenantID, &key.Bucket, &key.ObjectKeyHash, &key.VersionID, &body); err != nil {
+			return manifest_store.ScanResult{}, fmt.Errorf("sqlite: scan manifests row: %w", err)
+		}
+		m, derr := s.decodeBody(body, key.TenantID, key.Bucket, key.ObjectKeyHash)
+		if derr != nil {
+			return manifest_store.ScanResult{}, derr
+		}
+		out.Manifests = append(out.Manifests, manifest_store.ScannedManifest{Key: key, Manifest: m})
+		lastKey = key
+	}
+	if err := rows.Err(); err != nil {
+		return manifest_store.ScanResult{}, fmt.Errorf("sqlite: scan manifests iter: %w", err)
+	}
+	return out, nil
+}
+
 // HasManifestWithPieceID reports whether the given tenant has at
 // least one manifest whose pieces[].piece_id equals pieceID. Used
 // by the orphan GC worker. The body may be opaque ciphertext when a

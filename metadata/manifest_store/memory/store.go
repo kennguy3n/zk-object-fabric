@@ -192,6 +192,62 @@ func (s *Store) ListVersions(_ context.Context, tenantID, bucket, objectKeyHash 
 	return out, nil
 }
 
+// ScanManifests paginates over every stored manifest version across
+// all tenants and buckets, ordered by the full primary key
+// (tenant_id, bucket, object_key_hash, version_id). The cursor is the
+// encoded key of the last returned entry; pass "" to start.
+func (s *Store) ScanManifests(_ context.Context, cursor string, limit int) (manifest_store.ScanResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 {
+		limit = 1000
+	}
+	after, err := manifest_store.DecodeScanCursor(cursor)
+	if err != nil {
+		return manifest_store.ScanResult{}, err
+	}
+
+	keys := make([]manifest_store.ManifestKey, 0, len(s.byKey))
+	for k := range s.byKey {
+		if cursor != "" && !scanKeyLess(after, k) {
+			// Skip keys at or before the cursor.
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return scanKeyLess(keys[i], keys[j]) })
+
+	out := manifest_store.ScanResult{}
+	if len(keys) > limit {
+		last := keys[limit-1]
+		out.NextCursor = manifest_store.EncodeScanCursor(last)
+		keys = keys[:limit]
+	}
+	for _, k := range keys {
+		out.Manifests = append(out.Manifests, manifest_store.ScannedManifest{
+			Key:      k,
+			Manifest: cloneManifest(s.byKey[k]),
+		})
+	}
+	return out, nil
+}
+
+// scanKeyLess orders ManifestKeys by the full primary key tuple,
+// matching the Postgres store's ORDER BY so the two implementations
+// page identically.
+func scanKeyLess(a, b manifest_store.ManifestKey) bool {
+	if a.TenantID != b.TenantID {
+		return a.TenantID < b.TenantID
+	}
+	if a.Bucket != b.Bucket {
+		return a.Bucket < b.Bucket
+	}
+	if a.ObjectKeyHash != b.ObjectKeyHash {
+		return a.ObjectKeyHash < b.ObjectKeyHash
+	}
+	return a.VersionID < b.VersionID
+}
+
 func cloneManifest(m *metadata.ObjectManifest) *metadata.ObjectManifest {
 	if m == nil {
 		return nil

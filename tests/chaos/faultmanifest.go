@@ -191,3 +191,16 @@ func (s *FaultManifestStore) ListVersions(ctx context.Context, tenantID, bucket,
 	}
 	return s.Inner.ListVersions(ctx, tenantID, bucket, objectKeyHash)
 }
+
+// ScanManifests dispatches through ListFault (the scan shares the
+// read-path fault knob with List rather than adding a new field; the
+// chaos suite exercises read failures generically).
+func (s *FaultManifestStore) ScanManifests(ctx context.Context, cursor string, limit int) (manifest_store.ScanResult, error) {
+	s.Calls.Add(1)
+	fail, err := s.shouldFail("SCAN", s.ListFault)
+	if fail {
+		s.Failures.Add(1)
+		return manifest_store.ScanResult{}, err
+	}
+	return s.Inner.ScanManifests(ctx, cursor, limit)
+}
