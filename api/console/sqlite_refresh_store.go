@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // SQLiteRefreshTokenStore is the SQLite-backed RefreshTokenStore for
@@ -20,6 +21,7 @@ import (
 type SQLiteRefreshTokenStore struct {
 	db  *sql.DB
 	cfg RefreshConfig
+	now func() time.Time
 	ctx context.Context
 }
 
@@ -29,7 +31,7 @@ func NewSQLiteRefreshTokenStore(db *sql.DB, cfg RefreshConfig) (*SQLiteRefreshTo
 	if db == nil {
 		return nil, errors.New("console: sqlite refresh store requires a non-nil *sql.DB")
 	}
-	s := &SQLiteRefreshTokenStore{db: db, cfg: cfg}
+	s := &SQLiteRefreshTokenStore{db: db, cfg: cfg, now: cfg.resolveClock()}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
@@ -83,7 +85,7 @@ func (s *SQLiteRefreshTokenStore) Issue(tenantID string) (RefreshToken, error) {
 	if err != nil {
 		return RefreshToken{}, err
 	}
-	expiresAt := s.cfg.now()().Add(s.cfg.ttl())
+	expiresAt := s.now().Add(s.cfg.ttl())
 	const q = `INSERT INTO refresh_tokens (token_hash, family_id, tenant_id, expires_at, consumed)
 		VALUES (?, ?, ?, ?, 0)`
 	if _, err := s.db.ExecContext(s.cx(), q, hashRefreshToken(raw), family, tenantID, expiresAt.UnixNano()); err != nil {
@@ -98,7 +100,7 @@ func (s *SQLiteRefreshTokenStore) Rotate(rawToken string) (RefreshToken, error) 
 		return RefreshToken{}, errRefreshTokenInvalid
 	}
 	hash := hashRefreshToken(rawToken)
-	now := s.cfg.now()()
+	now := s.now()
 
 	tx, err := s.db.BeginTx(s.cx(), nil)
 	if err != nil {

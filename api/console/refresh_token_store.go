@@ -106,7 +106,11 @@ func (c RefreshConfig) ttl() time.Duration {
 	return c.TTL
 }
 
-func (c RefreshConfig) now() func() time.Time {
+// resolveClock returns the configured clock, defaulting to time.Now.
+// Stores call this once at construction and cache the result, so hot
+// paths invoke a stored func() time.Time directly rather than the
+// awkward double-call c.now()() on every operation.
+func (c RefreshConfig) resolveClock() func() time.Time {
 	if c.Now == nil {
 		return time.Now
 	}
@@ -158,6 +162,7 @@ func hashRefreshToken(raw string) string {
 // SQLite or Postgres backend instead.
 type MemoryRefreshTokenStore struct {
 	cfg RefreshConfig
+	now func() time.Time
 	mu  sync.Mutex
 	// rows is keyed by token hash. Storing the hash (not the raw
 	// token) keeps the in-memory store consistent with the persistent
@@ -174,7 +179,7 @@ type memoryRefreshRow struct {
 
 // NewMemoryRefreshTokenStore returns an empty store.
 func NewMemoryRefreshTokenStore(cfg RefreshConfig) *MemoryRefreshTokenStore {
-	return &MemoryRefreshTokenStore{cfg: cfg, rows: map[string]memoryRefreshRow{}}
+	return &MemoryRefreshTokenStore{cfg: cfg, now: cfg.resolveClock(), rows: map[string]memoryRefreshRow{}}
 }
 
 // Issue implements RefreshTokenStore.
@@ -195,7 +200,7 @@ func (s *MemoryRefreshTokenStore) Rotate(rawToken string) (RefreshToken, error) 
 		return RefreshToken{}, errRefreshTokenInvalid
 	}
 	hash := hashRefreshToken(rawToken)
-	now := s.cfg.now()()
+	now := s.now()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -262,7 +267,7 @@ func (s *MemoryRefreshTokenStore) RevokeAllForTenant(tenantID string) error {
 }
 
 func (s *MemoryRefreshTokenStore) mint(tenantID, familyID string) (RefreshToken, error) {
-	now := s.cfg.now()()
+	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mintLocked(tenantID, familyID, now)
