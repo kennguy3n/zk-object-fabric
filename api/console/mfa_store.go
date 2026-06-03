@@ -3,6 +3,7 @@ package console
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base32"
 	"encoding/hex"
 	"errors"
@@ -99,7 +100,14 @@ type MFAStore interface {
 	// in), and stores the one-time recovery-code hashes. It returns
 	// errMFANotEnrolled when there is no pending row to activate and
 	// is a no-op error (not a clobber) when the row is already active.
-	Activate(tenantID string, firstStep int64, recoveryHashes []string) error
+	//
+	// expectedSecret is the pending secret the caller verified the
+	// activating TOTP code against. Activate confirms, atomically, that
+	// the pending row still holds that secret before flipping active;
+	// if a concurrent BeginEnrollment replaced the pending secret in
+	// between, it returns errMFANotEnrolled rather than binding a secret
+	// the user's authenticator does not hold.
+	Activate(tenantID, expectedSecret string, firstStep int64, recoveryHashes []string) error
 
 	// MarkTOTPStep atomically advances the replay watermark: it
 	// records step as consumed and returns ok=true only if step is
@@ -217,7 +225,7 @@ func (s *MemoryMFAStore) GetMFA(tenantID string) (MFARecord, bool, error) {
 }
 
 // Activate implements MFAStore.
-func (s *MemoryMFAStore) Activate(tenantID string, firstStep int64, recoveryHashes []string) error {
+func (s *MemoryMFAStore) Activate(tenantID, expectedSecret string, firstStep int64, recoveryHashes []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.rec[tenantID]
@@ -231,6 +239,14 @@ func (s *MemoryMFAStore) Activate(tenantID string, firstStep int64, recoveryHash
 		// overwrite. This also closes the TOCTOU window between the
 		// handler's rec.Active check and this call when two activate
 		// requests race on the same pending enrollment.
+		return errMFANotEnrolled
+	}
+	// Refuse to activate a secret other than the one the caller
+	// verified the code against: a concurrent BeginEnrollment may have
+	// replaced the pending secret since the handler's GetMFA, and
+	// activating it would bind a secret the authenticator does not hold.
+	// Constant-time compare keeps the discipline totpVerify uses.
+	if subtle.ConstantTimeCompare([]byte(row.secret), []byte(expectedSecret)) != 1 {
 		return errMFANotEnrolled
 	}
 	row.active = true

@@ -88,7 +88,7 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 
 	t.Run("ActivateRequiresPending", func(t *testing.T) {
 		s := newStore(t)
-		if err := s.Activate("t-missing", 100, []string{"h1"}); err != errMFANotEnrolled {
+		if err := s.Activate("t-missing", "SECRET", 100, []string{"h1"}); err != errMFANotEnrolled {
 			t.Fatalf("Activate(no enrollment) err = %v; want errMFANotEnrolled", err)
 		}
 	})
@@ -99,7 +99,7 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 			t.Fatalf("BeginEnrollment: %v", err)
 		}
 		hashes := []string{hashRecoveryCode("AAAA"), hashRecoveryCode("BBBB")}
-		if err := s.Activate("t-2", 555, hashes); err != nil {
+		if err := s.Activate("t-2", "SECRET", 555, hashes); err != nil {
 			t.Fatalf("Activate: %v", err)
 		}
 		rec, ok, err := s.GetMFA("t-2")
@@ -123,14 +123,14 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 			t.Fatalf("BeginEnrollment: %v", err)
 		}
 		first := []string{hashRecoveryCode("AAAA"), hashRecoveryCode("BBBB")}
-		if err := s.Activate("t-2b", 555, first); err != nil {
+		if err := s.Activate("t-2b", "SECRET", 555, first); err != nil {
 			t.Fatalf("Activate: %v", err)
 		}
 		// A second activation (e.g. two enroll/activate requests
 		// racing on the same pending row) must not clobber the
 		// already-issued recovery codes — it is rejected outright.
 		second := []string{hashRecoveryCode("CCCC")}
-		if err := s.Activate("t-2b", 999, second); err != errMFANotEnrolled {
+		if err := s.Activate("t-2b", "SECRET", 999, second); err != errMFANotEnrolled {
 			t.Fatalf("re-Activate err = %v; want errMFANotEnrolled", err)
 		}
 		rec, _, err := s.GetMFA("t-2b")
@@ -204,7 +204,7 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 			t.Fatalf("BeginEnrollment: %v", err)
 		}
 		h := hashRecoveryCode("recover-me")
-		if err := s.Activate("t-6", 1, []string{h, hashRecoveryCode("other")}); err != nil {
+		if err := s.Activate("t-6", "SECRET", 1, []string{h, hashRecoveryCode("other")}); err != nil {
 			t.Fatalf("Activate: %v", err)
 		}
 		// First consume succeeds.
@@ -238,7 +238,7 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 		if err := s.BeginEnrollment("t-8", "SECRET"); err != nil {
 			t.Fatalf("BeginEnrollment: %v", err)
 		}
-		if err := s.Activate("t-8", 1, []string{hashRecoveryCode("a")}); err != nil {
+		if err := s.Activate("t-8", "SECRET", 1, []string{hashRecoveryCode("a")}); err != nil {
 			t.Fatalf("Activate: %v", err)
 		}
 		if err := s.Disable("t-8"); err != nil {
@@ -317,6 +317,38 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 			t.Fatalf("re-enroll pending record = %+v; want pending SECOND", rec)
 		}
 	})
+
+	t.Run("ActivateRejectsStaleSecret", func(t *testing.T) {
+		s := newStore(t)
+		// Model the TOCTOU: a code is verified against FIRST, but a
+		// concurrent re-enroll swaps in SECOND before Activate runs.
+		if err := s.BeginEnrollment("t-10", "FIRST"); err != nil {
+			t.Fatalf("BeginEnrollment(FIRST): %v", err)
+		}
+		if err := s.BeginEnrollment("t-10", "SECOND"); err != nil {
+			t.Fatalf("BeginEnrollment(SECOND): %v", err)
+		}
+		// Activating with the stale FIRST secret must be refused, not
+		// bind SECOND (which the user's authenticator never saw).
+		if err := s.Activate("t-10", "FIRST", 7, []string{hashRecoveryCode("x")}); err != errMFANotEnrolled {
+			t.Fatalf("Activate(stale secret) err = %v; want errMFANotEnrolled", err)
+		}
+		// The enrollment must remain pending and unchanged.
+		rec, ok, err := s.GetMFA("t-10")
+		if err != nil || !ok {
+			t.Fatalf("GetMFA after refused activate = (_, %v, %v)", ok, err)
+		}
+		if rec.Active || rec.Secret != "SECOND" {
+			t.Fatalf("record after refused activate = %+v; want pending SECOND", rec)
+		}
+		// Activating with the current secret still works.
+		if err := s.Activate("t-10", "SECOND", 7, []string{hashRecoveryCode("x")}); err != nil {
+			t.Fatalf("Activate(current secret): %v", err)
+		}
+		if rec, _, _ := s.GetMFA("t-10"); !rec.Active {
+			t.Fatalf("record should be Active after activating current secret: %+v", rec)
+		}
+	})
 }
 
 // mustEnrollAndActivate is a test helper that drives a tenant to the
@@ -326,7 +358,7 @@ func mustEnrollAndActivate(t *testing.T, s MFAStore, tenantID, secret string, fi
 	if err := s.BeginEnrollment(tenantID, secret); err != nil {
 		t.Fatalf("BeginEnrollment(%s): %v", tenantID, err)
 	}
-	if err := s.Activate(tenantID, firstStep, []string{hashRecoveryCode("seed")}); err != nil {
+	if err := s.Activate(tenantID, secret, firstStep, []string{hashRecoveryCode("seed")}); err != nil {
 		t.Fatalf("Activate(%s): %v", tenantID, err)
 	}
 }

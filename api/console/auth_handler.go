@@ -1129,7 +1129,10 @@ func (h *AuthHandler) mfaActivate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "activate failed; please retry")
 		return
 	}
-	if err := h.cfg.MFA.Activate(tenantID, step, hashes); err != nil {
+	// Pass the secret the code was verified against so Activate refuses,
+	// atomically, to confirm a different secret a concurrent re-enroll
+	// may have swapped into the pending row since GetMFA above.
+	if err := h.cfg.MFA.Activate(tenantID, rec.Secret, step, hashes); err != nil {
 		if errors.Is(err, errMFANotEnrolled) {
 			writeError(w, http.StatusConflict, "no pending mfa enrollment to activate")
 			return

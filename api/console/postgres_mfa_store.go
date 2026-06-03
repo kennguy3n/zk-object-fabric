@@ -2,6 +2,7 @@ package console
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -130,12 +131,37 @@ func (s *PostgresMFAStore) GetMFA(tenantID string) (MFARecord, bool, error) {
 }
 
 // Activate implements MFAStore.
-func (s *PostgresMFAStore) Activate(tenantID string, firstStep int64, recoveryHashes []string) error {
+func (s *PostgresMFAStore) Activate(tenantID, expectedSecret string, firstStep int64, recoveryHashes []string) error {
 	tx, err := s.db.BeginTx(s.cx(), nil)
 	if err != nil {
 		return fmt.Errorf("console: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Re-read the pending secret under a row lock and confirm it still
+	// matches the secret the caller verified the activating code
+	// against. BeginEnrollment replaces a pending secret via upsert, so
+	// a concurrent enroll between the handler's GetMFA and this call
+	// could otherwise flip active=TRUE on a row whose secret no longer
+	// matches the user's authenticator. FOR UPDATE serialises against
+	// that upsert; an already-active or missing row matches nothing
+	// (active = FALSE) and yields errMFANotEnrolled.
+	var stored string
+	switch err := tx.QueryRowContext(s.cx(),
+		`SELECT secret FROM mfa_credentials WHERE tenant_id = $1 AND active = FALSE FOR UPDATE`, tenantID).
+		Scan(&stored); {
+	case errors.Is(err, sql.ErrNoRows):
+		return errMFANotEnrolled
+	case err != nil:
+		return fmt.Errorf("console: load pending mfa: %w", err)
+	}
+	opened, err := s.openSecret(stored, tenantID)
+	if err != nil {
+		return fmt.Errorf("console: open pending mfa secret: %w", err)
+	}
+	if subtle.ConstantTimeCompare([]byte(opened), []byte(expectedSecret)) != 1 {
+		return errMFANotEnrolled
+	}
 
 	// "AND active = FALSE" makes activation atomic: a row that is
 	// already active matches zero rows, so a second (racing or
