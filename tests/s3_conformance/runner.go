@@ -97,6 +97,7 @@ func (r *Runner) Run(ctx context.Context) Matrix {
 	matrix.Operations = append(matrix.Operations, local.copyOps(ctx)...)
 	matrix.Operations = append(matrix.Operations, local.versioningOps(ctx)...)
 	matrix.Operations = append(matrix.Operations, local.taggingOps(ctx)...)
+	matrix.Operations = append(matrix.Operations, local.lifecycleOps(ctx)...)
 	matrix.Operations = append(matrix.Operations, local.unsupportedOps(ctx)...)
 
 	if local.Cleanup {
@@ -782,6 +783,58 @@ func (r *Runner) taggingOps(ctx context.Context) []OpResult {
 	}
 }
 
+// lifecycleOps exercises the bucket lifecycle sub-resource (WS8.2):
+// PUT a configuration, GET it back and assert the rule round-trips,
+// then DELETE it. The gateway wires a BucketConfig store, so all
+// three are expected to succeed.
+func (r *Runner) lifecycleOps(ctx context.Context) []OpResult {
+	return []OpResult{
+		r.run("lifecycle", "PutBucketLifecycleConfiguration", func(ctx context.Context) (string, OpStatus, error) {
+			_, err := r.Client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+				Bucket: aws.String(r.Bucket),
+				LifecycleConfiguration: &s3types.BucketLifecycleConfiguration{
+					Rules: []s3types.LifecycleRule{{
+						ID:     aws.String("expire-30d"),
+						Status: s3types.ExpirationStatusEnabled,
+						Filter: &s3types.LifecycleRuleFilter{Prefix: aws.String("ephemeral/")},
+						Expiration: &s3types.LifecycleExpiration{
+							Days: aws.Int32(30),
+						},
+					}},
+				},
+			})
+			if err != nil {
+				return "", OpFailed, err
+			}
+			return "lifecycle configuration applied", OpPassed, nil
+		})(ctx),
+		r.run("lifecycle", "GetBucketLifecycleConfiguration", func(ctx context.Context) (string, OpStatus, error) {
+			out, err := r.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{
+				Bucket: aws.String(r.Bucket),
+			})
+			if err != nil {
+				return "", OpFailed, err
+			}
+			if len(out.Rules) != 1 || aws.ToString(out.Rules[0].ID) != "expire-30d" {
+				return fmt.Sprintf("unexpected rule set: %d rules", len(out.Rules)), OpFailed, nil
+			}
+			if exp := out.Rules[0].Expiration; exp == nil || aws.ToInt32(exp.Days) != 30 {
+				return "expiration days did not round-trip", OpFailed, nil
+			}
+			return "returned 1 rule (expire-30d, 30d)", OpPassed, nil
+		})(ctx),
+		r.run("lifecycle", "DeleteBucketLifecycle", func(ctx context.Context) (string, OpStatus, error) {
+			_, err := r.Client.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{
+				Bucket: aws.String(r.Bucket),
+			})
+			if err != nil {
+				return "", OpFailed, err
+			}
+			return "lifecycle configuration cleared", OpPassed, nil
+		})(ctx),
+	}
+}
+
 // unsupportedOps drives the operations the gateway is intentionally
 // not implementing yet. Each one is expected to produce a 4xx. If
 // the gateway accidentally returns 200, the matrix records it as a
@@ -815,28 +868,6 @@ func (r *Runner) unsupportedOps(ctx context.Context) []OpResult {
 			_, err := r.Client.PutObjectAcl(ctx, &s3.PutObjectAclInput{
 				Bucket: aws.String(r.Bucket), Key: aws.String(key),
 				ACL: s3types.ObjectCannedACLPrivate,
-			})
-			return err
-		}},
-		{"lifecycle", "PutBucketLifecycleConfiguration", func(ctx context.Context) error {
-			_, err := r.Client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
-				Bucket: aws.String(r.Bucket),
-				LifecycleConfiguration: &s3types.BucketLifecycleConfiguration{
-					Rules: []s3types.LifecycleRule{{
-						ID:     aws.String("expire-30d"),
-						Status: s3types.ExpirationStatusEnabled,
-						Filter: &s3types.LifecycleRuleFilter{Prefix: aws.String("ephemeral/")},
-						Expiration: &s3types.LifecycleExpiration{
-							Days: aws.Int32(30),
-						},
-					}},
-				},
-			})
-			return err
-		}},
-		{"lifecycle", "GetBucketLifecycleConfiguration", func(ctx context.Context) error {
-			_, err := r.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{
-				Bucket: aws.String(r.Bucket),
 			})
 			return err
 		}},

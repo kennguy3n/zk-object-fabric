@@ -480,6 +480,7 @@ func (h *Handler) writeCopyManifest(
 			Generation:     1,
 			PrimaryBackend: backend,
 		},
+		CreatedAt: h.cfg.Now(),
 	}
 	rollbackCopyPiece := func() {
 		// Best-effort rollback for non-dedup copy: drop the

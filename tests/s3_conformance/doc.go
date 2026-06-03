@@ -1,9 +1,9 @@
 // Package s3_conformance is the WS1.5 S3 conformance harness.
 //
 // It exercises the full S3 API surface (core ops, listing, range,
-// multipart, copy, versioning, plus the operations that are
-// deliberately unsupported today — ACL, tagging, lifecycle, bucket
-// versioning toggle, multi-object delete) against an S3 endpoint and
+// multipart, copy, versioning, tagging, lifecycle, plus the
+// operations that are deliberately unsupported today — ACL,
+// multi-object delete) against an S3 endpoint and
 // produces a structured Matrix describing the outcome of every
 // operation, including which ones are unsupported and what response
 // the server returned in the unsupported case.

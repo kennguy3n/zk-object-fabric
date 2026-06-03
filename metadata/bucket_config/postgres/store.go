@@ -15,24 +15,28 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
+	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
 // Config is the store wiring. Table defaults to "bucket_versioning",
-// LockTable to "bucket_object_lock", and CorsTable to "bucket_cors".
+// LockTable to "bucket_object_lock", CorsTable to "bucket_cors", and
+// LifecycleTable to "bucket_lifecycle".
 type Config struct {
-	DB        *sql.DB
-	Table     string
-	LockTable string
-	CorsTable string
+	DB             *sql.DB
+	Table          string
+	LockTable      string
+	CorsTable      string
+	LifecycleTable string
 }
 
 // Store is a bucket_config.Store backed by Postgres tables.
 type Store struct {
-	db        *sql.DB
-	table     string
-	lockTable string
-	corsTable string
+	db             *sql.DB
+	table          string
+	lockTable      string
+	corsTable      string
+	lifecycleTable string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
@@ -64,7 +68,14 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(corsTable) {
 		return nil, fmt.Errorf("postgres: invalid cors table name %q", corsTable)
 	}
-	return &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable}, nil
+	lifecycleTable := cfg.LifecycleTable
+	if lifecycleTable == "" {
+		lifecycleTable = "bucket_lifecycle"
+	}
+	if !isSafeIdent(lifecycleTable) {
+		return nil, fmt.Errorf("postgres: invalid lifecycle table name %q", lifecycleTable)
+	}
+	return &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable, lifecycleTable: lifecycleTable}, nil
 }
 
 // GetVersioning returns the state for (tenantID, bucket) or
@@ -210,6 +221,94 @@ func (s *Store) DeleteCORS(ctx context.Context, tenantID, bucket string) error {
 		return fmt.Errorf("postgres: bucket_cors delete: %w", err)
 	}
 	return nil
+}
+
+// GetLifecycle returns the lifecycle config for (tenantID, bucket) or
+// the zero Config when no row exists.
+func (s *Store) GetLifecycle(ctx context.Context, tenantID, bucket string) (lifecycle.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return lifecycle.Config{}, errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT rules FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.lifecycleTable)
+	var raw []byte
+	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return lifecycle.Config{}, nil
+	case err != nil:
+		return lifecycle.Config{}, fmt.Errorf("postgres: bucket_lifecycle get: %w", err)
+	}
+	var cfg lifecycle.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return lifecycle.Config{}, fmt.Errorf("postgres: bucket_lifecycle decode: %w", err)
+	}
+	return cfg, nil
+}
+
+// SetLifecycle upserts the lifecycle config for (tenantID, bucket).
+func (s *Store) SetLifecycle(ctx context.Context, tenantID, bucket string, cfg lifecycle.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("postgres: bucket_lifecycle encode: %w", err)
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, rules, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET rules = EXCLUDED.rules, updated_at = now()
+	`, s.lifecycleTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+		return fmt.Errorf("postgres: bucket_lifecycle set: %w", err)
+	}
+	return nil
+}
+
+// DeleteLifecycle removes the lifecycle config for (tenantID, bucket).
+// Deleting an unconfigured bucket is a no-op, matching S3's idempotent
+// DeleteBucketLifecycle.
+func (s *Store) DeleteLifecycle(ctx context.Context, tenantID, bucket string) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.lifecycleTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket); err != nil {
+		return fmt.Errorf("postgres: bucket_lifecycle delete: %w", err)
+	}
+	return nil
+}
+
+// ListLifecycle returns every configured bucket lifecycle entry across
+// all tenants, for the background evaluator. The rows are scanned in
+// (tenant_id, bucket) order so a pass is deterministic.
+func (s *Store) ListLifecycle(ctx context.Context) ([]bucket_config.LifecycleEntry, error) {
+	q := fmt.Sprintf(`SELECT tenant_id, bucket, rules FROM %s ORDER BY tenant_id, bucket`, s.lifecycleTable)
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: bucket_lifecycle list: %w", err)
+	}
+	defer rows.Close()
+	var out []bucket_config.LifecycleEntry
+	for rows.Next() {
+		var tenantID, bucket string
+		var raw []byte
+		if err := rows.Scan(&tenantID, &bucket, &raw); err != nil {
+			return nil, fmt.Errorf("postgres: bucket_lifecycle list scan: %w", err)
+		}
+		var cfg lifecycle.Config
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return nil, fmt.Errorf("postgres: bucket_lifecycle list decode: %w", err)
+		}
+		out = append(out, bucket_config.LifecycleEntry{TenantID: tenantID, Bucket: bucket, Config: cfg})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: bucket_lifecycle list rows: %w", err)
+	}
+	return out, nil
 }
 
 // isSafeIdent guards the table name we interpolate into SQL (the

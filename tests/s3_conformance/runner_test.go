@@ -149,6 +149,9 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 		"PutBucketVersioning",
 		"GetBucketVersioning",
 		"DeleteMarker",
+		"PutBucketLifecycleConfiguration",
+		"GetBucketLifecycleConfiguration",
+		"DeleteBucketLifecycle",
 	}
 	byOp := indexByOp(matrix.Operations)
 	for _, op := range mustPass {
@@ -170,8 +173,6 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 	mustBeUnsupported := []string{
 		"GetObjectAcl",
 		"PutObjectAcl",
-		"PutBucketLifecycleConfiguration",
-		"GetBucketLifecycleConfiguration",
 		"DeleteObjects",
 	}
 	for _, op := range mustBeUnsupported {

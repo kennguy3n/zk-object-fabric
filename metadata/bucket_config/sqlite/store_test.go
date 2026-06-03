@@ -8,6 +8,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/embeddeddb"
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
+	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
@@ -158,5 +159,98 @@ func TestSQLite_CORSRejectsInvalid(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.SetCORS(context.Background(), "t1", "b1", cors.Config{}); err == nil {
 		t.Fatal("SetCORS(empty config): want error")
+	}
+}
+
+func TestSQLite_LifecycleRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if got, err := s.GetLifecycle(ctx, "t1", "b1"); err != nil || !got.Empty() {
+		t.Fatalf("unconfigured get = (%+v, %v), want (empty, nil)", got, err)
+	}
+
+	gt := int64(1024)
+	cfg := lifecycle.Config{Rules: []lifecycle.Rule{
+		{
+			ID:     "expire-logs",
+			Status: lifecycle.StatusEnabled,
+			Filter: lifecycle.Filter{
+				Prefix:                "logs/",
+				Tags:                  map[string]string{"team": "infra"},
+				ObjectSizeGreaterThan: &gt,
+			},
+			Expiration:  &lifecycle.Expiration{Days: 90},
+			Transitions: []lifecycle.Transition{{Days: 30, StorageClass: "GLACIER"}},
+		},
+		{
+			// AbortIncompleteMultipartUpload cannot be combined with a
+			// tag filter, so it lives on its own prefix-only rule.
+			ID:                             "abort-mpu",
+			Status:                         lifecycle.StatusEnabled,
+			Filter:                         lifecycle.Filter{Prefix: "tmp/"},
+			AbortIncompleteMultipartUpload: &lifecycle.AbortIncompleteMultipartUpload{DaysAfterInitiation: 7},
+		},
+	}}
+	if err := s.SetLifecycle(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetLifecycle: %v", err)
+	}
+	got, _ := s.GetLifecycle(ctx, "t1", "b1")
+	if len(got.Rules) != 2 {
+		t.Fatalf("rules = %d, want 2", len(got.Rules))
+	}
+	r0 := got.Rules[0]
+	if r0.ID != "expire-logs" || r0.Expiration == nil || r0.Expiration.Days != 90 ||
+		r0.Filter.Prefix != "logs/" || r0.Filter.ObjectSizeGreaterThan == nil ||
+		*r0.Filter.ObjectSizeGreaterThan != 1024 || len(r0.Transitions) != 1 ||
+		r0.Filter.Tags["team"] != "infra" {
+		t.Fatalf("rule 0 round-trip mismatch: %+v", r0)
+	}
+	if got.Rules[1].AbortIncompleteMultipartUpload == nil ||
+		got.Rules[1].AbortIncompleteMultipartUpload.DaysAfterInitiation != 7 {
+		t.Fatalf("rule 1 abort round-trip mismatch: %+v", got.Rules[1])
+	}
+
+	// ListLifecycle enumerates across tenants/buckets.
+	if err := s.SetLifecycle(ctx, "t2", "bx", cfg); err != nil {
+		t.Fatalf("SetLifecycle t2: %v", err)
+	}
+	entries, err := s.ListLifecycle(ctx)
+	if err != nil {
+		t.Fatalf("ListLifecycle: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("ListLifecycle len = %d, want 2", len(entries))
+	}
+
+	// Upsert replaces the rule set.
+	if err := s.SetLifecycle(ctx, "t1", "b1", lifecycle.Config{Rules: []lifecycle.Rule{{
+		Status:     lifecycle.StatusEnabled,
+		Expiration: &lifecycle.Expiration{Days: 1},
+	}}}); err != nil {
+		t.Fatalf("SetLifecycle(upsert): %v", err)
+	}
+	if got, _ := s.GetLifecycle(ctx, "t1", "b1"); len(got.Rules) != 1 || got.Rules[0].Expiration.Days != 1 {
+		t.Fatalf("upsert result = %+v", got)
+	}
+
+	// Delete then idempotent re-delete.
+	if err := s.DeleteLifecycle(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteLifecycle: %v", err)
+	}
+	if got, _ := s.GetLifecycle(ctx, "t1", "b1"); !got.Empty() {
+		t.Fatalf("after delete = %+v, want empty", got)
+	}
+	if err := s.DeleteLifecycle(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteLifecycle (no-op): %v", err)
+	}
+}
+
+func TestSQLite_LifecycleRejectsInvalid(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	if err := s.SetLifecycle(context.Background(), "t1", "b1", lifecycle.Config{}); err == nil {
+		t.Fatal("SetLifecycle(empty config): want error")
 	}
 }
