@@ -611,10 +611,16 @@ independent PR; check the box when the handler is wired and covered by
 
 **WS8 — Richer S3 API Support**
 
-- [ ] WS8.1 Object tagging (`?tagging`) — `tagging_handler.go`, JSONB
-      tags on the manifest row.
-- [ ] WS8.2 Object lifecycle (`?lifecycle`) — `metadata/lifecycle/`,
-      `bucket_lifecycle` table, daily evaluator, console editor.
+- [x] WS8.1 Object tagging (`?tagging`) — `tagging_handler.go`, JSONB
+      tags on the manifest row (≤ 10 tags/object, 128/256-char limits).
+      Covered by handler + `tests/s3_compat/` tagging tests.
+- [x] WS8.2 Object lifecycle (`?lifecycle`) — `metadata/lifecycle/`
+      domain + `bucket_lifecycle` config in `metadata/bucket_config`
+      (memory + Postgres + SQLite), the `api/s3compat/lifecycle_handler.go`
+      endpoints, and the top-level `lifecycle/evaluator/` daily sweep
+      (expire / delete-marker / abort) wired into `cmd/gateway/main.go`
+      with audit + billing hooks. Covered by domain, handler, and
+      evaluator unit tests.
 - [x] WS8.3 Object Lock / WORM (`?object-lock`, `?retention`,
       `?legal-hold`) — `metadata/object_lock/` domain types,
       `bucket_object_lock` config in `metadata/bucket_config`
@@ -640,8 +646,18 @@ independent PR; check the box when the handler is wired and covered by
       `internal/notifications/` webhook dispatcher + DLQ.
 - [ ] WS8.7 Server-side encryption config (`?encryption`) — SSE header
       → ZKOF encryption modes.
-- [ ] WS8.8 Docs — PROPOSAL §3.2.2 + §15.1, ARCHITECTURE.md packages,
-      S3_COMPATIBILITY.md matrix. *(this slice)*
+- [x] WS8.8 Docs — PROPOSAL §3.2.2 + §15.1, ARCHITECTURE.md packages,
+      S3_COMPATIBILITY.md matrix updated to reflect the shipped slices
+      (8.1–8.5) and the remaining planned ones (8.6–8.7).
+
+Production wiring (landed alongside the slices): `cmd/gateway/main.go`
+builds the `bucket_config` store and starts the `lifecycle/evaluator`
+ticker so all WS8 sub-resource handlers go live (#101); NodeID
+resolution is unified on `os.Hostname()` so billing/audit
+`SourceNodeID` is per-node (#103); and the embedded single-node
+profile persists the compliance audit trail to local SQLite (#104).
+Remaining future feature slices: WS8.6 (event notifications) and
+WS8.7 (SSE config sub-resource).
 
 **WS9 — Rust client-side encryption SDK**
 

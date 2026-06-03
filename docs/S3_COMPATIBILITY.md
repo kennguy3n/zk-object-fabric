@@ -44,7 +44,7 @@ deployment probe. The authoritative reject list is
 | `ListObjectsV2`                                | Supported       | Served from metadata store                                  |
 | `ListObjectVersions`                           | Supported       | Returns manifest versions                                   |
 | `Put/GetBucketVersioning`                      | Supported       | Bucket-level Enabled/Suspended config; delete markers       |
-| `Put/Get/DeleteBucketLifecycleConfiguration`   | Planned (WS8.2) | Per-bucket rules + daily evaluator                          |
+| `Put/Get/DeleteBucketLifecycleConfiguration`   | Supported       | Per-bucket rules + daily evaluator wired into the gateway   |
 | `Put/GetObjectLockConfiguration`               | Supported       | Default retention rule; requires versioning (WS8.4)         |
 | `Put/Get/DeleteBucketCors`                     | Supported       | Per-bucket rules + preflight (OPTIONS) and response headers  |
 | `Put/GetBucketNotificationConfiguration`       | Planned (WS8.6) | Webhook transport; `ObjectCreated`/`ObjectRemoved`          |
