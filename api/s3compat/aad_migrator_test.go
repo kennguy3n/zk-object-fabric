@@ -19,9 +19,11 @@ package s3compat
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 
@@ -342,6 +344,47 @@ func TestAADMigrator_DisabledRunReturns(t *testing.T) {
 	// so wiring it in without an interval is safe.
 	if err := mig.Run(context.Background()); err != nil {
 		t.Fatalf("disabled Run returned error: %v", err)
+	}
+}
+
+func TestAADMigrator_RunSweepsImmediately(t *testing.T) {
+	h, fake, store := newMigratorHandler(t)
+	eligibleKey := putLegacyObject(t, h, fake, store, "tenant-a", "bucket-a", "eligible", "v-1", []byte("migrate me"))
+
+	// A long interval guarantees the ticker never fires during the
+	// test: if the object is upgraded, it can only be from the
+	// immediate first sweep that Run performs before entering the
+	// ticker loop.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	mig, err := NewAADMigrator(h, AADMigratorConfig{Interval: time.Hour, Logger: nopLogger{}})
+	if err != nil {
+		t.Fatalf("NewAADMigrator: %v", err)
+	}
+	go func() { runErr <- mig.Run(ctx) }()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		man, err := store.Get(ctx, eligibleKey)
+		if err == nil && man.Encryption.AADVersion == AADVersionV1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("object was not migrated by the immediate first sweep within 2s")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancellation")
 	}
 }
 

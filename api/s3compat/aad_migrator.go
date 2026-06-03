@@ -139,11 +139,12 @@ const (
 	outcomeTooBig
 )
 
-// Run executes a sweep every cfg.Interval until ctx is cancelled. It
-// is a no-op (returns nil immediately) when Interval <= 0 so wiring
-// the worker in without configuring an interval is safe. Each sweep's
-// stats are logged; sweep errors are logged and the loop continues so
-// a transient store failure does not stop future passes.
+// Run sweeps once immediately and then every cfg.Interval until ctx
+// is cancelled. It is a no-op (returns nil immediately) when
+// Interval <= 0 so wiring the worker in without configuring an
+// interval is safe. Each sweep's stats are logged; sweep errors are
+// logged and the loop continues so a transient store failure does not
+// stop future passes.
 func (m *AADMigrator) Run(ctx context.Context) error {
 	if m.cfg.Interval <= 0 {
 		m.cfg.Logger.Printf("aad_migrator: disabled (interval <= 0)")
@@ -151,19 +152,28 @@ func (m *AADMigrator) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(m.cfg.Interval)
 	defer ticker.Stop()
+	// Run one sweep immediately so enabling the worker makes progress
+	// right away instead of sitting idle for a full interval (which is
+	// typically hours). A fleet upgrade should start converging as
+	// soon as an operator opts in; subsequent sweeps fire on the
+	// ticker. The sweep itself is rate-limited per object via
+	// PerObjectDelay, so an immediate start does not stampede backends.
 	for {
+		stats, err := m.Sweep(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
+			m.cfg.Logger.Printf("aad_migrator: sweep error: %v", err)
+		} else {
+			m.cfg.Logger.Printf("aad_migrator: sweep done: scanned=%d migrated=%d skipped(notmine=%d already=%d dedup=%d multi=%d toobig=%d) errors=%d",
+				stats.Scanned, stats.Migrated, stats.SkippedNotMine, stats.SkippedAlready,
+				stats.SkippedDedup, stats.SkippedMulti, stats.SkippedTooBig, stats.Errors)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			stats, err := m.Sweep(ctx)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				m.cfg.Logger.Printf("aad_migrator: sweep error: %v", err)
-				continue
-			}
-			m.cfg.Logger.Printf("aad_migrator: sweep done: scanned=%d migrated=%d skipped(notmine=%d already=%d dedup=%d multi=%d toobig=%d) errors=%d",
-				stats.Scanned, stats.Migrated, stats.SkippedNotMine, stats.SkippedAlready,
-				stats.SkippedDedup, stats.SkippedMulti, stats.SkippedTooBig, stats.Errors)
 		}
 	}
 }
@@ -380,8 +390,21 @@ func (m *AADMigrator) migrateOne(ctx context.Context, key manifest_store.Manifes
 }
 
 // cloneForMigrate makes a defensive copy of the manifest before the
-// worker mutates Pieces and Encryption, so the caller's value (and any
-// store that handed back a shared pointer) is never aliased.
+// worker mutates it. migrateOne mutates exactly two things on the
+// returned copy:
+//
+//   - Pieces[0], so Pieces is copied into a fresh backing array here
+//     (the shallow struct copy would otherwise share it with m); and
+//   - Encryption, which is a value type reassigned wholesale (not
+//     mutated field-by-field), so the assignment never reaches back
+//     into m's slices.
+//
+// Every other field is left untouched and is therefore safe to share.
+// This is deliberately narrower than the store's full cloneManifest:
+// IMPORTANT — if future migration logic starts mutating any other
+// field that has slice/map/pointer contents (e.g.
+// PlacementPolicy.Residency), extend this clone (or switch to a deep
+// clone) so the original manifest's backing arrays are not aliased.
 func cloneForMigrate(m *metadata.ObjectManifest) *metadata.ObjectManifest {
 	cp := *m
 	cp.Pieces = append([]metadata.Piece(nil), m.Pieces...)
