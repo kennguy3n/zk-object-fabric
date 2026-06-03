@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/kennguy3n/zk-object-fabric/billing"
 )
 
 // putTestObject writes a one-piece object through the Put handler so
@@ -97,6 +99,50 @@ func TestObjectTagging_RoundTripViaDispatch(t *testing.T) {
 	// element can parse the response.
 	if !strings.Contains(rec.Body.String(), "<TagSet>") {
 		t.Fatalf("empty tagging response missing <TagSet> wrapper; body=%s", rec.Body)
+	}
+}
+
+// TestObjectTagging_EmitsBillingEvents asserts the three tagging
+// handlers each meter exactly one TaggingRequests event on success,
+// and that they do NOT inflate the object-I/O request dimensions
+// (Put/Get/DeleteRequests) — tagging is metered on its own dimension.
+func TestObjectTagging_EmitsBillingEvents(t *testing.T) {
+	h, _, bill, _ := newTestHandler()
+	putTestObject(t, h, "/bucket/obj") // seeds 1 PutRequests
+
+	do := func(method, target string, body string) {
+		t.Helper()
+		var rdr *strings.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		} else {
+			rdr = strings.NewReader("")
+		}
+		req := httptest.NewRequest(method, target, rdr)
+		rec := httptest.NewRecorder()
+		h.dispatch(rec, req)
+		if rec.Code >= 400 {
+			t.Fatalf("%s %s = %d; body=%s", method, target, rec.Code, rec.Body)
+		}
+	}
+
+	do(http.MethodPut, "/bucket/obj?tagging", putTaggingXML([2]string{"env", "prod"}))
+	do(http.MethodGet, "/bucket/obj?tagging", "")
+	do(http.MethodDelete, "/bucket/obj?tagging", "")
+
+	if got := bill.count(billing.TaggingRequests); got != 3 {
+		t.Fatalf("TaggingRequests = %d, want 3 (put+get+delete)", got)
+	}
+	// Tagging must not be billed as object I/O. Only the seed PUT
+	// counts as a PutRequests; tagging adds no Put/Get/DeleteRequests.
+	if got := bill.count(billing.PutRequests); got != 1 {
+		t.Fatalf("PutRequests = %d, want 1 (seed only)", got)
+	}
+	if got := bill.count(billing.GetRequests); got != 0 {
+		t.Fatalf("GetRequests = %d, want 0", got)
+	}
+	if got := bill.count(billing.DeleteRequests); got != 0 {
+		t.Fatalf("DeleteRequests = %d, want 0", got)
 	}
 }
 

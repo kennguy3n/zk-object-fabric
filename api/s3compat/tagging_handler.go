@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"sort"
 
+	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 )
 
@@ -119,6 +120,7 @@ func (h *Handler) PutObjectTagging(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ManifestPutFailed", err.Error(), r.URL.Path)
 		return
 	}
+	h.emit(tenantID, bucket, billing.TaggingRequests, 1)
 	if manifest.VersionID != "" {
 		w.Header().Set("x-amz-version-id", manifest.VersionID)
 	}
@@ -144,6 +146,7 @@ func (h *Handler) GetObjectTagging(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.emit(tenantID, bucket, billing.TaggingRequests, 1)
 	doc := taggingDocument{XMLNS: s3TaggingNamespace, TagSet: tagSet{Tags: tagsToEntries(manifest.Tags)}}
 	if manifest.VersionID != "" {
 		w.Header().Set("x-amz-version-id", manifest.VersionID)
@@ -184,6 +187,7 @@ func (h *Handler) DeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	h.emit(tenantID, bucket, billing.TaggingRequests, 1)
 	if manifest.VersionID != "" {
 		w.Header().Set("x-amz-version-id", manifest.VersionID)
 	}
