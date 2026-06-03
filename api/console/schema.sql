@@ -63,6 +63,41 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant ON refresh_tokens(tenant_id
 -- stops being used would linger until this sweep removes it.
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
 
+-- mfa_credentials persists a tenant's TOTP multi-factor enrollment.
+-- secret is the base32 shared secret (the symmetric key TOTP needs to
+-- verify a code, so it cannot be hashed at rest the way a password is).
+-- Because it cannot be hashed, the gateway seals it under its at-rest
+-- key before storage (console.SecretSealer): the column holds an
+-- "enc:v1:"-prefixed XChaCha20-Poly1305 blob, not the raw seed, so a
+-- database dump does not hand an attacker every tenant's second factor.
+-- (Rows written before sealing was enabled remain readable — Open
+-- passes through any value lacking the prefix.)
+-- active is FALSE for a pending enrollment (secret minted, first code
+-- not yet confirmed) and TRUE once the user has proven they can generate
+-- a code. last_step is the most recent TOTP time step consumed by a
+-- successful login: it is the replay watermark, advanced only forward by
+-- PostgresMFAStore.MarkTOTPStep so a code cannot be reused within its
+-- still-valid window.
+CREATE TABLE IF NOT EXISTS mfa_credentials (
+    tenant_id TEXT    PRIMARY KEY,
+    secret    TEXT    NOT NULL,
+    active    BOOLEAN NOT NULL DEFAULT FALSE,
+    last_step BIGINT  NOT NULL DEFAULT 0
+);
+
+-- mfa_recovery_codes holds the single-use recovery codes minted at
+-- activation, stored only as SHA-256 hex hashes (code_hash) so a
+-- database dump exposes no usable codes. Each consume DELETEs one row;
+-- disabling MFA deletes every row for the tenant. The composite primary
+-- key (tenant_id, code_hash) already provides a tenant_id-leading B-tree,
+-- so the tenant-only lookups (the DELETE in Disable, the COUNT in GetMFA)
+-- ride its leftmost prefix — no separate tenant_id index is needed.
+CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+    tenant_id TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, code_hash)
+);
+
 -- dedicated_cells persists the operator-allocated cells the B2B /
 -- sovereign console surface lists for tenants whose contract type
 -- is b2b_dedicated or sovereign. Provisioning requests insert a
