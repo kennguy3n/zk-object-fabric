@@ -77,7 +77,7 @@ func putLegacyObject(t *testing.T, h *Handler, fake *fakeProvider, store manifes
 	t.Helper()
 	ciphertext, legacyEnc := sealLegacy(t, h, plaintext)
 	pieceID := "legacy-piece-" + key + "-" + version
-	fake.pieces[pieceID] = ciphertext
+	fake.setPiece(pieceID, ciphertext)
 
 	hash := hashObjectKey(key)
 	mkey := manifest_store.ManifestKey{TenantID: tenant, Bucket: bucket, ObjectKeyHash: hash, VersionID: version}
@@ -144,13 +144,13 @@ func TestAADMigrator_MigratesLegacySinglePiece(t *testing.T) {
 	}
 
 	// Old piece reclaimed.
-	if _, ok := fake.pieces[oldPieceID]; ok {
+	if _, ok := fake.pieceBytes(oldPieceID); ok {
 		t.Fatalf("old piece %s was not deleted after migration", oldPieceID)
 	}
 
 	// The new ciphertext must open under the object's own identity
 	// (the GET path) and fail under any other — proving the v1 bind.
-	newCT := fake.pieces[got.Pieces[0].PieceID]
+	newCT, _ := fake.pieceBytes(got.Pieces[0].PieceID)
 	if len(newCT) == 0 {
 		t.Fatalf("new piece %s missing on backend", got.Pieces[0].PieceID)
 	}
@@ -288,7 +288,7 @@ func TestAADMigrator_SkipsIneligibleEndToEnd(t *testing.T) {
 
 	// Convergent (dedup): legacy seal but ContentHash set.
 	dedupCT, dedupEnc := sealLegacy(t, h, []byte("dedup payload"))
-	fake.pieces["dedup-piece"] = dedupCT
+	fake.setPiece("dedup-piece", dedupCT)
 	dedupKey := manifest_store.ManifestKey{TenantID: "tenant-a", Bucket: "bucket-a", ObjectKeyHash: hashObjectKey("dedup"), VersionID: "v-1"}
 	if err := store.Put(ctx, dedupKey, &metadata.ObjectManifest{
 		TenantID: "tenant-a", Bucket: "bucket-a", ObjectKey: "dedup", ObjectKeyHash: dedupKey.ObjectKeyHash, VersionID: "v-1",
@@ -301,8 +301,8 @@ func TestAADMigrator_SkipsIneligibleEndToEnd(t *testing.T) {
 
 	// Multi-piece. Seed dummy bytes so the post-sweep presence check
 	// is meaningful (the worker must never read or delete them).
-	fake.pieces["m1"] = []byte("shard-1")
-	fake.pieces["m2"] = []byte("shard-2")
+	fake.setPiece("m1", []byte("shard-1"))
+	fake.setPiece("m2", []byte("shard-2"))
 	multiKey := manifest_store.ManifestKey{TenantID: "tenant-a", Bucket: "bucket-a", ObjectKeyHash: hashObjectKey("multi"), VersionID: "v-1"}
 	if err := store.Put(ctx, multiKey, &metadata.ObjectManifest{
 		TenantID: "tenant-a", Bucket: "bucket-a", ObjectKey: "multi", ObjectKeyHash: multiKey.ObjectKeyHash, VersionID: "v-1",
@@ -322,10 +322,10 @@ func TestAADMigrator_SkipsIneligibleEndToEnd(t *testing.T) {
 	}
 
 	// Dedup and multi pieces untouched.
-	if _, ok := fake.pieces["dedup-piece"]; !ok {
+	if _, ok := fake.pieceBytes("dedup-piece"); !ok {
 		t.Fatal("dedup piece was deleted; convergent objects must be left alone")
 	}
-	if _, ok := fake.pieces["m1"]; !ok {
+	if _, ok := fake.pieceBytes("m1"); !ok {
 		t.Fatal("multi-piece m1 was deleted; multi-piece objects must be left alone")
 	}
 	dedupAfter, _ := store.Get(ctx, dedupKey)

@@ -123,8 +123,19 @@ type scanCursor struct {
 // token ScanManifests returns. The four key fields are arbitrary
 // byte-strings (object keys and hashes can contain any character), so
 // a delimiter-joined form would be ambiguous; JSON + base64 sidesteps
-// escaping entirely and keeps the token URL-safe. All stores (memory,
-// Postgres, SQLite) use this codec so a cursor is portable across them.
+// escaping entirely and keeps the token URL-safe.
+//
+// All stores (memory, Postgres, SQLite) share this codec, so the
+// cursor's *encoding* is identical everywhere. Resuming a cursor on a
+// different store than it was minted on additionally requires the two
+// stores to agree on the keyset *ordering*: memory uses Go string
+// comparison, Postgres uses its column collation, SQLite uses BINARY.
+// Those agree for the byte values these key fields actually hold —
+// ObjectKeyHash and VersionID are hex SHA-256, TenantID/Bucket are
+// system-issued ASCII — so the cursor is portable in practice. A field
+// carrying non-ASCII bytes could order differently across stores; none
+// does today, and the keyset would have to be byte-ordered uniformly
+// before that changed.
 func EncodeScanCursor(key ManifestKey) string {
 	b, _ := json.Marshal(scanCursor{
 		TenantID:      key.TenantID,
