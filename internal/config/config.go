@@ -438,6 +438,23 @@ type ConsoleConfig struct {
 	// operators who want a pure stateless-JWT deployment with no
 	// server-side session state to persist or reap.
 	DisableRefreshTokens bool `json:"disable_refresh_tokens"`
+
+	// DisableMFA opts the deployment out of TOTP multi-factor auth
+	// entirely. When true the gateway wires no MFAStore, so the
+	// /api/v1/auth/mfa/* endpoints reply 503 and login enforces no
+	// second factor. Defaults to false (MFA available): the store is
+	// wired but only enforces for tenants who have actively enrolled,
+	// so leaving it on is safe — it is an additive, opt-in-per-tenant
+	// security feature, never a barrier for users who have not set it
+	// up. The store follows the same backend selection as the
+	// AuthStore (embedded SQLite under the embedded profile, Postgres
+	// when a metadata DSN is configured, in-memory otherwise).
+	DisableMFA bool `json:"disable_mfa"`
+
+	// MFAIssuer is the human-facing service name shown in the user's
+	// authenticator app, embedded in the otpauth:// enrollment URI.
+	// Empty selects the console default (DefaultMFAIssuer).
+	MFAIssuer string `json:"mfa_issuer"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the

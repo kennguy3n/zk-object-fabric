@@ -217,6 +217,17 @@ func main() {
 	// sessions). Skipped when the console is disabled — see
 	// checkProductionRefreshTokenStore.
 	enforceProductionRefreshTokenStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.DisableRefreshTokens, metadataDB != nil || embeddedDB != nil)
+	// Production safety net for the MFA store, the sibling of the
+	// access-token and refresh-token guards above. buildMFAStore falls
+	// back to the process-local MemoryMFAStore when neither a metadata
+	// DSN (Postgres) nor the embedded SQLite profile is configured; that
+	// store loses every enrollment on restart and is not shared across
+	// replicas, so an enrolled user would stop being challenged for a
+	// second factor — a silent security downgrade. Refuse to boot in
+	// production unless a persistent backend is wired or the operator
+	// deliberately opted out via console.disable_mfa. Skipped when the
+	// console is disabled — see checkProductionMFAStore.
+	enforceProductionMFAStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.DisableMFA, metadataDB != nil || embeddedDB != nil)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -242,6 +253,11 @@ func main() {
 	// tier. Built here (rather than inside startConsoleAPI) so it sees
 	// both the metadata and embedded handles.
 	refreshStore := buildRefreshTokenStore(cfg, metadataDB, embeddedDB)
+	// The MFA store follows the same backend selection as the
+	// AuthStore and refresh store so the TOTP second factor is
+	// enforced uniformly across replicas. Built here for the same
+	// reason: it sees both the metadata and embedded handles.
+	mfaStore := buildMFAStore(cfg, metadataDB, embeddedDB)
 	// authHooks is built once and shared between the console API
 	// and the S3 handler's email-verification gate. When
 	// SendVerificationEmail is nil (no SES / transactional email
@@ -439,7 +455,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, mfaStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -839,6 +855,63 @@ func checkProductionRefreshTokenStore(env, consoleListenAddr string, disableRefr
 // the test binary.
 func enforceProductionRefreshTokenStore(env, consoleListenAddr string, disableRefresh, persistent bool) {
 	if err := checkProductionRefreshTokenStore(env, consoleListenAddr, disableRefresh, persistent); err != nil {
+		log.Fatalf("%s", err)
+	}
+}
+
+// errProductionMFAStoreRequired is returned by checkProductionMFAStore
+// when the gateway is started with env=production and the console
+// enabled but no persistent backend (Postgres DSN or embedded SQLite)
+// is configured, so buildMFAStore would fall back to the process-local
+// MemoryMFAStore. Exposed as a sentinel so cmd/gateway can log a
+// friendly message and main_test.go can errors.Is against it.
+var errProductionMFAStoreRequired = errors.New("gateway: env=production but no persistent MFA backend is configured (no control_plane.metadata_dsn and no embedded SQLite); the console would fall back to the in-memory MemoryMFAStore, whose enrollments are lost on restart and are not shared across replicas behind a load balancer. That silently downgrades security: a user who enrolled a second factor against one replica would not be challenged on another, and every enrollment vanishes on restart. Configure a metadata DSN or the embedded profile, set console.disable_mfa=true to run without a second factor, or use env=development")
+
+// checkProductionMFAStore refuses to start the gateway when
+// cfg.Env == "production", the console API is enabled, the operator has
+// not explicitly disabled MFA, and no persistent backend is configured
+// — i.e. buildMFAStore would select the process-local MemoryMFAStore.
+// An in-memory MFA store is a security downgrade in production, not just
+// an availability one: enrolled tenants are stored server-side, so a
+// store that silently loses them (restart) or is not shared across
+// replicas would stop challenging enrolled users for their second
+// factor, defeating the point of MFA.
+//
+// The guard is gated like its siblings:
+//   - consoleListenAddr == "" means the console is disabled and no MFA
+//     store is ever built, so there is nothing to be unsafe.
+//   - disableMFA is the deliberate operator opt-out (Console.DisableMFA),
+//     where buildMFAStore returns nil by design and the /auth/mfa/*
+//     endpoints reply 503 — an intentional configuration, not the
+//     accidental memory fallback this guard exists to catch.
+//   - persistent is metadataDB != nil || embeddedDB != nil, the same
+//     "a Postgres or SQLite store will be selected" signal the sibling
+//     guards use.
+//
+// Returns a sentinel error rather than calling log.Fatalf so tests can
+// exercise both branches in-process.
+func checkProductionMFAStore(env, consoleListenAddr string, disableMFA, persistent bool) error {
+	if env != "production" {
+		return nil
+	}
+	if consoleListenAddr == "" {
+		return nil
+	}
+	if disableMFA {
+		return nil
+	}
+	if persistent {
+		return nil
+	}
+	return errProductionMFAStoreRequired
+}
+
+// enforceProductionMFAStore wraps checkProductionMFAStore at the startup
+// callsite: a non-nil error is fatal. Tests should call
+// checkProductionMFAStore directly so they can errors.Is against the
+// sentinel without forking the test binary.
+func enforceProductionMFAStore(env, consoleListenAddr string, disableMFA, persistent bool) {
+	if err := checkProductionMFAStore(env, consoleListenAddr, disableMFA, persistent); err != nil {
 		log.Fatalf("%s", err)
 	}
 }
@@ -1432,6 +1505,36 @@ func buildManifestBodyEncryptor(cfg config.Config) manifest_store.BodyEncryptor 
 	return enc
 }
 
+// buildMFASecretSealer loads the optional console MFA secret sealer from
+// the same at-rest key as the manifest body encryptor
+// (cfg.Encryption.ManifestBodyKeyPath). It returns nil when no key is
+// configured (TOTP secret stored in the clear — the dev posture).
+//
+// Reusing the manifest-body key avoids a second key file for operators
+// and rides the existing enforceProductionManifestEncryption guard: that
+// guard already refuses to boot env=production with a persistent
+// control-plane store (the same db/embeddedDB handles buildMFAStore
+// selects a persistent backend from) unless this key is set, so a
+// persistent MFA store in production is always sealed. The sealer uses
+// an MFA-specific AAD namespace, so a manifest-body ciphertext and an
+// MFA-secret ciphertext are not interchangeable under the shared key.
+func buildMFASecretSealer(cfg config.Config) console.SecretSealer {
+	p := cfg.Encryption.ManifestBodyKeyPath
+	if p == "" {
+		return nil
+	}
+	key, rerr := os.ReadFile(p)
+	if rerr != nil {
+		log.Fatalf("gateway: read mfa secret key %q: %v", p, rerr)
+	}
+	sealer, eerr := console.NewAEADSecretSealer(key)
+	if eerr != nil {
+		log.Fatalf("gateway: build mfa secret sealer: %v", eerr)
+	}
+	log.Printf("gateway: mfa secret sealing enabled (key=%s)", p)
+	return sealer
+}
+
 // buildGatewayEncryption constructs the GatewayEncryption wiring
 // the S3 handler consumes for managed / public_distribution
 // tenant policies. The wrapper is selected from cfg.CMKURI:
@@ -1978,6 +2081,7 @@ func startConsoleAPI(
 	tenantStore auth.TenantStore,
 	authStore console.AuthStore,
 	refreshStore console.RefreshTokenStore,
+	mfaStore console.MFAStore,
 	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
 	billingProvider billing.BillingProvider,
@@ -2012,6 +2116,8 @@ func startConsoleAPI(
 		Auth:            authStore,
 		Tokens:          tokens,
 		RefreshTokens:   refreshStore,
+		MFA:             mfaStore,
+		MFAIssuer:       cfg.Console.MFAIssuer,
 		AuthHooks:       authHooks,
 		AdminAuth:       buildAdminAuth(cfg),
 		BillingSink:     billingSink,
@@ -2134,6 +2240,61 @@ func buildRefreshTokenStore(cfg config.Config, db, embeddedDB *sql.DB) console.R
 		return memoryFallback("build postgres refresh store", err)
 	}
 	log.Printf("gateway: postgres refresh-token store enabled")
+	return store
+}
+
+// buildMFAStore selects the console MFAStore using the same backend
+// precedence as buildAuthStore: Postgres when a metadata DSN is
+// configured, the embedded SQLite store under the embedded profile, and
+// the process-local in-memory store otherwise (dev / single-node).
+//
+// A Postgres / SQLite construction failure downgrades to the in-memory
+// store outside production (the fail-open-to-dev posture the auth store
+// uses, so a transient construction error degrades to single-node MFA
+// rather than crashing the gateway). In production, however, a
+// persistent backend was already demanded by enforceProductionMFAStore,
+// so a construction failure must be fatal rather than a silent downgrade
+// to a store that loses enrollments on restart and is not shared across
+// replicas — which would stop challenging enrolled users for their
+// second factor.
+//
+// Returns nil when the operator sets Console.DisableMFA, which the auth
+// handler reads as "MFA disabled": the /api/v1/auth/mfa/* endpoints reply
+// 503 and login enforces no second factor.
+func buildMFAStore(cfg config.Config, db, embeddedDB *sql.DB) console.MFAStore {
+	if cfg.Console.DisableMFA {
+		log.Printf("gateway: mfa disabled by config; login enforces no second factor")
+		return nil
+	}
+	memoryFallback := func(what string, err error) console.MFAStore {
+		if cfg.Env == "production" {
+			log.Fatalf("gateway: %s: %v; refusing to fall back to the in-memory MFA store under env=production (enrollments are lost on restart and not shared across replicas, so enrolled users would stop being challenged for a second factor). Fix the backend or set console.disable_mfa=true", what, err)
+		}
+		log.Printf("gateway: %s: %v; falling back to in-memory", what, err)
+		return console.NewMemoryMFAStore()
+	}
+	// Only the persistent backends seal the TOTP secret at rest under the
+	// gateway's at-rest key (see buildMFASecretSealer); the sealer is built
+	// inside those branches so the in-memory path — which never touches
+	// disk and needs no sealer — does not load the at-rest key.
+	if db == nil {
+		if embeddedDB != nil {
+			sealer := console.WithSecretSealer(buildMFASecretSealer(cfg))
+			store, err := console.NewSQLiteMFAStore(embeddedDB, sealer)
+			if err != nil {
+				return memoryFallback("build embedded mfa store", err)
+			}
+			log.Printf("gateway: embedded SQLite mfa store enabled")
+			return store
+		}
+		return console.NewMemoryMFAStore()
+	}
+	sealer := console.WithSecretSealer(buildMFASecretSealer(cfg))
+	store, err := console.NewPostgresMFAStore(db, sealer)
+	if err != nil {
+		return memoryFallback("build postgres mfa store", err)
+	}
+	log.Printf("gateway: postgres mfa store enabled")
 	return store
 }
 

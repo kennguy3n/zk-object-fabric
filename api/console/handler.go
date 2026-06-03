@@ -238,6 +238,16 @@ type Config struct {
 	// returning a refresh token and the refresh endpoint replies 503.
 	RefreshTokens RefreshTokenStore
 
+	// MFA persists TOTP multi-factor enrollments. When nil, the
+	// /api/v1/auth/mfa/* endpoints reply 503 and login enforces no
+	// second factor (single-factor deployment).
+	MFA MFAStore
+
+	// MFAIssuer is the service name shown in the user's authenticator
+	// app (embedded in the otpauth:// enrollment URI). Defaults to
+	// DefaultMFAIssuer when empty.
+	MFAIssuer string
+
 	// AuthHooks are the optional production integrations the
 	// signup flow needs (CAPTCHA, verification email). All hooks
 	// are no-ops by default.
@@ -339,6 +349,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 			Auth:            h.cfg.Auth,
 			Tokens:          tokens,
 			RefreshTokens:   h.cfg.RefreshTokens,
+			MFA:             h.cfg.MFA,
+			MFAIssuer:       h.cfg.MFAIssuer,
 			GenerateKey:     h.cfg.GenerateKey,
 			NewTenantID:     h.cfg.NewTenantID,
 			Hooks:           h.cfg.AuthHooks,

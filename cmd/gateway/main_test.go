@@ -818,6 +818,69 @@ func TestCheckProductionRefreshTokenStore_ProductionFails(t *testing.T) {
 	}
 }
 
+// TestCheckProductionMFAStore_NonProduction: outside production the MFA
+// guard must never fire, even with no persistent backend — dev and
+// single-node profiles legitimately use the in-memory MFA store.
+func TestCheckProductionMFAStore_NonProduction(t *testing.T) {
+	for _, env := range []string{"development", "", "staging"} {
+		if err := checkProductionMFAStore(env, ":9090", false, false); err != nil {
+			t.Errorf("checkProductionMFAStore(%q, \":9090\", false, false) = %v; want nil", env, err)
+		}
+	}
+}
+
+// TestCheckProductionMFAStore_ConsoleDisabled: the console API is opt-in
+// (empty ListenAddr). When it is disabled no MFA store is ever built, so
+// the guard must not fire even under env=production with no persistent
+// backend.
+func TestCheckProductionMFAStore_ConsoleDisabled(t *testing.T) {
+	if err := checkProductionMFAStore("production", "", false, false); err != nil {
+		t.Errorf("checkProductionMFAStore(production, \"\", false, false) = %v; want nil when console disabled", err)
+	}
+}
+
+// TestCheckProductionMFAStore_ProductionWithPersistent: in production
+// with a persistent backend (Postgres or embedded SQLite) the guard must
+// not fire — buildMFAStore wires a replica-safe store.
+func TestCheckProductionMFAStore_ProductionWithPersistent(t *testing.T) {
+	if err := checkProductionMFAStore("production", ":9090", false, true); err != nil {
+		t.Errorf("checkProductionMFAStore(production, addr, false, true) = %v; want nil", err)
+	}
+}
+
+// TestCheckProductionMFAStore_ProductionDisabled: in production with the
+// deliberate opt-out (console.disable_mfa) the guard must not fire even
+// with no persistent backend — buildMFAStore returns nil by design and
+// /auth/mfa/* 503s, which is an intentional no-second-factor
+// configuration rather than the accidental memory fallback the guard
+// exists to catch.
+func TestCheckProductionMFAStore_ProductionDisabled(t *testing.T) {
+	if err := checkProductionMFAStore("production", ":9090", true, false); err != nil {
+		t.Errorf("checkProductionMFAStore(production, addr, true, false) = %v; want nil when mfa disabled", err)
+	}
+}
+
+// TestCheckProductionMFAStore_ProductionFails verifies the error path:
+// production, console enabled, MFA not disabled, and no persistent
+// backend must return errProductionMFAStoreRequired so the startup
+// wrapper refuses to boot rather than silently falling back to the
+// process-local, non-replica-safe MemoryMFAStore.
+func TestCheckProductionMFAStore_ProductionFails(t *testing.T) {
+	err := checkProductionMFAStore("production", ":9090", false, false)
+	if err == nil {
+		t.Fatalf("checkProductionMFAStore(production, addr, false, false) = nil; want errProductionMFAStoreRequired")
+	}
+	if !errors.Is(err, errProductionMFAStoreRequired) {
+		t.Fatalf("checkProductionMFAStore returned %v; want errors.Is(_, errProductionMFAStoreRequired)", err)
+	}
+	if !strings.Contains(err.Error(), "disable_mfa") {
+		t.Errorf("error message = %q; want to mention 'disable_mfa' so the operator knows the opt-out knob", err.Error())
+	}
+	if !strings.Contains(err.Error(), "MemoryMFAStore") {
+		t.Errorf("error message = %q; want to name 'MemoryMFAStore' so the operator understands the fallback being refused", err.Error())
+	}
+}
+
 // TestCheckProductionLocalCMK pins the four-case truth table the
 // task spec lays out for the production local-file CMK guard:
 //
