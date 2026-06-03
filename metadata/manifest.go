@@ -90,9 +90,13 @@ type ObjectManifest struct {
 	// true age — distinct from LIST's LastModified, which the API
 	// derives separately. The daily lifecycle evaluator uses it to
 	// decide age-based ("Days") expiration; a manifest written before
-	// WS8.2 has the zero value, and the evaluator treats an unknown age
-	// as "never expire" so it can never delete an object whose age it
-	// cannot establish. Rides the manifest JSONB body.
+	// WS8.2 has the zero value, and for a Days-based rule the evaluator
+	// treats an unknown age as "never expire" so it can never delete an
+	// object whose age it cannot establish. This fail-safe is specific
+	// to Days-based rules: a Date-based rule is an absolute cutoff (not
+	// age-relative, matching AWS), so it still applies to a zero-
+	// CreatedAt manifest once the configured Date has passed. Rides the
+	// manifest JSONB body.
 	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
@@ -253,10 +257,10 @@ type PlacementPolicy struct {
 // source cell to a destination cell. Mode values:
 //
 //   - "sync":  the gateway copies the piece synchronously on the
-//              PUT critical path. Slower but RPO=0.
+//     PUT critical path. Slower but RPO=0.
 //   - "async": the cross-cell replicator drains the manifest at
-//              its own cadence; the policy's RPO bound is the
-//              maximum staleness clients should expect.
+//     its own cadence; the policy's RPO bound is the
+//     maximum staleness clients should expect.
 type ReplicationPolicy struct {
 	SourceCell string `json:"source_cell"`
 	DestCell   string `json:"dest_cell"`

@@ -228,8 +228,11 @@ func (f Filter) valid() error {
 	if f.ObjectSizeGreaterThan != nil && *f.ObjectSizeGreaterThan < 0 {
 		return errors.New("ObjectSizeGreaterThan must not be negative")
 	}
-	if f.ObjectSizeLessThan != nil && *f.ObjectSizeLessThan < 0 {
-		return errors.New("ObjectSizeLessThan must not be negative")
+	// AWS rejects ObjectSizeLessThan below 1: "< 0 bytes" matches no
+	// object, so a zero bound is a useless predicate. ObjectSizeGreaterThan
+	// of 0 is accepted (it selects every object larger than zero bytes).
+	if f.ObjectSizeLessThan != nil && *f.ObjectSizeLessThan < 1 {
+		return errors.New("ObjectSizeLessThan must be a positive number of bytes")
 	}
 	if f.ObjectSizeGreaterThan != nil && f.ObjectSizeLessThan != nil &&
 		*f.ObjectSizeGreaterThan >= *f.ObjectSizeLessThan {

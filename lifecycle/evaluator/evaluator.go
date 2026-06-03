@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
+	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
@@ -77,6 +78,55 @@ type Uploads interface {
 type ContentIndex interface {
 	DecrementRef(ctx context.Context, tenantID, contentHash string) (newCount int, err error)
 	Delete(ctx context.Context, tenantID, contentHash string) error
+}
+
+// AuditRecorder receives one entry per lifecycle action (expiration,
+// delete marker, delete-marker cleanup, multipart abort) for the
+// compliance audit trail. internal/compliance.AuditStore satisfies it
+// via cmd/gateway's thin adapter — the same store the interactive
+// PUT/GET/DELETE path writes to. Defined as a minimal local interface
+// (with a shape-compatible AuditEntry) so the background worker does
+// not import internal/compliance. Optional; nil disables auditing.
+type AuditRecorder interface {
+	Record(ctx context.Context, entry AuditEntry) error
+}
+
+// AuditEntry mirrors compliance.AuditEntry (and s3compat.AuditEntry)
+// so cmd/gateway can forward evaluator entries to the same audit store
+// with a trivial adapter. RequestID is always empty for lifecycle
+// actions: the sweep runs on an internal goroutine with no inbound
+// *http.Request, which the audit consumer already treats as "no id".
+type AuditEntry struct {
+	TenantID       string
+	Operation      string
+	Bucket         string
+	ObjectKey      string
+	PieceID        string
+	PieceBackend   string
+	BackendCountry string
+	Timestamp      time.Time
+	RequestID      string
+}
+
+// Lifecycle audit operation labels. They are intentionally distinct
+// from the interactive path's HTTP-verb operations ("PUT"/"DELETE") so
+// an auditor can tell a system-driven lifecycle action apart from a
+// user-issued API call.
+const (
+	auditOpExpiration     = "LifecycleExpiration"          // permanent delete (unversioned bucket)
+	auditOpDeleteMarker   = "LifecycleDeleteMarker"        // marker inserted (versioned bucket)
+	auditOpDeleteMarkerGC = "LifecycleExpiredDeleteMarker" // ExpiredObjectDeleteMarker cleanup
+	auditOpAbortMultipart = "LifecycleAbortMultipartUpload"
+)
+
+// BillingSink receives usage events for lifecycle actions. billing
+// sinks (LoggerSink, ClickHouseSink, …) satisfy it. Optional; nil
+// disables metering. Lifecycle actions are metered on dedicated
+// dimensions (billing.Lifecycle*) rather than the Tier-1
+// Put/Delete-request dimensions because AWS does not bill lifecycle
+// expirations as API requests.
+type BillingSink interface {
+	Emit(event billing.UsageEvent)
 }
 
 // Config wires the evaluator's dependencies.
@@ -122,6 +172,23 @@ type Config struct {
 	// Clock returns the current time. Nil defaults to time.Now. Tests
 	// override it to make age comparisons deterministic.
 	Clock func() time.Time
+
+	// Audit, when non-nil, records one entry per lifecycle action
+	// (expiration, delete marker, delete-marker cleanup, multipart
+	// abort) so lifecycle-driven mutations land in the same
+	// compliance trail as interactive PUT/DELETE. Optional.
+	Audit AuditRecorder
+
+	// Billing, when non-nil, receives a usage event per lifecycle
+	// action on a dedicated billing.Lifecycle* dimension (these are
+	// deliberately not folded into the Tier-1 request dimensions —
+	// AWS does not bill lifecycle expirations as API requests).
+	// Optional.
+	Billing BillingSink
+
+	// NodeID identifies the worker node emitting billing events. It
+	// is copied into each UsageEvent.SourceNodeID. Optional.
+	NodeID string
 
 	// Logger receives per-object / per-upload outcomes. Nil disables
 	// logging.
@@ -220,6 +287,8 @@ func (e *Evaluator) abortStaleUploads(ctx context.Context, entry bucket_config.L
 		}
 		e.deletePieces(ctx, partsBackends(parts))
 		stats.UploadsAborted++
+		e.audit(ctx, auditOpAbortMultipart, entry.TenantID, entry.Bucket, u.ObjectKey, firstBackendPiece(partsBackends(parts)), now)
+		e.emit(entry.TenantID, entry.Bucket, billing.LifecycleAbortedUploads, 1, now)
 	}
 }
 
@@ -301,7 +370,7 @@ func (e *Evaluator) expireOne(ctx context.Context, entry bucket_config.Lifecycle
 			if !m.DeleteMarker {
 				continue
 			}
-			if e.removeExpiredDeleteMarker(ctx, entry, m, stats) {
+			if e.removeExpiredDeleteMarker(ctx, entry, m, now, stats) {
 				return
 			}
 			continue
@@ -326,7 +395,7 @@ func (e *Evaluator) expireOne(ctx context.Context, entry bucket_config.Lifecycle
 			stats.Skipped++
 			return
 		}
-		e.permanentlyDelete(ctx, entry, m, stats)
+		e.permanentlyDelete(ctx, entry, m, now, stats)
 		return
 	}
 }
@@ -334,7 +403,7 @@ func (e *Evaluator) expireOne(ctx context.Context, entry bucket_config.Lifecycle
 // removeExpiredDeleteMarker deletes m (a delete marker) when it is the
 // sole remaining version of its key. Returns true when the marker was
 // removed.
-func (e *Evaluator) removeExpiredDeleteMarker(ctx context.Context, entry bucket_config.LifecycleEntry, m *metadata.ObjectManifest, stats *Stats) bool {
+func (e *Evaluator) removeExpiredDeleteMarker(ctx context.Context, entry bucket_config.LifecycleEntry, m *metadata.ObjectManifest, now time.Time, stats *Stats) bool {
 	versions, err := e.cfg.Manifests.ListVersions(ctx, entry.TenantID, entry.Bucket, m.ObjectKeyHash)
 	if err != nil {
 		stats.Errors++
@@ -356,6 +425,7 @@ func (e *Evaluator) removeExpiredDeleteMarker(ctx context.Context, entry bucket_
 		return false
 	}
 	stats.DeleteMarkersRemoved++
+	e.audit(ctx, auditOpDeleteMarkerGC, entry.TenantID, entry.Bucket, m.ObjectKey, backendPiece{}, now)
 	return true
 }
 
@@ -385,11 +455,13 @@ func (e *Evaluator) insertDeleteMarker(ctx context.Context, entry bucket_config.
 		return
 	}
 	stats.DeleteMarkersCreated++
+	e.audit(ctx, auditOpDeleteMarker, entry.TenantID, entry.Bucket, m.ObjectKey, backendPiece{}, now)
+	e.emit(entry.TenantID, entry.Bucket, billing.LifecycleDeleteMarkers, 1, now)
 }
 
 // permanentlyDelete removes the manifest version and best-effort
 // deletes its backend pieces.
-func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.LifecycleEntry, m *metadata.ObjectManifest, stats *Stats) {
+func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.LifecycleEntry, m *metadata.ObjectManifest, now time.Time, stats *Stats) {
 	key := manifest_store.ManifestKey{
 		TenantID:      entry.TenantID,
 		Bucket:        entry.Bucket,
@@ -404,8 +476,10 @@ func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.L
 		e.logf("lifecycle/evaluator: delete object %s/%s: %v", entry.Bucket, m.ObjectKey, err)
 		return
 	}
-	e.reclaimPieces(ctx, entry.TenantID, m)
+	e.reclaimPieces(ctx, entry.TenantID, m, now)
 	stats.ObjectsExpired++
+	e.audit(ctx, auditOpExpiration, entry.TenantID, entry.Bucket, m.ObjectKey, firstBackendPiece(pieceBackends(m.Pieces)), now)
+	e.emit(entry.TenantID, entry.Bucket, billing.LifecycleExpirations, 1, now)
 }
 
 // reclaimPieces removes the backend bytes backing a just-deleted
@@ -420,7 +494,7 @@ func (e *Evaluator) permanentlyDelete(ctx context.Context, entry bucket_config.L
 // lifecycle expiration can never delete a piece another object still
 // references or leave a dangling index row. Non-deduped manifests, or
 // a nil ContentIndex, fall back to a direct best-effort piece delete.
-func (e *Evaluator) reclaimPieces(ctx context.Context, tenantID string, m *metadata.ObjectManifest) {
+func (e *Evaluator) reclaimPieces(ctx context.Context, tenantID string, m *metadata.ObjectManifest, now time.Time) {
 	if m.ContentHash == "" || e.cfg.ContentIndex == nil {
 		e.deletePieces(ctx, pieceBackends(m.Pieces))
 		return
@@ -447,7 +521,11 @@ func (e *Evaluator) reclaimPieces(ctx context.Context, tenantID string, m *metad
 		}
 	default:
 		// newCount > 0: the piece is still referenced by another
-		// manifest in this tenant. Leave it on the backend.
+		// manifest in this tenant. Leave it on the backend, and emit
+		// the post-decrement refcount sample so the billing pipeline
+		// can track hot content — exactly as the interactive DELETE
+		// path does.
+		e.emit(m.TenantID, m.Bucket, billing.DedupRefCount, uint64(newCount), now)
 	}
 }
 
@@ -505,6 +583,59 @@ func (e *Evaluator) deletePieces(ctx context.Context, pieces []backendPiece) {
 			e.logf("lifecycle/evaluator: delete piece %s on %s: %v", p.pieceID, p.backend, err)
 		}
 	}
+}
+
+// firstBackendPiece returns the first piece in the slice (the
+// representative recorded in the audit entry, matching the interactive
+// DELETE path which audits manifest.Pieces[0]). The zero value carries
+// empty backend/pieceID for actions with no backing piece (delete
+// markers).
+func firstBackendPiece(ps []backendPiece) backendPiece {
+	if len(ps) > 0 {
+		return ps[0]
+	}
+	return backendPiece{}
+}
+
+// audit records one lifecycle action to the compliance trail. It
+// resolves the piece's backend placement country the same way the
+// interactive DELETE path does. A nil Audit recorder is a no-op.
+func (e *Evaluator) audit(ctx context.Context, op, tenantID, bucket, objectKey string, bp backendPiece, now time.Time) {
+	if e.cfg.Audit == nil {
+		return
+	}
+	var country string
+	if bp.backend != "" {
+		if prov, ok := e.cfg.Providers[bp.backend]; ok {
+			country = prov.PlacementLabels().Country
+		}
+	}
+	_ = e.cfg.Audit.Record(ctx, AuditEntry{
+		TenantID:       tenantID,
+		Operation:      op,
+		Bucket:         bucket,
+		ObjectKey:      objectKey,
+		PieceID:        bp.pieceID,
+		PieceBackend:   bp.backend,
+		BackendCountry: country,
+		Timestamp:      now,
+	})
+}
+
+// emit records one lifecycle usage event. A nil Billing sink is a
+// no-op.
+func (e *Evaluator) emit(tenantID, bucket string, dim billing.Dimension, delta uint64, now time.Time) {
+	if e.cfg.Billing == nil {
+		return
+	}
+	e.cfg.Billing.Emit(billing.UsageEvent{
+		TenantID:     tenantID,
+		Bucket:       bucket,
+		Dimension:    dim,
+		Delta:        delta,
+		ObservedAt:   now,
+		SourceNodeID: e.cfg.NodeID,
+	})
 }
 
 func (e *Evaluator) logf(format string, args ...any) {
