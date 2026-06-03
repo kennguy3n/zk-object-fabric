@@ -62,6 +62,14 @@ type Authenticator interface {
 // the browser whether it may attempt the cross-origin request; the
 // follow-up actual request is fully authenticated as usual. ok is
 // false when the request carries no recognisable access key.
+//
+// This capability is also what lets applyCORS attach CORS headers to
+// an actual request that fails authentication, so a browser SPA reads
+// the real error instead of an opaque CORS failure. An Authenticator
+// that does NOT implement TenantResolver fails closed: preflights get
+// 403 and auth-failure responses carry no CORS headers. A third-party
+// Authenticator therefore must implement TenantResolver for CORS to
+// work on presigned-URL flows. The production HMACAuthenticator does.
 type TenantResolver interface {
 	ResolveTenantUnverified(r *http.Request) (tenantID string, ok bool)
 }
