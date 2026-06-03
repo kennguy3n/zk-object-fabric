@@ -1,4 +1,4 @@
-package postgres
+package manifest_store
 
 import (
 	"bytes"

@@ -3,11 +3,19 @@
 A one-command, zero-external-dependency demo of the ZK Object Fabric
 gateway. It boots the S3-compatible data plane on `:8080` and the
 tenant console API on `:8081`, backed by the `local_fs_dev`
-filesystem provider and an in-memory manifest / tenant store.
+filesystem provider and an embedded SQLite metadata store — no
+Postgres required.
 
-This is **development-only**: manifest and tenant bindings live in
-memory and are lost on container restart, though object bodies
-persist in the `zk-data` Docker volume mounted at `/data/objects`.
+This is **development-only**, but it is now durable: the manifest,
+content-index, console auth, and billing-usage state all persist in
+the embedded SQLite database at `/data/metadata/embedded.db` (the
+`zk-metadata` Docker volume), and object bodies persist in the
+`zk-data` volume mounted at `/data/objects`. Both survive a
+container restart. Static tenant bindings (access/secret keys) are
+still loaded from `demo/tenants.json` on each boot, and in-flight
+multipart uploads remain in-memory. To run the control plane on
+Postgres instead, set `control_plane.metadata_dsn` in
+`demo/config.json`, which overrides the embedded store.
 It is the same S3 API surface Phase 1 (Wasabi), Phase 2 (Ceph RGW),
 and Phase 3 (owned DC) serve — downstream apps can point at it now
 and keep the same bucket name, object key, and URL when the

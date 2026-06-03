@@ -40,6 +40,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 	"github.com/kennguy3n/zk-object-fabric/internal/compliance"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
+	"github.com/kennguy3n/zk-object-fabric/internal/embeddeddb"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
 	"github.com/kennguy3n/zk-object-fabric/internal/metrics"
 	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
@@ -47,10 +48,12 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/version"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	cipostgres "github.com/kennguy3n/zk-object-fabric/metadata/content_index/postgres"
+	cisqlite "github.com/kennguy3n/zk-object-fabric/metadata/content_index/sqlite"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	pgstore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/postgres"
+	sqlitestore "github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/sqlite"
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 	"github.com/kennguy3n/zk-object-fabric/internal/repair"
@@ -123,6 +126,21 @@ func main() {
 		defer func() { _ = metadataDB.Close() }()
 	}
 
+	// Embedded / single-node profile: when no Postgres DSN is set
+	// but an embedded DB path is configured, open the local SQLite
+	// database the manifest, content-index, auth, and billing
+	// stores share. metadataDB stays nil in this mode (the
+	// Postgres-only stores fall back to their in-memory dev
+	// variants); embeddedDB is threaded into the four stores that
+	// have a SQLite backend. See openEmbeddedDB.
+	embeddedDB, err := openEmbeddedDB(cfg)
+	if err != nil {
+		log.Fatalf("gateway: %v", err)
+	}
+	if embeddedDB != nil {
+		defer func() { _ = embeddedDB.Close() }()
+	}
+
 	// Pre-flight TLS validation for every configured listener
 	// BEFORE any goroutines spawn. startListener also calls
 	// t.Validate inside as a defence-in-depth, but the console
@@ -137,8 +155,8 @@ func main() {
 	// TLS but typoed one of the paths.
 	validateAllTLSConfigs(cfg)
 
-	store := buildManifestStore(cfg, metadataDB)
-	contentIndex := buildContentIndex(cfg, metadataDB)
+	store := buildManifestStore(cfg, metadataDB, embeddedDB)
+	contentIndex := buildContentIndex(cfg, metadataDB, embeddedDB)
 	registry := buildProviderRegistry(context.Background(), cfg)
 	if lister, ok := buildDedicatedCellStore(metadataDB).(cellops.CellLister); ok {
 		registerCellProviders(context.Background(), registry, lister, cfg)
@@ -179,7 +197,7 @@ func main() {
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
 
-	billingSink := buildBillingSink(cfg)
+	billingSink := buildBillingSink(cfg, embeddedDB)
 	if cfg.Metrics.Enabled {
 		billingSink = metrics.NewMetricsBillingSink(billingSink, metricsRegistry)
 	}
@@ -194,7 +212,7 @@ func main() {
 	// same view of (tenant → verified) state. The Postgres-backed
 	// store is selected when a metadata DSN is configured;
 	// otherwise the dev MemoryAuthStore is used.
-	authStore := buildAuthStore(metadataDB)
+	authStore := buildAuthStore(metadataDB, embeddedDB)
 	// authHooks is built once and shared between the console API
 	// and the S3 handler's email-verification gate. When
 	// SendVerificationEmail is nil (no SES / transactional email
@@ -1075,6 +1093,28 @@ func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 	return db, nil
 }
 
+// openEmbeddedDB opens the local SQLite database that backs the
+// embedded / single-node deployment profile. It returns (nil, nil)
+// unless a metadata DSN is absent AND an embedded path is set, so
+// callers can branch on embeddedDB == nil exactly as they do for the
+// Postgres pool. Postgres always wins: when MetadataDSN is set the
+// embedded path is ignored and this returns nil so the gateway does
+// not open a redundant, never-read SQLite file.
+func openEmbeddedDB(cfg config.Config) (*sql.DB, error) {
+	if cfg.ControlPlane.MetadataDSN != "" {
+		return nil, nil
+	}
+	if cfg.ControlPlane.EmbeddedDBPath == "" {
+		return nil, nil
+	}
+	db, err := embeddeddb.Open(cfg.ControlPlane.EmbeddedDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("open embedded metadata DB: %w", err)
+	}
+	log.Printf("gateway: embedded SQLite metadata store enabled (path=%s); manifest, content_index, auth, and billing persist locally without Postgres", cfg.ControlPlane.EmbeddedDBPath)
+	return db, nil
+}
+
 // buildContentIndex returns the intra-tenant deduplication index
 // store. Postgres-backed when MetadataDSN is configured AND the
 // dedup feature is enabled in cfg.Dedup; in-memory otherwise. The
@@ -1085,12 +1125,20 @@ func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 // S3 handler short-circuits the dedup path: every PUT writes a
 // fresh piece, every DELETE removes it directly, and the store is
 // never consulted.
-func buildContentIndex(cfg config.Config, db *sql.DB) content_index.Store {
+func buildContentIndex(cfg config.Config, db, embeddedDB *sql.DB) content_index.Store {
 	if !cfg.Dedup.Enabled {
 		log.Printf("gateway: dedup disabled (dedup.enabled = false); content_index store will not be built")
 		return nil
 	}
 	if db == nil {
+		if embeddedDB != nil {
+			store, err := cisqlite.New(cisqlite.Config{DB: embeddedDB})
+			if err != nil {
+				log.Fatalf("gateway: build embedded content_index store: %v", err)
+			}
+			log.Printf("gateway: embedded SQLite content_index store enabled (default_scope=%s default_level=%s)", cfg.Dedup.DefaultScope, cfg.Dedup.DefaultLevel)
+			return store
+		}
 		log.Printf("gateway: dedup enabled with no metadata_dsn; using in-memory content_index store (dev only — entries do NOT survive restart)")
 		return content_index.NewMemoryStore()
 	}
@@ -1102,29 +1150,48 @@ func buildContentIndex(cfg config.Config, db *sql.DB) content_index.Store {
 	return store
 }
 
-func buildManifestStore(cfg config.Config, db *sql.DB) manifest_store.ManifestStore {
+func buildManifestStore(cfg config.Config, db, embeddedDB *sql.DB) manifest_store.ManifestStore {
+	bodyEnc := buildManifestBodyEncryptor(cfg)
 	if db == nil {
+		if embeddedDB != nil {
+			store, err := sqlitestore.New(sqlitestore.Config{DB: embeddedDB, BodyEncryptor: bodyEnc})
+			if err != nil {
+				log.Fatalf("gateway: build embedded manifest store: %v", err)
+			}
+			log.Printf("gateway: embedded SQLite manifest store enabled")
+			return store
+		}
 		log.Printf("gateway: no control_plane.metadata_dsn; using in-memory manifest store (dev only)")
 		return memory.New()
 	}
-	pgCfg := pgstore.Config{DB: db}
-	if p := cfg.Encryption.ManifestBodyKeyPath; p != "" {
-		key, rerr := os.ReadFile(p)
-		if rerr != nil {
-			log.Fatalf("gateway: read manifest body key %q: %v", p, rerr)
-		}
-		enc, eerr := pgstore.NewAEADBodyEncryptor(key)
-		if eerr != nil {
-			log.Fatalf("gateway: build manifest body encryptor: %v", eerr)
-		}
-		pgCfg.BodyEncryptor = enc
-		log.Printf("gateway: manifest body encryption enabled (key=%s)", p)
-	}
-	store, err := pgstore.New(pgCfg)
+	store, err := pgstore.New(pgstore.Config{DB: db, BodyEncryptor: bodyEnc})
 	if err != nil {
 		log.Fatalf("gateway: build postgres manifest store: %v", err)
 	}
 	return store
+}
+
+// buildManifestBodyEncryptor loads the optional manifest-body AEAD
+// encryptor from cfg.Encryption.ManifestBodyKeyPath. It returns nil
+// when no key is configured (bodies stored as plaintext JSON). The
+// same encryptor is shared by the Postgres and embedded SQLite
+// manifest stores, so a deployment can switch backends without
+// re-keying.
+func buildManifestBodyEncryptor(cfg config.Config) manifest_store.BodyEncryptor {
+	p := cfg.Encryption.ManifestBodyKeyPath
+	if p == "" {
+		return nil
+	}
+	key, rerr := os.ReadFile(p)
+	if rerr != nil {
+		log.Fatalf("gateway: read manifest body key %q: %v", p, rerr)
+	}
+	enc, eerr := manifest_store.NewAEADBodyEncryptor(key)
+	if eerr != nil {
+		log.Fatalf("gateway: build manifest body encryptor: %v", eerr)
+	}
+	log.Printf("gateway: manifest body encryption enabled (key=%s)", p)
+	return enc
 }
 
 // buildGatewayEncryption constructs the GatewayEncryption wiring
@@ -1519,12 +1586,29 @@ func buildHotObjectCache(cfg config.Config) (hot_object_cache.HotObjectCache, er
 }
 
 // buildBillingSink returns the ClickHouseSink when billing is
-// configured, otherwise the development LoggerSink. The returned
-// value satisfies api/s3compat.BillingSink.
-func buildBillingSink(cfg config.Config) interface {
+// configured, the embedded SQLite sink when the embedded profile is
+// active (so usage events persist locally and feed the console usage
+// page without ClickHouse), and otherwise the development LoggerSink.
+// The returned value satisfies api/s3compat.BillingSink; the
+// SQLite sink additionally implements Close(ctx) (drained on
+// shutdown) and console.UsageQuery.
+func buildBillingSink(cfg config.Config, embeddedDB *sql.DB) interface {
 	Emit(event billing.UsageEvent)
 } {
 	if cfg.Billing.ClickHouseURL == "" {
+		if embeddedDB != nil {
+			sink, err := billing.NewSQLiteSink(billing.SQLiteSinkConfig{
+				DB:            embeddedDB,
+				BatchSize:     cfg.Billing.BatchSize,
+				FlushInterval: cfg.Billing.FlushInterval.ToDuration(),
+				Logger:        log.New(os.Stdout, "billing ", log.LstdFlags),
+			})
+			if err != nil {
+				log.Fatalf("gateway: build embedded billing sink: %v", err)
+			}
+			log.Printf("gateway: embedded SQLite billing sink enabled")
+			return sink
+		}
 		return &billing.LoggerSink{Logger: log.New(os.Stdout, "", log.LstdFlags)}
 	}
 	sink, err := billing.NewClickHouseSink(billing.ClickHouseConfig{
@@ -1733,11 +1817,20 @@ func startConsoleAPI(
 }
 
 // buildAuthStore returns the Postgres-backed AuthStore when a
-// metadata DSN is configured, falling back to MemoryAuthStore for
-// dev mode. The store is shared between the console signup / login
+// metadata DSN is configured, the embedded SQLite store when the
+// embedded profile is active, and MemoryAuthStore otherwise (dev
+// mode). The store is shared between the console signup / login
 // handler and the S3 handler's email-verification gate.
-func buildAuthStore(db *sql.DB) console.AuthStore {
+func buildAuthStore(db, embeddedDB *sql.DB) console.AuthStore {
 	if db == nil {
+		if embeddedDB != nil {
+			store, err := console.NewSQLiteAuthStore(embeddedDB)
+			if err != nil {
+				log.Fatalf("gateway: build embedded auth store: %v", err)
+			}
+			log.Printf("gateway: embedded SQLite auth store enabled")
+			return store
+		}
 		return console.NewMemoryAuthStore()
 	}
 	store, err := console.NewPostgresAuthStore(db)

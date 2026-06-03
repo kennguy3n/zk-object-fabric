@@ -610,6 +610,17 @@ type ControlPlaneConfig struct {
 	AuthIssuer  string `json:"auth_issuer"`
 	BillingURL  string `json:"billing_url"`
 
+	// EmbeddedDBPath selects the embedded / single-node deployment
+	// profile: when MetadataDSN is empty and EmbeddedDBPath is set,
+	// the gateway opens a local SQLite database at this path and
+	// backs the manifest, content-index, auth, and billing stores
+	// with it instead of in-memory stores. This gives `docker
+	// compose up` durable control-plane state without standing up a
+	// Postgres. It is ignored when MetadataDSN is set (Postgres
+	// wins). An empty value with an empty MetadataDSN falls back to
+	// the in-memory stores (ephemeral, single-process).
+	EmbeddedDBPath string `json:"embedded_db_path"`
+
 	// MaxOpenConns caps concurrent open connections to the metadata
 	// database. Zero means use Go's default (unlimited), which is
 	// fine for dev but can saturate RDS in production.
@@ -979,6 +990,12 @@ func Default() Config {
 		// override any of these via config.control_plane.* when
 		// their RDS class can support a larger pool.
 		ControlPlane: ControlPlaneConfig{
+			// EmbeddedDBPath is wired by default so a fresh `docker
+			// compose up` (or a bare `gateway` run) gets durable
+			// control-plane state without a Postgres. Setting
+			// MetadataDSN overrides this and switches every store to
+			// Postgres; see openMetadataDB in cmd/gateway.
+			EmbeddedDBPath:  "/var/lib/zk-object-fabric/embedded.db",
 			MaxOpenConns:    32,
 			MaxIdleConns:    8,
 			ConnMaxLifetime: Duration(4 * time.Minute),

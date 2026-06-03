@@ -83,9 +83,13 @@ FROM alpine:3.20 AS runtime
 RUN apk add --no-cache ca-certificates tzdata wget gettext
 
 # Object data persists under /data/objects (see demo/config.json's
-# providers.local_fs_dev.root_path). docker-compose.yml mounts a
-# named volume here so object bodies survive container restarts.
-RUN mkdir -p /data/objects /app/demo /app/frontend /run/zk-fabric
+# providers.local_fs_dev.root_path); the embedded SQLite metadata
+# store lives under /data/metadata (control_plane.embedded_db_path).
+# docker-compose.yml mounts a named volume at each path so object
+# bodies AND control-plane state survive container restarts. The
+# gateway also creates /data/metadata on demand, but pre-creating it
+# keeps a bare `docker run` (no compose volume) working too.
+RUN mkdir -p /data/objects /data/metadata /app/demo /app/frontend /run/zk-fabric
 
 COPY --from=gateway-build /out/gateway /usr/local/bin/gateway
 COPY --from=frontend-build /src/frontend/dist /app/frontend
