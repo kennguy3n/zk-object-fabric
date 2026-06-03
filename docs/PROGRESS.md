@@ -617,8 +617,11 @@ independent PR; check the box when the handler is wired and covered by
       `bucket_lifecycle` table, daily evaluator, console editor.
 - [ ] WS8.3 Object Lock / WORM (`?object-lock`, `?retention`,
       `?legal-hold`) — `metadata/object_lock/`; depends on WS8.4.
-- [ ] WS8.4 Bucket versioning (`?versioning`) — config endpoints +
-      delete markers.
+- [x] WS8.4 Bucket versioning (`?versioning`) — Put/GetBucketVersioning
+      config endpoints (`api/s3compat/versioning_handler.go`),
+      `metadata/bucket_config` store (memory + Postgres + SQLite), and
+      delete-marker semantics on versioning-enabled DELETE. Covered by
+      handler unit tests + s3_conformance bucket-versioning probes.
 - [ ] WS8.5 CORS (`?cors`) — per-bucket config + gateway middleware.
 - [ ] WS8.6 Event notifications (`?notification`) —
       `internal/notifications/` webhook dispatcher + DLQ.
