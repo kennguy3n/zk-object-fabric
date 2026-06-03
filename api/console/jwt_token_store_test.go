@@ -313,6 +313,32 @@ func TestLoadRSAPrivateKeyPEM(t *testing.T) {
 	if _, err := LoadRSAPrivateKeyPEM(notPEM); err == nil {
 		t.Fatal("non-PEM file should error")
 	}
+
+	// A password-protected key must be rejected with a clear,
+	// encryption-specific message rather than a confusing PKCS parse
+	// failure. Cover both the legacy OpenSSL (Proc-Type/DEK-Info) and
+	// the PKCS#8 ("ENCRYPTED PRIVATE KEY") encodings.
+	legacyEnc := filepath.Join(dir, "legacy-enc.pem")
+	legacyEncPEM := pem.EncodeToMemory(&pem.Block{
+		Type:    "RSA PRIVATE KEY",
+		Headers: map[string]string{"Proc-Type": "4,ENCRYPTED", "DEK-Info": "AES-256-CBC,0000"},
+		Bytes:   []byte("ciphertext"),
+	})
+	if err := os.WriteFile(legacyEnc, legacyEncPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRSAPrivateKeyPEM(legacyEnc); err == nil || !strings.Contains(err.Error(), "password-protected") {
+		t.Fatalf("legacy encrypted key: err = %v; want 'password-protected'", err)
+	}
+
+	pkcs8Enc := filepath.Join(dir, "pkcs8-enc.pem")
+	pkcs8EncPEM := pem.EncodeToMemory(&pem.Block{Type: "ENCRYPTED PRIVATE KEY", Bytes: []byte("ciphertext")})
+	if err := os.WriteFile(pkcs8Enc, pkcs8EncPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRSAPrivateKeyPEM(pkcs8Enc); err == nil || !strings.Contains(err.Error(), "password-protected") {
+		t.Fatalf("pkcs8 encrypted key: err = %v; want 'password-protected'", err)
+	}
 }
 
 // storeKey extracts the private key from a store for tests that need

@@ -253,6 +253,15 @@ func LoadRSAPrivateKeyPEM(path string) (*rsa.PrivateKey, error) {
 	if block == nil {
 		return nil, fmt.Errorf("console: JWT signing key %q is not PEM-encoded", path)
 	}
+	// Reject password-protected keys with a clear message rather than
+	// letting them fall through to a confusing PKCS#1/#8 parse failure.
+	// Legacy OpenSSL encryption marks the block with a Proc-Type header;
+	// PKCS#8 encryption uses the "ENCRYPTED PRIVATE KEY" block type. The
+	// store needs an unencrypted key it can sign with unattended, so the
+	// operator must decrypt it first (e.g. `openssl rsa -in enc.pem`).
+	if _, encrypted := block.Headers["DEK-Info"]; encrypted || block.Type == "ENCRYPTED PRIVATE KEY" {
+		return nil, fmt.Errorf("console: JWT signing key %q is password-protected; provide an unencrypted PEM (the gateway signs unattended and cannot prompt for a passphrase)", path)
+	}
 	key, pkcs1Err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if pkcs1Err == nil {
 		return key, nil
