@@ -241,7 +241,7 @@ func categoryTitle(cat string) string {
 	case "lifecycle":
 		return "Bucket lifecycle (intentionally unsupported)"
 	case "bucket-versioning":
-		return "Bucket versioning toggle (intentionally unsupported)"
+		return "Bucket versioning toggle (enable/suspend + delete markers)"
 	case "bulk":
 		return "Bulk operations"
 	}
