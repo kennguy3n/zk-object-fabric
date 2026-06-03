@@ -948,7 +948,13 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 		// client (IssueToken failure is a server-side fault — a rand
 		// failure for MemoryTokenStore or a signing-key error for the
 		// JWT store — not a bad token).
-		_ = h.cfg.RefreshTokens.Revoke(rotated.Raw)
+		if rerr := h.cfg.RefreshTokens.Revoke(rotated.Raw); rerr != nil {
+			// The successor was never sent to any client and carries 256
+			// bits of entropy, so an un-revoked orphan is unguessable and
+			// expires on its own — log it for observability rather than
+			// failing the response we're already returning.
+			log.Printf("console: revoke undeliverable successor for tenant %q failed: %v", rotated.TenantID, rerr)
+		}
 		log.Printf("console: issue access token during refresh for tenant %q failed: %v", rotated.TenantID, err)
 		writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 		return
@@ -987,7 +993,12 @@ func (h *AuthHandler) logout(w http.ResponseWriter, r *http.Request) {
 	// Trim like the refresh handler so a whitespace-padded copy/paste
 	// resolves to the same lookup; an empty token is a no-op Revoke.
 	if err := h.cfg.RefreshTokens.Revoke(strings.TrimSpace(req.RefreshToken)); err != nil {
-		writeError(w, http.StatusInternalServerError, "revoke refresh token: "+err.Error())
+		// Mirror the refresh handler: a Revoke failure is an
+		// infrastructure fault whose detail (DB host / DSN) belongs in
+		// the logs, not the wire — the client only needs to know the
+		// logout didn't complete.
+		log.Printf("console: revoke refresh token on logout failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "logout failed; please retry")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
