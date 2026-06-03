@@ -326,7 +326,8 @@ adapter status matrix.
 
 - `auth/` — SigV4 authenticator, rate limiter, abuse guard, webhook
   alert sink, DDoS shield (Cloudflare provider + memory shield),
-  legal-hold store (memory + Postgres).
+  legal-hold store (memory + Postgres + SQLite — the embedded
+  single-node profile persists holds locally across restart).
 - `cellops/` — cell registry over the `dedicated_cells` table,
   manual + automated provisioner (Terraform runner stub).
 - `compliance/` — audit trail (memory + Postgres), residency

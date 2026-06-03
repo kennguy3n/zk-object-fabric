@@ -358,7 +358,7 @@ func main() {
 	// mutations land in the same compliance trail. nil when auditing
 	// is disabled.
 	auditStore := buildAuditStore(cfg.Compliance, metadataDB, embeddedDB)
-	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB, auditStore)
+	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB, embeddedDB, auditStore)
 	// gatewayNodeID is resolved once (gateway.node_id override, else
 	// os.Hostname) and shared by the interactive s3 handler and the
 	// background lifecycle evaluator so billing/audit events from this
@@ -2877,7 +2877,7 @@ func buildAuditStore(cfg config.ComplianceConfig, db, embeddedDB *sql.DB) compli
 // audit recorder that the s3compat handler consults. Both fields
 // of the returned ComplianceHooks may be nil; the handler treats
 // nil as "feature disabled".
-func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB, auditStore compliance.AuditStore) s3compat.ComplianceHooks {
+func buildComplianceHooks(cfg config.ComplianceConfig, db, embeddedDB *sql.DB, auditStore compliance.AuditStore) s3compat.ComplianceHooks {
 	hooks := s3compat.ComplianceHooks{}
 	if cfg.ResidencyEnabled {
 		var lookup compliance.AllowlistLookup
@@ -2892,8 +2892,15 @@ func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB, auditStore co
 		hooks.Audit = &auditAdapter{store: auditStore}
 	}
 	if cfg.LegalHoldEnabled {
+		// Backend selection mirrors the audit store
+		// (buildAuditStore): Postgres when a metadata DB is
+		// configured, embedded SQLite in the single-node profile
+		// (persists holds across restart), and an in-memory store
+		// only when neither is present (dev only — holds do NOT
+		// survive restart, dropping a WORM guarantee).
 		var store auth.LegalHoldStore
-		if db != nil {
+		switch {
+		case db != nil:
 			pg, err := auth.NewPostgresLegalHoldStore(db)
 			if err != nil {
 				log.Printf("gateway: legal hold store: %v; falling back to in-memory", err)
@@ -2901,7 +2908,17 @@ func buildComplianceHooks(cfg config.ComplianceConfig, db *sql.DB, auditStore co
 			} else {
 				store = pg
 			}
-		} else {
+		case embeddedDB != nil:
+			lite, err := auth.NewSQLiteLegalHoldStore(embeddedDB)
+			if err != nil {
+				log.Printf("gateway: embedded legal hold store: %v; falling back to in-memory", err)
+				store = auth.NewMemoryLegalHoldStore()
+			} else {
+				log.Printf("gateway: embedded SQLite legal hold store enabled (holds persist locally across restart)")
+				store = lite
+			}
+		default:
+			log.Printf("gateway: no metadata_dsn; using in-memory legal hold store (dev only — holds do NOT survive restart)")
 			store = auth.NewMemoryLegalHoldStore()
 		}
 		hooks.LegalHoldStore = &legalHoldAdapter{store: store}
