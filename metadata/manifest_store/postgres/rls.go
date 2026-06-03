@@ -4,11 +4,11 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/kennguy3n/zk-object-fabric/metadata/internal/rlsdb"
+	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 )
 
 // Row-Level Security (RLS) for the manifests table — Workstream 3.4
-// defence-in-depth. The mechanism lives in the shared metadata/internal/rlsdb
+// defence-in-depth. The mechanism lives in the shared internal/rlsdb
 // package (GUC binding, the tenant_isolation policy DDL, and the
 // superuser caveat); the helpers below are thin Store-scoped adapters so
 // the eight manifest methods read naturally.

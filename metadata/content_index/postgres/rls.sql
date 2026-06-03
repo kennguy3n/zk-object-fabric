@@ -2,7 +2,7 @@
 -- docs/security/audit-package-security.md §8). This is the operator
 -- reference; the gateway's live tests apply the identical statements via
 -- postgres.RLSStatements(table, appRole), which delegates to
--- metadata/internal/rlsdb.Statements — the single source of truth shared
+-- internal/rlsdb.Statements — the single source of truth shared
 -- with the manifests table.
 --
 -- content_index's (tenant_id, content_hash) primary key is the

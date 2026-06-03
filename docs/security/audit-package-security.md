@@ -421,7 +421,7 @@ should attempt:
   each tenant-scoped statement runs in a transaction that binds
   a transaction-local `zkof.tenant_id` GUC, and a FORCE'd
   `tenant_isolation` policy re-checks it. The mechanism is centralised
-  in `metadata/internal/rlsdb` (GUC binding + the single-source policy
+  in `internal/rlsdb` (GUC binding + the single-source policy
   DDL), with per-table operator references in
   `metadata/manifest_store/postgres/rls.sql`,
   `metadata/content_index/postgres/rls.sql`, and
