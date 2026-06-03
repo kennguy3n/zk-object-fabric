@@ -10,9 +10,12 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -194,6 +197,14 @@ func main() {
 	// the in-memory tenant store cannot satisfy production auth
 	// without static --tenants bindings.
 	enforceProductionManifestEncryption(cfg.Env, metadataDB != nil || embeddedDB != nil, cfg.Encryption.ManifestBodyKeyPath)
+	// Production safety net: refuse to start when env=production, the
+	// console API is enabled, and no console JWT signing key is
+	// configured. Without it the console falls back to the process-
+	// local MemoryTokenStore, whose tokens are lost on restart and are
+	// not shared across replicas behind a load balancer. Skipped when
+	// the console is disabled (ListenAddr empty), since no TokenStore
+	// is built then — see checkProductionTokenStore.
+	enforceProductionTokenStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.JWTSigningKeyPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -698,6 +709,112 @@ func enforceProductionManifestEncryption(env string, manifestStorePersistent boo
 	if err := checkProductionManifestEncryption(env, manifestStorePersistent, manifestBodyKeyPath); err != nil {
 		log.Fatalf("SECURITY: env=production with a persistent manifest store (Postgres or embedded SQLite) but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext. Set encryption.manifest_body_key_path or use env=development.")
 	}
+}
+
+// errProductionTokenStoreRequired is returned by
+// checkProductionTokenStore when the gateway is started with
+// env=production but no console.jwt_signing_key_path is configured,
+// so the console would fall back to the process-local
+// MemoryTokenStore. Exposed as a sentinel so cmd/gateway can log a
+// friendly message and main_test.go can errors.Is against it.
+var errProductionTokenStoreRequired = errors.New("gateway: env=production but no console.jwt_signing_key_path is configured; the console would fall back to the in-memory MemoryTokenStore, whose tokens are lost on restart and are not shared across replicas behind a load balancer. Set console.jwt_signing_key_path to a PEM-encoded RSA private key or use env=development")
+
+// checkProductionTokenStore refuses to start the gateway when
+// cfg.Env == "production", the console API is enabled, and no JWT
+// signing key is configured. The MemoryTokenStore the console
+// otherwise falls back to is process-local: every issued session
+// token is dropped on restart, and two gateway replicas behind a load
+// balancer mint tokens the other cannot validate, so a multi-replica
+// production deploy would log users out on every rolling restart and
+// fail authentication for any request that lands on a replica other
+// than the one that issued the token. The stateless JWTTokenStore
+// (signed, self-contained, validated against a shared public key) is
+// the only production-safe option, so production must configure a
+// signing key.
+//
+// The guard is gated on consoleListenAddr because the console API is
+// opt-in: when it is empty startConsoleAPI returns before
+// buildTokenStore is ever called, so no TokenStore exists to be
+// unsafe. An S3 data-plane-only production gateway (console disabled)
+// must not be forced to configure a signing key it never uses.
+//
+// Layered alongside enforceProductionAuth: that guard protects the
+// S3 data-plane authenticator; this one protects the console session
+// layer. Returns a sentinel error rather than calling log.Fatalf so
+// tests can exercise both branches in-process.
+func checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string) error {
+	if env != "production" {
+		return nil
+	}
+	if consoleListenAddr == "" {
+		return nil
+	}
+	if jwtSigningKeyPath != "" {
+		return nil
+	}
+	return errProductionTokenStoreRequired
+}
+
+// enforceProductionTokenStore wraps checkProductionTokenStore at the
+// startup callsite: a non-nil error is fatal. Tests should call
+// checkProductionTokenStore directly so they can errors.Is against
+// the sentinel without forking the test binary.
+func enforceProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string) {
+	if err := checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath); err != nil {
+		log.Fatalf("%s", err)
+	}
+}
+
+// buildTokenStore selects the console TokenStore from config. When
+// cfg.Console.JWTSigningKeyPath is set it loads the RSA key and
+// returns a stateless JWTTokenStore; otherwise it returns the
+// process-local MemoryTokenStore with a loud warning. The "iss"
+// claim is taken from cfg.ControlPlane.AuthIssuer, falling back to a
+// stable default when the operator left it unset, so a dev who wires
+// only a key still gets verifiable tokens.
+func buildTokenStore(cfg config.Config) console.TokenStore {
+	p := cfg.Console.JWTSigningKeyPath
+	if p == "" {
+		// MemoryTokenStore is process-local and loses every
+		// issued token on restart; production never reaches here
+		// because enforceProductionTokenStore fails closed first.
+		log.Printf("console: jwt_signing_key_path not set; using in-memory MemoryTokenStore — DO NOT use in production (tokens are lost on restart and not shared across replicas)")
+		return console.NewMemoryTokenStore()
+	}
+	key, err := console.LoadRSAPrivateKeyPEM(p)
+	if err != nil {
+		log.Fatalf("gateway: load console JWT signing key: %v", err)
+	}
+	issuer := cfg.ControlPlane.AuthIssuer
+	if issuer == "" {
+		issuer = defaultJWTIssuer
+	}
+	store, err := console.NewJWTTokenStore(console.JWTConfig{
+		SigningKey: key,
+		Issuer:     issuer,
+		TTL:        cfg.Console.JWTTokenTTL.ToDuration(),
+		KeyID:      jwtKeyIDFromKey(key),
+	})
+	if err != nil {
+		log.Fatalf("gateway: build console JWT token store: %v", err)
+	}
+	log.Printf("console: stateless JWT session tokens enabled (key=%s issuer=%s ttl=%s)", p, issuer, store.TokenTTL())
+	return store
+}
+
+// defaultJWTIssuer is the "iss" claim used when the operator wires a
+// JWT signing key but leaves control_plane.auth_issuer empty.
+const defaultJWTIssuer = "zk-object-fabric-console"
+
+// jwtKeyIDFromKey derives a short, stable key identifier from the
+// public modulus so issued tokens carry a "kid" that pins them to a
+// specific key. This is purely forward-looking: it lets a future
+// multi-key rotation select the verifier by kid without re-minting
+// outstanding tokens. The value is a non-secret fingerprint of the
+// public key (which is published anyway).
+func jwtKeyIDFromKey(key *rsa.PrivateKey) string {
+	sum := sha256.Sum256(key.PublicKey.N.Bytes())
+	return hex.EncodeToString(sum[:8])
 }
 
 // checkAllTLSConfigs validates the TLS config for every listener
@@ -1804,7 +1921,7 @@ func startConsoleAPI(
 		usage = uq
 	}
 	placements := buildPlacementStore(metadataDB)
-	tokens := console.NewMemoryTokenStore()
+	tokens := buildTokenStore(cfg)
 
 	cellStore := buildDedicatedCellStore(metadataDB)
 	cellProvisioner := buildCellProvisioner(cellStore)
