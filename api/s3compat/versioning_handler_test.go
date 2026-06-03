@@ -131,6 +131,31 @@ func TestBucketVersioning_NotImplementedWithoutStore(t *testing.T) {
 	}
 }
 
+// TestGetObjectWithVersioningQuery_NotRoutedToBucketConfig guards the
+// dispatch fix where GET /{bucket}/{key}?versioning must fall through
+// to the object GET (a key is present) rather than being routed to
+// GetBucketVersioning, which would return the bucket's versioning XML
+// in place of the object body.
+func TestGetObjectWithVersioningQuery_NotRoutedToBucketConfig(t *testing.T) {
+	h, _ := newVersioningTestHandler()
+	setVersioning(t, h, "bucket", "Enabled")
+	const body = "object-bytes"
+	putObj(t, h, "/bucket/obj", body)
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/obj?versioning", nil)
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /bucket/obj?versioning = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if rec.Body.String() != body {
+		t.Fatalf("GET /bucket/obj?versioning body = %q, want object data %q (was the request misrouted to GetBucketVersioning?)", rec.Body.String(), body)
+	}
+	if strings.Contains(rec.Body.String(), "VersioningConfiguration") {
+		t.Fatalf("GET /bucket/obj?versioning returned the bucket versioning document instead of object data; body=%s", rec.Body)
+	}
+}
+
 // putObj writes an object through the Put handler and returns its
 // version id.
 func putObj(t *testing.T, h *Handler, path, body string) string {

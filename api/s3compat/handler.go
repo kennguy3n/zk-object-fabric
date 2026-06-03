@@ -642,8 +642,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.ListMultipartUploads(w, r, bucket)
 			return
 		}
-		// Bucket versioning config (GET /{bucket}?versioning).
-		if q.Has("versioning") {
+		// Bucket versioning config (GET /{bucket}?versioning). Guard
+		// on key=="" like the other bucket-level sub-resources so
+		// GET /{bucket}/{key}?versioning falls through to the object
+		// GET rather than returning the bucket versioning document.
+		if key == "" && q.Has("versioning") {
 			h.GetBucketVersioning(w, r, bucket)
 			return
 		}
