@@ -52,6 +52,30 @@ const (
 	// per-request rate.
 	TaggingRequests Dimension = "tagging_requests"
 
+	// LifecycleExpirations counts object versions permanently
+	// deleted by the daily lifecycle evaluator (WS8.2) — the
+	// versioning-disabled expiration path. These are metered on
+	// their own dimension rather than folded into DeleteRequests
+	// because AWS does NOT charge lifecycle expirations as Tier-1
+	// DELETE API requests; keeping them separate lets operators
+	// account for lifecycle activity without inflating billable
+	// request counts. Delta is always 1.
+	LifecycleExpirations Dimension = "lifecycle_expirations"
+
+	// LifecycleDeleteMarkers counts delete markers inserted by the
+	// lifecycle evaluator when expiring an object in a
+	// versioning-enabled bucket (the current version is preserved
+	// as noncurrent). Like LifecycleExpirations these are not
+	// billable DELETE requests. Delta is always 1.
+	LifecycleDeleteMarkers Dimension = "lifecycle_delete_markers"
+
+	// LifecycleAbortedUploads counts incomplete multipart uploads
+	// aborted by the lifecycle evaluator's
+	// AbortIncompleteMultipartUpload action. AWS does not charge
+	// the abort itself; the dimension exists for operator
+	// visibility into reclaimed staging space. Delta is always 1.
+	LifecycleAbortedUploads Dimension = "lifecycle_aborted_uploads"
+
 	// EgressBytes counts ciphertext bytes served to clients.
 	EgressBytes Dimension = "egress_bytes"
 

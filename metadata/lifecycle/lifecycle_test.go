@@ -93,6 +93,27 @@ func TestConfigValid(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// AWS rejects ObjectSizeLessThan below 1: "< 0 bytes"
+			// matches no object, so it is a useless predicate.
+			name: "size lt zero rejected",
+			cfg: Config{Rules: []Rule{{
+				Status:     StatusEnabled,
+				Filter:     Filter{ObjectSizeLessThan: i64(0)},
+				Expiration: &Expiration{Days: 1},
+			}}},
+			wantErr: true,
+		},
+		{
+			// ObjectSizeGreaterThan of 0 is valid (selects every
+			// object larger than zero bytes).
+			name: "size gt zero ok",
+			cfg: Config{Rules: []Rule{{
+				Status:     StatusEnabled,
+				Filter:     Filter{ObjectSizeGreaterThan: i64(0)},
+				Expiration: &Expiration{Days: 1},
+			}}},
+		},
+		{
 			name: "duplicate rule IDs",
 			cfg: Config{Rules: []Rule{
 				{ID: "r1", Status: StatusEnabled, Expiration: &Expiration{Days: 1}},
