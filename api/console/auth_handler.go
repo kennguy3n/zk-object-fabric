@@ -927,6 +927,9 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 //     store outage become an MFA bypass);
 //   - 401 with mfaRequired=true when the code is missing or wrong, so the
 //     SPA prompts for the authenticator code rather than the password.
+//     mfaInvalid=true is added when a code was actually supplied but
+//     rejected (wrong / replayed), so the SPA can show "that code was
+//     incorrect" instead of a bare prompt.
 func (h *AuthHandler) enforceSecondFactor(w http.ResponseWriter, tenantID string, req loginRequest) bool {
 	if h.cfg.MFA == nil {
 		return true
@@ -952,9 +955,19 @@ func (h *AuthHandler) enforceSecondFactor(w http.ResponseWriter, tenantID string
 		// bad-password 401. A correct-password prober already knows
 		// the password, so revealing that MFA is on leaks nothing
 		// they could not already see by logging in themselves.
+		//
+		// mfaInvalid distinguishes "you submitted a code and it was
+		// wrong/replayed" from "you haven't sent a code yet" so the
+		// SPA can surface a retry error rather than re-showing a blank
+		// prompt. It leaks nothing further: the caller has already
+		// proven the password, so they could observe the same result
+		// by simply attempting the second factor themselves.
+		codeSupplied := strings.TrimSpace(req.TOTPCode) != "" ||
+			strings.TrimSpace(req.RecoveryCode) != ""
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"error":       "multi-factor authentication required",
 			"mfaRequired": true,
+			"mfaInvalid":  codeSupplied,
 		})
 		return false
 	}

@@ -113,17 +113,31 @@ func TestMFAEnrollActivateAndLoginStepUp(t *testing.T) {
 	}
 	var failBody struct {
 		MFARequired bool `json:"mfaRequired"`
+		MFAInvalid  bool `json:"mfaInvalid"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &failBody)
 	if !failBody.MFARequired {
 		t.Fatalf("login without TOTP should set mfaRequired=true; body = %s", rec.Body.String())
 	}
+	// No code was supplied, so this is a prompt, not a rejection.
+	if failBody.MFAInvalid {
+		t.Fatalf("login without a code should set mfaInvalid=false; body = %s", rec.Body.String())
+	}
 
-	// A wrong code is also rejected.
+	// A wrong code is also rejected, and flagged as invalid so the SPA
+	// can show a retry error rather than a blank prompt.
 	rec = postJSON(t, mux, authPathLogin,
 		`{"email":"`+mfaTestEmail+`","password":"`+mfaTestPass+`","totpCode":"000000"}`)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("login with wrong TOTP status = %d, want 401; body = %s", rec.Code, rec.Body.String())
+	}
+	failBody = struct {
+		MFARequired bool `json:"mfaRequired"`
+		MFAInvalid  bool `json:"mfaInvalid"`
+	}{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &failBody)
+	if !failBody.MFARequired || !failBody.MFAInvalid {
+		t.Fatalf("login with wrong code should set mfaRequired=true and mfaInvalid=true; body = %s", rec.Body.String())
 	}
 
 	// The correct code unlocks login and issues a token.
