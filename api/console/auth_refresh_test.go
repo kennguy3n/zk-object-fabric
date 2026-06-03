@@ -185,6 +185,21 @@ func TestRefreshInfraErrorReturns503(t *testing.T) {
 	}
 }
 
+// TestLogoutInfraErrorReturns503 verifies that an infrastructure
+// failure from Revoke (a DB timeout / connection refused, not a
+// validation outcome — Revoke treats unknown/expired tokens as a no-op
+// 204) surfaces as 503, matching the refresh handler's retryable status
+// for the same fault class rather than a misleading 500. A
+// status-specific SPA can then retry so the server-side token is
+// actually revoked.
+func TestLogoutInfraErrorReturns503(t *testing.T) {
+	mux := newRefreshTestHandler(t, errRotateStore{err: errors.New("dial tcp: connection refused")})
+	rec := postJSON(t, mux, authPathLogout, `{"refreshToken":"live-looking-token"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("logout on infra error status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 // flakyTokenStore issues tokens normally until failAfter successful
 // issues, then fails every subsequent IssueToken. It lets a test let
 // signup succeed (one issue) and then force the refresh handler's

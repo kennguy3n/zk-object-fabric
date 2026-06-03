@@ -995,12 +995,16 @@ func (h *AuthHandler) logout(w http.ResponseWriter, r *http.Request) {
 	// Trim like the refresh handler so a whitespace-padded copy/paste
 	// resolves to the same lookup; an empty token is a no-op Revoke.
 	if err := h.cfg.RefreshTokens.Revoke(strings.TrimSpace(req.RefreshToken)); err != nil {
-		// Mirror the refresh handler: a Revoke failure is an
-		// infrastructure fault whose detail (DB host / DSN) belongs in
-		// the logs, not the wire — the client only needs to know the
-		// logout didn't complete.
-		log.Printf("console: revoke refresh token on logout failed: %v", err)
-		writeError(w, http.StatusInternalServerError, "logout failed; please retry")
+		// Mirror the refresh handler exactly: a Revoke failure is a
+		// transient infrastructure fault (DB timeout / connection
+		// refused), so it returns 503 — the same retryable status the
+		// refresh handler uses for its non-sentinel Rotate errors — not
+		// 500. A status-specific SPA ("retry only on 503") then retries
+		// the logout so the server-side token is actually revoked rather
+		// than silently left live. The detail (which may name hosts /
+		// DSNs) is logged server-side, not returned on the wire.
+		log.Printf("console: revoke refresh token on logout failed (infrastructure): %v", err)
+		writeError(w, http.StatusServiceUnavailable, "logout temporarily unavailable; please retry")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
