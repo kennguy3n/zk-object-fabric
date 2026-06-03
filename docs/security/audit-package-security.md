@@ -433,8 +433,9 @@ should attempt:
   tenants. RLS only applies to a non-superuser, non-`BYPASSRLS` role,
   so the gateway refuses to boot in production on a privileged metadata
   connection (`cmd/gateway/main.go` `checkProductionRLSRole`). The
-  remaining control-plane tables (console auth/refresh/mfa) reuse the
-  same substrate in follow-ups.
+  remaining tenant tables (the `api/s3compat/multipart` store and the
+  console auth/refresh/mfa stores) reuse the same substrate in
+  follow-ups.
 - **CMK is held by the gateway process in `ManagedEncrypted` mode.**
   This is the documented trust model — in Strict ZK mode the
   gateway never sees the CMK; in `ManagedEncrypted` mode the
