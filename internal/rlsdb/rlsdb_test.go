@@ -1,9 +1,18 @@
 package rlsdb
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
+
+func TestBeginTenant_RejectsEmptyTenant(t *testing.T) {
+	// A nil *sql.DB is fine here: the empty-tenant guard must fail before
+	// any database access, so the call never dereferences db.
+	if _, err := BeginTenant(context.Background(), nil, ""); err == nil {
+		t.Fatal("BeginTenant accepted an empty tenant id; want fail-closed error")
+	}
+}
 
 func TestStatements_Validation(t *testing.T) {
 	if _, err := Statements("bad-table", "zkof_app"); err == nil {
