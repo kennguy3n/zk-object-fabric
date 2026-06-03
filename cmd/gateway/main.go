@@ -787,7 +787,7 @@ func buildTokenStore(cfg config.Config) console.TokenStore {
 	store, err := console.NewJWTTokenStore(console.JWTConfig{
 		SigningKey: key,
 		Issuer:     issuer,
-		TTL:        time.Duration(cfg.Console.JWTTokenTTL),
+		TTL:        cfg.Console.JWTTokenTTL.ToDuration(),
 		KeyID:      jwtKeyIDFromKey(key),
 	})
 	if err != nil {
