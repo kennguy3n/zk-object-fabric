@@ -703,9 +703,20 @@ func TestBuildTokenStore(t *testing.T) {
 // single-node profiles legitimately use the in-memory token store.
 func TestCheckProductionTokenStore_NonProduction(t *testing.T) {
 	for _, env := range []string{"development", "", "staging"} {
-		if err := checkProductionTokenStore(env, ""); err != nil {
-			t.Errorf("checkProductionTokenStore(%q, \"\") = %v; want nil", env, err)
+		if err := checkProductionTokenStore(env, ":9090", ""); err != nil {
+			t.Errorf("checkProductionTokenStore(%q, \":9090\", \"\") = %v; want nil", env, err)
 		}
+	}
+}
+
+// TestCheckProductionTokenStore_ConsoleDisabled: the console API is
+// opt-in (empty ListenAddr). When it is disabled no TokenStore is ever
+// built, so the guard must not fire even under env=production with no
+// signing key — an S3 data-plane-only gateway must boot without a JWT
+// key it would never use.
+func TestCheckProductionTokenStore_ConsoleDisabled(t *testing.T) {
+	if err := checkProductionTokenStore("production", "", ""); err != nil {
+		t.Errorf("checkProductionTokenStore(production, \"\", \"\") = %v; want nil when console disabled", err)
 	}
 }
 
@@ -713,8 +724,8 @@ func TestCheckProductionTokenStore_NonProduction(t *testing.T) {
 // a JWT signing key configured the guard must not fire — the console
 // will wire the stateless JWTTokenStore.
 func TestCheckProductionTokenStore_ProductionWithKey(t *testing.T) {
-	if err := checkProductionTokenStore("production", "/etc/zkof/jwt-signing.key"); err != nil {
-		t.Errorf("checkProductionTokenStore(production, key) = %v; want nil", err)
+	if err := checkProductionTokenStore("production", ":9090", "/etc/zkof/jwt-signing.key"); err != nil {
+		t.Errorf("checkProductionTokenStore(production, addr, key) = %v; want nil", err)
 	}
 }
 
@@ -724,9 +735,9 @@ func TestCheckProductionTokenStore_ProductionWithKey(t *testing.T) {
 // boot rather than silently falling back to the process-local,
 // non-replica-safe MemoryTokenStore.
 func TestCheckProductionTokenStore_ProductionFails(t *testing.T) {
-	err := checkProductionTokenStore("production", "")
+	err := checkProductionTokenStore("production", ":9090", "")
 	if err == nil {
-		t.Fatalf("checkProductionTokenStore(production, \"\") = nil; want errProductionTokenStoreRequired")
+		t.Fatalf("checkProductionTokenStore(production, addr, \"\") = nil; want errProductionTokenStoreRequired")
 	}
 	if !errors.Is(err, errProductionTokenStoreRequired) {
 		t.Fatalf("checkProductionTokenStore returned %v; want errors.Is(_, errProductionTokenStoreRequired)", err)

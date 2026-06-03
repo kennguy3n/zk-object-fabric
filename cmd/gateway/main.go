@@ -197,12 +197,14 @@ func main() {
 	// the in-memory tenant store cannot satisfy production auth
 	// without static --tenants bindings.
 	enforceProductionManifestEncryption(cfg.Env, metadataDB != nil || embeddedDB != nil, cfg.Encryption.ManifestBodyKeyPath)
-	// Production safety net: refuse to start when env=production and
-	// no console JWT signing key is configured. Without it the
-	// console falls back to the process-local MemoryTokenStore,
-	// whose tokens are lost on restart and are not shared across
-	// replicas behind a load balancer — see checkProductionTokenStore.
-	enforceProductionTokenStore(cfg.Env, cfg.Console.JWTSigningKeyPath)
+	// Production safety net: refuse to start when env=production, the
+	// console API is enabled, and no console JWT signing key is
+	// configured. Without it the console falls back to the process-
+	// local MemoryTokenStore, whose tokens are lost on restart and are
+	// not shared across replicas behind a load balancer. Skipped when
+	// the console is disabled (ListenAddr empty), since no TokenStore
+	// is built then — see checkProductionTokenStore.
+	enforceProductionTokenStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.JWTSigningKeyPath)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -713,23 +715,33 @@ func enforceProductionManifestEncryption(env string, manifestStorePersistent boo
 var errProductionTokenStoreRequired = errors.New("gateway: env=production but no console.jwt_signing_key_path is configured; the console would fall back to the in-memory MemoryTokenStore, whose tokens are lost on restart and are not shared across replicas behind a load balancer. Set console.jwt_signing_key_path to a PEM-encoded RSA private key or use env=development")
 
 // checkProductionTokenStore refuses to start the gateway when
-// cfg.Env == "production" and no JWT signing key is configured. The
-// MemoryTokenStore the console otherwise falls back to is process-
-// local: every issued session token is dropped on restart, and two
-// gateway replicas behind a load balancer mint tokens the other
-// cannot validate, so a multi-replica production deploy would log
-// users out on every rolling restart and fail authentication for any
-// request that lands on a replica other than the one that issued the
-// token. The stateless JWTTokenStore (signed, self-contained,
-// validated against a shared public key) is the only production-safe
-// option, so production must configure a signing key.
+// cfg.Env == "production", the console API is enabled, and no JWT
+// signing key is configured. The MemoryTokenStore the console
+// otherwise falls back to is process-local: every issued session
+// token is dropped on restart, and two gateway replicas behind a load
+// balancer mint tokens the other cannot validate, so a multi-replica
+// production deploy would log users out on every rolling restart and
+// fail authentication for any request that lands on a replica other
+// than the one that issued the token. The stateless JWTTokenStore
+// (signed, self-contained, validated against a shared public key) is
+// the only production-safe option, so production must configure a
+// signing key.
+//
+// The guard is gated on consoleListenAddr because the console API is
+// opt-in: when it is empty startConsoleAPI returns before
+// buildTokenStore is ever called, so no TokenStore exists to be
+// unsafe. An S3 data-plane-only production gateway (console disabled)
+// must not be forced to configure a signing key it never uses.
 //
 // Layered alongside enforceProductionAuth: that guard protects the
 // S3 data-plane authenticator; this one protects the console session
 // layer. Returns a sentinel error rather than calling log.Fatalf so
 // tests can exercise both branches in-process.
-func checkProductionTokenStore(env, jwtSigningKeyPath string) error {
+func checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string) error {
 	if env != "production" {
+		return nil
+	}
+	if consoleListenAddr == "" {
 		return nil
 	}
 	if jwtSigningKeyPath != "" {
@@ -742,8 +754,8 @@ func checkProductionTokenStore(env, jwtSigningKeyPath string) error {
 // startup callsite: a non-nil error is fatal. Tests should call
 // checkProductionTokenStore directly so they can errors.Is against
 // the sentinel without forking the test binary.
-func enforceProductionTokenStore(env, jwtSigningKeyPath string) {
-	if err := checkProductionTokenStore(env, jwtSigningKeyPath); err != nil {
+func enforceProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string) {
+	if err := checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath); err != nil {
 		log.Fatalf("%s", err)
 	}
 }

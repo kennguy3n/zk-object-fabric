@@ -253,12 +253,16 @@ func LoadRSAPrivateKeyPEM(path string) (*rsa.PrivateKey, error) {
 	if block == nil {
 		return nil, fmt.Errorf("console: JWT signing key %q is not PEM-encoded", path)
 	}
-	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+	key, pkcs1Err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if pkcs1Err == nil {
 		return key, nil
 	}
-	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("console: parse JWT signing key %q (tried PKCS#1 and PKCS#8): %w", path, err)
+	parsed, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if pkcs8Err != nil {
+		// Surface both parse failures: when an operator hands us a
+		// corrupted PKCS#1 file the PKCS#8 error alone is misleading
+		// (it complains about the wrong format), so report each.
+		return nil, fmt.Errorf("console: parse JWT signing key %q (PKCS#1: %v; PKCS#8: %v)", path, pkcs1Err, pkcs8Err)
 	}
 	rsaKey, ok := parsed.(*rsa.PrivateKey)
 	if !ok {
