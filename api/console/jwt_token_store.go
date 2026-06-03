@@ -15,7 +15,7 @@ import (
 )
 
 // DefaultJWTTokenTTL is the access-token lifetime JWTTokenStore uses
-// when AuthConfig leaves TTL unset. One hour balances the SPA's
+// when JWTConfig leaves TTL unset. One hour balances the SPA's
 // session length against the blast radius of a leaked token: a
 // stolen token stops working within the hour, and the SPA simply
 // re-authenticates (login round-trip) rather than carrying a
@@ -259,7 +259,11 @@ func LoadRSAPrivateKeyPEM(path string) (*rsa.PrivateKey, error) {
 	// PKCS#8 encryption uses the "ENCRYPTED PRIVATE KEY" block type. The
 	// store needs an unencrypted key it can sign with unattended, so the
 	// operator must decrypt it first (e.g. `openssl rsa -in enc.pem`).
-	if _, encrypted := block.Headers["DEK-Info"]; encrypted || block.Type == "ENCRYPTED PRIVATE KEY" {
+	// Match either legacy header (Proc-Type or DEK-Info) defensively so a
+	// malformed block carrying only one is still caught.
+	_, hasProcType := block.Headers["Proc-Type"]
+	_, hasDEKInfo := block.Headers["DEK-Info"]
+	if hasProcType || hasDEKInfo || block.Type == "ENCRYPTED PRIVATE KEY" {
 		return nil, fmt.Errorf("console: JWT signing key %q is password-protected; provide an unencrypted PEM (the gateway signs unattended and cannot prompt for a passphrase)", path)
 	}
 	key, pkcs1Err := x509.ParsePKCS1PrivateKey(block.Bytes)
