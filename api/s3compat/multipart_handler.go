@@ -302,7 +302,14 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 			upload.SetPlaintextPartHash(partNumber, ptDigest[:])
 		}
 
-		ciphertext, eerr := h.encryptWithDEK(plaintext, upload.DEKMaterial, uploadAADIdentity(upload))
+		// partsEncryptionConfig gates the seal: AADVersion "v1"
+		// (session carries a version) binds the part's chunks to
+		// uploadAADIdentity; a legacy session (upload.VersionID
+		// == "") seals with nil AAD, matching the AADVersion ""
+		// that CompleteMultipartUpload records and the GET path
+		// reads back. This is the exact signal partsEncryptionConfig
+		// already feeds the consolidate decrypt path.
+		ciphertext, eerr := h.encryptWithDEK(plaintext, upload.DEKMaterial, partsEncryptionConfig(upload), uploadAADIdentity(upload))
 		if eerr != nil {
 			writeError(w, http.StatusInternalServerError, "EncryptionFailed", eerr.Error(), r.URL.Path)
 			return

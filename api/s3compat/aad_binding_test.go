@@ -179,6 +179,75 @@ func TestAADLegacy_NilAADRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncryptWithDEK_VersionAwareSymmetry locks the encrypt/decrypt
+// symmetry for the shared-DEK multipart helpers. encryptWithDEK and
+// decryptWithDEK must agree on the AAD shape based on the SAME
+// recorded EncryptionConfig.AADVersion:
+//
+//   - A legacy multipart session loads with upload.VersionID == "",
+//     so partsEncryptionConfig returns AADVersion "". The part must
+//     seal with nil AAD (matching the "" the manifest records and the
+//     GET path reads), even though the identity carries a populated
+//     tenant/bucket/object-key-hash. Before the fix encryptWithDEK
+//     bound AAD unconditionally, so the part sealed with non-nil AAD
+//     while CompleteMultipartUpload recorded "" — Open with nil AAD
+//     then failed the Poly1305 tag and the data was permanently
+//     undecryptable.
+//   - A v1 session (VersionID set) seals bound and opens bound.
+//   - The cross cases (seal bound / open nil and seal nil / open
+//     bound) must both fail, proving the version flag is load-bearing.
+func TestEncryptWithDEK_VersionAwareSymmetry(t *testing.T) {
+	h := newAADTestHandler(t)
+	dek, err := client_sdk.GenerateDEK()
+	if err != nil {
+		t.Fatalf("GenerateDEK: %v", err)
+	}
+	// A legacy session still has a populated identity (the DB
+	// columns are NOT NULL) — only VersionID is empty. Use the
+	// populated form so the test would catch the original bug,
+	// where chunkAAD produced "tenant|bucket|hash|" rather than nil.
+	id := aadIdentity{TenantID: "tenant-a", Bucket: "bucket-a", ObjectKeyHash: "deadbeef", VersionID: ""}
+	plaintext := []byte("legacy multipart part must round-trip with nil AAD")
+
+	legacyEnc := metadata.EncryptionConfig{AADVersion: ""}
+	v1Enc := metadata.EncryptionConfig{AADVersion: AADVersionV1}
+
+	legacyCT, err := h.encryptWithDEK(append([]byte(nil), plaintext...), dek, legacyEnc, id)
+	if err != nil {
+		t.Fatalf("encryptWithDEK (legacy): %v", err)
+	}
+	got, err := h.decryptWithDEK(legacyCT, dek, legacyEnc, id)
+	if err != nil {
+		t.Fatalf("decryptWithDEK (legacy round-trip): %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("legacy round-trip mismatch: want %q got %q", plaintext, got)
+	}
+
+	// Regression guard: the legacy seal must NOT be openable as v1,
+	// and a v1 seal must NOT be openable as legacy. If encryptWithDEK
+	// ignored enc and always bound (the original bug), legacyCT would
+	// open under v1Enc and this assertion would fail.
+	if _, derr := h.decryptWithDEK(legacyCT, dek, v1Enc, id); derr == nil {
+		t.Fatal("legacy-sealed part opened as v1: want AEAD failure, got nil (encryptWithDEK bound AAD despite AADVersion \"\")")
+	}
+	v1ID := aadIdentity{TenantID: id.TenantID, Bucket: id.Bucket, ObjectKeyHash: id.ObjectKeyHash, VersionID: "v-0001"}
+	v1CT, err := h.encryptWithDEK(append([]byte(nil), plaintext...), dek, v1Enc, v1ID)
+	if err != nil {
+		t.Fatalf("encryptWithDEK (v1): %v", err)
+	}
+	if _, derr := h.decryptWithDEK(v1CT, dek, legacyEnc, v1ID); derr == nil {
+		t.Fatal("v1-sealed part opened as legacy: want AEAD failure, got nil")
+	}
+	v1Got, err := h.decryptWithDEK(v1CT, dek, v1Enc, v1ID)
+	if err != nil {
+		t.Fatalf("decryptWithDEK (v1 round-trip): %v", err)
+	}
+	if !bytes.Equal(v1Got, plaintext) {
+		t.Fatalf("v1 round-trip mismatch: want %q got %q", plaintext, v1Got)
+	}
+}
+
 // sealLegacy reproduces a pre-AAD object: ciphertext sealed with the
 // SDK's nil-AAD Options and a wrapped DEK, recorded with an empty
 // AADVersion exactly as objects written before this change carry.
