@@ -14,6 +14,7 @@
 //	    tenant_id           TEXT NOT NULL,
 //	    bucket              TEXT NOT NULL,
 //	    object_key          TEXT NOT NULL,
+//	    version_id          TEXT,
 //	    backend             TEXT,
 //	    policy              JSONB NOT NULL,
 //	    enc_mode            TEXT,
@@ -257,17 +258,18 @@ func (s *PostgresStore) Create(upload *Upload) error {
 	}
 	q := fmt.Sprintf(`
 		INSERT INTO %s (
-			upload_id, tenant_id, bucket, object_key, backend,
+			upload_id, tenant_id, bucket, object_key, version_id, backend,
 			policy, enc_mode,
 			wrapped_dek, wrapped_key_id, wrap_algorithm, content_algorithm,
 			created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, s.uploadsTable)
 	if _, err := s.db.ExecContext(context.Background(), q,
 		upload.ID,
 		upload.TenantID,
 		upload.Bucket,
 		upload.ObjectKey,
+		nullableString(upload.VersionID),
 		upload.Backend,
 		policy,
 		upload.EncMode,
@@ -327,7 +329,7 @@ func (s *PostgresStore) Get(uploadID string) (*Upload, error) {
 // DEKMaterial. Returns ErrNotFound when the row is missing.
 func (s *PostgresStore) loadUpload(uploadID string) (*Upload, error) {
 	q := fmt.Sprintf(`
-		SELECT tenant_id, bucket, object_key, backend, policy,
+		SELECT tenant_id, bucket, object_key, version_id, backend, policy,
 		       enc_mode, wrapped_dek, wrapped_key_id, wrap_algorithm,
 		       content_algorithm, created_at
 		FROM %s WHERE upload_id = $1
@@ -341,12 +343,14 @@ func (s *PostgresStore) loadUpload(uploadID string) (*Upload, error) {
 		contentAlg       sql.NullString
 		encMode          sql.NullString
 		backend          sql.NullString
+		versionID        sql.NullString
 		upload           = &Upload{ID: uploadID}
 	)
 	switch err := row.Scan(
 		&upload.TenantID,
 		&upload.Bucket,
 		&upload.ObjectKey,
+		&versionID,
 		&backend,
 		&policyJSON,
 		&encMode,
@@ -363,6 +367,9 @@ func (s *PostgresStore) loadUpload(uploadID string) (*Upload, error) {
 	}
 	if err := json.Unmarshal(policyJSON, &upload.Policy); err != nil {
 		return nil, fmt.Errorf("multipart: unmarshal policy: %w", err)
+	}
+	if versionID.Valid {
+		upload.VersionID = versionID.String
 	}
 	if backend.Valid {
 		upload.Backend = backend.String

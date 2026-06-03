@@ -74,6 +74,7 @@ func requireMultipartPostgres(t *testing.T) *sql.DB {
 			tenant_id         TEXT NOT NULL,
 			bucket            TEXT NOT NULL,
 			object_key        TEXT NOT NULL,
+			version_id        TEXT,
 			backend           TEXT,
 			policy            JSONB NOT NULL,
 			enc_mode          TEXT,

@@ -764,12 +764,23 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encCfg, body, contentLength, plaintextSizeFn, ok := h.prepareSinglePieceEncryption(w, r, encMode)
+	// Generate the version (pieceID) BEFORE encryption so the AAD
+	// v1 binding can fix it into every chunk's tag. The manifest
+	// records this same VersionID, so the GET path rebuilds the
+	// identical AAD; deferring it until after the encrypt stream
+	// (as the pre-AAD code did) would leave nothing to bind to.
+	pieceID := newPieceID(tenantID, bucket, key, h.cfg.Now())
+	encID := aadIdentity{
+		TenantID:      tenantID,
+		Bucket:        bucket,
+		ObjectKeyHash: hashObjectKey(key),
+		VersionID:     pieceID,
+	}
+
+	encCfg, body, contentLength, plaintextSizeFn, ok := h.prepareSinglePieceEncryption(w, r, encMode, encID)
 	if !ok {
 		return
 	}
-
-	pieceID := newPieceID(tenantID, bucket, key, h.cfg.Now())
 
 	// Tee the body through a BLAKE3 hasher so we record an
 	// independent content-integrity hash that does not rely on
@@ -1072,7 +1083,7 @@ func (h *Handler) bufferedGatewayDecryptedGet(
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
 		return
 	}
-	plaintext, derr := h.decryptFromStorage(ciphertext, manifest.Encryption)
+	plaintext, derr := h.decryptFromStorage(ciphertext, manifest.Encryption, aadIdentityOf(manifest))
 	if derr != nil {
 		writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
 		return
@@ -1153,7 +1164,7 @@ func (h *Handler) streamGatewayDecryptedGet(
 	}
 	defer ciphertextSrc.Close()
 
-	plaintext, derr := h.streamDecryptFromStorage(ciphertextSrc, manifest.Encryption)
+	plaintext, derr := h.streamDecryptFromStorage(ciphertextSrc, manifest.Encryption, aadIdentityOf(manifest))
 	if derr != nil {
 		writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
 		return

@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     tenant_id         TEXT        NOT NULL,
     bucket            TEXT        NOT NULL,
     object_key        TEXT        NOT NULL,
+    -- version_id is the object version assigned at Create and
+    -- recorded on the final manifest at Complete. It is fixed
+    -- up-front because the managed AAD v1 binding seals each part's
+    -- chunks against tenant_id|bucket|object_key_hash|version_id at
+    -- UploadPart time, and the GET path rebuilds the identical AAD.
+    version_id        TEXT,
     backend           TEXT,
     -- policy is the resolved metadata.PlacementPolicy captured at
     -- CreateMultipartUpload time so each UploadPart applies the
