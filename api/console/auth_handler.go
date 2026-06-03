@@ -321,6 +321,19 @@ type AuthConfig struct {
 	// accidental default.
 	RefreshTokens RefreshTokenStore
 
+	// MFA persists TOTP multi-factor enrollments. When nil, the
+	// /api/v1/auth/mfa/* endpoints reply 503 and login performs no
+	// second-factor step — the deployment is single-factor. When
+	// wired, login enforces a TOTP (or recovery) code for any tenant
+	// whose enrollment is active, and the management endpoints let a
+	// user enroll / activate / disable their authenticator.
+	MFA MFAStore
+
+	// MFAIssuer is the human-facing service name embedded in the
+	// otpauth:// enrollment URI (what the user sees in their
+	// authenticator app). Defaults to DefaultMFAIssuer.
+	MFAIssuer string
+
 	// NewTenantID returns a fresh tenant ID. Defaults to a 16-byte
 	// hex-encoded identifier prefixed with "t-".
 	NewTenantID func() (string, error)
@@ -445,6 +458,9 @@ func NewAuthHandler(cfg AuthConfig) *AuthHandler {
 	if cfg.Tokens == nil {
 		cfg.Tokens = NewMemoryTokenStore()
 	}
+	if strings.TrimSpace(cfg.MFAIssuer) == "" {
+		cfg.MFAIssuer = DefaultMFAIssuer
+	}
 	return &AuthHandler{cfg: cfg}
 }
 
@@ -464,6 +480,10 @@ const (
 	authPathVerify  = "/api/v1/auth/verify"
 	authPathRefresh = "/api/v1/auth/refresh"
 	authPathLogout  = "/api/v1/auth/logout"
+
+	authPathMFAEnroll   = "/api/v1/auth/mfa/enroll"
+	authPathMFAActivate = "/api/v1/auth/mfa/activate"
+	authPathMFADisable  = "/api/v1/auth/mfa/disable"
 )
 
 // maxAuthBodyBytes caps the request body the auth endpoints decode.
@@ -506,6 +526,24 @@ func (h *AuthHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.logout(w, r)
+	case authPathMFAEnroll:
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.mfaEnroll(w, r)
+	case authPathMFAActivate:
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.mfaActivate(w, r)
+	case authPathMFADisable:
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.mfaDisable(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "unknown auth path "+r.URL.Path)
 	}
@@ -806,10 +844,18 @@ func (h *AuthHandler) issueRefreshToken(tenantID string) (string, time.Time) {
 	return rt.Raw, rt.ExpiresAt
 }
 
-// loginRequest is the payload accepted by POST /api/v1/auth/login.
+// loginRequest is the payload accepted by POST /api/v1/auth/login. When
+// the tenant has active MFA, exactly one of TOTPCode or RecoveryCode is
+// also required on the second call (the first call returns mfaRequired so
+// the SPA knows to prompt).
 type loginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	// TOTPCode is the 6-digit code from the user's authenticator app.
+	TOTPCode string `json:"totpCode,omitempty"`
+	// RecoveryCode is a single-use backup code, used when the user has
+	// lost access to their authenticator. Consumed on success.
+	RecoveryCode string `json:"recoveryCode,omitempty"`
 }
 
 func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
@@ -851,6 +897,14 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "tenant record missing for user")
 		return
 	}
+	// Second factor. A tenant with active TOTP MFA must present a
+	// valid code (or a single-use recovery code) before any session
+	// token is issued. The check fails closed: if the MFA store errors
+	// we return 503 rather than letting the login through, so an
+	// outage can never be a second-factor bypass.
+	if !h.enforceSecondFactor(w, tenantID, req) {
+		return
+	}
 	token, err := h.cfg.Tokens.IssueToken(tenantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
@@ -863,6 +917,273 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 		RefreshToken:          refreshToken,
 		RefreshTokenExpiresAt: refreshExpiresAt,
 	})
+}
+
+// enforceSecondFactor gates token issuance on a valid second factor when
+// the tenant has active MFA. It returns true (proceed) when MFA is not
+// configured, not enrolled, or satisfied by the request's TOTP / recovery
+// code. It writes the response and returns false otherwise:
+//   - 503 on an MFA-store infrastructure error (fail closed — never let a
+//     store outage become an MFA bypass);
+//   - 401 with mfaRequired=true when the code is missing or wrong, so the
+//     SPA prompts for the authenticator code rather than the password.
+func (h *AuthHandler) enforceSecondFactor(w http.ResponseWriter, tenantID string, req loginRequest) bool {
+	if h.cfg.MFA == nil {
+		return true
+	}
+	rec, ok, err := h.cfg.MFA.GetMFA(tenantID)
+	if err != nil {
+		log.Printf("console: load mfa for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "login temporarily unavailable; please retry")
+		return false
+	}
+	if !ok || !rec.Active {
+		return true
+	}
+	valid, err := h.checkSecondFactor(tenantID, rec, req.TOTPCode, req.RecoveryCode)
+	if err != nil {
+		log.Printf("console: verify second factor for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "login temporarily unavailable; please retry")
+		return false
+	}
+	if !valid {
+		// mfaRequired lets the SPA distinguish "password was right,
+		// now show the authenticator-code prompt" from a plain
+		// bad-password 401. A correct-password prober already knows
+		// the password, so revealing that MFA is on leaks nothing
+		// they could not already see by logging in themselves.
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"error":       "multi-factor authentication required",
+			"mfaRequired": true,
+		})
+		return false
+	}
+	return true
+}
+
+// checkSecondFactor reports whether a TOTP or recovery code satisfies a
+// tenant's active MFA. A non-empty recoveryCode takes precedence and is
+// consumed (single-use); otherwise a TOTP code is verified against the
+// stored secret and, on success, its time step is recorded as the replay
+// watermark — MarkTOTPStep advances only forward, so the same code cannot
+// be replayed within its still-valid window. The (false, nil) result
+// means "missing or wrong code"; a non-nil error is an infrastructure
+// fault the caller surfaces as 503.
+func (h *AuthHandler) checkSecondFactor(tenantID string, rec MFARecord, totpCode, recoveryCode string) (bool, error) {
+	if code := strings.TrimSpace(recoveryCode); code != "" {
+		return h.cfg.MFA.ConsumeRecoveryCode(tenantID, hashRecoveryCode(code))
+	}
+	code := strings.TrimSpace(totpCode)
+	if code == "" {
+		return false, nil
+	}
+	step, ok := totpVerify(rec.Secret, code, h.cfg.Now())
+	if !ok {
+		return false, nil
+	}
+	return h.cfg.MFA.MarkTOTPStep(tenantID, step)
+}
+
+// mfaRequest is the payload accepted by the /api/v1/auth/mfa/*
+// management endpoints. Email + Password re-authenticate the caller —
+// changing MFA settings is a security-sensitive operation, so it
+// requires the password again (step-up auth) rather than trusting an
+// ambient session. TOTPCode / RecoveryCode carry the second factor that
+// activate (TOTP) and disable (either) require.
+type mfaRequest struct {
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	TOTPCode     string `json:"totpCode,omitempty"`
+	RecoveryCode string `json:"recoveryCode,omitempty"`
+}
+
+// authenticateMFARequest decodes and password-authenticates an MFA
+// management request, returning the caller's tenant ID. On any failure
+// it writes the response (mirroring login's uniform 401 so a prober
+// cannot enumerate accounts) and returns ok=false. Callers must check
+// h.cfg.MFA / h.cfg.Auth for nil before calling.
+func (h *AuthHandler) authenticateMFARequest(w http.ResponseWriter, r *http.Request) (tenantID string, req mfaRequest, ok bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("mfa payload exceeds %d bytes", maxAuthBodyBytes))
+			return "", req, false
+		}
+		writeError(w, http.StatusBadRequest, "decode mfa request: "+err.Error())
+		return "", req, false
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Email == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, "email and password are required")
+		return "", req, false
+	}
+	hash, tid, found := h.cfg.Auth.LookupUser(req.Email)
+	if !found || hash == "" || strings.HasPrefix(hash, "oauth:") {
+		writeError(w, http.StatusUnauthorized, "invalid email or password")
+		return "", req, false
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid email or password")
+		return "", req, false
+	}
+	return tid, req, true
+}
+
+// mfaEnroll handles POST /api/v1/auth/mfa/enroll. It mints a fresh TOTP
+// secret, stores it as a pending (inactive) enrollment, and returns the
+// secret plus an otpauth:// URI the SPA renders as a QR code. The secret
+// does not take effect until the user confirms a code via mfaActivate,
+// so an interrupted enrollment never locks the user out.
+func (h *AuthHandler) mfaEnroll(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.MFA == nil {
+		writeError(w, http.StatusServiceUnavailable, "mfa is not configured")
+		return
+	}
+	if h.cfg.Auth == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth store not configured")
+		return
+	}
+	tenantID, req, ok := h.authenticateMFARequest(w, r)
+	if !ok {
+		return
+	}
+	secret, err := newTOTPSecret()
+	if err != nil {
+		log.Printf("console: generate totp secret for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusInternalServerError, "enroll failed; please retry")
+		return
+	}
+	if err := h.cfg.MFA.BeginEnrollment(tenantID, secret); err != nil {
+		if errors.Is(err, errMFAAlreadyActive) {
+			writeError(w, http.StatusConflict, "mfa is already active; disable it before re-enrolling")
+			return
+		}
+		log.Printf("console: begin mfa enrollment for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "enroll temporarily unavailable; please retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"secret":     secret,
+		"otpauthUri": totpEnrollmentURI(h.cfg.MFAIssuer, req.Email, secret),
+	})
+}
+
+// mfaActivate handles POST /api/v1/auth/mfa/activate. It confirms a
+// pending enrollment by verifying a TOTP code the user read from their
+// authenticator, flips the enrollment active, and returns the one-time
+// recovery codes (shown to the user exactly once). The activating code's
+// time step becomes the initial replay watermark so it cannot be
+// immediately reused to log in.
+func (h *AuthHandler) mfaActivate(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.MFA == nil {
+		writeError(w, http.StatusServiceUnavailable, "mfa is not configured")
+		return
+	}
+	if h.cfg.Auth == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth store not configured")
+		return
+	}
+	tenantID, req, ok := h.authenticateMFARequest(w, r)
+	if !ok {
+		return
+	}
+	rec, found, err := h.cfg.MFA.GetMFA(tenantID)
+	if err != nil {
+		log.Printf("console: load mfa for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "activate temporarily unavailable; please retry")
+		return
+	}
+	if !found || rec.Active {
+		// Nothing pending to confirm (never enrolled, or already
+		// active). 409 so the SPA does not misread it as success.
+		writeError(w, http.StatusConflict, "no pending mfa enrollment to activate")
+		return
+	}
+	code := strings.TrimSpace(req.TOTPCode)
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "totpCode is required")
+		return
+	}
+	step, valid := totpVerify(rec.Secret, code, h.cfg.Now())
+	if !valid {
+		writeError(w, http.StatusUnauthorized, "invalid authenticator code")
+		return
+	}
+	codes, hashes, err := generateRecoveryCodes()
+	if err != nil {
+		log.Printf("console: generate recovery codes for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusInternalServerError, "activate failed; please retry")
+		return
+	}
+	if err := h.cfg.MFA.Activate(tenantID, step, hashes); err != nil {
+		if errors.Is(err, errMFANotEnrolled) {
+			writeError(w, http.StatusConflict, "no pending mfa enrollment to activate")
+			return
+		}
+		log.Printf("console: activate mfa for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "activate temporarily unavailable; please retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":        true,
+		"recoveryCodes": codes,
+	})
+}
+
+// mfaDisable handles POST /api/v1/auth/mfa/disable. It removes a tenant's
+// MFA enrollment but only after the caller proves possession of the
+// second factor (a TOTP or recovery code) on top of the password — so a
+// stolen password alone cannot strip MFA. Disabling when MFA is not
+// active is an idempotent success.
+func (h *AuthHandler) mfaDisable(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.MFA == nil {
+		writeError(w, http.StatusServiceUnavailable, "mfa is not configured")
+		return
+	}
+	if h.cfg.Auth == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth store not configured")
+		return
+	}
+	tenantID, req, ok := h.authenticateMFARequest(w, r)
+	if !ok {
+		return
+	}
+	rec, found, err := h.cfg.MFA.GetMFA(tenantID)
+	if err != nil {
+		log.Printf("console: load mfa for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
+		return
+	}
+	if !found || !rec.Active {
+		// Already disabled or only a pending enrollment: clear any
+		// pending state and report the idempotent end state.
+		if found {
+			if err := h.cfg.MFA.Disable(tenantID); err != nil {
+				log.Printf("console: disable pending mfa for tenant %q failed: %v", tenantID, err)
+				writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	valid, err := h.checkSecondFactor(tenantID, rec, req.TOTPCode, req.RecoveryCode)
+	if err != nil {
+		log.Printf("console: verify second factor on disable for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
+		return
+	}
+	if !valid {
+		writeError(w, http.StatusUnauthorized, "a valid authenticator or recovery code is required to disable mfa")
+		return
+	}
+	if err := h.cfg.MFA.Disable(tenantID); err != nil {
+		log.Printf("console: disable mfa for tenant %q failed: %v", tenantID, err)
+		writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"active": false})
 }
 
 // refreshRequest is the payload accepted by POST /api/v1/auth/refresh

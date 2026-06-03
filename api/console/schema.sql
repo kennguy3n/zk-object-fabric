@@ -57,6 +57,34 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant ON refresh_tokens(tenant_id);
 
+-- mfa_credentials persists a tenant's TOTP multi-factor enrollment.
+-- secret is the base32 shared secret (the symmetric key TOTP needs to
+-- verify a code, so it cannot be hashed at rest the way a password is).
+-- active is FALSE for a pending enrollment (secret minted, first code
+-- not yet confirmed) and TRUE once the user has proven they can generate
+-- a code. last_step is the most recent TOTP time step consumed by a
+-- successful login: it is the replay watermark, advanced only forward by
+-- PostgresMFAStore.MarkTOTPStep so a code cannot be reused within its
+-- still-valid window.
+CREATE TABLE IF NOT EXISTS mfa_credentials (
+    tenant_id TEXT    PRIMARY KEY,
+    secret    TEXT    NOT NULL,
+    active    BOOLEAN NOT NULL DEFAULT FALSE,
+    last_step BIGINT  NOT NULL DEFAULT 0
+);
+
+-- mfa_recovery_codes holds the single-use recovery codes minted at
+-- activation, stored only as SHA-256 hex hashes (code_hash) so a
+-- database dump exposes no usable codes. Each consume DELETEs one row;
+-- disabling MFA deletes every row for the tenant.
+CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+    tenant_id TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, code_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mfa_recovery_tenant ON mfa_recovery_codes(tenant_id);
+
 -- dedicated_cells persists the operator-allocated cells the B2B /
 -- sovereign console surface lists for tenants whose contract type
 -- is b2b_dedicated or sovereign. Provisioning requests insert a

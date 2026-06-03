@@ -1,0 +1,241 @@
+package console
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+)
+
+// SQLiteMFAStore is the SQLite-backed MFAStore for the embedded /
+// single-node profile. It persists TOTP enrollments so a returning user
+// keeps their second factor across a gateway restart, mirroring the
+// SQLiteAuthStore and SQLiteRefreshTokenStore in the same embedded
+// database.
+//
+// Concurrency: Activate and the recovery / step mutations read-then-
+// write, so they run inside an explicit transaction. A database/sql Tx
+// pins one connection, making the read-then-write atomic even though the
+// embedded pool would otherwise hand the connection back between
+// statements.
+type SQLiteMFAStore struct {
+	db  *sql.DB
+	ctx context.Context
+}
+
+// NewSQLiteMFAStore wraps db and creates the MFA tables if they do not
+// yet exist.
+func NewSQLiteMFAStore(db *sql.DB) (*SQLiteMFAStore, error) {
+	if db == nil {
+		return nil, errors.New("console: sqlite mfa store requires a non-nil *sql.DB")
+	}
+	s := &SQLiteMFAStore{db: db}
+	if err := s.ensureSchema(context.Background()); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *SQLiteMFAStore) ensureSchema(ctx context.Context) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS mfa_credentials (
+			tenant_id  TEXT    PRIMARY KEY,
+			secret     TEXT    NOT NULL,
+			active     INTEGER NOT NULL DEFAULT 0,
+			last_step  INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+			tenant_id  TEXT NOT NULL,
+			code_hash  TEXT NOT NULL,
+			PRIMARY KEY (tenant_id, code_hash)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_mfa_recovery_tenant ON mfa_recovery_codes(tenant_id)`,
+	}
+	for _, q := range stmts {
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("console: ensure mfa schema: %w", err)
+		}
+	}
+	return nil
+}
+
+// WithContext returns a copy of the store bound to ctx.
+func (s *SQLiteMFAStore) WithContext(ctx context.Context) *SQLiteMFAStore {
+	clone := *s
+	clone.ctx = ctx
+	return &clone
+}
+
+func (s *SQLiteMFAStore) cx() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+// BeginEnrollment implements MFAStore.
+func (s *SQLiteMFAStore) BeginEnrollment(tenantID, secret string) error {
+	if tenantID == "" || secret == "" {
+		return errors.New("console: tenantID and secret are required")
+	}
+	tx, err := s.db.BeginTx(s.cx(), nil)
+	if err != nil {
+		return fmt.Errorf("console: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var active bool
+	switch err := tx.QueryRowContext(s.cx(),
+		`SELECT active FROM mfa_credentials WHERE tenant_id = ?`, tenantID).Scan(&active); {
+	case errors.Is(err, sql.ErrNoRows):
+		// no existing row — fall through to insert
+	case err != nil:
+		return fmt.Errorf("console: load mfa row: %w", err)
+	default:
+		if active {
+			return errMFAAlreadyActive
+		}
+	}
+
+	// Replace any prior pending secret and clear stale recovery rows
+	// (recovery codes only become real at activation).
+	if _, err := tx.ExecContext(s.cx(),
+		`INSERT INTO mfa_credentials (tenant_id, secret, active, last_step)
+		 VALUES (?, ?, 0, 0)
+		 ON CONFLICT(tenant_id) DO UPDATE SET secret = excluded.secret, active = 0, last_step = 0`,
+		tenantID, secret); err != nil {
+		return fmt.Errorf("console: upsert pending mfa: %w", err)
+	}
+	if _, err := tx.ExecContext(s.cx(),
+		`DELETE FROM mfa_recovery_codes WHERE tenant_id = ?`, tenantID); err != nil {
+		return fmt.Errorf("console: clear stale recovery codes: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("console: commit begin enrollment: %w", err)
+	}
+	return nil
+}
+
+// GetMFA implements MFAStore.
+func (s *SQLiteMFAStore) GetMFA(tenantID string) (MFARecord, bool, error) {
+	var (
+		secret   string
+		active   bool
+		lastStep int64
+	)
+	switch err := s.db.QueryRowContext(s.cx(),
+		`SELECT secret, active, last_step FROM mfa_credentials WHERE tenant_id = ?`, tenantID).
+		Scan(&secret, &active, &lastStep); {
+	case errors.Is(err, sql.ErrNoRows):
+		return MFARecord{}, false, nil
+	case err != nil:
+		return MFARecord{}, false, fmt.Errorf("console: load mfa: %w", err)
+	}
+
+	var remaining int
+	if err := s.db.QueryRowContext(s.cx(),
+		`SELECT COUNT(*) FROM mfa_recovery_codes WHERE tenant_id = ?`, tenantID).
+		Scan(&remaining); err != nil {
+		return MFARecord{}, false, fmt.Errorf("console: count recovery codes: %w", err)
+	}
+	return MFARecord{Secret: secret, Active: active, LastStep: lastStep, RecoveryRemaining: remaining}, true, nil
+}
+
+// Activate implements MFAStore.
+func (s *SQLiteMFAStore) Activate(tenantID string, firstStep int64, recoveryHashes []string) error {
+	tx, err := s.db.BeginTx(s.cx(), nil)
+	if err != nil {
+		return fmt.Errorf("console: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(s.cx(),
+		`UPDATE mfa_credentials SET active = 1, last_step = ? WHERE tenant_id = ?`,
+		firstStep, tenantID)
+	if err != nil {
+		return fmt.Errorf("console: activate mfa: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("console: activate rows affected: %w", err)
+	}
+	if n == 0 {
+		return errMFANotEnrolled
+	}
+
+	// Fresh activation replaces any prior recovery set.
+	if _, err := tx.ExecContext(s.cx(),
+		`DELETE FROM mfa_recovery_codes WHERE tenant_id = ?`, tenantID); err != nil {
+		return fmt.Errorf("console: clear recovery codes: %w", err)
+	}
+	for _, h := range recoveryHashes {
+		if _, err := tx.ExecContext(s.cx(),
+			`INSERT INTO mfa_recovery_codes (tenant_id, code_hash) VALUES (?, ?)`,
+			tenantID, h); err != nil {
+			return fmt.Errorf("console: insert recovery code: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("console: commit activate: %w", err)
+	}
+	return nil
+}
+
+// MarkTOTPStep implements MFAStore. The UPDATE's WHERE clause is the
+// atomic replay guard: it advances last_step only when the presented
+// step is strictly newer and the row is active, so a replayed code (step
+// <= last_step) affects zero rows and returns ok=false.
+func (s *SQLiteMFAStore) MarkTOTPStep(tenantID string, step int64) (bool, error) {
+	res, err := s.db.ExecContext(s.cx(),
+		`UPDATE mfa_credentials SET last_step = ? WHERE tenant_id = ? AND active = 1 AND last_step < ?`,
+		step, tenantID, step)
+	if err != nil {
+		return false, fmt.Errorf("console: mark totp step: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("console: mark step rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
+// ConsumeRecoveryCode implements MFAStore. The DELETE is atomic: a hash
+// matching an unused code is removed once and returns ok=true; a
+// concurrent second attempt with the same code affects zero rows.
+func (s *SQLiteMFAStore) ConsumeRecoveryCode(tenantID, codeHash string) (bool, error) {
+	if codeHash == "" {
+		return false, nil
+	}
+	res, err := s.db.ExecContext(s.cx(),
+		`DELETE FROM mfa_recovery_codes WHERE tenant_id = ? AND code_hash = ?`,
+		tenantID, codeHash)
+	if err != nil {
+		return false, fmt.Errorf("console: consume recovery code: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("console: consume rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
+// Disable implements MFAStore.
+func (s *SQLiteMFAStore) Disable(tenantID string) error {
+	tx, err := s.db.BeginTx(s.cx(), nil)
+	if err != nil {
+		return fmt.Errorf("console: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(s.cx(),
+		`DELETE FROM mfa_recovery_codes WHERE tenant_id = ?`, tenantID); err != nil {
+		return fmt.Errorf("console: delete recovery codes: %w", err)
+	}
+	if _, err := tx.ExecContext(s.cx(),
+		`DELETE FROM mfa_credentials WHERE tenant_id = ?`, tenantID); err != nil {
+		return fmt.Errorf("console: delete mfa credentials: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("console: commit disable: %w", err)
+	}
+	return nil
+}
