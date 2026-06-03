@@ -14,23 +14,27 @@ import (
 	"fmt"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
-// Config is the store wiring. Table defaults to "bucket_versioning".
+// Config is the store wiring. Table defaults to "bucket_versioning"
+// and LockTable to "bucket_object_lock".
 type Config struct {
-	DB    *sql.DB
-	Table string
+	DB        *sql.DB
+	Table     string
+	LockTable string
 }
 
-// Store is a bucket_config.Store backed by a SQLite table.
+// Store is a bucket_config.Store backed by SQLite tables.
 type Store struct {
-	db    *sql.DB
-	table string
+	db        *sql.DB
+	table     string
+	lockTable string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
 
-// New returns a Store and creates the backing table if it does not
+// New returns a Store and creates the backing tables if they do not
 // yet exist.
 func New(cfg Config) (*Store, error) {
 	if cfg.DB == nil {
@@ -43,7 +47,14 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(table) {
 		return nil, fmt.Errorf("sqlite: invalid table name %q", table)
 	}
-	s := &Store{db: cfg.DB, table: table}
+	lockTable := cfg.LockTable
+	if lockTable == "" {
+		lockTable = "bucket_object_lock"
+	}
+	if !isSafeIdent(lockTable) {
+		return nil, fmt.Errorf("sqlite: invalid lock table name %q", lockTable)
+	}
+	s := &Store{db: cfg.DB, table: table, lockTable: lockTable}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
@@ -60,6 +71,19 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	)`, s.table)
 	if _, err := s.db.ExecContext(ctx, q); err != nil {
 		return fmt.Errorf("sqlite: ensure bucket_versioning schema: %w", err)
+	}
+	lq := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		tenant_id     TEXT NOT NULL,
+		bucket        TEXT NOT NULL,
+		enabled       INTEGER NOT NULL,
+		default_mode  TEXT NOT NULL DEFAULT '' CHECK (default_mode IN ('', 'GOVERNANCE', 'COMPLIANCE')),
+		default_days  INTEGER NOT NULL DEFAULT 0,
+		default_years INTEGER NOT NULL DEFAULT 0,
+		updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (tenant_id, bucket)
+	)`, s.lockTable)
+	if _, err := s.db.ExecContext(ctx, lq); err != nil {
+		return fmt.Errorf("sqlite: ensure bucket_object_lock schema: %w", err)
 	}
 	return nil
 }
@@ -97,6 +121,55 @@ func (s *Store) SetVersioning(ctx context.Context, tenantID, bucket string, stat
 	`, s.table)
 	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, string(state)); err != nil {
 		return fmt.Errorf("sqlite: bucket_versioning set: %w", err)
+	}
+	return nil
+}
+
+// GetObjectLock returns the Object Lock config for (tenantID, bucket)
+// or the zero Config when no row exists.
+func (s *Store) GetObjectLock(ctx context.Context, tenantID, bucket string) (object_lock.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return object_lock.Config{}, errors.New("sqlite: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT enabled, default_mode, default_days, default_years FROM %s WHERE tenant_id = ? AND bucket = ?`, s.lockTable)
+	var (
+		enabled     bool
+		defaultMode string
+		defaultDays int
+		defaultYrs  int
+	)
+	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&enabled, &defaultMode, &defaultDays, &defaultYrs); {
+	case errors.Is(err, sql.ErrNoRows):
+		return object_lock.Config{}, nil
+	case err != nil:
+		return object_lock.Config{}, fmt.Errorf("sqlite: bucket_object_lock get: %w", err)
+	}
+	return object_lock.Config{
+		Enabled:      enabled,
+		DefaultMode:  object_lock.RetentionMode(defaultMode),
+		DefaultDays:  defaultDays,
+		DefaultYears: defaultYrs,
+	}, nil
+}
+
+// SetObjectLock upserts the Object Lock config for (tenantID, bucket).
+func (s *Store) SetObjectLock(ctx context.Context, tenantID, bucket string, cfg object_lock.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("sqlite: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, enabled, default_mode, default_days, default_years, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET enabled = excluded.enabled, default_mode = excluded.default_mode,
+			default_days = excluded.default_days, default_years = excluded.default_years,
+			updated_at = CURRENT_TIMESTAMP
+	`, s.lockTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, cfg.Enabled, string(cfg.DefaultMode), cfg.DefaultDays, cfg.DefaultYears); err != nil {
+		return fmt.Errorf("sqlite: bucket_object_lock set: %w", err)
 	}
 	return nil
 }

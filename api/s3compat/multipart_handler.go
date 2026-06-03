@@ -700,6 +700,15 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
+		// Mirror the manifest-Put refcount rollback; orphaned
+		// pieces (if any) are reclaimed by the background GC.
+		if manifest.ContentHash != "" && h.cfg.ContentIndex != nil {
+			_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, manifest.ContentHash)
+		}
+		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
+		return
+	}
 	mkey := manifest_store.ManifestKey{
 		TenantID:      tenantID,
 		Bucket:        bucket,

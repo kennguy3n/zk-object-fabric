@@ -270,7 +270,7 @@ operations perfectly than many operations partially.
 | Versioning   | `GetObject?versionId=`                   | Phase 1+  | Yes      | Yes     | Object versioning via manifest versions                                 |
 | Tagging      | `Put/Get/DeleteObjectTagging`            | Yes       | Yes      | Yes     | Tags stored as JSONB on the manifest row; 10 tags/object (see §15.1)    |
 | Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Planned | WS8.2 | WS8.2   | Per-bucket rules + daily evaluator; extends migration tiering (see §15.1) |
-| Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Planned | WS8.3 | WS8.3 | Governance/compliance retention + legal hold; requires versioning (see §15.1) |
+| Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Shipped | WS8.3 | WS8.3 | Governance/compliance retention + legal hold enforced in DELETE/PUT-overwrite; requires versioning (see §15.1) |
 | Versioning   | `Put/GetBucketVersioning`                | Shipped   | WS8.4    | WS8.4   | Bucket-level Enabled/Suspended config + delete markers (see §15.1)      |
 | CORS         | `Put/Get/DeleteBucketCors`               | Planned   | WS8.5    | WS8.5   | Enables browser direct-upload via presigned URLs (see §15.1)            |
 | Notifications| `Put/GetBucketNotificationConfiguration` | Planned   | WS8.6    | WS8.6   | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events (see §15.1) |

@@ -9,6 +9,7 @@ package metadata
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // ObjectManifest is the provider-neutral description of a single
@@ -61,6 +62,27 @@ type ObjectManifest struct {
 	// ≤128-char keys, ≤256-char values) are enforced at the API
 	// boundary in api/s3compat, not here. See docs/PROPOSAL.md §15.1.1.
 	Tags map[string]string `json:"tags,omitempty"`
+
+	// RetentionMode and RetainUntil hold the S3 Object Lock retention
+	// for this object version (WS8.3), set by PutObjectRetention or
+	// inherited from the bucket default rule at PUT time. RetentionMode
+	// is "GOVERNANCE" or "COMPLIANCE" (object_lock.RetentionMode);
+	// empty means no retention. A version whose RetainUntil is in the
+	// future is protected from permanent deletion/overwrite — the API
+	// boundary in api/s3compat enforces this, never the manifest
+	// store. These fields are version-scoped, so they ride the
+	// manifest JSONB body and are amended in place via UpdateManifest
+	// (which never promotes a non-latest version). See docs/PROPOSAL.md
+	// §15.3.
+	RetentionMode string    `json:"retention_mode,omitempty"`
+	RetainUntil   time.Time `json:"retain_until,omitempty"`
+
+	// LegalHold, when true, marks this object version as under an S3
+	// Object Lock legal hold (WS8.3), set by PutObjectLegalHold. A
+	// held version cannot be permanently deleted or overwritten until
+	// the hold is turned off, independently of RetentionMode/RetainUntil
+	// and with no expiry. Enforced at the api/s3compat boundary.
+	LegalHold bool `json:"legal_hold,omitempty"`
 }
 
 // EncryptionConfig describes how the object is encrypted.

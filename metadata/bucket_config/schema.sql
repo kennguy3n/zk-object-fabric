@@ -18,3 +18,20 @@ CREATE TABLE IF NOT EXISTS bucket_versioning (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, bucket)
 );
+
+-- Per-bucket S3 Object Lock configuration (WS8.3). The never-configured
+-- state is the absence of a row, surfaced as a zero object_lock.Config
+-- (Enabled false). When enabled WITH a default retention rule,
+-- default_mode is set and exactly one of default_days/default_years is
+-- > 0; new object versions inherit that retention at PUT time. Enabling
+-- Object Lock requires bucket versioning, enforced at the API layer.
+CREATE TABLE IF NOT EXISTS bucket_object_lock (
+    tenant_id     TEXT NOT NULL,
+    bucket        TEXT NOT NULL,
+    enabled       BOOLEAN NOT NULL,
+    default_mode  TEXT NOT NULL DEFAULT '' CHECK (default_mode IN ('', 'GOVERNANCE', 'COMPLIANCE')),
+    default_days  INTEGER NOT NULL DEFAULT 0,
+    default_years INTEGER NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, bucket)
+);

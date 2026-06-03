@@ -19,7 +19,11 @@
 // <VersioningConfiguration/> document.
 package bucket_config
 
-import "context"
+import (
+	"context"
+
+	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+)
 
 // VersioningState is the S3 bucket-versioning status. The zero value
 // (VersioningUnset) means the bucket has never had versioning
@@ -68,4 +72,17 @@ type Store interface {
 	// bucket). state must be Valid(); implementations reject
 	// VersioningUnset.
 	SetVersioning(ctx context.Context, tenantID, bucket string, state VersioningState) error
+
+	// GetObjectLock returns the bucket-level S3 Object Lock
+	// configuration for (tenantID, bucket) — WS8.3. A bucket that was
+	// never configured returns the zero object_lock.Config (Enabled
+	// false) with a nil error, so callers never have to distinguish
+	// "missing" from "no Object Lock".
+	GetObjectLock(ctx context.Context, tenantID, bucket string) (object_lock.Config, error)
+
+	// SetObjectLock upserts the bucket-level Object Lock configuration
+	// for (tenantID, bucket). cfg must pass cfg.Valid(); enabling
+	// Object Lock requires bucket versioning, which the API layer
+	// enforces before calling this.
+	SetObjectLock(ctx context.Context, tenantID, bucket string, cfg object_lock.Config) error
 }
