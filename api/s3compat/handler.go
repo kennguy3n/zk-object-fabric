@@ -525,7 +525,8 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // keys (`tagging`, `versioning`) were removed here and `?tagging` /
 // `?versioning` routing was added to the dispatch switch. Object
 // Lock (WS8.3) followed the same path for `object-lock`, `retention`,
-// and `legal-hold`, and bucket CORS (WS8.5) for `cors`.
+// and `legal-hold`, bucket CORS (WS8.5) for `cors`, and bucket
+// lifecycle (WS8.2) for `lifecycle`.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -549,7 +550,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // incorrectly reject bulk-delete requests as unsupported.
 var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
-	"lifecycle":           "NotImplemented",
 	"policy":              "NotImplemented",
 	"encryption":          "NotImplemented",
 	"logging":             "NotImplemented",
@@ -670,6 +670,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutBucketCors(w, r)
 			return
 		}
+		// Bucket lifecycle config (PUT /{bucket}?lifecycle) — WS8.2.
+		// Bucket-level sub-resource; route before the
+		// implicit-CreateBucket / CopyObject / Put branches.
+		if q.Has("lifecycle") {
+			h.PutBucketLifecycleConfiguration(w, r)
+			return
+		}
 		if q.Has("retention") {
 			h.PutObjectRetention(w, r)
 			return
@@ -728,6 +735,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.GetBucketCors(w, r, bucket)
 			return
 		}
+		// Bucket lifecycle config (GET /{bucket}?lifecycle) — WS8.2.
+		// Guard on key=="" so GET /{bucket}/{key}?lifecycle falls
+		// through to the object GET.
+		if key == "" && q.Has("lifecycle") {
+			h.GetBucketLifecycleConfiguration(w, r, bucket)
+			return
+		}
 		if key != "" && q.Has("retention") {
 			h.GetObjectRetention(w, r)
 			return
@@ -781,6 +795,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// Bucket CORS config (DELETE /{bucket}?cors) — WS8.5.
 		if q.Has("cors") {
 			h.DeleteBucketCors(w, r)
+			return
+		}
+		// Bucket lifecycle config (DELETE /{bucket}?lifecycle) — WS8.2.
+		if q.Has("lifecycle") {
+			h.DeleteBucketLifecycleConfiguration(w, r)
 			return
 		}
 		h.Delete(w, r)
@@ -1005,6 +1024,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			Generation:     1,
 			PrimaryBackend: backendName,
 		},
+		CreatedAt: h.cfg.Now(),
 	}
 	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
 		_ = provider.DeletePiece(r.Context(), pieceID)
@@ -2318,6 +2338,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			ObjectKeyHash: hashObjectKey(key),
 			VersionID:     markerID,
 			DeleteMarker:  true,
+			CreatedAt:     h.cfg.Now(),
 		}
 		mkey := manifest_store.ManifestKey{
 			TenantID:      tenantID,

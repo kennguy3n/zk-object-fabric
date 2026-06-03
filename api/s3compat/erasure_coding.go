@@ -244,6 +244,7 @@ func (h *Handler) putErasureCoded(
 			Generation:     1,
 			PrimaryBackend: backendName,
 		},
+		CreatedAt: h.cfg.Now(),
 	}
 	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
 		rollbackEC(r, h.cfg.Providers, provider, backendName, written)

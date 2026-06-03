@@ -564,6 +564,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 			Generation:     1,
 			PrimaryBackend: upload.Backend,
 		},
+		CreatedAt: h.cfg.Now(),
 	}
 
 	// Multipart dedup. Two flows feed the content_index, selected

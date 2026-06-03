@@ -239,7 +239,7 @@ func categoryTitle(cat string) string {
 	case "tagging":
 		return "Object tagging (intentionally unsupported)"
 	case "lifecycle":
-		return "Bucket lifecycle (intentionally unsupported)"
+		return "Bucket lifecycle configuration"
 	case "bucket-versioning":
 		return "Bucket versioning toggle (enable/suspend + delete markers)"
 	case "bulk":

@@ -522,6 +522,7 @@ func (h *Handler) putDeduped(
 			Generation:     1,
 			PrimaryBackend: pieceBackend,
 		},
+		CreatedAt: h.cfg.Now(),
 	}
 	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
 		if _, derr := h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, res.ContentHash); derr != nil {

@@ -83,6 +83,17 @@ type ObjectManifest struct {
 	// the hold is turned off, independently of RetentionMode/RetainUntil
 	// and with no expiry. Enforced at the api/s3compat boundary.
 	LegalHold bool `json:"legal_hold,omitempty"`
+
+	// CreatedAt is the wall-clock instant the object version was
+	// written (WS8.2). It is set once at PUT/Copy/CompleteMultipartUpload
+	// time and is never amended afterwards, so it records the version's
+	// true age — distinct from LIST's LastModified, which the API
+	// derives separately. The daily lifecycle evaluator uses it to
+	// decide age-based ("Days") expiration; a manifest written before
+	// WS8.2 has the zero value, and the evaluator treats an unknown age
+	// as "never expire" so it can never delete an object whose age it
+	// cannot establish. Rides the manifest JSONB body.
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 // EncryptionConfig describes how the object is encrypted.

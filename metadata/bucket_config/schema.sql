@@ -51,3 +51,22 @@ CREATE TABLE IF NOT EXISTS bucket_cors (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, bucket)
 );
+
+-- Per-bucket S3 lifecycle configuration (WS8.2). As with CORS, the
+-- never-configured state is the absence of a row, surfaced to callers
+-- as an empty lifecycle.Config (no rules) and to the S3 API as 404
+-- NoSuchLifecycleConfiguration. The full rule set (expiration,
+-- transition, abort-incomplete-multipart, and filter predicates) is
+-- stored as one JSON document — the stable encoding owned by
+-- metadata/lifecycle — rather than a column per field, because each
+-- rule carries optional nested actions and variable-length tag
+-- filters. DeleteBucketLifecycle removes the row. The background
+-- lifecycle evaluator reads every row across all tenants once per pass
+-- (Store.ListLifecycle).
+CREATE TABLE IF NOT EXISTS bucket_lifecycle (
+    tenant_id  TEXT NOT NULL,
+    bucket     TEXT NOT NULL,
+    rules      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, bucket)
+);

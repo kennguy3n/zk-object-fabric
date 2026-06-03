@@ -23,6 +23,7 @@ import (
 	"context"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
+	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
@@ -104,4 +105,40 @@ type Store interface {
 	// no-op and returns a nil error, matching S3's idempotent
 	// DeleteBucketCors.
 	DeleteCORS(ctx context.Context, tenantID, bucket string) error
+
+	// GetLifecycle returns the bucket lifecycle configuration for
+	// (tenantID, bucket) — WS8.2. A bucket with no lifecycle
+	// configuration returns the zero lifecycle.Config (no rules) with
+	// a nil error; callers use Config.Empty to distinguish "not
+	// configured" (which the S3 API surfaces as 404
+	// NoSuchLifecycleConfiguration) from a configured rule set.
+	GetLifecycle(ctx context.Context, tenantID, bucket string) (lifecycle.Config, error)
+
+	// SetLifecycle upserts the bucket lifecycle configuration for
+	// (tenantID, bucket). cfg must pass cfg.Valid().
+	SetLifecycle(ctx context.Context, tenantID, bucket string, cfg lifecycle.Config) error
+
+	// DeleteLifecycle removes any lifecycle configuration for
+	// (tenantID, bucket). Deleting a bucket that has none is a no-op
+	// and returns a nil error, matching S3's idempotent
+	// DeleteBucketLifecycle.
+	DeleteLifecycle(ctx context.Context, tenantID, bucket string) error
+
+	// ListLifecycle returns every (tenantID, bucket) that currently
+	// has a lifecycle configuration, together with its rules. Unlike
+	// every other method on this interface it is NOT tenant-scoped: it
+	// exists solely for the background lifecycle evaluator, which has
+	// no tenant list to iterate over and must visit every configured
+	// bucket across all tenants once per pass. It is never reachable
+	// from a tenant-facing request path.
+	ListLifecycle(ctx context.Context) ([]LifecycleEntry, error)
+}
+
+// LifecycleEntry is one (tenant, bucket) bucket lifecycle
+// configuration returned by Store.ListLifecycle, for the background
+// evaluator to act on.
+type LifecycleEntry struct {
+	TenantID string
+	Bucket   string
+	Config   lifecycle.Config
 }
