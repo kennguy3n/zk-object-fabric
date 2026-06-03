@@ -11,6 +11,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/internal/rlsdb"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 )
 
@@ -118,8 +119,8 @@ func TestRLSStatements_Validation(t *testing.T) {
 		if idx < 0 {
 			continue
 		}
-		if strings.Contains(s[idx:], gucScanAll) {
-			t.Errorf("WITH CHECK clause must not reference %s (write bypass):\n%s", gucScanAll, s[idx:])
+		if strings.Contains(s[idx:], rlsdb.GUCScanAll) {
+			t.Errorf("WITH CHECK clause must not reference %s (write bypass):\n%s", rlsdb.GUCScanAll, s[idx:])
 		}
 	}
 }
