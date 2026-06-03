@@ -59,7 +59,12 @@ func (s *Store) Lookup(ctx context.Context, tenantID, contentHash string) (*cont
 		FROM %s
 		WHERE tenant_id = $1 AND content_hash = $2
 	`, s.table)
-	row := s.db.QueryRowContext(ctx, q, tenantID, contentHash)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	row := tx.QueryRowContext(ctx, q, tenantID, contentHash)
 	return scanEntry(row)
 }
 
@@ -81,7 +86,12 @@ func (s *Store) LookupByPlaintextHash(ctx context.Context, tenantID, plaintextHa
 		WHERE tenant_id = $1 AND plaintext_hash = $2
 		LIMIT 1
 	`, s.table)
-	row := s.db.QueryRowContext(ctx, q, tenantID, plaintextHash)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	row := tx.QueryRowContext(ctx, q, tenantID, plaintextHash)
 	return scanEntry(row)
 }
 
@@ -138,7 +148,12 @@ func (s *Store) Register(ctx context.Context, entry content_index.ContentIndexEn
 		VALUES ($1, $2, $3, $4, 1, $5, NULLIF($6, ''), $7, NULLIF($8, ''))
 		ON CONFLICT (tenant_id, content_hash) DO NOTHING
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes, entry.ETag, nullableJSON(pieceIDsJSON), entry.PlaintextHash)
+	tx, err := s.beginTenant(ctx, entry.TenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, q, entry.TenantID, entry.ContentHash, entry.PieceID, entry.Backend, entry.SizeBytes, entry.ETag, nullableJSON(pieceIDsJSON), entry.PlaintextHash)
 	if err != nil {
 		return fmt.Errorf("postgres: content_index register: %w", err)
 	}
@@ -149,7 +164,7 @@ func (s *Store) Register(ctx context.Context, entry content_index.ContentIndexEn
 	if n == 0 {
 		return content_index.ErrAlreadyExists
 	}
-	return nil
+	return tx.Commit()
 }
 
 // IncrementRef atomically bumps RefCount on an existing row.
@@ -162,7 +177,12 @@ func (s *Store) IncrementRef(ctx context.Context, tenantID, contentHash string) 
 		SET ref_count = ref_count + 1
 		WHERE tenant_id = $1 AND content_hash = $2
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, tenantID, contentHash)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, q, tenantID, contentHash)
 	if err != nil {
 		return fmt.Errorf("postgres: content_index increment: %w", err)
 	}
@@ -173,7 +193,7 @@ func (s *Store) IncrementRef(ctx context.Context, tenantID, contentHash string) 
 	if n == 0 {
 		return content_index.ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // DecrementRef atomically decrements RefCount and returns the new
@@ -192,8 +212,13 @@ func (s *Store) DecrementRef(ctx context.Context, tenantID, contentHash string) 
 		WHERE tenant_id = $1 AND content_hash = $2
 		RETURNING ref_count
 	`, s.table)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var newCount int
-	if err := s.db.QueryRowContext(ctx, q, tenantID, contentHash).Scan(&newCount); err != nil {
+	if err := tx.QueryRowContext(ctx, q, tenantID, contentHash).Scan(&newCount); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, content_index.ErrNotFound
 		}
@@ -206,6 +231,9 @@ func (s *Store) DecrementRef(ctx context.Context, tenantID, contentHash string) 
 			return 0, content_index.ErrInvalidRefCount
 		}
 		return 0, fmt.Errorf("postgres: content_index decrement: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("postgres: content_index decrement commit: %w", err)
 	}
 	return newCount, nil
 }
@@ -221,10 +249,15 @@ func (s *Store) Delete(ctx context.Context, tenantID, contentHash string) error 
 	if tenantID == "" || contentHash == "" {
 		return errors.New("postgres: tenant_id and content_hash are required")
 	}
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	q := fmt.Sprintf(`
 		DELETE FROM %s WHERE tenant_id = $1 AND content_hash = $2 AND ref_count = 0
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, tenantID, contentHash)
+	res, err := tx.ExecContext(ctx, q, tenantID, contentHash)
 	if err != nil {
 		return fmt.Errorf("postgres: content_index delete: %w", err)
 	}
@@ -233,13 +266,14 @@ func (s *Store) Delete(ctx context.Context, tenantID, contentHash string) error 
 		return fmt.Errorf("postgres: content_index delete rows affected: %w", err)
 	}
 	if n > 0 {
-		return nil
+		return tx.Commit()
 	}
 	// Row was either gone already or had a non-zero ref_count.
-	// Cheap probe to surface the difference.
+	// Cheap probe to surface the difference; it runs in the same
+	// tenant-bound transaction so RLS admits the row.
 	probe := fmt.Sprintf(`SELECT 1 FROM %s WHERE tenant_id = $1 AND content_hash = $2`, s.table)
 	var exists int
-	if err := s.db.QueryRowContext(ctx, probe, tenantID, contentHash).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, probe, tenantID, contentHash).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return content_index.ErrNotFound
 		}
@@ -260,7 +294,12 @@ func (s *Store) ScanAll(ctx context.Context, tenantID string) ([]content_index.C
 		FROM %s
 		WHERE tenant_id = $1
 	`, s.table)
-	rows, err := s.db.QueryContext(ctx, q, tenantID)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, q, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: content_index scan: %w", err)
 	}
@@ -290,7 +329,14 @@ func (s *Store) ScanAll(ctx context.Context, tenantID string) ([]content_index.C
 // per-tenant work.
 func (s *Store) ListTenants(ctx context.Context) ([]string, error) {
 	q := fmt.Sprintf(`SELECT DISTINCT tenant_id FROM %s ORDER BY tenant_id`, s.table)
-	rows, err := s.db.QueryContext(ctx, q)
+	// ListTenants is the audited cross-tenant enumerator for the orphan
+	// GC sweep, so it binds the scan_all GUC rather than a single tenant.
+	tx, err := s.beginScanAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: content_index list tenants: %w", err)
 	}
