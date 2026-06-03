@@ -208,13 +208,18 @@ func (s *SQLiteMFAStore) MarkTOTPStep(tenantID string, step int64) (bool, error)
 
 // ConsumeRecoveryCode implements MFAStore. The DELETE is atomic: a hash
 // matching an unused code is removed once and returns ok=true; a
-// concurrent second attempt with the same code affects zero rows.
+// concurrent second attempt with the same code affects zero rows. The
+// EXISTS guard requires the enrollment to be active, mirroring
+// MemoryMFAStore's `!row.active` check so all three backends agree —
+// a recovery code is only ever honoured for an active enrollment.
 func (s *SQLiteMFAStore) ConsumeRecoveryCode(tenantID, codeHash string) (bool, error) {
 	if codeHash == "" {
 		return false, nil
 	}
 	res, err := s.db.ExecContext(s.cx(),
-		`DELETE FROM mfa_recovery_codes WHERE tenant_id = ? AND code_hash = ?`,
+		`DELETE FROM mfa_recovery_codes WHERE tenant_id = ? AND code_hash = ?
+		   AND EXISTS (SELECT 1 FROM mfa_credentials c
+		               WHERE c.tenant_id = mfa_recovery_codes.tenant_id AND c.active = 1)`,
 		tenantID, codeHash)
 	if err != nil {
 		return false, fmt.Errorf("console: consume recovery code: %w", err)

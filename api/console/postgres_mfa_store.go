@@ -174,13 +174,18 @@ func (s *PostgresMFAStore) MarkTOTPStep(tenantID string, step int64) (bool, erro
 
 // ConsumeRecoveryCode implements MFAStore. The DELETE is atomic: a hash
 // matching an unused code is removed once; a concurrent replay of the
-// same code affects zero rows.
+// same code affects zero rows. The EXISTS guard requires the enrollment
+// to be active, mirroring MemoryMFAStore's `!row.active` check so all
+// three backends agree — a recovery code is only ever honoured for an
+// active enrollment.
 func (s *PostgresMFAStore) ConsumeRecoveryCode(tenantID, codeHash string) (bool, error) {
 	if codeHash == "" {
 		return false, nil
 	}
 	res, err := s.db.ExecContext(s.cx(),
-		`DELETE FROM mfa_recovery_codes WHERE tenant_id = $1 AND code_hash = $2`,
+		`DELETE FROM mfa_recovery_codes WHERE tenant_id = $1 AND code_hash = $2
+		   AND EXISTS (SELECT 1 FROM mfa_credentials c
+		               WHERE c.tenant_id = mfa_recovery_codes.tenant_id AND c.active = TRUE)`,
 		tenantID, codeHash)
 	if err != nil {
 		return false, fmt.Errorf("console: consume recovery code: %w", err)
