@@ -117,6 +117,43 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 		}
 	})
 
+	t.Run("ActivateOnActiveIsRejectedAndPreservesCodes", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.BeginEnrollment("t-2b", "SECRET"); err != nil {
+			t.Fatalf("BeginEnrollment: %v", err)
+		}
+		first := []string{hashRecoveryCode("AAAA"), hashRecoveryCode("BBBB")}
+		if err := s.Activate("t-2b", 555, first); err != nil {
+			t.Fatalf("Activate: %v", err)
+		}
+		// A second activation (e.g. two enroll/activate requests
+		// racing on the same pending row) must not clobber the
+		// already-issued recovery codes — it is rejected outright.
+		second := []string{hashRecoveryCode("CCCC")}
+		if err := s.Activate("t-2b", 999, second); err != errMFANotEnrolled {
+			t.Fatalf("re-Activate err = %v; want errMFANotEnrolled", err)
+		}
+		rec, _, err := s.GetMFA("t-2b")
+		if err != nil {
+			t.Fatalf("GetMFA: %v", err)
+		}
+		// Watermark and recovery set must be the first activation's.
+		if rec.LastStep != 555 {
+			t.Fatalf("LastStep = %d, want 555 (unchanged by rejected re-activate)", rec.LastStep)
+		}
+		if rec.RecoveryRemaining != 2 {
+			t.Fatalf("RecoveryRemaining = %d, want 2 (first set preserved)", rec.RecoveryRemaining)
+		}
+		// The first set's codes must still be usable; the rejected
+		// set's code must never have been stored.
+		if ok, err := s.ConsumeRecoveryCode("t-2b", hashRecoveryCode("CCCC")); err != nil || ok {
+			t.Fatalf("ConsumeRecoveryCode(rejected set) = (%v, %v); want (false, nil)", ok, err)
+		}
+		if ok, err := s.ConsumeRecoveryCode("t-2b", hashRecoveryCode("AAAA")); err != nil || !ok {
+			t.Fatalf("ConsumeRecoveryCode(first set) = (%v, %v); want (true, nil)", ok, err)
+		}
+	})
+
 	t.Run("EnrollOnActiveIsRejected", func(t *testing.T) {
 		s := newStore(t)
 		mustEnrollAndActivate(t, s, "t-3", "SECRET", 1)

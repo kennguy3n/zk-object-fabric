@@ -119,8 +119,13 @@ func (s *PostgresMFAStore) Activate(tenantID string, firstStep int64, recoveryHa
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// "AND active = FALSE" makes activation atomic: a row that is
+	// already active matches zero rows, so a second (racing or
+	// repeated) activate returns errMFANotEnrolled instead of
+	// clobbering the recovery codes the first activation already handed
+	// to the user.
 	res, err := tx.ExecContext(s.cx(),
-		`UPDATE mfa_credentials SET active = TRUE, last_step = $1 WHERE tenant_id = $2`,
+		`UPDATE mfa_credentials SET active = TRUE, last_step = $1 WHERE tenant_id = $2 AND active = FALSE`,
 		firstStep, tenantID)
 	if err != nil {
 		return fmt.Errorf("console: activate mfa: %w", err)

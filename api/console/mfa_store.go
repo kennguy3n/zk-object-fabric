@@ -209,6 +209,15 @@ func (s *MemoryMFAStore) Activate(tenantID string, firstStep int64, recoveryHash
 	if !ok {
 		return errMFANotEnrolled
 	}
+	if row.active {
+		// Already confirmed: a second activation would clobber the
+		// recovery codes the first one returned, leaving the user
+		// holding codes that no longer match. Refuse rather than
+		// overwrite. This also closes the TOCTOU window between the
+		// handler's rec.Active check and this call when two activate
+		// requests race on the same pending enrollment.
+		return errMFANotEnrolled
+	}
 	row.active = true
 	row.lastStep = firstStep
 	row.recovery = make(map[string]struct{}, len(recoveryHashes))

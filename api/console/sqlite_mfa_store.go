@@ -149,8 +149,12 @@ func (s *SQLiteMFAStore) Activate(tenantID string, firstStep int64, recoveryHash
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// "AND active = 0" makes activation atomic: a row that is already
+	// active matches zero rows, so a second (racing or repeated)
+	// activate returns errMFANotEnrolled instead of clobbering the
+	// recovery codes the first activation already handed to the user.
 	res, err := tx.ExecContext(s.cx(),
-		`UPDATE mfa_credentials SET active = 1, last_step = ? WHERE tenant_id = ?`,
+		`UPDATE mfa_credentials SET active = 1, last_step = ? WHERE tenant_id = ? AND active = 0`,
 		firstStep, tenantID)
 	if err != nil {
 		return fmt.Errorf("console: activate mfa: %w", err)
