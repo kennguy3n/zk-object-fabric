@@ -197,6 +197,15 @@ func main() {
 	// the in-memory tenant store cannot satisfy production auth
 	// without static --tenants bindings.
 	enforceProductionManifestEncryption(cfg.Env, metadataDB != nil || embeddedDB != nil, cfg.Encryption.ManifestBodyKeyPath)
+	// Production safety net: refuse to start when env=production and the
+	// Postgres metadata connection uses a role that bypasses Row-Level
+	// Security (superuser or BYPASSRLS). RLS is the Workstream 3.4
+	// defence-in-depth layer behind the application-level tenant
+	// predicates; Postgres silently skips it for such roles, so booting
+	// on a superuser connection would ship that layer disabled with no
+	// visible symptom. Skipped for the embedded/in-memory profiles, which
+	// have no Postgres RLS — see checkProductionRLSRole.
+	enforceProductionRLSRole(context.Background(), cfg.Env, metadataDB)
 	// Production safety net: refuse to start when env=production, the
 	// console API is enabled, and no console JWT signing key is
 	// configured. Without it the console falls back to the process-
@@ -725,6 +734,66 @@ func checkProductionManifestEncryption(env string, manifestStorePersistent bool,
 func enforceProductionManifestEncryption(env string, manifestStorePersistent bool, manifestBodyKeyPath string) {
 	if err := checkProductionManifestEncryption(env, manifestStorePersistent, manifestBodyKeyPath); err != nil {
 		log.Fatalf("SECURITY: env=production with a persistent manifest store (Postgres or embedded SQLite) but no manifest_body_key_path is configured; manifest JSON will be stored as plaintext. Set encryption.manifest_body_key_path or use env=development.")
+	}
+}
+
+// errProductionRLSRoleInert is returned by checkProductionRLSRole when
+// the gateway is started with env=production against a Postgres metadata
+// store, but the connecting role bypasses Row-Level Security — either it
+// is a superuser or it carries the BYPASSRLS attribute. Postgres skips
+// all RLS policies for such roles regardless of FORCE ROW LEVEL
+// SECURITY, so the Workstream 3.4 tenant-isolation policies on the
+// manifests table (and the other control-plane tables) would be silently
+// inert: a query that omitted or mistook its tenant predicate could read
+// or write across tenants with no database-level backstop. Exposed as a
+// sentinel so cmd/gateway can log a friendly message and main_test.go can
+// errors.Is against it.
+var errProductionRLSRoleInert = errors.New("gateway: env=production with a Postgres metadata store, but the connecting role bypasses Row-Level Security (it is a superuser or has BYPASSRLS). RLS tenant-isolation policies would be silently ineffective, leaving application-layer scoping as the only defence. Connect the gateway as a least-privilege, non-superuser role without BYPASSRLS, or use env=development")
+
+// checkProductionRLSRole refuses to start the gateway when cfg.Env ==
+// "production" and the Postgres metadata connection uses a role that
+// bypasses RLS. RLS is the Workstream 3.4 defence-in-depth layer
+// (docs/security/audit-package-security.md §8): it only takes effect for
+// non-superuser, non-BYPASSRLS roles, so booting in production on a
+// superuser connection would ship that layer disabled without any visible
+// symptom. This guard makes that misconfiguration fail loudly at startup.
+//
+// It is gated on metadataDB != nil: the embedded SQLite profile and the
+// in-memory dev profile have no Postgres RLS, and the application-layer
+// tenant predicate remains the control there. The check issues a single
+// catalog probe of current_user's attributes; a probe failure is surfaced
+// rather than swallowed so a broken metadata connection cannot masquerade
+// as a satisfied guard. Returns a sentinel error rather than calling
+// log.Fatalf so tests can exercise it in-process.
+func checkProductionRLSRole(ctx context.Context, env string, metadataDB *sql.DB) error {
+	if env != "production" {
+		return nil
+	}
+	if metadataDB == nil {
+		return nil
+	}
+	var isSuperuser, bypassRLS bool
+	if err := metadataDB.QueryRowContext(ctx, `
+		SELECT current_setting('is_superuser')::bool,
+		       COALESCE(bool_or(rolbypassrls), false)
+		FROM pg_roles
+		WHERE rolname = current_user`).Scan(&isSuperuser, &bypassRLS); err != nil {
+		return fmt.Errorf("gateway: probe metadata role for RLS enforcement: %w", err)
+	}
+	if isSuperuser || bypassRLS {
+		return errProductionRLSRoleInert
+	}
+	return nil
+}
+
+// enforceProductionRLSRole wraps checkProductionRLSRole at the startup
+// callsite: a non-nil error is fatal (the gateway must not boot in
+// production with RLS silently bypassed). Tests should call
+// checkProductionRLSRole directly so they can errors.Is against the
+// sentinel without forking the test binary.
+func enforceProductionRLSRole(ctx context.Context, env string, metadataDB *sql.DB) {
+	if err := checkProductionRLSRole(ctx, env, metadataDB); err != nil {
+		log.Fatalf("%s", err)
 	}
 }
 
