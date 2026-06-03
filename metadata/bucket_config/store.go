@@ -1,8 +1,8 @@
 // Package bucket_config is the control-plane store for per-bucket S3
 // configuration sub-resources. Today it persists bucket versioning
-// state (WS8.4); future workstreams (CORS, lifecycle, notifications)
-// can extend the same store rather than adding one table per
-// sub-resource.
+// state (WS8.4) and Object Lock configuration (WS8.3); future
+// workstreams (CORS, lifecycle, notifications) can extend the same
+// store rather than adding one table per sub-resource.
 //
 // The Store interface is the integration boundary the gateway
 // consumes. Concrete implementations live in subpackages

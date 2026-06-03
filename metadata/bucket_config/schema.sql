@@ -1,7 +1,8 @@
 -- Per-bucket S3 configuration sub-resources (WS8.4+).
 --
--- Today this holds bucket versioning state; future sub-resources
--- (CORS, lifecycle, notifications) can add columns or sibling tables.
+-- Today this holds bucket versioning state and Object Lock config;
+-- future sub-resources (CORS, lifecycle, notifications) can add columns
+-- or sibling tables.
 -- Buckets are implicit in the fabric, so the row is keyed by
 -- (tenant_id, bucket) directly rather than referencing a bucket table.
 --
