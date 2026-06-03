@@ -1505,6 +1505,36 @@ func buildManifestBodyEncryptor(cfg config.Config) manifest_store.BodyEncryptor 
 	return enc
 }
 
+// buildMFASecretSealer loads the optional console MFA secret sealer from
+// the same at-rest key as the manifest body encryptor
+// (cfg.Encryption.ManifestBodyKeyPath). It returns nil when no key is
+// configured (TOTP secret stored in the clear — the dev posture).
+//
+// Reusing the manifest-body key avoids a second key file for operators
+// and rides the existing enforceProductionManifestEncryption guard: that
+// guard already refuses to boot env=production with a persistent
+// control-plane store (the same db/embeddedDB handles buildMFAStore
+// selects a persistent backend from) unless this key is set, so a
+// persistent MFA store in production is always sealed. The sealer uses
+// an MFA-specific AAD namespace, so a manifest-body ciphertext and an
+// MFA-secret ciphertext are not interchangeable under the shared key.
+func buildMFASecretSealer(cfg config.Config) console.SecretSealer {
+	p := cfg.Encryption.ManifestBodyKeyPath
+	if p == "" {
+		return nil
+	}
+	key, rerr := os.ReadFile(p)
+	if rerr != nil {
+		log.Fatalf("gateway: read mfa secret key %q: %v", p, rerr)
+	}
+	sealer, eerr := console.NewAEADSecretSealer(key)
+	if eerr != nil {
+		log.Fatalf("gateway: build mfa secret sealer: %v", eerr)
+	}
+	log.Printf("gateway: mfa secret sealing enabled (key=%s)", p)
+	return sealer
+}
+
 // buildGatewayEncryption constructs the GatewayEncryption wiring
 // the S3 handler consumes for managed / public_distribution
 // tenant policies. The wrapper is selected from cfg.CMKURI:
@@ -2243,9 +2273,13 @@ func buildMFAStore(cfg config.Config, db, embeddedDB *sql.DB) console.MFAStore {
 		log.Printf("gateway: %s: %v; falling back to in-memory", what, err)
 		return console.NewMemoryMFAStore()
 	}
+	// The persistent backends seal the TOTP secret at rest under the
+	// gateway's at-rest key (see buildMFASecretSealer). The in-memory
+	// store needs no sealer — it never touches disk.
+	sealer := console.WithSecretSealer(buildMFASecretSealer(cfg))
 	if db == nil {
 		if embeddedDB != nil {
-			store, err := console.NewSQLiteMFAStore(embeddedDB)
+			store, err := console.NewSQLiteMFAStore(embeddedDB, sealer)
 			if err != nil {
 				return memoryFallback("build embedded mfa store", err)
 			}
@@ -2254,7 +2288,7 @@ func buildMFAStore(cfg config.Config, db, embeddedDB *sql.DB) console.MFAStore {
 		}
 		return console.NewMemoryMFAStore()
 	}
-	store, err := console.NewPostgresMFAStore(db)
+	store, err := console.NewPostgresMFAStore(db, sealer)
 	if err != nil {
 		return memoryFallback("build postgres mfa store", err)
 	}

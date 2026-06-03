@@ -42,12 +42,17 @@ var errMFAAlreadyActive = errors.New("console: mfa is already active for tenant"
 // Secret is the base32 shared secret; it is required to verify a code
 // and so cannot be hashed at rest the way a password or refresh token
 // is — it is the cryptographic equivalent of the symmetric key itself.
-// (Encrypting it under the gateway CMK is a possible hardening, deferred
-// so this change stays scoped to the MFA protocol; the secret is no more
-// sensitive than the access-token signing key already held in the same
-// trust boundary.)
+// Because it cannot be hashed, the persistent backends seal it at rest
+// under a gateway-held key (see SecretSealer / WithSecretSealer): a
+// database admin with only store access cannot read tenants' TOTP seeds
+// out of the secret column, which would otherwise be a standing
+// second-factor bypass. Sealing is transparent to this type — GetMFA
+// always returns the plaintext base32 secret regardless of backend or
+// whether a sealer is configured.
 type MFARecord struct {
-	// Secret is the base32-encoded TOTP shared secret.
+	// Secret is the base32-encoded TOTP shared secret. It is always the
+	// plaintext form here; at-rest sealing happens inside the SQL
+	// stores and is undone before the value reaches this field.
 	Secret string
 
 	// Active is false for a pending enrollment (secret minted, first

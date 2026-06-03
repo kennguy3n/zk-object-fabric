@@ -66,6 +66,12 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_
 -- mfa_credentials persists a tenant's TOTP multi-factor enrollment.
 -- secret is the base32 shared secret (the symmetric key TOTP needs to
 -- verify a code, so it cannot be hashed at rest the way a password is).
+-- Because it cannot be hashed, the gateway seals it under its at-rest
+-- key before storage (console.SecretSealer): the column holds an
+-- "enc:v1:"-prefixed XChaCha20-Poly1305 blob, not the raw seed, so a
+-- database dump does not hand an attacker every tenant's second factor.
+-- (Rows written before sealing was enabled remain readable — Open
+-- passes through any value lacking the prefix.)
 -- active is FALSE for a pending enrollment (secret minted, first code
 -- not yet confirmed) and TRUE once the user has proven they can generate
 -- a code. last_step is the most recent TOTP time step consumed by a

@@ -19,17 +19,18 @@ import (
 // embedded pool would otherwise hand the connection back between
 // statements.
 type SQLiteMFAStore struct {
-	db  *sql.DB
-	ctx context.Context
+	db     *sql.DB
+	ctx    context.Context
+	sealer SecretSealer
 }
 
 // NewSQLiteMFAStore wraps db and creates the MFA tables if they do not
-// yet exist.
-func NewSQLiteMFAStore(db *sql.DB) (*SQLiteMFAStore, error) {
+// yet exist. Pass WithSecretSealer to seal the TOTP secret at rest.
+func NewSQLiteMFAStore(db *sql.DB, opts ...MFAStoreOption) (*SQLiteMFAStore, error) {
 	if db == nil {
 		return nil, errors.New("console: sqlite mfa store requires a non-nil *sql.DB")
 	}
-	s := &SQLiteMFAStore{db: db}
+	s := &SQLiteMFAStore{db: db, sealer: applyMFAStoreOptions(opts).sealer}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
@@ -76,10 +77,22 @@ func (s *SQLiteMFAStore) cx() context.Context {
 	return context.Background()
 }
 
+func (s *SQLiteMFAStore) sealSecret(plaintext, tenantID string) (string, error) {
+	return sealSecretWith(s.sealer, plaintext, tenantID)
+}
+
+func (s *SQLiteMFAStore) openSecret(stored, tenantID string) (string, error) {
+	return openSecretWith(s.sealer, stored, tenantID)
+}
+
 // BeginEnrollment implements MFAStore.
 func (s *SQLiteMFAStore) BeginEnrollment(tenantID, secret string) error {
 	if tenantID == "" || secret == "" {
 		return errors.New("console: tenantID and secret are required")
+	}
+	stored, err := s.sealSecret(secret, tenantID)
+	if err != nil {
+		return err
 	}
 	tx, err := s.db.BeginTx(s.cx(), nil)
 	if err != nil {
@@ -106,7 +119,7 @@ func (s *SQLiteMFAStore) BeginEnrollment(tenantID, secret string) error {
 		`INSERT INTO mfa_credentials (tenant_id, secret, active, last_step)
 		 VALUES (?, ?, 0, 0)
 		 ON CONFLICT(tenant_id) DO UPDATE SET secret = excluded.secret, active = 0, last_step = 0`,
-		tenantID, secret); err != nil {
+		tenantID, stored); err != nil {
 		return fmt.Errorf("console: upsert pending mfa: %w", err)
 	}
 	if _, err := tx.ExecContext(s.cx(),
@@ -133,6 +146,10 @@ func (s *SQLiteMFAStore) GetMFA(tenantID string) (MFARecord, bool, error) {
 		return MFARecord{}, false, nil
 	case err != nil:
 		return MFARecord{}, false, fmt.Errorf("console: load mfa: %w", err)
+	}
+	secret, err := s.openSecret(secret, tenantID)
+	if err != nil {
+		return MFARecord{}, false, err
 	}
 
 	var remaining int

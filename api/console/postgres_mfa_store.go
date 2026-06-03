@@ -17,16 +17,18 @@ import (
 // Like PostgresAuthStore it does not create its own schema; operators run
 // schema.sql before the first query.
 type PostgresMFAStore struct {
-	db  *sql.DB
-	ctx context.Context
+	db     *sql.DB
+	ctx    context.Context
+	sealer SecretSealer
 }
 
-// NewPostgresMFAStore wraps db.
-func NewPostgresMFAStore(db *sql.DB) (*PostgresMFAStore, error) {
+// NewPostgresMFAStore wraps db. Pass WithSecretSealer to seal the TOTP
+// secret at rest.
+func NewPostgresMFAStore(db *sql.DB, opts ...MFAStoreOption) (*PostgresMFAStore, error) {
 	if db == nil {
 		return nil, errors.New("console: postgres mfa store requires a non-nil *sql.DB")
 	}
-	return &PostgresMFAStore{db: db}, nil
+	return &PostgresMFAStore{db: db, sealer: applyMFAStoreOptions(opts).sealer}, nil
 }
 
 // WithContext returns a copy of the store bound to ctx.
@@ -43,12 +45,24 @@ func (s *PostgresMFAStore) cx() context.Context {
 	return context.Background()
 }
 
+func (s *PostgresMFAStore) sealSecret(plaintext, tenantID string) (string, error) {
+	return sealSecretWith(s.sealer, plaintext, tenantID)
+}
+
+func (s *PostgresMFAStore) openSecret(stored, tenantID string) (string, error) {
+	return openSecretWith(s.sealer, stored, tenantID)
+}
+
 // BeginEnrollment implements MFAStore. The SELECT ... FOR UPDATE
 // serialises a concurrent enroll / activate on the same tenant so the
 // active-row check and the upsert see a consistent state.
 func (s *PostgresMFAStore) BeginEnrollment(tenantID, secret string) error {
 	if tenantID == "" || secret == "" {
 		return errors.New("console: tenantID and secret are required")
+	}
+	stored, err := s.sealSecret(secret, tenantID)
+	if err != nil {
+		return err
 	}
 	tx, err := s.db.BeginTx(s.cx(), nil)
 	if err != nil {
@@ -73,7 +87,7 @@ func (s *PostgresMFAStore) BeginEnrollment(tenantID, secret string) error {
 		`INSERT INTO mfa_credentials (tenant_id, secret, active, last_step)
 		 VALUES ($1, $2, FALSE, 0)
 		 ON CONFLICT (tenant_id) DO UPDATE SET secret = EXCLUDED.secret, active = FALSE, last_step = 0`,
-		tenantID, secret); err != nil {
+		tenantID, stored); err != nil {
 		return fmt.Errorf("console: upsert pending mfa: %w", err)
 	}
 	if _, err := tx.ExecContext(s.cx(),
@@ -100,6 +114,10 @@ func (s *PostgresMFAStore) GetMFA(tenantID string) (MFARecord, bool, error) {
 		return MFARecord{}, false, nil
 	case err != nil:
 		return MFARecord{}, false, fmt.Errorf("console: load mfa: %w", err)
+	}
+	secret, err := s.openSecret(secret, tenantID)
+	if err != nil {
+		return MFARecord{}, false, err
 	}
 
 	var remaining int
