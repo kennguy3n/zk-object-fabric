@@ -536,6 +536,11 @@ func (s *PostgresStore) PutPart(tenantID, uploadID string, part Part) error {
 			etag, size_bytes, part_hash, plaintext_part_hash, uploaded_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (upload_id, part_number) DO UPDATE SET
+			-- Self-heal the denormalised tenant_id on re-upload: in steady
+			-- state it already equals EXCLUDED.tenant_id (no-op), but if a
+			-- pre-migration row predates the backfill its NULL gets fixed
+			-- here rather than lingering invisible under RLS.
+			tenant_id           = EXCLUDED.tenant_id,
 			piece_id            = EXCLUDED.piece_id,
 			backend             = EXCLUDED.backend,
 			etag                = EXCLUDED.etag,
@@ -824,22 +829,31 @@ func (s *PostgresStore) sweepExpired() error {
 // row deletion — the alternative would be an infinitely retrying
 // sweep on a single broken upload.
 func (s *PostgresStore) expireOne(tenantID, uploadID string) {
-	// Bind the upload's own tenant so the load + delete (and the parts
-	// cascade) are RLS-visible; the sweeper never deletes across tenants
-	// in a single transaction.
-	tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
+	// Phase 1 — load the upload + parts under a short, read-only,
+	// tenant-bound transaction and release it *before* the cleanup
+	// callback. The callback fans out to storage backends with a 30s
+	// timeout (network I/O); holding the load transaction open across it
+	// would pin a pool connection idle for the whole callback, and with
+	// up to 1000 victims swept sequentially a slow backend could starve
+	// the pool. The delete runs in its own transaction below (Phase 2),
+	// matching how Complete/Abort split Get from deleteUpload.
+	upload, err := func() (*Upload, error) {
+		tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = tx.Rollback() }()
+		u, err := s.loadUpload(tx, uploadID)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.loadParts(tx, uploadID, u); err != nil {
+			return nil, err
+		}
+		return u, nil
+	}()
 	if err != nil {
-		s.logf("expire begin %s: %v", uploadID, err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	upload, err := s.loadUpload(tx, uploadID)
-	if err != nil {
-		s.logf("expire load upload %s: %v", uploadID, err)
-		return
-	}
-	if err := s.loadParts(tx, uploadID, upload); err != nil {
-		s.logf("expire load parts %s: %v", uploadID, err)
+		s.logf("expire load %s: %v", uploadID, err)
 		return
 	}
 	if s.cleanup != nil {
@@ -859,13 +873,11 @@ func (s *PostgresStore) expireOne(tenantID, uploadID string) {
 			s.cleanup(ctx, upload, parts)
 		}()
 	}
-	q := fmt.Sprintf(`DELETE FROM %s WHERE upload_id = $1`, s.uploadsTable)
-	if _, err := tx.ExecContext(context.Background(), q, uploadID); err != nil {
+	// Phase 2 — delete the row (parts cascade) under its own short
+	// tenant-bound transaction, so the pool connection is only held for
+	// the DELETE, never across the cleanup callback above.
+	if err := s.deleteUpload(tenantID, uploadID); err != nil {
 		s.logf("expire delete %s: %v", uploadID, err)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		s.logf("expire commit %s: %v", uploadID, err)
 		return
 	}
 	s.sessions.Delete(uploadID)
