@@ -48,6 +48,32 @@ type Authenticator interface {
 	Authenticate(r *http.Request) (tenantID string, err error)
 }
 
+// TenantResolver is an optional capability an Authenticator may
+// implement to resolve the tenant a request's credentials *claim*
+// WITHOUT verifying the SigV4 signature. It exists for the CORS
+// preflight (OPTIONS): a browser never signs a preflight, so
+// Authenticate always fails on one — yet a presigned-URL preflight
+// still carries X-Amz-Credential in the query string, which names the
+// tenant whose bucket CORS rules apply. The browser sends the
+// preflight to the same URL (query string included) as the follow-up
+// actual request, so the credential is present.
+//
+// Resolving a tenant here grants no access: the preflight only tells
+// the browser whether it may attempt the cross-origin request; the
+// follow-up actual request is fully authenticated as usual. ok is
+// false when the request carries no recognisable access key.
+//
+// This capability is also what lets applyCORS attach CORS headers to
+// an actual request that fails authentication, so a browser SPA reads
+// the real error instead of an opaque CORS failure. An Authenticator
+// that does NOT implement TenantResolver fails closed: preflights get
+// 403 and auth-failure responses carry no CORS headers. A third-party
+// Authenticator therefore must implement TenantResolver for CORS to
+// work on presigned-URL flows. The production HMACAuthenticator does.
+type TenantResolver interface {
+	ResolveTenantUnverified(r *http.Request) (tenantID string, ok bool)
+}
+
 // AnonymousTenant is the tenant ID the handler uses when no
 // Authenticator is configured. Deployments MUST configure an
 // Authenticator in production.
@@ -477,7 +503,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //                      GetBucketAcl, PutBucketAcl)
 //   lifecycle          Bucket lifecycle configuration
 //   policy             Bucket policy document
-//   cors               Bucket CORS configuration
 //   encryption         Bucket-level SSE configuration
 //   logging            Bucket logging configuration
 //   notification       Bucket event notification configuration
@@ -500,7 +525,7 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // keys (`tagging`, `versioning`) were removed here and `?tagging` /
 // `?versioning` routing was added to the dispatch switch. Object
 // Lock (WS8.3) followed the same path for `object-lock`, `retention`,
-// and `legal-hold`.
+// and `legal-hold`, and bucket CORS (WS8.5) for `cors`.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -526,7 +551,6 @@ var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
 	"lifecycle":           "NotImplemented",
 	"policy":              "NotImplemented",
-	"cors":                "NotImplemented",
 	"encryption":          "NotImplemented",
 	"logging":             "NotImplemented",
 	"notification":        "NotImplemented",
@@ -548,7 +572,7 @@ var unsupportedSubresources = map[string]string{
 // order. Without this, `for key := range unsupportedSubresources`
 // picks whichever key Go's randomised map iteration hits first,
 // which makes error messages non-deterministic when a request
-// carries multiple unsupported keys (e.g. `?acl&cors`). Stable
+// carries multiple unsupported keys (e.g. `?acl&policy`). Stable
 // ordering also lets the conformance harness snapshot error bodies.
 var unsupportedSubresourceKeys = func() []string {
 	out := make([]string, 0, len(unsupportedSubresources))
@@ -586,8 +610,27 @@ func (h *Handler) rejectUnsupportedSubresource(w http.ResponseWriter, r *http.Re
 }
 
 func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
+	// Attach a per-request auth memo so the at-most-two authenticate
+	// calls a cross-origin request makes (applyCORS, then the operation
+	// handler) resolve the tenant once instead of recomputing the
+	// SigV4 HMAC twice. Scoped to this request: a fresh cell per
+	// dispatch, read sequentially within the single request goroutine.
+	r = withAuthMemo(r)
 	q := r.URL.Query()
 	h.capRequestBody(w, r)
+	// An OPTIONS request is a CORS preflight (WS8.5); answer it before
+	// the unsupported-subresource check and the method switch, since it
+	// is unauthenticated and never carries a real S3 operation.
+	if r.Method == http.MethodOptions {
+		h.handleCORSPreflight(w, r)
+		return
+	}
+	// Attach cross-origin response headers (WS8.5) before routing so
+	// they are present on the actual request's response, including
+	// error responses (e.g. the 501 from an unsupported sub-resource —
+	// otherwise a browser would surface a CORS error instead of the
+	// real status). No-op when the request carries no Origin.
+	h.applyCORS(w, r)
 	if h.rejectUnsupportedSubresource(w, r, q) {
 		return
 	}
@@ -618,6 +661,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// object-level (their handlers validate the path).
 		if q.Has("object-lock") {
 			h.PutObjectLockConfiguration(w, r)
+			return
+		}
+		// Bucket CORS config (PUT /{bucket}?cors) — WS8.5. Bucket-level
+		// sub-resource; must route before the implicit-CreateBucket /
+		// CopyObject / Put branches.
+		if q.Has("cors") {
+			h.PutBucketCors(w, r)
 			return
 		}
 		if q.Has("retention") {
@@ -671,6 +721,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.GetObjectLockConfiguration(w, r, bucket)
 			return
 		}
+		// Bucket CORS config (GET /{bucket}?cors) — WS8.5. Guard on
+		// key=="" so GET /{bucket}/{key}?cors falls through to the
+		// object GET rather than returning the bucket CORS document.
+		if key == "" && q.Has("cors") {
+			h.GetBucketCors(w, r, bucket)
+			return
+		}
 		if key != "" && q.Has("retention") {
 			h.GetObjectRetention(w, r)
 			return
@@ -719,6 +776,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// Object tagging (?tagging) — WS8.1.
 		if q.Has("tagging") {
 			h.DeleteObjectTagging(w, r)
+			return
+		}
+		// Bucket CORS config (DELETE /{bucket}?cors) — WS8.5.
+		if q.Has("cors") {
+			h.DeleteBucketCors(w, r)
 			return
 		}
 		h.Delete(w, r)
@@ -2555,7 +2617,40 @@ func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.
 	return manifest, provider, piece, tenantID, bucket, nil
 }
 
+// authMemo caches the outcome of authenticate for a single request so
+// repeated calls (applyCORS then the operation handler) do not redo
+// the SigV4 HMAC. It is never shared across requests and is read by a
+// single goroutine, so it needs no locking.
+type authMemo struct {
+	done   bool
+	tenant string
+	err    error
+}
+
+type authMemoKeyType struct{}
+
+var authMemoKey authMemoKeyType
+
+// withAuthMemo returns r carrying a fresh, request-scoped auth memo
+// cell. dispatch installs it so authenticate can be called more than
+// once per request without paying for the HMAC twice.
+func withAuthMemo(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), authMemoKey, &authMemo{}))
+}
+
 func (h *Handler) authenticate(r *http.Request) (string, error) {
+	memo, _ := r.Context().Value(authMemoKey).(*authMemo)
+	if memo == nil {
+		return h.authenticateNow(r)
+	}
+	if !memo.done {
+		memo.tenant, memo.err = h.authenticateNow(r)
+		memo.done = true
+	}
+	return memo.tenant, memo.err
+}
+
+func (h *Handler) authenticateNow(r *http.Request) (string, error) {
 	if h.cfg.Auth == nil {
 		// Production-mode safety net: when an operator
 		// configures RequireAuth=true (cmd/gateway does this

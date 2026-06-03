@@ -689,3 +689,64 @@ func TestSigV4PercentEncode(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveTenantUnverified covers the CORS preflight tenant
+// resolution: it must resolve the tenant a request's credentials name
+// WITHOUT a verified signature (a preflight is never signed), from
+// either the presigned X-Amz-Credential query param or the
+// Authorization header, and report ok=false when no recognisable
+// access key is present.
+func TestResolveTenantUnverified(t *testing.T) {
+	store, tid, ak, sk := newStoreWithTenant(t)
+	a := &HMACAuthenticator{
+		Store:        store,
+		Region:       "us-east-1",
+		Service:      "s3",
+		Clock:        func() time.Time { return time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC) },
+		MaxClockSkew: time.Hour,
+	}
+
+	// Presigned credential, no signature (the preflight case): resolves
+	// the tenant from X-Amz-Credential alone.
+	t.Run("presigned credential, unsigned", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodOptions, "/bucket/key?X-Amz-Credential="+
+			url.QueryEscape(ak+"/20260422/us-east-1/s3/aws4_request"), nil)
+		got, ok := a.ResolveTenantUnverified(r)
+		if !ok || got != tid {
+			t.Fatalf("ResolveTenantUnverified = (%q, %v), want (%q, true)", got, ok, tid)
+		}
+	})
+
+	// Authorization-header credential (signed request) also resolves,
+	// without the signature being verified.
+	t.Run("authorization header credential", func(t *testing.T) {
+		r := signAndBuild(t, "GET", "/bucket/key", "", ak, sk,
+			time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC))
+		got, ok := a.ResolveTenantUnverified(r)
+		if !ok || got != tid {
+			t.Fatalf("ResolveTenantUnverified = (%q, %v), want (%q, true)", got, ok, tid)
+		}
+	})
+
+	t.Run("no credential", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodOptions, "/bucket/key", nil)
+		if got, ok := a.ResolveTenantUnverified(r); ok {
+			t.Fatalf("ResolveTenantUnverified = (%q, true), want ok=false", got)
+		}
+	})
+
+	t.Run("unknown access key", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodOptions, "/bucket/key?X-Amz-Credential="+
+			url.QueryEscape("AKIDUNKNOWN/20260422/us-east-1/s3/aws4_request"), nil)
+		if got, ok := a.ResolveTenantUnverified(r); ok {
+			t.Fatalf("ResolveTenantUnverified = (%q, true), want ok=false", got)
+		}
+	})
+
+	t.Run("malformed credential", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodOptions, "/bucket/key?X-Amz-Credential=garbage", nil)
+		if got, ok := a.ResolveTenantUnverified(r); ok {
+			t.Fatalf("ResolveTenantUnverified = (%q, true), want ok=false", got)
+		}
+	})
+}

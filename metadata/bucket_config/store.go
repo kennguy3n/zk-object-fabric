@@ -22,6 +22,7 @@ package bucket_config
 import (
 	"context"
 
+	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
@@ -85,4 +86,22 @@ type Store interface {
 	// Object Lock requires bucket versioning, which the API layer
 	// enforces before calling this.
 	SetObjectLock(ctx context.Context, tenantID, bucket string, cfg object_lock.Config) error
+
+	// GetCORS returns the bucket CORS configuration for (tenantID,
+	// bucket) — WS8.5. A bucket with no CORS configuration returns the
+	// zero cors.Config (no rules) with a nil error; callers use
+	// Config.Empty to distinguish "not configured" (which the S3 API
+	// surfaces as 404 NoSuchCORSConfiguration) from a configured rule
+	// set.
+	GetCORS(ctx context.Context, tenantID, bucket string) (cors.Config, error)
+
+	// SetCORS upserts the bucket CORS configuration for (tenantID,
+	// bucket). cfg must pass cfg.Valid().
+	SetCORS(ctx context.Context, tenantID, bucket string, cfg cors.Config) error
+
+	// DeleteCORS removes any CORS configuration for (tenantID,
+	// bucket). Deleting a bucket that has no CORS configuration is a
+	// no-op and returns a nil error, matching S3's idempotent
+	// DeleteBucketCors.
+	DeleteCORS(ctx context.Context, tenantID, bucket string) error
 }

@@ -194,6 +194,54 @@ func (a *HMACAuthenticator) Authenticate(r *http.Request) (string, error) {
 	return res.TenantID, nil
 }
 
+// ResolveTenantUnverified implements s3compat.TenantResolver. It
+// resolves the tenant a request's credentials NAME, without verifying
+// the SigV4 signature, by looking up the access key the request
+// presents (the X-Amz-Credential query param of a presigned URL, or
+// the Authorization header credential). It backs the CORS preflight:
+// a browser never signs a preflight, but a presigned-URL preflight
+// still carries X-Amz-Credential identifying the tenant whose bucket
+// CORS rules apply.
+//
+// This MUST NOT be used to authorise an operation — it performs no
+// signature, expiry, or scope verification. The follow-up actual
+// request is fully authenticated through Authenticate. ok is false
+// when the request carries no recognisable access key or the key is
+// unknown.
+func (a *HMACAuthenticator) ResolveTenantUnverified(r *http.Request) (string, bool) {
+	accessKey := accessKeyFromRequest(r)
+	if accessKey == "" {
+		return "", false
+	}
+	binding, ok := a.Store.LookupByAccessKey(accessKey)
+	if !ok {
+		return "", false
+	}
+	return binding.Tenant.ID, true
+}
+
+// accessKeyFromRequest extracts the SigV4 access key id a request
+// presents, from either the presigned X-Amz-Credential query param or
+// the Authorization header credential scope. It performs no
+// validation beyond parsing the credential structure and returns ""
+// when neither is present or well-formed.
+func accessKeyFromRequest(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	if cred := r.URL.Query().Get("X-Amz-Credential"); cred != "" {
+		if segs := strings.Split(cred, "/"); len(segs) == 5 && segs[4] == "aws4_request" {
+			return segs[0]
+		}
+	}
+	if authz := r.Header.Get("Authorization"); authz != "" {
+		if parsed, err := parseAuthHeader(authz); err == nil {
+			return parsed.AccessKey
+		}
+	}
+	return ""
+}
+
 // AuthenticateEx is the rich-result form of Authenticate. It walks
 // the configured strategy list in order, dispatching to the first
 // strategy whose Matches returns true. If no strategy matches it
