@@ -100,6 +100,10 @@ var sealedKeyMaterialFields = map[string]bool{
 	"metadata.ObjectManifest.Encryption.WrappedDEK":                true,
 	"ManifestStore.Get.Out[0].Encryption.WrappedDEK":               true,
 	"ManifestStore.Put.In[2].Encryption.WrappedDEK":                true,
+	// UpdateManifest takes the same *metadata.ObjectManifest as Put
+	// (in-place body amend, e.g. object tagging); its WrappedDEK is
+	// the identical sealed envelope DEK, never an object body.
+	"ManifestStore.UpdateManifest.In[2].Encryption.WrappedDEK":     true,
 	"ManifestStore.List.Out[0].Manifests[*].Encryption.WrappedDEK": true,
 	// ScanManifests returns the same sealed envelope DEK as List,
 	// just wrapped in a ScannedManifest alongside the key the

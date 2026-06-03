@@ -137,6 +137,19 @@ func (s *FaultManifestStore) Put(ctx context.Context, key manifest_store.Manifes
 	return s.Inner.Put(ctx, key, m)
 }
 
+// UpdateManifest dispatches through PutFault — it is a write to an
+// existing manifest, so the chaos suite treats it as a PUT for
+// fault-injection purposes.
+func (s *FaultManifestStore) UpdateManifest(ctx context.Context, key manifest_store.ManifestKey, m *metadata.ObjectManifest) error {
+	s.Calls.Add(1)
+	fail, err := s.shouldFail("PUT", s.PutFault)
+	if fail {
+		s.Failures.Add(1)
+		return err
+	}
+	return s.Inner.UpdateManifest(ctx, key, m)
+}
+
 // Get dispatches through GetFault.
 func (s *FaultManifestStore) Get(ctx context.Context, key manifest_store.ManifestKey) (*metadata.ObjectManifest, error) {
 	s.Calls.Add(1)

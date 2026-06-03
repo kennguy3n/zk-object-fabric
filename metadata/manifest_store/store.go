@@ -36,7 +36,30 @@ type ManifestKey struct {
 type ManifestStore interface {
 	// Put stores a manifest at key. If the manifest already exists,
 	// behaviour is defined by the implementation's consistency model.
+	//
+	// Put establishes (or re-establishes) key as the LATEST version of
+	// its (tenant, bucket, object_key_hash) triple. Callers that need
+	// to amend an existing version's body without changing which
+	// version is latest must use UpdateManifest instead.
 	Put(ctx context.Context, key ManifestKey, m *metadata.ObjectManifest) error
+
+	// UpdateManifest replaces the opaque body of an EXISTING manifest
+	// version in place, without altering latest-version ordering. The
+	// key MUST name a specific stored version: VersionID is matched
+	// exactly (the empty-VersionID "latest" sentinel that Get/Delete
+	// accept is NOT resolved here — pass the manifest's own VersionID).
+	//
+	// This is the metadata-amend path for sub-resources that mutate an
+	// already-stored object in place (object tagging today; retention
+	// and legal-hold later). Using Put for those would promote the
+	// amended version to latest — corrupting unversioned GET/HEAD/
+	// DELETE/LIST resolution when the amended version is not the most
+	// recent one. UpdateManifest leaves the latest pointer
+	// (memory: s.latest; Postgres: updated_at; SQLite: write_seq)
+	// untouched.
+	//
+	// Returns ErrNotFound if no manifest exists at key.
+	UpdateManifest(ctx context.Context, key ManifestKey, m *metadata.ObjectManifest) error
 
 	// Get fetches the manifest at key. It returns ErrNotFound if no
 	// manifest exists at that key.

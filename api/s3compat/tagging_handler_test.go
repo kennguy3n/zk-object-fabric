@@ -14,8 +14,16 @@ import (
 // id the gateway assigned.
 func putTestObject(t *testing.T, h *Handler, path string) string {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader([]byte("body")))
-	req.ContentLength = 4
+	return putTestObjectBody(t, h, path, "body")
+}
+
+// putTestObjectBody seeds an object with explicit content. Version ids
+// are content-addressed, so callers that need two DISTINCT versions of
+// the same key must pass different bodies.
+func putTestObjectBody(t *testing.T, h *Handler, path, body string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader([]byte(body)))
+	req.ContentLength = int64(len(body))
 	rec := httptest.NewRecorder()
 	h.Put(rec, req)
 	if rec.Code != http.StatusOK {
@@ -57,11 +65,11 @@ func TestObjectTagging_RoundTripViaDispatch(t *testing.T) {
 	if err := xml.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("unmarshal tagging response: %v; body=%s", err, rec.Body)
 	}
-	if len(doc.TagSet) != 2 {
-		t.Fatalf("TagSet len = %d, want 2", len(doc.TagSet))
+	if len(doc.TagSet.Tags) != 2 {
+		t.Fatalf("TagSet len = %d, want 2", len(doc.TagSet.Tags))
 	}
 	want := map[string]string{"env": "prod", "team": "storage"}
-	for _, tg := range doc.TagSet {
+	for _, tg := range doc.TagSet.Tags {
 		if want[tg.Key] != tg.Value {
 			t.Fatalf("tag %q = %q, want %q", tg.Key, tg.Value, want[tg.Key])
 		}
@@ -81,8 +89,60 @@ func TestObjectTagging_RoundTripViaDispatch(t *testing.T) {
 	h.dispatch(rec, req)
 	doc = taggingDocument{}
 	_ = xml.Unmarshal(rec.Body.Bytes(), &doc)
-	if len(doc.TagSet) != 0 {
-		t.Fatalf("after delete TagSet len = %d, want 0", len(doc.TagSet))
+	if len(doc.TagSet.Tags) != 0 {
+		t.Fatalf("after delete TagSet len = %d, want 0", len(doc.TagSet.Tags))
+	}
+	// AWS returns the <TagSet> wrapper even when empty. Assert the
+	// serialised body carries it so non-AWS SDKs that require the
+	// element can parse the response.
+	if !strings.Contains(rec.Body.String(), "<TagSet>") {
+		t.Fatalf("empty tagging response missing <TagSet> wrapper; body=%s", rec.Body)
+	}
+}
+
+// TestObjectTagging_NonLatestVersionDoesNotPromote guards the WS8.1
+// fix where tagging an OLD version via ?versionId must not promote it
+// to latest. Tagging is an in-place metadata amend (UpdateManifest),
+// so after tagging v1 the unversioned GET must still resolve to v2.
+func TestObjectTagging_NonLatestVersionDoesNotPromote(t *testing.T) {
+	h, _ := newAdvancingClockTestHandler()
+	v1 := putTestObjectBody(t, h, "/bucket/obj", "version-one")
+	v2 := putTestObjectBody(t, h, "/bucket/obj", "version-two")
+	if v1 == "" || v2 == "" || v1 == v2 {
+		t.Fatalf("expected two distinct version ids, got v1=%q v2=%q", v1, v2)
+	}
+
+	// Tag the OLD version v1 explicitly.
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj?tagging&versionId="+v1,
+		strings.NewReader(putTaggingXML([2]string{"env", "prod"})))
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT ?tagging&versionId=v1 = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Unversioned GET ?tagging must still resolve to v2 (latest),
+	// which carries no tags — proving v1 was not promoted.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/obj?tagging", nil)
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if got := rec.Header().Get("x-amz-version-id"); got != v2 {
+		t.Fatalf("latest version after tagging v1 = %q, want v2=%q", got, v2)
+	}
+	var doc taggingDocument
+	_ = xml.Unmarshal(rec.Body.Bytes(), &doc)
+	if len(doc.TagSet.Tags) != 0 {
+		t.Fatalf("latest (v2) tag count = %d, want 0", len(doc.TagSet.Tags))
+	}
+
+	// And the tags ARE retrievable on v1 by explicit versionId.
+	req = httptest.NewRequest(http.MethodGet, "/bucket/obj?tagging&versionId="+v1, nil)
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	doc = taggingDocument{}
+	_ = xml.Unmarshal(rec.Body.Bytes(), &doc)
+	if len(doc.TagSet.Tags) != 1 || doc.TagSet.Tags[0].Key != "env" {
+		t.Fatalf("v1 tags = %+v, want one env=prod tag", doc.TagSet.Tags)
 	}
 }
 

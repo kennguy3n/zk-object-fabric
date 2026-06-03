@@ -41,13 +41,23 @@ type tagEntry struct {
 	Value string `xml:"Value"`
 }
 
+// tagSet is the <TagSet> wrapper element. It is a named struct (rather
+// than a flattened `xml:"TagSet>Tag"` slice) so the encoder always
+// emits the wrapper, including the empty form <TagSet></TagSet> that
+// AWS returns for an untagged object. A flattened slice would omit the
+// wrapper entirely when there are no tags, which some S3 clients fail
+// to parse.
+type tagSet struct {
+	Tags []tagEntry `xml:"Tag"`
+}
+
 // taggingDocument is the S3 Tagging request/response body:
 //
 //	<Tagging><TagSet><Tag><Key>..</Key><Value>..</Value></Tag>..</TagSet></Tagging>
 type taggingDocument struct {
-	XMLName xml.Name   `xml:"Tagging"`
-	XMLNS   string     `xml:"xmlns,attr,omitempty"`
-	TagSet  []tagEntry `xml:"TagSet>Tag"`
+	XMLName xml.Name `xml:"Tagging"`
+	XMLNS   string   `xml:"xmlns,attr,omitempty"`
+	TagSet  tagSet   `xml:"TagSet"`
 }
 
 // PutObjectTagging handles PUT /{bucket}/{key}?tagging. It replaces
@@ -69,7 +79,7 @@ func (h *Handler) PutObjectTagging(w http.ResponseWriter, r *http.Request) {
 			"the XML you provided was not well-formed or did not validate against our published schema", r.URL.Path)
 		return
 	}
-	tags, verr := validateTagSet(doc.TagSet)
+	tags, verr := validateTagSet(doc.TagSet.Tags)
 	if verr != nil {
 		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
 		return
@@ -87,13 +97,13 @@ func (h *Handler) PutObjectTagging(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Persist the tag set onto the resolved version. We re-Put using
-	// the manifest's own VersionID (not the possibly-empty request
-	// versionId) so the write targets exactly the version we read.
-	// Both ManifestStore backends treat "latest" as the most-recently
-	// written/updated version, so re-Putting the latest version (the
-	// default, versionId omitted) keeps it latest; this mirrors the
-	// existing overwrite-PUT semantics.
+	// Persist the tag set onto the resolved version via UpdateManifest
+	// (an in-place body amend), addressing exactly the version we read
+	// by its own VersionID. We must NOT use Put here: Put promotes its
+	// key to latest, so tagging a non-latest version (?versionId=<old>)
+	// would corrupt unversioned GET/HEAD/DELETE/LIST resolution by
+	// making the old version appear newest. UpdateManifest leaves the
+	// latest pointer untouched.
 	if len(tags) == 0 {
 		manifest.Tags = nil
 	} else {
@@ -105,7 +115,7 @@ func (h *Handler) PutObjectTagging(w http.ResponseWriter, r *http.Request) {
 		ObjectKeyHash: hashObjectKey(key),
 		VersionID:     manifest.VersionID,
 	}
-	if err := h.cfg.Manifests.Put(r.Context(), putKey, manifest); err != nil {
+	if err := h.cfg.Manifests.UpdateManifest(r.Context(), putKey, manifest); err != nil {
 		writeError(w, http.StatusInternalServerError, "ManifestPutFailed", err.Error(), r.URL.Path)
 		return
 	}
@@ -134,7 +144,7 @@ func (h *Handler) GetObjectTagging(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc := taggingDocument{XMLNS: s3TaggingNamespace, TagSet: tagsToEntries(manifest.Tags)}
+	doc := taggingDocument{XMLNS: s3TaggingNamespace, TagSet: tagSet{Tags: tagsToEntries(manifest.Tags)}}
 	if manifest.VersionID != "" {
 		w.Header().Set("x-amz-version-id", manifest.VersionID)
 	}
@@ -167,7 +177,9 @@ func (h *Handler) DeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
 			ObjectKeyHash: hashObjectKey(key),
 			VersionID:     manifest.VersionID,
 		}
-		if err := h.cfg.Manifests.Put(r.Context(), putKey, manifest); err != nil {
+		// In-place amend (not Put) so clearing tags on a non-latest
+		// version does not promote it to latest. See PutObjectTagging.
+		if err := h.cfg.Manifests.UpdateManifest(r.Context(), putKey, manifest); err != nil {
 			writeError(w, http.StatusInternalServerError, "ManifestPutFailed", err.Error(), r.URL.Path)
 			return
 		}

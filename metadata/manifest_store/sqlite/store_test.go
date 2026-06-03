@@ -397,3 +397,52 @@ func TestScanManifests_RejectsMalformedCursor(t *testing.T) {
 		t.Fatal("malformed cursor: want error, got nil")
 	}
 }
+
+// TestUpdateManifest_PreservesLatestPointer pins the WS8.1 contract:
+// amending a non-latest version in place must not bump write_seq, so
+// the empty-VersionID "latest" read still resolves to the newest Put.
+func TestUpdateManifest_PreservesLatestPointer(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, nil)
+	ctx := context.Background()
+
+	if err := s.Put(ctx, key("t1", "b1", "h1", "v1"), manifestFor("t1", "b1", "h1", "v1")); err != nil {
+		t.Fatalf("Put v1: %v", err)
+	}
+	if err := s.Put(ctx, key("t1", "b1", "h1", "v2"), manifestFor("t1", "b1", "h1", "v2")); err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+
+	amended := manifestFor("t1", "b1", "h1", "v1")
+	amended.Tags = map[string]string{"env": "prod"}
+	if err := s.UpdateManifest(ctx, key("t1", "b1", "h1", "v1"), amended); err != nil {
+		t.Fatalf("UpdateManifest v1: %v", err)
+	}
+
+	latest, err := s.Get(ctx, key("t1", "b1", "h1", ""))
+	if err != nil {
+		t.Fatalf("Get latest: %v", err)
+	}
+	if latest.VersionID != "v2" {
+		t.Fatalf("latest VersionID = %q, want v2", latest.VersionID)
+	}
+
+	got1, err := s.Get(ctx, key("t1", "b1", "h1", "v1"))
+	if err != nil {
+		t.Fatalf("Get v1: %v", err)
+	}
+	if got1.Tags["env"] != "prod" {
+		t.Fatalf("v1 Tags = %v, want env=prod", got1.Tags)
+	}
+}
+
+// TestUpdateManifest_NotFound verifies an amend to a missing version
+// returns ErrNotFound rather than inserting a row.
+func TestUpdateManifest_NotFound(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, nil)
+	err := s.UpdateManifest(context.Background(), key("t1", "b1", "h1", "nope"), manifestFor("t1", "b1", "h1", "nope"))
+	if err != manifest_store.ErrNotFound {
+		t.Fatalf("UpdateManifest missing key err = %v, want ErrNotFound", err)
+	}
+}

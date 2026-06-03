@@ -146,6 +146,50 @@ func (s *Store) Put(ctx context.Context, key manifest_store.ManifestKey, m *meta
 	return nil
 }
 
+// UpdateManifest replaces an existing version's body without bumping
+// write_seq, so the row's position in the ORDER BY write_seq DESC
+// latest-resolution is preserved. Returns ErrNotFound if no row
+// matches the exact key.
+func (s *Store) UpdateManifest(ctx context.Context, key manifest_store.ManifestKey, m *metadata.ObjectManifest) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if m == nil {
+		return errors.New("sqlite: manifest is nil")
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("sqlite: marshal manifest: %w", err)
+	}
+	if s.encryptor != nil {
+		sealed, eerr := s.encryptor.Encrypt(body, manifest_store.BodyContext{
+			TenantID:      key.TenantID,
+			Bucket:        key.Bucket,
+			ObjectKeyHash: key.ObjectKeyHash,
+		})
+		if eerr != nil {
+			return fmt.Errorf("sqlite: encrypt manifest body: %w", eerr)
+		}
+		body = sealed
+	}
+	q := fmt.Sprintf(`
+		UPDATE %s SET body = ?
+		WHERE tenant_id = ? AND bucket = ? AND object_key_hash = ? AND version_id = ?
+	`, s.table)
+	res, err := s.db.ExecContext(ctx, q, body, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID)
+	if err != nil {
+		return fmt.Errorf("sqlite: update manifest: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite: update manifest rows affected: %w", err)
+	}
+	if n == 0 {
+		return manifest_store.ErrNotFound
+	}
+	return nil
+}
+
 // Get reads a manifest by exact key. If VersionID is empty, Get
 // returns the most recently written version for the (tenant,
 // bucket, object_key_hash) triple.

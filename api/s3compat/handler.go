@@ -467,7 +467,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //
 //   acl                ACL operations (GetObjectAcl, PutObjectAcl,
 //                      GetBucketAcl, PutBucketAcl)
-//   tagging            Object and bucket tagging
 //   lifecycle          Bucket lifecycle configuration
 //   versioning         Bucket versioning toggle (note: this is the
 //                      ?versioning *subresource*, not the ?versions
@@ -492,8 +491,10 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //
 // The conformance harness in `tests/s3_conformance` asserts every
 // entry here returns 4xx (specifically 501); a future implementation
-// that wires up (say) tagging should remove the `tagging` key from
-// this map and add tagging routing in the dispatch switch below.
+// that wires up (say) cors should remove the `cors` key from this
+// map and add cors routing in the dispatch switch below. (Object
+// tagging followed exactly this path in WS8.1: the `tagging` key was
+// removed here and `?tagging` routing added to dispatch.)
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -545,7 +546,7 @@ var unsupportedSubresources = map[string]string{
 // order. Without this, `for key := range unsupportedSubresources`
 // picks whichever key Go's randomised map iteration hits first,
 // which makes error messages non-deterministic when a request
-// carries multiple unsupported keys (e.g. `?acl&tagging`). Stable
+// carries multiple unsupported keys (e.g. `?acl&cors`). Stable
 // ordering also lets the conformance harness snapshot error bodies.
 var unsupportedSubresourceKeys = func() []string {
 	out := make([]string, 0, len(unsupportedSubresources))

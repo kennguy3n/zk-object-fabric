@@ -49,6 +49,20 @@ func (s *Store) Put(_ context.Context, key manifest_store.ManifestKey, m *metada
 	return nil
 }
 
+// UpdateManifest replaces an existing version's body in place without
+// touching the insertion sequence or latest pointer, so an amend to a
+// non-latest version (e.g. tagging an old version) does not promote it
+// to latest. Returns ErrNotFound if key names no stored version.
+func (s *Store) UpdateManifest(_ context.Context, key manifest_store.ManifestKey, m *metadata.ObjectManifest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.byKey[key]; !ok {
+		return manifest_store.ErrNotFound
+	}
+	s.byKey[key] = cloneManifest(m)
+	return nil
+}
+
 // Get returns the manifest at key. If VersionID is empty the most
 // recently written version for the (tenant, bucket, object_key_hash)
 // triple is returned.
