@@ -268,6 +268,19 @@ operations perfectly than many operations partially.
 | Bucket ops   | `HeadBucket`                             | Yes       | Yes      | Yes     |                                                                         |
 | Conditional  | `If-None-Match`, `If-Modified-Since`     | Yes       | Yes      | Yes     | Evaluated against manifest metadata                                     |
 | Versioning   | `GetObject?versionId=`                   | Phase 1+  | Yes      | Yes     | Object versioning via manifest versions                                 |
+| Tagging      | `Put/Get/DeleteObjectTagging`            | Planned   | WS8.1    | WS8.1   | Tags stored as JSONB on the manifest row; 10 tags/object (see §15.1)    |
+| Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Planned | WS8.2 | WS8.2   | Per-bucket rules + daily evaluator; extends migration tiering (see §15.1) |
+| Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Planned | WS8.3 | WS8.3 | Governance/compliance retention + legal hold; requires versioning (see §15.1) |
+| Versioning   | `Put/GetBucketVersioning`                | Planned   | WS8.4    | WS8.4   | Bucket-level Enabled/Suspended config + delete markers (see §15.1)      |
+| CORS         | `Put/Get/DeleteBucketCors`               | Planned   | WS8.5    | WS8.5   | Enables browser direct-upload via presigned URLs (see §15.1)            |
+| Notifications| `Put/GetBucketNotificationConfiguration` | Planned   | WS8.6    | WS8.6   | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events (see §15.1) |
+| SSE config   | `Put/Get/DeleteBucketEncryption`         | Planned   | WS8.7    | WS8.7   | Maps `x-amz-server-side-encryption` to ZK encryption modes (see §15.1)  |
+
+The rows marked **Planned / WS8.x** are roadmap commitments tracked in
+§15.1 (Workstream 8). They are not yet shipped; the gateway currently
+rejects their sub-resource query keys with `501 NotImplemented` (see
+`api/s3compat/handler.go` `unsupportedSubresources`). Each WS8 slice
+removes its key from that map as the handler lands.
 
 **Operations explicitly NOT supported** (to avoid scope creep):
 
@@ -279,7 +292,15 @@ operations perfectly than many operations partially.
 - Bucket policies (replaced by ZK placement policies — see §3.10)
 - Cross-region replication (replaced by the ZK migration engine — see §4)
 - S3 Transfer Acceleration (replaced by the ZK cache layer — see §3.7)
-- Object Lock / WORM (deferred to Phase 3)
+
+> **Previously deferred, now roadmapped.** Object Lock / WORM,
+> object/bucket tagging, bucket lifecycle configuration, bucket-level
+> versioning config, CORS, event notifications, and the server-side
+> encryption config sub-resource were formerly listed here as out of
+> scope. They are now planned under **Workstream 8** (§15.1) and appear
+> as *Planned* rows in the table above. The S3 compatibility matrix in
+> [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) tracks current vs planned
+> coverage against the AWS S3 surface.
 
 #### 3.2.3 S3 API behavior across backend transitions
 
@@ -1476,3 +1497,160 @@ sensible defaults, ZK Hot and ZK Dedicated expect customer
 configuration, ZK Sovereign requires it. Storage and egress are
 priced separately; commercial pricing is intentionally not pinned
 in this document.
+
+---
+
+## 15. Roadmap Workstreams: Richer S3 API & Client SDK Parity
+
+These two workstreams extend the SaaS transformation effort. They are
+**roadmap commitments, not yet shipped**. Each numbered slice below is
+sized to land as an independent PR (matching the existing slice-based
+delivery model). The live status of each slice is tracked in
+[PROGRESS.md](PROGRESS.md); the AWS-surface coverage view lives in
+[S3_COMPATIBILITY.md](S3_COMPATIBILITY.md).
+
+### 15.1 Workstream 8 — Richer S3 API Support
+
+**Goal**: implement the most-demanded currently-unsupported S3
+sub-resources so that off-the-shelf S3 tooling (browser SPAs, backup
+software, compliance tooling) works against ZKOF without bespoke
+glue. Each slice removes its key from `unsupportedSubresources` in
+`api/s3compat/handler.go` only when the handler is wired and covered
+by `tests/s3_compat/`.
+
+#### 15.1.1 Object Tagging (`?tagging`)
+
+- Handlers `PutObjectTagging`, `GetObjectTagging`,
+  `DeleteObjectTagging` in a new `api/s3compat/tagging_handler.go`.
+- Tags stored as JSONB on the manifest row in
+  `metadata/manifest_store/` via a new `Tags map[string]string` field
+  on the manifest struct.
+- S3 limits enforced: ≤ 10 tags per object, ≤ 128-char keys, ≤
+  256-char values.
+- S3 compliance tests in `tests/s3_compat/`.
+
+#### 15.1.2 Object Lifecycle (`?lifecycle`) — extends WS 4.4
+
+- New `metadata/lifecycle/` package with a `LifecycleRule` struct:
+  expiration (days or date), transition (to archive tier), abort
+  incomplete multipart (days), and a tag-based filter.
+- Handlers `PutBucketLifecycleConfiguration`,
+  `GetBucketLifecycleConfiguration`,
+  `DeleteBucketLifecycleConfiguration` in
+  `api/s3compat/lifecycle_handler.go`.
+- Config stored per bucket in Postgres (new `bucket_lifecycle` table).
+- A background lifecycle evaluator runs daily: expire objects,
+  transition tiers, and abort stale multipart uploads. Reuses the
+  migration tiering machinery (§4) for transitions.
+- Console: per-bucket lifecycle-rule editor in
+  `frontend/src/pages/BucketsPage.tsx`.
+
+#### 15.1.3 Object Lock / WORM (`?object-lock`, `?retention`, `?legal-hold`)
+
+- New `metadata/object_lock/` package: `LockConfig`
+  (governance/compliance mode, retain-until-date) and `LegalHold`
+  (on/off per object).
+- Handlers `PutObjectLockConfiguration`,
+  `GetObjectLockConfiguration`, `PutObjectRetention`,
+  `GetObjectRetention`, `PutObjectLegalHold`, `GetObjectLegalHold`.
+- Enforcement: the `DeleteObject` and `PutObject` (overwrite) paths in
+  `api/s3compat/handler.go` check lock / retention / legal-hold status
+  before allowing the operation and return `403 AccessDenied` if the
+  object is locked. (`internal/auth` already carries a legal-hold
+  check on DELETE — this generalises it.)
+- **Depends on bucket versioning (15.1.4).**
+
+#### 15.1.4 Bucket Versioning (`?versioning`)
+
+- Object versioning via manifest versions already exists (§3.2.2:
+  `GetObject?versionId=`). What is missing is the bucket-level config
+  endpoints.
+- Handlers `PutBucketVersioning`, `GetBucketVersioning` in
+  `api/s3compat/versioning_handler.go`.
+- Versioning state (Enabled / Suspended) stored per bucket in tenant
+  metadata.
+- When enabled, `DeleteObject` creates a delete marker instead of
+  tombstoning, and `ListObjectVersions` returns all versions.
+
+#### 15.1.5 CORS (`?cors`)
+
+- Handlers `PutBucketCors`, `GetBucketCors`, `DeleteBucketCors`.
+- CORS config stored per bucket in Postgres.
+- Gateway middleware reads the config and sets the appropriate
+  `Access-Control-*` response headers.
+- Critical for browser-based direct upload using presigned URLs from
+  SPAs.
+
+#### 15.1.6 Event Notifications (`?notification`)
+
+- Handlers `PutBucketNotificationConfiguration`,
+  `GetBucketNotificationConfiguration`.
+- Initial transport: webhook destinations (HTTP POST to a
+  tenant-configured URL) — no dependency on SNS/SQS.
+- Events emitted on `s3:ObjectCreated:*` and `s3:ObjectRemoved:*`.
+- New `internal/notifications/` package: an async event dispatcher
+  with retry and a dead-letter queue.
+- Notification configs stored per bucket in Postgres.
+
+#### 15.1.7 Server-Side Encryption Config (`?encryption`)
+
+- Handlers `PutBucketEncryption`, `GetBucketEncryption`,
+  `DeleteBucketEncryption`.
+- Maps to ZKOF encryption modes (§3.7): the
+  `x-amz-server-side-encryption` header selects between
+  `managed` (ManagedEncrypted) and `client_side` (StrictZK) modes.
+- Default: `managed` encrypted, matching the SaaS default for ease of
+  use.
+
+#### 15.1.8 Documentation
+
+- This section and the §3.2.2 table reflect the planned operations.
+- [ARCHITECTURE.md](ARCHITECTURE.md) documents the new packages.
+- [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) is the ZKOF-vs-AWS-S3
+  compatibility matrix.
+
+### 15.2 Workstream 9 — Rust Client-Side Encryption SDK
+
+**Goal**: a Rust client-side encryption SDK that is **byte-compatible**
+with the existing Go SDK (`encryption/client_sdk/`), so an object
+sealed by one SDK decrypts cleanly with the other. This unlocks Strict
+ZK mode for Rust consumers and for the selective Rust hot paths
+described in §1.1 without forking the wire format.
+
+**Byte-compatibility contract** (the Go SDK is the reference; the Rust
+SDK MUST reproduce it exactly):
+
+- **Chunk frame**: `| 24-byte nonce | 4-byte big-endian ciphertext
+  length | ciphertext |`, where ciphertext is `plaintext_len + 16-byte
+  Poly1305 tag`. The 28-byte header (`chunkHeaderSize`) lets the
+  decryptor walk frames without a separate manifest.
+- **Chunking**: fixed `DefaultChunkSize` of 16 MiB of plaintext per
+  chunk; all chunks except the last are full-size.
+- **AEAD**: XChaCha20-Poly1305 (`ContentAlgorithm =
+  "xchacha20-poly1305"`).
+- **Per-chunk AAD**: when bound to object identity, `AAD = ChunkAAD ||
+  "|" || big-endian uint64(chunk_index)`, with the recommended
+  `ChunkAAD` being the pipe-separated tuple
+  `tenant_id|bucket|object_key_hash|version_id` (where
+  `object_key_hash` is a SHA-256 over the object key). When `ChunkAAD`
+  is empty the AAD is `nil` for both seal and open, preserving
+  compatibility with pre-AAD objects.
+- **DEK wrapping**: per-object DEKs generated with a CSPRNG and wrapped
+  with the tenant CMK behind the same `Wrapper` abstraction (local key
+  file in Phase 2; AWS KMS / Vault Transit in Phase 3).
+
+**Deliverables**:
+
+- A new Rust crate (proposed `encryption/rust_sdk/`) exposing
+  `encrypt_object` / `decrypt_object` and a `Wrapper` trait mirroring
+  the Go SDK surface.
+- A cross-language parity test corpus: Go-sealed fixtures opened by
+  Rust and vice-versa, asserting byte-identical ciphertext for a fixed
+  DEK + nonce schedule, wired into CI alongside `tests/s3_compat/`.
+- SDK usage docs and an interop note added to
+  [INTEGRATION.md](INTEGRATION.md).
+
+> **Note**: the Go SDK already declares this cross-language invariant —
+> `encryption/client_sdk/sdk.go` states that "other SDK implementations
+> MUST reproduce this format byte-for-byte to interoperate." WS9 is the
+> first such implementation.
