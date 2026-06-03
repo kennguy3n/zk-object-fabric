@@ -503,6 +503,17 @@ type GatewayConfig struct {
 	MaxRequestBytes int64    `json:"max_request_bytes"`
 	CachePath       string   `json:"cache_path"`
 
+	// NodeID is the stable per-node identifier this gateway stamps
+	// onto the billing/audit events it emits (UsageEvent.SourceNodeID
+	// and the lifecycle evaluator's metering), so usage can be
+	// attributed to the individual node in a fleet. When empty the
+	// gateway falls back to os.Hostname() — the typical container /
+	// pod name — so the default is already per-node; set this only to
+	// override that (e.g. a stable logical name that outlives a pod
+	// reschedule). Mirrors rebalancer.node_id, which independently
+	// identifies claim ownership in the rebalancer's JobStore.
+	NodeID string `json:"node_id"`
+
 	// ReadHeaderTimeout caps how long the gateway is willing to
 	// wait for the request headers to finish arriving before
 	// dropping the connection. A zero value here means "use

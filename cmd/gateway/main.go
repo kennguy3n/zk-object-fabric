@@ -359,6 +359,12 @@ func main() {
 	// is disabled.
 	auditStore := buildAuditStore(cfg.Compliance, metadataDB)
 	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB, auditStore)
+	// gatewayNodeID is resolved once (gateway.node_id override, else
+	// os.Hostname) and shared by the interactive s3 handler and the
+	// background lifecycle evaluator so billing/audit events from this
+	// node carry the same per-node SourceNodeID, instead of the coarse
+	// cfg.Env they used previously.
+	gatewayNodeID := resolveGatewayNodeID(cfg.Gateway.NodeID)
 	s3Handler := s3compat.New(s3compat.Config{
 		Manifests:                store,
 		Providers:                registry,
@@ -375,7 +381,7 @@ func main() {
 		Encryption:               gatewayEnc,
 		ContentIndex:             contentIndex,
 		Compliance:               complianceHooks,
-		NodeID:                   cfg.Env,
+		NodeID:                   gatewayNodeID,
 		IntegrityFailures:        integrityFailureSink{r: metricsRegistry},
 		MaxRequestBytes:          cfg.Gateway.MaxRequestBytes,
 		CacheWarmingMemoryBudget: cfg.Gateway.CacheWarmingMemoryBudget,
@@ -398,7 +404,7 @@ func main() {
 	// exactly like the interactive DELETE path.
 	lifecycleDone := startLifecycleEvaluator(
 		workerCtx, cfg.Lifecycle, bucketConfigStore, store, multipartStore,
-		contentIndex, registry, auditStore, billingSink, cfg.Env)
+		contentIndex, registry, auditStore, billingSink, gatewayNodeID)
 
 	handler := http.Handler(mux)
 	if cfg.Tracing.Enabled {
@@ -1508,22 +1514,36 @@ func jobStoreLabel(s migration.JobStore) string {
 	}
 }
 
-// resolveRebalancerNodeID picks the identifier the JobStore
-// uses to attribute claim ownership. Explicit cfg wins;
-// otherwise os.Hostname is the usual container / pod name;
-// a fallback of "gateway-unknown" only fires when Hostname
-// errors (rare in practice but defended against because the
-// orchestrator constructor refuses an empty NodeID).
-func resolveRebalancerNodeID(cfg config.RebalancerConfig) string {
-	if cfg.NodeID != "" {
-		return cfg.NodeID
+// resolveGatewayNodeID resolves this gateway's node identity from an
+// optional explicit override: a non-empty override wins, otherwise
+// os.Hostname() (the usual container / pod name) is used, and a
+// "gateway-unknown" fallback only fires when Hostname errors (rare,
+// but defended against because some consumers — e.g. the rebalancer
+// orchestrator — refuse an empty NodeID). Every subsystem that stamps
+// a node identity (billing/audit SourceNodeID via the s3 handler and
+// lifecycle evaluator, and claim ownership via the rebalancer) shares
+// this one resolution path; the resolved value is identical across
+// them only when their overrides are (e.g. both empty → the same
+// os.Hostname()). gateway.node_id and rebalancer.node_id remain
+// independent overrides, so setting just one can intentionally yield
+// distinct identities for billing/audit vs. claim ownership.
+func resolveGatewayNodeID(override string) string {
+	if override != "" {
+		return override
 	}
 	host, err := os.Hostname()
 	if err != nil || host == "" {
-		log.Printf("gateway: os.Hostname() failed (%v); falling back to gateway-unknown — set rebalancer.node_id explicitly", err)
+		log.Printf("gateway: os.Hostname() failed (%v); falling back to gateway-unknown — set gateway.node_id (or rebalancer.node_id) explicitly", err)
 		return "gateway-unknown"
 	}
 	return host
+}
+
+// resolveRebalancerNodeID picks the identifier the JobStore uses to
+// attribute claim ownership: the rebalancer's explicit node_id wins,
+// otherwise it shares the gateway-wide host-based resolution.
+func resolveRebalancerNodeID(cfg config.RebalancerConfig) string {
+	return resolveGatewayNodeID(cfg.NodeID)
 }
 
 // applyDBConnectionPool applies the gateway's RDS / Postgres
