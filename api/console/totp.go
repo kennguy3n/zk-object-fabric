@@ -99,9 +99,16 @@ func hotpCode(key []byte, counter int64) string {
 // totpVerify reports whether code is a valid TOTP for secretB32 at time
 // t, scanning ±totpSkewSteps around the current step. On success it
 // returns the matched step so the caller can record it and reject a
-// replay of the same code within its still-valid window. The code
-// comparison is constant time so a timing side channel cannot reveal how
-// many leading digits were correct.
+// replay of the same code within its still-valid window.
+//
+// Each candidate comparison uses subtle.ConstantTimeCompare so a timing
+// side channel cannot reveal how many leading digits were correct — the
+// security-relevant guarantee, since the digits are the secret-derived
+// value an attacker is guessing. The loop does early-return on the first
+// match, so the *total* runtime can betray which of the (2·skew+1) steps
+// matched; that leaks only the coarse server↔authenticator clock
+// alignment, which an attacker already knows from the wall clock, so it
+// is not worth the constant extra HMACs to scan all steps unconditionally.
 //
 // matchedStep is meaningful only when ok is true.
 func totpVerify(secretB32, code string, t time.Time) (matchedStep int64, ok bool) {

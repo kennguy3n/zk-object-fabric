@@ -44,12 +44,15 @@ func (s *SQLiteMFAStore) ensureSchema(ctx context.Context) error {
 			active     INTEGER NOT NULL DEFAULT 0,
 			last_step  INTEGER NOT NULL DEFAULT 0
 		)`,
+		// The composite primary key (tenant_id, code_hash) already
+		// yields a tenant_id-leading index, so the tenant-only lookups
+		// (Disable's DELETE, GetMFA's COUNT) ride its leftmost prefix —
+		// a separate tenant_id index would be redundant write overhead.
 		`CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
 			tenant_id  TEXT NOT NULL,
 			code_hash  TEXT NOT NULL,
 			PRIMARY KEY (tenant_id, code_hash)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_mfa_recovery_tenant ON mfa_recovery_codes(tenant_id)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {

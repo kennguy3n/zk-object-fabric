@@ -82,14 +82,15 @@ CREATE TABLE IF NOT EXISTS mfa_credentials (
 -- mfa_recovery_codes holds the single-use recovery codes minted at
 -- activation, stored only as SHA-256 hex hashes (code_hash) so a
 -- database dump exposes no usable codes. Each consume DELETEs one row;
--- disabling MFA deletes every row for the tenant.
+-- disabling MFA deletes every row for the tenant. The composite primary
+-- key (tenant_id, code_hash) already provides a tenant_id-leading B-tree,
+-- so the tenant-only lookups (the DELETE in Disable, the COUNT in GetMFA)
+-- ride its leftmost prefix — no separate tenant_id index is needed.
 CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
     tenant_id TEXT NOT NULL,
     code_hash TEXT NOT NULL,
     PRIMARY KEY (tenant_id, code_hash)
 );
-
-CREATE INDEX IF NOT EXISTS idx_mfa_recovery_tenant ON mfa_recovery_codes(tenant_id);
 
 -- dedicated_cells persists the operator-allocated cells the B2B /
 -- sovereign console surface lists for tenants whose contract type
