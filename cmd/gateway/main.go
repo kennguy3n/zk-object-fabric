@@ -357,7 +357,7 @@ func main() {
 	// lifecycle evaluator so lifecycle-driven and user-issued
 	// mutations land in the same compliance trail. nil when auditing
 	// is disabled.
-	auditStore := buildAuditStore(cfg.Compliance, metadataDB)
+	auditStore := buildAuditStore(cfg.Compliance, metadataDB, embeddedDB)
 	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB, auditStore)
 	// gatewayNodeID is resolved once (gateway.node_id override, else
 	// os.Hostname) and shared by the interactive s3 handler and the
@@ -2848,17 +2848,28 @@ func statusClass(code int) string {
 // by the interactive s3compat handler and the background lifecycle
 // evaluator so both write lifecycle/interactive entries to the same
 // trail. Returns nil when auditing is disabled (the consumers treat
-// nil as "feature off"). Postgres-backed when a metadata DB is
-// configured; an in-memory store otherwise (dev only — entries do
-// not survive restart and are process-local, so the two consumers
-// only share a view within a single process).
-func buildAuditStore(cfg config.ComplianceConfig, db *sql.DB) compliance.AuditStore {
+// nil as "feature off"). Backend selection mirrors the other embedded
+// stores (buildBucketConfigStore/buildContentIndex/buildManifestStore):
+// Postgres when a metadata DB is configured, embedded SQLite in the
+// single-node profile (persists across restart), and an in-memory
+// store only when neither is present (dev only — entries do not survive
+// restart and are process-local).
+func buildAuditStore(cfg config.ComplianceConfig, db, embeddedDB *sql.DB) compliance.AuditStore {
 	if !cfg.AuditEnabled {
 		return nil
 	}
 	if db != nil {
 		return compliance.NewPostgresAuditStore(db)
 	}
+	if embeddedDB != nil {
+		store, err := compliance.NewSQLiteAuditStore(embeddedDB)
+		if err != nil {
+			log.Fatalf("gateway: build embedded compliance audit store: %v", err)
+		}
+		log.Printf("gateway: embedded SQLite compliance audit store enabled (lifecycle + interactive entries persist locally)")
+		return store
+	}
+	log.Printf("gateway: no metadata_dsn; using in-memory compliance audit store (dev only — audit entries do NOT survive restart)")
 	return compliance.NewMemoryAuditStore()
 }
 
