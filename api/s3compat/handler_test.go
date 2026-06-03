@@ -148,6 +148,28 @@ func newTestHandler() (*Handler, *fakeProvider, *recordingBilling, manifest_stor
 	return h, fake, bill, store
 }
 
+// newAdvancingClockTestHandler is like newTestHandler but its clock
+// advances one second per Now() call, so successive PUTs of the same
+// key get distinct version ids (newPieceID mixes the timestamp).
+// Tests that need two real versions of one object use this.
+func newAdvancingClockTestHandler() (*Handler, manifest_store.ManifestStore) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	now := time.Unix(1700000000, 0)
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Now: func() time.Time {
+			t := now
+			now = now.Add(time.Second)
+			return t
+		},
+	})
+	return h, store
+}
+
 func TestPutGetHeadDelete_Roundtrip(t *testing.T) {
 	h, fake, bill, _ := newTestHandler()
 	body := []byte("hello world")
@@ -871,6 +893,51 @@ func TestCopyObject_MissingSource(t *testing.T) {
 	h.Copy(cw, cr)
 	if cw.Code != http.StatusNotFound {
 		t.Fatalf("Copy missing: %d %s", cw.Code, cw.Body.String())
+	}
+}
+
+// TestCopyObject_DeleteMarkerSource guards the WS8.4 fix where a copy
+// source resolving to a delete marker must mirror GET/HEAD semantics
+// (404 when resolved as latest, 405 when addressed by explicit
+// versionId) rather than surfacing the marker's empty Pieces list as
+// a misleading 500 EmptyManifest.
+func TestCopyObject_DeleteMarkerSource(t *testing.T) {
+	h, _, _, store := newTestHandler()
+	const vid = "v-marker-1"
+	marker := &metadata.ObjectManifest{
+		TenantID:      "anonymous",
+		Bucket:        "bucket",
+		ObjectKey:     "gone.txt",
+		ObjectKeyHash: hashObjectKey("gone.txt"),
+		VersionID:     vid,
+		DeleteMarker:  true,
+	}
+	mkey := manifest_store.ManifestKey{
+		TenantID:      "anonymous",
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("gone.txt"),
+		VersionID:     vid,
+	}
+	if err := store.Put(context.Background(), mkey, marker); err != nil {
+		t.Fatalf("seed delete marker: %v", err)
+	}
+
+	// Latest resolves to the marker → 404 NoSuchKey.
+	cr := httptest.NewRequest(http.MethodPut, "/bucket/dst.txt", nil)
+	cr.Header.Set("x-amz-copy-source", "/bucket/gone.txt")
+	cw := httptest.NewRecorder()
+	h.Copy(cw, cr)
+	if cw.Code != http.StatusNotFound {
+		t.Fatalf("Copy from delete-marker latest = %d, want 404; body=%s", cw.Code, cw.Body)
+	}
+
+	// Explicit versionId pointing at the marker → 405 MethodNotAllowed.
+	cr = httptest.NewRequest(http.MethodPut, "/bucket/dst.txt", nil)
+	cr.Header.Set("x-amz-copy-source", "/bucket/gone.txt?versionId="+vid)
+	cw = httptest.NewRecorder()
+	h.Copy(cw, cr)
+	if cw.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("Copy from delete-marker versionId = %d, want 405; body=%s", cw.Code, cw.Body)
 	}
 }
 

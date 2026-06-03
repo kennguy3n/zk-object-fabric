@@ -473,34 +473,33 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // gap rather than as a generic 5xx. Operation names map 1:1 to the
 // AWS API:
 //
-//	acl                ACL operations (GetObjectAcl, PutObjectAcl,
-//	                   GetBucketAcl, PutBucketAcl)
-//	tagging            Object and bucket tagging
-//	lifecycle          Bucket lifecycle configuration
-//	policy             Bucket policy document
-//	cors               Bucket CORS configuration
-//	encryption         Bucket-level SSE configuration
-//	logging            Bucket logging configuration
-//	notification       Bucket event notification configuration
-//	replication        Cross-region replication configuration
-//	accelerate         Transfer-acceleration toggle
-//	requestPayment     Requester-pays configuration
-//	website            Static-website hosting configuration
-//	inventory          Bucket inventory configuration
-//	metrics            Bucket metrics configuration
-//	analytics          Bucket analytics configuration
-//	intelligent-tiering, object-lock, retention, legal-hold:
-//	                   Object Lock surface (immutability)
-//	publicAccessBlock  Block-public-access settings
-//	ownershipControls  Object Ownership settings
+//   acl                ACL operations (GetObjectAcl, PutObjectAcl,
+//                      GetBucketAcl, PutBucketAcl)
+//   lifecycle          Bucket lifecycle configuration
+//   policy             Bucket policy document
+//   cors               Bucket CORS configuration
+//   encryption         Bucket-level SSE configuration
+//   logging            Bucket logging configuration
+//   notification       Bucket event notification configuration
+//   replication        Cross-region replication configuration
+//   accelerate         Transfer-acceleration toggle
+//   requestPayment     Requester-pays configuration
+//   website            Static-website hosting configuration
+//   inventory          Bucket inventory configuration
+//   metrics            Bucket metrics configuration
+//   analytics          Bucket analytics configuration
+//   intelligent-tiering, object-lock, retention, legal-hold:
+//                      Object Lock surface (immutability)
+//   publicAccessBlock  Block-public-access settings
+//   ownershipControls  Object Ownership settings
 //
 // The conformance harness in `tests/s3_conformance` asserts every
 // entry here returns 4xx (specifically 501); a future implementation
 // that wires up a sub-resource removes its key from this map and adds
-// routing in the dispatch switch below. Bucket versioning followed
-// exactly this path (WS8.4): `versioning` was removed from this map
-// and PUT/GET `?versioning` are now routed to
-// Put/GetBucketVersioning.
+// routing in the dispatch switch below. Object tagging (WS8.1) and
+// bucket versioning (WS8.4) both followed exactly this path: their
+// keys (`tagging`, `versioning`) were removed here and `?tagging` /
+// `?versioning` routing was added to the dispatch switch.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -524,7 +523,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // incorrectly reject bulk-delete requests as unsupported.
 var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
-	"tagging":             "NotImplemented",
 	"lifecycle":           "NotImplemented",
 	"policy":              "NotImplemented",
 	"cors":                "NotImplemented",
@@ -552,7 +550,7 @@ var unsupportedSubresources = map[string]string{
 // order. Without this, `for key := range unsupportedSubresources`
 // picks whichever key Go's randomised map iteration hits first,
 // which makes error messages non-deterministic when a request
-// carries multiple unsupported keys (e.g. `?acl&tagging`). Stable
+// carries multiple unsupported keys (e.g. `?acl&cors`). Stable
 // ordering also lets the conformance harness snapshot error bodies.
 var unsupportedSubresourceKeys = func() []string {
 	out := make([]string, 0, len(unsupportedSubresources))
@@ -601,6 +599,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.UploadPart(w, r)
 			return
 		}
+		// Object tagging (?tagging) — WS8.1. Checked before the
+		// implicit-CreateBucket and CopyObject branches because it is
+		// a distinct sub-resource operation, not an object write.
+		if q.Has("tagging") {
+			h.PutObjectTagging(w, r)
+			return
+		}
 		// Bucket versioning config (PUT /{bucket}?versioning) is a
 		// bucket-level sub-resource and must route before the
 		// implicit-CreateBucket branch below.
@@ -638,6 +643,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported POST operation", r.URL.Path)
 	case http.MethodGet:
 		bucket, key := parseBucketKey(r.URL.Path)
+		// Object tagging (?tagging) — WS8.1.
+		if q.Has("tagging") {
+			h.GetObjectTagging(w, r)
+			return
+		}
 		if key == "" && q.Has("uploads") {
 			h.ListMultipartUploads(w, r, bucket)
 			return
@@ -673,6 +683,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		if q.Get("uploadId") != "" {
 			h.AbortMultipartUpload(w, r)
+			return
+		}
+		// Object tagging (?tagging) — WS8.1.
+		if q.Has("tagging") {
+			h.DeleteObjectTagging(w, r)
 			return
 		}
 		h.Delete(w, r)

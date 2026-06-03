@@ -127,6 +127,22 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ManifestGetFailed", err.Error(), r.URL.Path)
 		return
 	}
+	// A delete marker carries no payload, so it can never be a copy
+	// source. Mirror GET/HEAD semantics (handler.go resolve): an
+	// explicit ?versionId pointing at a marker is a 405, while a
+	// marker resolved as the latest version reads as a missing key
+	// (404). Both checks MUST precede the empty-Pieces guard below,
+	// since a marker also has zero pieces and would otherwise surface
+	// as a misleading 500 EmptyManifest.
+	if srcManifest.DeleteMarker {
+		if srcVersion != "" {
+			writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
+				"copy source version is a delete marker", r.URL.Path)
+			return
+		}
+		writeError(w, http.StatusNotFound, "NoSuchKey", "copy source not found", r.URL.Path)
+		return
+	}
 	if len(srcManifest.Pieces) == 0 {
 		writeError(w, http.StatusInternalServerError, "EmptyManifest", "source manifest has no pieces", r.URL.Path)
 		return
