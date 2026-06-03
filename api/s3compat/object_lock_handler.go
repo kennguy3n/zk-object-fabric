@@ -537,6 +537,12 @@ func weakensRetention(cur, next object_lock.Retention) bool {
 	if !next.Mode.Valid() {
 		return true // removing retention entirely
 	}
+	// Downgrading COMPLIANCE to the bypassable GOVERNANCE mode weakens
+	// protection even when the retain-until date is unchanged or
+	// extended, so it must be guarded like a shortening.
+	if cur.Mode == object_lock.ModeCompliance && next.Mode == object_lock.ModeGovernance {
+		return true
+	}
 	return next.RetainUntil.Before(cur.RetainUntil)
 }
 

@@ -142,6 +142,12 @@ func TestPutObjectRetention_ComplianceCannotBeWeakened(t *testing.T) {
 	if code := putRet("COMPLIANCE", "2098-01-01T00:00:00Z", true); code != http.StatusForbidden {
 		t.Fatalf("shorten COMPLIANCE with bypass = %d, want 403", code)
 	}
+	// Downgrading COMPLIANCE to the bypassable GOVERNANCE mode is
+	// refused even with an unchanged retain-until date and the bypass
+	// header — it would silently weaken absolute protection.
+	if code := putRet("GOVERNANCE", "2099-01-01T00:00:00Z", true); code != http.StatusForbidden {
+		t.Fatalf("downgrade COMPLIANCE->GOVERNANCE = %d, want 403", code)
+	}
 }
 
 func TestObjectLegalHold_RoundTrip(t *testing.T) {
