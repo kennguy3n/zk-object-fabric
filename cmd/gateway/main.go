@@ -2086,10 +2086,17 @@ func buildAuthStore(db, embeddedDB *sql.DB) console.AuthStore {
 // the same backend precedence as buildAuthStore: Postgres when a
 // metadata DSN is configured, the embedded SQLite store under the
 // embedded profile, and the process-local in-memory store otherwise
-// (dev / single-node). A Postgres / SQLite build failure falls back to
-// the in-memory store with a loud log rather than wedging startup —
-// refresh tokens are an additive session convenience, and the access
-// token continues to work without them.
+// (dev / single-node).
+//
+// A persistent-store *construction* failure (e.g. the embedded SQLite
+// ensureSchema DDL erroring) is fatal under env=production and a
+// dev-friendly in-memory fallback otherwise. This closes the gap
+// enforceProductionRefreshTokenStore alone leaves: that guard checks a
+// persistent backend is *configured*, but a silent memory downgrade
+// here would still strand production on a non-replica-safe store after
+// the guard passed — exactly the outcome the guard exists to prevent.
+// Outside production the loud-log fallback keeps single-node and dev
+// profiles booting even if the embedded DB is briefly unavailable.
 //
 // Returns nil when the operator sets Console.DisableRefreshTokens, which
 // the auth handler reads as "refresh disabled": login / signup omit the
@@ -2100,12 +2107,22 @@ func buildRefreshTokenStore(cfg config.Config, db, embeddedDB *sql.DB) console.R
 		return nil
 	}
 	rcfg := console.RefreshConfig{TTL: cfg.Console.RefreshTokenTTL.ToDuration()}
+	// memoryFallback downgrades to the process-local store outside
+	// production, but in production a persistent backend was demanded by
+	// enforceProductionRefreshTokenStore, so a construction failure must
+	// be fatal rather than a silent, non-replica-safe downgrade.
+	memoryFallback := func(what string, err error) console.RefreshTokenStore {
+		if cfg.Env == "production" {
+			log.Fatalf("gateway: %s: %v; refusing to fall back to the in-memory refresh-token store under env=production (it is lost on restart and not shared across replicas). Fix the backend or set console.disable_refresh_tokens=true", what, err)
+		}
+		log.Printf("gateway: %s: %v; falling back to in-memory", what, err)
+		return console.NewMemoryRefreshTokenStore(rcfg)
+	}
 	if db == nil {
 		if embeddedDB != nil {
 			store, err := console.NewSQLiteRefreshTokenStore(embeddedDB, rcfg)
 			if err != nil {
-				log.Printf("gateway: build embedded refresh store: %v; falling back to in-memory", err)
-				return console.NewMemoryRefreshTokenStore(rcfg)
+				return memoryFallback("build embedded refresh store", err)
 			}
 			log.Printf("gateway: embedded SQLite refresh-token store enabled")
 			return store
@@ -2114,8 +2131,7 @@ func buildRefreshTokenStore(cfg config.Config, db, embeddedDB *sql.DB) console.R
 	}
 	store, err := console.NewPostgresRefreshTokenStore(db, rcfg)
 	if err != nil {
-		log.Printf("gateway: build postgres refresh store: %v; falling back to in-memory", err)
-		return console.NewMemoryRefreshTokenStore(rcfg)
+		return memoryFallback("build postgres refresh store", err)
 	}
 	log.Printf("gateway: postgres refresh-token store enabled")
 	return store
