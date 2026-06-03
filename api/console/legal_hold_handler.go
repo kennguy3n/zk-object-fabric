@@ -138,6 +138,14 @@ func (h *LegalHoldHandler) release(w http.ResponseWriter, r *http.Request, tenan
 		return
 	}
 	if err := h.Store.Release(r.Context(), id); err != nil {
+		// The hold existed at Get time but is already released (or was
+		// released by a concurrent request between Get and Release): the
+		// store reports this as ErrLegalHoldNotFound. Map it to 404, the
+		// same as the Get lookup above, instead of a misleading 500.
+		if errors.Is(err, auth.ErrLegalHoldNotFound) {
+			http.Error(w, "legal hold not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
