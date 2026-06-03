@@ -76,6 +76,21 @@ func (h *Handler) PutBucketVersioning(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "IllegalVersioningConfigurationException", "Status must be Enabled or Suspended", r.URL.Path)
 		return
 	}
+	// AWS forbids suspending versioning once Object Lock is enabled on a
+	// bucket: Object Lock relies on versions being immutable, so allowing
+	// Suspended would let a later overwrite/complete silently replace a
+	// locked version. Reject the transition rather than enter that state.
+	if state == bucket_config.VersioningSuspended {
+		lockCfg, lerr := h.bucketObjectLock(r, tenantID, bucket)
+		if lerr != nil {
+			writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", lerr.Error(), r.URL.Path)
+			return
+		}
+		if lockCfg.Enabled {
+			writeError(w, http.StatusConflict, "InvalidBucketState", "cannot suspend versioning while Object Lock is enabled on the bucket", r.URL.Path)
+			return
+		}
+	}
 	if err := h.cfg.BucketConfig.SetVersioning(r.Context(), tenantID, bucket, state); err != nil {
 		writeError(w, http.StatusInternalServerError, "VersioningPutFailed", err.Error(), r.URL.Path)
 		return

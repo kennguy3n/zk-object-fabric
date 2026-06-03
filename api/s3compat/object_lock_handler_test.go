@@ -2,11 +2,22 @@ package s3compat
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
+	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
+	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
+	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
 // enableObjectLock turns on bucket Object Lock via the dispatch path
@@ -296,7 +307,7 @@ func TestObjectLock_DefaultRetentionInheritedAtPut(t *testing.T) {
 }
 
 func TestObjectLock_OverwriteBlockedWhenVersioningNotEnabled(t *testing.T) {
-	h, _ := newVersioningTestHandler()
+	h, cfg := newVersioningTestHandler()
 	setVersioning(t, h, "bucket", "Enabled")
 	enableObjectLock(t, h, "bucket", objectLockEnabledNoRule)
 	putTestObject(t, h, "/bucket/obj")
@@ -310,15 +321,159 @@ func TestObjectLock_OverwriteBlockedWhenVersioningNotEnabled(t *testing.T) {
 		t.Fatalf("set retention = %d; body=%s", rec.Code, rec.Body)
 	}
 
-	// Suspend versioning so a PUT would overwrite the locked version
-	// in place instead of creating a new one. The pre-flight guard
-	// must refuse it.
-	setVersioning(t, h, "bucket", "Suspended")
+	// Force versioning to Suspended directly in the store so a PUT
+	// would overwrite the locked version in place instead of creating
+	// a new one. (The handler now refuses this transition while Object
+	// Lock is enabled, so we bypass it to recreate the legacy/
+	// inconsistent state the pre-flight guard defends against.)
+	if err := cfg.SetVersioning(context.Background(), AnonymousTenant, "bucket", bucket_config.VersioningSuspended); err != nil {
+		t.Fatalf("force-suspend versioning: %v", err)
+	}
 	ow := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader([]byte("new")))
 	ow.ContentLength = 3
 	owRec := httptest.NewRecorder()
 	h.Put(owRec, ow)
 	if owRec.Code != http.StatusForbidden {
 		t.Fatalf("overwrite of locked version = %d, want 403; body=%s", owRec.Code, owRec.Body)
+	}
+}
+
+// newObjectLockMultipartHandler builds a handler with BucketConfig and
+// a multipart store wired plus an advancing clock (so successive
+// writes of a key get distinct version ids).
+func newObjectLockMultipartHandler() (*Handler, bucket_config.Store) {
+	cfg := bucket_config.NewMemoryStore()
+	now := time.Unix(1700000000, 0)
+	h := New(Config{
+		Manifests:    memory.New(),
+		Providers:    map[string]providers.StorageProvider{"test": newFakeProvider("test")},
+		Placement:    fixedPlacement{backend: "test"},
+		Billing:      &recordingBilling{},
+		BucketConfig: cfg,
+		Multipart:    multipart.NewMemoryStore(),
+		Now: func() time.Time {
+			t := now
+			now = now.Add(time.Second)
+			return t
+		},
+	})
+	return h, cfg
+}
+
+// TestObjectLock_MultipartCompleteBlockedWhenVersioningNotEnabled
+// proves CompleteMultipartUpload mirrors the Put/Copy overwrite guard:
+// completing a multipart upload that would overwrite a locked current
+// version on an Object-Lock bucket that is not versioning-Enabled is
+// refused with 403, and the locked version is left intact.
+func TestObjectLock_MultipartCompleteBlockedWhenVersioningNotEnabled(t *testing.T) {
+	h, cfg := newObjectLockMultipartHandler()
+	setVersioning(t, h, "bucket", "Enabled")
+	enableObjectLock(t, h, "bucket", objectLockEnabledNoRule)
+	putTestObject(t, h, "/bucket/mp-obj")
+
+	// Lock the current version under COMPLIANCE.
+	ret := "<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>"
+	req := httptest.NewRequest(http.MethodPut, "/bucket/mp-obj?retention", strings.NewReader(ret))
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set retention = %d; body=%s", rec.Code, rec.Body)
+	}
+
+	// Force versioning Suspended directly (the handler refuses this
+	// transition while Object Lock is enabled).
+	if err := cfg.SetVersioning(context.Background(), AnonymousTenant, "bucket", bucket_config.VersioningSuspended); err != nil {
+		t.Fatalf("force-suspend versioning: %v", err)
+	}
+
+	// Start a multipart upload and stage one part.
+	req = httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	rec = httptest.NewRecorder()
+	h.CreateMultipartUpload(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload = %d; body=%s", rec.Code, rec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	part := bytes.Repeat([]byte("x"), 16)
+	url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=1", initRes.UploadID)
+	preq := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(part))
+	preq.ContentLength = int64(len(part))
+	prec := httptest.NewRecorder()
+	h.UploadPart(prec, preq)
+	if prec.Code != http.StatusOK {
+		t.Fatalf("UploadPart = %d; body=%s", prec.Code, prec.Body)
+	}
+	etag := strings.Trim(prec.Header().Get("ETag"), `"`)
+
+	// Completing would overwrite the locked current version → 403.
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: []completeUploadEntry{{PartNumber: 1, ETag: etag}}})
+	creq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/bucket/mp-obj?uploadId=%s", initRes.UploadID), bytes.NewReader(completeXML))
+	crec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(crec, creq)
+	if crec.Code != http.StatusForbidden {
+		t.Fatalf("CompleteMultipartUpload overwriting locked version = %d, want 403; body=%s", crec.Code, crec.Body)
+	}
+
+	// The locked version must still be readable unchanged.
+	greq := httptest.NewRequest(http.MethodGet, "/bucket/mp-obj", nil)
+	grec := httptest.NewRecorder()
+	h.dispatch(grec, greq)
+	if grec.Code != http.StatusOK || grec.Body.String() != "body" {
+		t.Fatalf("GET after blocked complete = %d body=%q, want 200 'body'", grec.Code, grec.Body)
+	}
+}
+
+// getFailingManifestStore wraps a real ManifestStore but forces Get to
+// return a chosen (non-ErrNotFound) error, simulating a transient
+// backend read failure.
+type getFailingManifestStore struct {
+	manifest_store.ManifestStore
+	getErr error
+}
+
+func (s getFailingManifestStore) Get(context.Context, manifest_store.ManifestKey) (*metadata.ObjectManifest, error) {
+	return nil, s.getErr
+}
+
+// TestObjectLock_OverwriteFailsClosedOnReadError verifies the WORM
+// guarantee that a transient manifest read error during the overwrite
+// pre-flight does NOT fail open: rather than silently proceeding (and
+// risking destruction of a locked version), the write is refused with
+// 500. ErrNotFound is the only "allow" case, exercised elsewhere.
+func TestObjectLock_OverwriteFailsClosedOnReadError(t *testing.T) {
+	cfg := bucket_config.NewMemoryStore()
+	now := time.Unix(1700000000, 0)
+	h := New(Config{
+		Manifests:    getFailingManifestStore{ManifestStore: memory.New(), getErr: errors.New("manifest backend unavailable")},
+		Providers:    map[string]providers.StorageProvider{"test": newFakeProvider("test")},
+		Placement:    fixedPlacement{backend: "test"},
+		Billing:      &recordingBilling{},
+		BucketConfig: cfg,
+		Now: func() time.Time {
+			t := now
+			now = now.Add(time.Second)
+			return t
+		},
+	})
+	setVersioning(t, h, "bucket", "Enabled")
+	enableObjectLock(t, h, "bucket", objectLockEnabledNoRule)
+	// Force the inconsistent Suspended state so the overwrite guard
+	// reaches the manifest Get (which fails).
+	if err := cfg.SetVersioning(context.Background(), AnonymousTenant, "bucket", bucket_config.VersioningSuspended); err != nil {
+		t.Fatalf("force-suspend versioning: %v", err)
+	}
+
+	ow := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader([]byte("new")))
+	ow.ContentLength = 3
+	rec := httptest.NewRecorder()
+	h.Put(rec, ow)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("overwrite with failing manifest read = %d, want 500 (fail-closed); body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "ObjectLockGetFailed") {
+		t.Fatalf("expected ObjectLockGetFailed error code, got body=%s", rec.Body)
 	}
 }

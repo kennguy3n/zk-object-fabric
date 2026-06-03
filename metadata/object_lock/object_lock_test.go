@@ -83,9 +83,15 @@ func TestConfig_DefaultRetainUntil(t *testing.T) {
 	if got := (Config{Enabled: true, DefaultMode: ModeGovernance, DefaultDays: 10}).DefaultRetainUntil(now); !got.Equal(now.AddDate(0, 0, 10)) {
 		t.Errorf("days: got %v", got)
 	}
-	// AWS treats a default-retention year as 365 days.
-	if got := (Config{Enabled: true, DefaultMode: ModeCompliance, DefaultYears: 2}).DefaultRetainUntil(now); !got.Equal(now.AddDate(0, 0, 730)) {
+	// Years are calendar years (now + N years), matching the AWS SDKs
+	// and MinIO, not 365-day spans.
+	if got := (Config{Enabled: true, DefaultMode: ModeCompliance, DefaultYears: 2}).DefaultRetainUntil(now); !got.Equal(now.AddDate(2, 0, 0)) {
 		t.Errorf("years: got %v", got)
+	}
+	// A year spanning Feb-29 is a full calendar year (366 days), not 365.
+	leapNow := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	if got := (Config{Enabled: true, DefaultMode: ModeCompliance, DefaultYears: 1}).DefaultRetainUntil(leapNow); !got.Equal(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("leap year: got %v, want 2025-01-01", got)
 	}
 }
 

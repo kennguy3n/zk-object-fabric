@@ -116,13 +116,20 @@ func (c Config) HasDefaultRetention() bool {
 
 // DefaultRetainUntil computes the retain-until date a new object
 // version inherits from the bucket default rule, relative to now.
-// Callers should only use it when HasDefaultRetention is true. AWS
-// treats a year as 365 days for Object Lock default retention.
+// Callers should only use it when HasDefaultRetention is true.
+//
+// Years are calendar years, not 365-day spans: S3-compatible
+// implementations (and the AWS SDKs) compute the retain-until date as
+// now + N calendar years, so a year that spans a leap day is 366 days.
+// We mirror that with time.AddDate(years, 0, 0) so a default of "1
+// year" lands on the same calendar date next year regardless of leap
+// years. (Reference: MinIO internal/bucket/object/lock computes
+// validity via t.AddDate(years, 0, 0).)
 func (c Config) DefaultRetainUntil(now time.Time) time.Time {
 	if c.DefaultDays > 0 {
 		return now.AddDate(0, 0, c.DefaultDays)
 	}
-	return now.AddDate(0, 0, c.DefaultYears*365)
+	return now.AddDate(c.DefaultYears, 0, 0)
 }
 
 // Retention is a per-object-version retention setting (the body of

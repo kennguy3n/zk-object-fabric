@@ -491,11 +491,16 @@ func (h *Handler) allowObjectLockOverwrite(w http.ResponseWriter, r *http.Reques
 		Bucket:        bucket,
 		ObjectKeyHash: hashObjectKey(key),
 	})
-	if err != nil {
-		// No current version (or it cannot be read) → nothing to
-		// protect; let the write proceed and surface real store
-		// failures on the write path.
+	if errors.Is(err, manifest_store.ErrNotFound) {
+		// No current version → nothing to protect; allow the write.
 		return true
+	}
+	if err != nil {
+		// Fail closed: on a WORM bucket a transient read error must
+		// not be allowed to mask an existing locked version. Refuse
+		// the overwrite rather than risk destroying immutable data.
+		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
+		return false
 	}
 	if msg, locked := objectLockBlocksDelete(current, h.cfg.Now(), governanceBypassRequested(r)); locked {
 		writeError(w, http.StatusForbidden, "AccessDenied", msg, r.URL.Path)
