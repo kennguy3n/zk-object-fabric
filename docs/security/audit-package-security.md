@@ -412,11 +412,20 @@ should attempt:
 - **Console API uses a flat bearer token.** RS256/ES256 JWT
   migration is on Workstream 3.2. Same as above: flag but not a
   novel finding.
-- **No Postgres Row Level Security.** Defence-in-depth via RLS is
-  on Workstream 3.4. The current code enforces tenant scoping in
-  the application layer (`metadata/manifest_store/postgres/store.go`);
-  the audit should look for any path that bypasses the `Store`
-  wrapper.
+- **Postgres Row Level Security (Workstream 3.4) — in progress.**
+  The application layer enforces tenant scoping on every query
+  (`metadata/manifest_store/postgres/store.go`); the audit should
+  look for any path that bypasses the `Store` wrapper. RLS is now
+  armed as defence-in-depth on the **manifests** table: each
+  tenant-scoped statement runs in a transaction that binds a
+  transaction-local `zkof.tenant_id` GUC, and a FORCE'd
+  `tenant_isolation` policy re-checks it (see
+  `metadata/manifest_store/postgres/rls.sql`). RLS only applies to a
+  non-superuser, non-`BYPASSRLS` role, so the gateway refuses to boot
+  in production on a privileged metadata connection
+  (`cmd/gateway/main.go` `checkProductionRLSRole`). The remaining
+  control-plane tables (content_index, bucket_config, multipart,
+  console auth/refresh/mfa) reuse the same substrate in follow-ups.
 - **CMK is held by the gateway process in `ManagedEncrypted` mode.**
   This is the documented trust model — in Strict ZK mode the
   gateway never sees the CMK; in `ManagedEncrypted` mode the

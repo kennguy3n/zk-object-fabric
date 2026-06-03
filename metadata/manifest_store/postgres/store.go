@@ -105,10 +105,15 @@ func (s *Store) Put(ctx context.Context, key manifest_store.ManifestKey, m *meta
 		ON CONFLICT (tenant_id, bucket, object_key_hash, version_id)
 		DO UPDATE SET body = EXCLUDED.body, updated_at = now()
 	`, s.table)
-	if _, err := s.db.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID, body); err != nil {
+	tx, err := s.beginTenant(ctx, key.TenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID, body); err != nil {
 		return fmt.Errorf("postgres: put manifest: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // UpdateManifest replaces an existing version's body without bumping
@@ -141,7 +146,12 @@ func (s *Store) UpdateManifest(ctx context.Context, key manifest_store.ManifestK
 		UPDATE %s SET body = $5
 		WHERE tenant_id = $1 AND bucket = $2 AND object_key_hash = $3 AND version_id = $4
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID, body)
+	tx, err := s.beginTenant(ctx, key.TenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID, body)
 	if err != nil {
 		return fmt.Errorf("postgres: update manifest: %w", err)
 	}
@@ -152,7 +162,7 @@ func (s *Store) UpdateManifest(ctx context.Context, key manifest_store.ManifestK
 	if n == 0 {
 		return manifest_store.ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // Get reads a manifest by exact key. If VersionID is empty, Get
@@ -162,13 +172,18 @@ func (s *Store) Get(ctx context.Context, key manifest_store.ManifestKey) (*metad
 	if key.TenantID == "" || key.Bucket == "" || key.ObjectKeyHash == "" {
 		return nil, errors.New("postgres: tenant_id, bucket, and object_key_hash are required")
 	}
+	tx, err := s.beginTenant(ctx, key.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var row *sql.Row
 	if key.VersionID != "" {
 		q := fmt.Sprintf(`
 			SELECT body FROM %s
 			WHERE tenant_id = $1 AND bucket = $2 AND object_key_hash = $3 AND version_id = $4
 		`, s.table)
-		row = s.db.QueryRowContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID)
+		row = tx.QueryRowContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID)
 	} else {
 		q := fmt.Sprintf(`
 			SELECT body FROM %s
@@ -176,7 +191,7 @@ func (s *Store) Get(ctx context.Context, key manifest_store.ManifestKey) (*metad
 			ORDER BY updated_at DESC
 			LIMIT 1
 		`, s.table)
-		row = s.db.QueryRowContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash)
+		row = tx.QueryRowContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash)
 	}
 
 	var body []byte
@@ -213,7 +228,12 @@ func (s *Store) Delete(ctx context.Context, key manifest_store.ManifestKey) erro
 		DELETE FROM %s
 		WHERE tenant_id = $1 AND bucket = $2 AND object_key_hash = $3 AND version_id = $4
 	`, s.table)
-	res, err := s.db.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID)
+	tx, err := s.beginTenant(ctx, key.TenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID)
 	if err != nil {
 		return fmt.Errorf("postgres: delete manifest: %w", err)
 	}
@@ -224,7 +244,7 @@ func (s *Store) Delete(ctx context.Context, key manifest_store.ManifestKey) erro
 	if n == 0 {
 		return manifest_store.ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // List paginates manifests under (tenantID, bucket). The cursor is
@@ -252,7 +272,12 @@ func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit
 		ORDER BY object_key_hash, updated_at DESC
 		LIMIT $4
 	`, s.table)
-	rows, err := s.db.QueryContext(ctx, q, tenantID, bucket, cursorHash, limit+1)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return manifest_store.ListResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, q, tenantID, bucket, cursorHash, limit+1)
 	if err != nil {
 		return manifest_store.ListResult{}, fmt.Errorf("postgres: list manifests: %w", err)
 	}
@@ -323,7 +348,12 @@ func (s *Store) ScanManifests(ctx context.Context, cursor string, limit int) (ma
 		ORDER BY tenant_id, bucket, object_key_hash, version_id
 		LIMIT $5
 	`, s.table)
-	rows, err := s.db.QueryContext(ctx, q, after.TenantID, after.Bucket, after.ObjectKeyHash, after.VersionID, limit+1)
+	tx, err := s.beginScanAll(ctx)
+	if err != nil {
+		return manifest_store.ScanResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, q, after.TenantID, after.Bucket, after.ObjectKeyHash, after.VersionID, limit+1)
 	if err != nil {
 		return manifest_store.ScanResult{}, fmt.Errorf("postgres: scan manifests: %w", err)
 	}
@@ -383,6 +413,11 @@ func (s *Store) HasManifestWithPieceID(ctx context.Context, tenantID, pieceID st
 	if tenantID == "" || pieceID == "" {
 		return false, errors.New("postgres: tenant_id and piece_id are required")
 	}
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	if s.encryptor == nil {
 		// JSONB containment query: pieces array contains an
 		// object with the given piece_id.
@@ -393,7 +428,7 @@ func (s *Store) HasManifestWithPieceID(ctx context.Context, tenantID, pieceID st
 			LIMIT 1
 		`, s.table)
 		var x int
-		if err := s.db.QueryRowContext(ctx, q, tenantID, pieceID).Scan(&x); err != nil {
+		if err := tx.QueryRowContext(ctx, q, tenantID, pieceID).Scan(&x); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return false, nil
 			}
@@ -408,7 +443,7 @@ func (s *Store) HasManifestWithPieceID(ctx context.Context, tenantID, pieceID st
 	// AAD-bound decrypt can use the manifest key the row was
 	// sealed under.
 	q := fmt.Sprintf(`SELECT bucket, object_key_hash, body FROM %s WHERE tenant_id = $1`, s.table)
-	rows, err := s.db.QueryContext(ctx, q, tenantID)
+	rows, err := tx.QueryContext(ctx, q, tenantID)
 	if err != nil {
 		return false, fmt.Errorf("postgres: has manifest with piece_id: %w", err)
 	}
@@ -457,7 +492,12 @@ func (s *Store) ListVersions(ctx context.Context, tenantID, bucket, objectKeyHas
 		WHERE tenant_id = $1 AND bucket = $2 AND object_key_hash = $3
 		ORDER BY updated_at DESC
 	`, s.table)
-	rows, err := s.db.QueryContext(ctx, q, tenantID, bucket, objectKeyHash)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, q, tenantID, bucket, objectKeyHash)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list versions: %w", err)
 	}
