@@ -339,6 +339,22 @@ func TestLoadRSAPrivateKeyPEM(t *testing.T) {
 	if _, err := LoadRSAPrivateKeyPEM(pkcs8Enc); err == nil || !strings.Contains(err.Error(), "password-protected") {
 		t.Fatalf("pkcs8 encrypted key: err = %v; want 'password-protected'", err)
 	}
+
+	// A structurally valid but undersized key must be rejected: RS256
+	// with a sub-2048-bit modulus is forgeable and unsafe for session
+	// tokens.
+	weak, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	weakPath := filepath.Join(dir, "weak.pem")
+	weakPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(weak)})
+	if err := os.WriteFile(weakPath, weakPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRSAPrivateKeyPEM(weakPath); err == nil || !strings.Contains(err.Error(), "1024-bit") {
+		t.Fatalf("1024-bit key: err = %v; want rejection mentioning '1024-bit'", err)
+	}
 }
 
 // storeKey extracts the private key from a store for tests that need

@@ -38,6 +38,13 @@ const DefaultJWTTokenTTL = time.Hour
 // wrong clock.
 const jwtClockSkewLeeway = 60 * time.Second
 
+// minRSAKeyBits is the smallest RSA modulus LoadRSAPrivateKeyPEM
+// accepts. NIST SP 800-131A disallows RSA below 2048 bits, and a
+// console session token signed with a factorable key is no protection
+// at all, so the loader fails closed rather than letting an operator
+// wire a 1024-bit key that parses fine but is trivially forgeable.
+const minRSAKeyBits = 2048
+
 // jwtSigningMethod pins the algorithm JWTTokenStore signs and accepts.
 // It is referenced both when minting (so issued tokens advertise
 // RS256) and when verifying (so the parser rejects any token whose
@@ -266,20 +273,34 @@ func LoadRSAPrivateKeyPEM(path string) (*rsa.PrivateKey, error) {
 	if hasProcType || hasDEKInfo || block.Type == "ENCRYPTED PRIVATE KEY" {
 		return nil, fmt.Errorf("console: JWT signing key %q is password-protected; provide an unencrypted PEM (the gateway signs unattended and cannot prompt for a passphrase)", path)
 	}
-	key, pkcs1Err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if pkcs1Err == nil {
-		return key, nil
+	var rsaKey *rsa.PrivateKey
+	if key, pkcs1Err := x509.ParsePKCS1PrivateKey(block.Bytes); pkcs1Err == nil {
+		rsaKey = key
+	} else {
+		parsed, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if pkcs8Err != nil {
+			// Surface both parse failures: when an operator hands us a
+			// corrupted PKCS#1 file the PKCS#8 error alone is misleading
+			// (it complains about the wrong format), so report each.
+			return nil, fmt.Errorf("console: parse JWT signing key %q (PKCS#1: %v; PKCS#8: %v)", path, pkcs1Err, pkcs8Err)
+		}
+		key, ok := parsed.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("console: JWT signing key %q is %T, want *rsa.PrivateKey", path, parsed)
+		}
+		rsaKey = key
 	}
-	parsed, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if pkcs8Err != nil {
-		// Surface both parse failures: when an operator hands us a
-		// corrupted PKCS#1 file the PKCS#8 error alone is misleading
-		// (it complains about the wrong format), so report each.
-		return nil, fmt.Errorf("console: parse JWT signing key %q (PKCS#1: %v; PKCS#8: %v)", path, pkcs1Err, pkcs8Err)
+	// Defence in depth against an operator wiring a structurally valid
+	// but cryptographically weak key. Validate() catches a malformed
+	// key whose CRT parameters are inconsistent (which would otherwise
+	// only surface as a signing failure at the first token mint), and
+	// the modulus-size floor rejects keys too small to be safe for
+	// RS256 — NIST has disallowed <2048-bit RSA since 2014.
+	if err := rsaKey.Validate(); err != nil {
+		return nil, fmt.Errorf("console: JWT signing key %q failed RSA consistency check: %w", path, err)
 	}
-	rsaKey, ok := parsed.(*rsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("console: JWT signing key %q is %T, want *rsa.PrivateKey", path, parsed)
+	if bits := rsaKey.N.BitLen(); bits < minRSAKeyBits {
+		return nil, fmt.Errorf("console: JWT signing key %q is %d-bit; RS256 requires at least %d-bit for adequate security", path, bits, minRSAKeyBits)
 	}
 	return rsaKey, nil
 }
