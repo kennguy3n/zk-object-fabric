@@ -43,7 +43,7 @@ deployment probe. The authoritative reject list is
 | `ListBuckets`                                  | Supported       | From tenant metadata                                        |
 | `ListObjectsV2`                                | Supported       | Served from metadata store                                  |
 | `ListObjectVersions`                           | Supported       | Returns manifest versions                                   |
-| `Put/GetBucketVersioning`                      | Planned (WS8.4) | Bucket-level Enabled/Suspended config; delete markers       |
+| `Put/GetBucketVersioning`                      | Supported       | Bucket-level Enabled/Suspended config; delete markers       |
 | `Put/Get/DeleteBucketLifecycleConfiguration`   | Planned (WS8.2) | Per-bucket rules + daily evaluator                          |
 | `Put/GetObjectLockConfiguration`               | Planned (WS8.3) | Requires versioning (WS8.4)                                 |
 | `Put/Get/DeleteBucketCors`                     | Planned (WS8.5) | Enables browser direct-upload via presigned URLs            |

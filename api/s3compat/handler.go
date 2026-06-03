@@ -30,6 +30,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -168,6 +169,13 @@ type Config struct {
 	// CompleteMultipartUpload / AbortMultipartUpload. A nil store
 	// causes those endpoints to return 501 NotImplemented.
 	Multipart multipart.Store
+
+	// BucketConfig persists per-bucket S3 configuration
+	// sub-resources (today: versioning state — WS8.4). A nil store
+	// makes PutBucketVersioning / GetBucketVersioning return 501
+	// NotImplemented and leaves DeleteObject on its non-versioned
+	// (permanent-delete) path.
+	BucketConfig bucket_config.Store
 
 	// ErasureCoding is the registry of erasure-coding profiles the
 	// handler can use when a placement policy names an
@@ -468,10 +476,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //   acl                ACL operations (GetObjectAcl, PutObjectAcl,
 //                      GetBucketAcl, PutBucketAcl)
 //   lifecycle          Bucket lifecycle configuration
-//   versioning         Bucket versioning toggle (note: this is the
-//                      ?versioning *subresource*, not the ?versions
-//                      LIST query which is handled by the GET path
-//                      via ListObjectVersions)
 //   policy             Bucket policy document
 //   cors               Bucket CORS configuration
 //   encryption         Bucket-level SSE configuration
@@ -491,10 +495,11 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //
 // The conformance harness in `tests/s3_conformance` asserts every
 // entry here returns 4xx (specifically 501); a future implementation
-// that wires up (say) cors should remove the `cors` key from this
-// map and add cors routing in the dispatch switch below. (Object
-// tagging followed exactly this path in WS8.1: the `tagging` key was
-// removed here and `?tagging` routing added to dispatch.)
+// that wires up a sub-resource removes its key from this map and adds
+// routing in the dispatch switch below. Object tagging (WS8.1) and
+// bucket versioning (WS8.4) both followed exactly this path: their
+// keys (`tagging`, `versioning`) were removed here and `?tagging` /
+// `?versioning` routing was added to the dispatch switch.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -519,7 +524,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
 	"lifecycle":           "NotImplemented",
-	"versioning":          "NotImplemented",
 	"policy":              "NotImplemented",
 	"cors":                "NotImplemented",
 	"encryption":          "NotImplemented",
@@ -602,6 +606,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutObjectTagging(w, r)
 			return
 		}
+		// Bucket versioning config (PUT /{bucket}?versioning) is a
+		// bucket-level sub-resource and must route before the
+		// implicit-CreateBucket branch below.
+		if q.Has("versioning") {
+			h.PutBucketVersioning(w, r)
+			return
+		}
 		// Bucket-level PUT (s3 mb / CreateBucket). Buckets in this
 		// gateway are implicit — they come into existence the first
 		// time an object is written to them — so CreateBucket is a
@@ -639,6 +650,14 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if key == "" && q.Has("uploads") {
 			h.ListMultipartUploads(w, r, bucket)
+			return
+		}
+		// Bucket versioning config (GET /{bucket}?versioning). Guard
+		// on key=="" like the other bucket-level sub-resources so
+		// GET /{bucket}/{key}?versioning falls through to the object
+		// GET rather than returning the bucket versioning document.
+		if key == "" && q.Has("versioning") {
+			h.GetBucketVersioning(w, r, bucket)
 			return
 		}
 		// ListObjectVersions is bucket-level GET ?versions.
@@ -1828,13 +1847,13 @@ func (h *Handler) recordIntegrityUnrecognized(piece metadata.Piece, verr error) 
 // migration-in-progress state (Generation > 1). It returns:
 //
 //   - (body, true,  nil)   — repair succeeded; body has already
-//                            been integrity-verified by ReadRepair
-//                            and the caller MAY skip a second
-//                            pieceintegrity.Verify pass.
+//     been integrity-verified by ReadRepair
+//     and the caller MAY skip a second
+//     pieceintegrity.Verify pass.
 //   - (nil,  false, nil)   — repair is not applicable (no repair
-//                            wired, manifest not in migration, or
-//                            no pieces). Caller falls through to
-//                            the original backend error.
+//     wired, manifest not in migration, or
+//     no pieces). Caller falls through to
+//     the original backend error.
 //   - (nil,  false, error) — repair attempt itself failed.
 //
 // The bool is part of the signature (not inferred at the call
@@ -2166,6 +2185,48 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Versioning-enabled DELETE without an explicit ?versionId does
+	// not remove data: it inserts a delete marker as a new latest
+	// version (WS8.4), which hides older versions from
+	// GET/HEAD/ListObjectsV2 while preserving them for
+	// ListObjectVersions and versionId-addressed reads. This mirrors
+	// AWS S3, where the marker is created even if the key has no
+	// current version, so we skip the Get/legal-hold path entirely.
+	// An explicit ?versionId still performs a permanent version
+	// delete below (and is still subject to legal hold).
+	versioning, verr := h.bucketVersioning(r.Context(), tenantID, bucket)
+	if verr != nil {
+		writeError(w, http.StatusInternalServerError, "VersioningLookupFailed", verr.Error(), r.URL.Path)
+		return
+	}
+	if versioning == bucket_config.VersioningEnabled && r.URL.Query().Get("versionId") == "" {
+		markerID := newPieceID(tenantID, bucket, key, h.cfg.Now())
+		marker := &metadata.ObjectManifest{
+			TenantID:      tenantID,
+			Bucket:        bucket,
+			ObjectKey:     key,
+			ObjectKeyHash: hashObjectKey(key),
+			VersionID:     markerID,
+			DeleteMarker:  true,
+		}
+		mkey := manifest_store.ManifestKey{
+			TenantID:      tenantID,
+			Bucket:        bucket,
+			ObjectKeyHash: hashObjectKey(key),
+			VersionID:     markerID,
+		}
+		if err := h.cfg.Manifests.Put(r.Context(), mkey, marker); err != nil {
+			writeError(w, http.StatusInternalServerError, "DeleteMarkerPutFailed", err.Error(), r.URL.Path)
+			return
+		}
+		w.Header().Set("x-amz-delete-marker", "true")
+		w.Header().Set("x-amz-version-id", markerID)
+		h.emit(tenantID, bucket, billing.DeleteRequests, 1)
+		h.audit(r, "DELETE", tenantID, bucket, key, "", "", "")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if h.cfg.Compliance.LegalHoldStore != nil {
 		holds, herr := h.cfg.Compliance.LegalHoldStore.Active(r.Context(), tenantID, bucket, key)
 		if herr != nil {
@@ -2350,6 +2411,13 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 		if m.ObjectKey == "" {
 			continue
 		}
+		// A delete marker as the latest version hides the key from
+		// ListObjectsV2 (WS8.4); it remains visible via
+		// ListObjectVersions. List returns latest-per-key, so a
+		// marker here means the object is logically deleted.
+		if m.DeleteMarker {
+			continue
+		}
 		c := content{Key: m.ObjectKey, Size: m.ObjectSize}
 		if len(m.Pieces) > 0 {
 			c.ETag = quote(pieceETag(m.Pieces[0]))
@@ -2401,6 +2469,21 @@ func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.
 			return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusNotFound, s3code: "NoSuchKey", msg: "no such key"}
 		}
 		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusInternalServerError, s3code: "ManifestGetFailed", msg: err.Error()}
+	}
+	// Delete markers (WS8.4) carry no payload. AWS S3 returns 404
+	// NoSuchKey when the *latest* version is a delete marker (an
+	// unversioned GET/HEAD), and 405 MethodNotAllowed when a delete
+	// marker is addressed directly by ?versionId. Both responses set
+	// x-amz-delete-marker: true and echo the marker's version id.
+	if manifest.DeleteMarker {
+		hdrs := map[string]string{"x-amz-delete-marker": "true"}
+		if manifest.VersionID != "" {
+			hdrs["x-amz-version-id"] = manifest.VersionID
+		}
+		if r.URL.Query().Get("versionId") != "" {
+			return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusMethodNotAllowed, s3code: "MethodNotAllowed", msg: "the specified version is a delete marker and cannot be downloaded", headers: hdrs}
+		}
+		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusNotFound, s3code: "NoSuchKey", msg: "no such key", headers: hdrs}
 	}
 	if len(manifest.Pieces) == 0 {
 		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusInternalServerError, s3code: "EmptyManifest", msg: "manifest has no pieces"}
@@ -2595,6 +2678,10 @@ type httpError struct {
 	s3code string
 	msg    string
 	err    error
+	// headers carries extra response headers that must accompany
+	// the error (e.g. x-amz-delete-marker / x-amz-version-id on a
+	// GET/HEAD that resolves to a delete marker). May be nil.
+	headers map[string]string
 }
 
 func (e *httpError) Error() string { return e.msg }
@@ -2609,6 +2696,9 @@ func (e *httpError) Unwrap() error { return e.err }
 func writeResolveError(w http.ResponseWriter, r *http.Request, err error) {
 	var he *httpError
 	if errors.As(err, &he) {
+		for k, v := range he.headers {
+			w.Header().Set(k, v)
+		}
 		writeError(w, he.code, he.s3code, he.msg, r.URL.Path)
 		return
 	}

@@ -37,12 +37,12 @@ import (
 // after the run completes. Failures are logged into the Matrix as a
 // dedicated `bulk / Cleanup` operation rather than swallowed.
 type Runner struct {
-	Client      *s3.Client
-	Endpoint    string
-	Bucket      string
-	KeyPrefix   string
+	Client       *s3.Client
+	Endpoint     string
+	Bucket       string
+	KeyPrefix    string
 	CreateBucket bool
-	Cleanup     bool
+	Cleanup      bool
 }
 
 // Run executes the full conformance battery and returns the populated
@@ -623,13 +623,18 @@ func (r *Runner) copyOps(ctx context.Context) []OpResult {
 	}
 }
 
-// versioningOps exercises the version-aware GET and
-// ListObjectVersions endpoints that the gateway publishes today.
-// Bucket versioning enable/disable is part of unsupportedOps because
-// the gateway exposes server-side versioning by default (every PUT
-// creates a new version) rather than gating it behind a bucket flag.
+// versioningOps exercises the version-aware GET / ListObjectVersions
+// endpoints plus the WS8.4 bucket-versioning surface
+// (Put/GetBucketVersioning and delete-marker semantics).
+//
+// The bucket-versioning probes are adaptive: the gateway only honours
+// PUT/GET ?versioning when a BucketConfig store is wired. When it is
+// not (e.g. the embedded cleanup-only test gateway), the gateway
+// returns 501 and the probes self-classify as Unsupported rather than
+// Failed — so the same battery runs cleanly against a gateway with or
+// without versioning wired.
 func (r *Runner) versioningOps(ctx context.Context) []OpResult {
-	return []OpResult{
+	out := []OpResult{
 		r.run("versioning", "ListObjectVersions", func(ctx context.Context) (string, OpStatus, error) {
 			page, err := r.Client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
 				Bucket: aws.String(r.Bucket),
@@ -644,6 +649,82 @@ func (r *Runner) versioningOps(ctx context.Context) []OpResult {
 			return fmt.Sprintf("returned %d versions + %d delete markers", len(page.Versions), len(page.DeleteMarkers)), OpPassed, nil
 		})(ctx),
 	}
+
+	// PutBucketVersioning(Enabled). Records whether the gateway
+	// actually honours versioning so the dependent probes below can
+	// decide between a real assertion and an Unsupported skip.
+	versioningEnabled := false
+	out = append(out, r.run("bucket-versioning", "PutBucketVersioning", func(ctx context.Context) (string, OpStatus, error) {
+		_, err := r.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+			Bucket: aws.String(r.Bucket),
+			VersioningConfiguration: &s3types.VersioningConfiguration{
+				Status: s3types.BucketVersioningStatusEnabled,
+			},
+		})
+		if err != nil {
+			if code := statusCode(err); isUnsupportedCode(code) {
+				return fmt.Sprintf("HTTP %d: bucket versioning not wired", code), OpUnsupported, nil
+			}
+			return "", OpFailed, err
+		}
+		versioningEnabled = true
+		return "enabled bucket versioning", OpPassed, nil
+	})(ctx))
+
+	out = append(out, r.run("bucket-versioning", "GetBucketVersioning", func(ctx context.Context) (string, OpStatus, error) {
+		got, err := r.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(r.Bucket)})
+		if err != nil {
+			if code := statusCode(err); isUnsupportedCode(code) {
+				return fmt.Sprintf("HTTP %d: bucket versioning not wired", code), OpUnsupported, nil
+			}
+			return "", OpFailed, err
+		}
+		if versioningEnabled && got.Status != s3types.BucketVersioningStatusEnabled {
+			return fmt.Sprintf("status=%q, want Enabled", got.Status), OpFailed, nil
+		}
+		return fmt.Sprintf("status=%q", got.Status), OpPassed, nil
+	})(ctx))
+
+	// Delete-marker round trip: with versioning enabled, an
+	// unversioned DELETE inserts a delete marker (not a hard delete),
+	// so the SDK reports DeleteMarker=true and a subsequent GET 404s.
+	out = append(out, r.run("bucket-versioning", "DeleteMarker", func(ctx context.Context) (string, OpStatus, error) {
+		if !versioningEnabled {
+			return "skipped: bucket versioning not wired", OpUnsupported, nil
+		}
+		mkey := r.KeyPrefix + "versioning/marker-probe.txt"
+		if _, err := r.Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:        aws.String(r.Bucket),
+			Key:           aws.String(mkey),
+			Body:          bytes.NewReader([]byte("marker-data")),
+			ContentLength: aws.Int64(int64(len("marker-data"))),
+		}); err != nil {
+			return "", OpFailed, fmt.Errorf("seed put: %w", err)
+		}
+		del, err := r.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(r.Bucket),
+			Key:    aws.String(mkey),
+		})
+		if err != nil {
+			return "", OpFailed, fmt.Errorf("delete: %w", err)
+		}
+		if !aws.ToBool(del.DeleteMarker) {
+			return "DELETE did not report x-amz-delete-marker", OpFailed, nil
+		}
+		_, gerr := r.Client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(r.Bucket),
+			Key:    aws.String(mkey),
+		})
+		if gerr == nil {
+			return "GET after delete-marker returned 200, want 404", OpFailed, nil
+		}
+		if code := statusCode(gerr); code != http.StatusNotFound {
+			return fmt.Sprintf("GET after delete-marker = HTTP %d, want 404", code), OpFailed, nil
+		}
+		return fmt.Sprintf("delete marker %s hides latest; GET=404", aws.ToString(del.VersionId)), OpPassed, nil
+	})(ctx))
+
+	return out
 }
 
 // taggingOps drives the WS8.1 object-tagging round trip
@@ -755,21 +836,6 @@ func (r *Runner) unsupportedOps(ctx context.Context) []OpResult {
 		}},
 		{"lifecycle", "GetBucketLifecycleConfiguration", func(ctx context.Context) error {
 			_, err := r.Client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{
-				Bucket: aws.String(r.Bucket),
-			})
-			return err
-		}},
-		{"bucket-versioning", "PutBucketVersioning", func(ctx context.Context) error {
-			_, err := r.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
-				Bucket: aws.String(r.Bucket),
-				VersioningConfiguration: &s3types.VersioningConfiguration{
-					Status: s3types.BucketVersioningStatusEnabled,
-				},
-			})
-			return err
-		}},
-		{"bucket-versioning", "GetBucketVersioning", func(ctx context.Context) error {
-			_, err := r.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 				Bucket: aws.String(r.Bucket),
 			})
 			return err

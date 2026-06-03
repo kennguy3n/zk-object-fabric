@@ -21,6 +21,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat/multipart"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -55,12 +56,13 @@ func newLocalFSGateway(t *testing.T) (*s3.Client, string, string) {
 	}
 	mux := http.NewServeMux()
 	s3compat.New(s3compat.Config{
-		Manifests: memory.New(),
-		Providers: map[string]providers.StorageProvider{"local": provider},
-		Placement: fixedPlacement{backend: "local"},
-		Multipart: multipart.NewMemoryStore(),
+		Manifests:     memory.New(),
+		Providers:     map[string]providers.StorageProvider{"local": provider},
+		Placement:     fixedPlacement{backend: "local"},
+		Multipart:     multipart.NewMemoryStore(),
+		BucketConfig:  bucket_config.NewMemoryStore(),
 		ErasureCoding: erasure_coding.DefaultRegistry(),
-		Now:       time.Now,
+		Now:           time.Now,
 	}).Register(mux)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -90,9 +92,12 @@ func newLocalFSGateway(t *testing.T) (*s3.Client, string, string) {
 //     either passed or was explicitly classified as Unsupported
 //     (we never expect Failed or Errored on the local_fs_dev path)
 //   - the intentionally-unsupported operations (acl, tagging,
-//     lifecycle, bucket-versioning, bulk DeleteObjects) all returned
-//     a 4xx and were correctly classified as Unsupported (not
-//     silently accepted with OpFailed)
+//     lifecycle, bulk DeleteObjects) all returned a 4xx and were
+//     correctly classified as Unsupported (not silently accepted
+//     with OpFailed)
+//   - the WS8.4 bucket-versioning surface (Put/GetBucketVersioning +
+//     delete markers) passed, since this gateway wires a BucketConfig
+//     store
 //   - the matrix serialises cleanly to both JSON and Markdown
 //
 // This test is the regression gate for the gateway's S3 surface:
@@ -141,6 +146,9 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 		"PutObjectTagging",
 		"GetObjectTagging",
 		"DeleteObjectTagging",
+		"PutBucketVersioning",
+		"GetBucketVersioning",
+		"DeleteMarker",
 	}
 	byOp := indexByOp(matrix.Operations)
 	for _, op := range mustPass {
@@ -164,8 +172,6 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 		"PutObjectAcl",
 		"PutBucketLifecycleConfiguration",
 		"GetBucketLifecycleConfiguration",
-		"PutBucketVersioning",
-		"GetBucketVersioning",
 		"DeleteObjects",
 	}
 	for _, op := range mustBeUnsupported {
@@ -249,10 +255,10 @@ func TestRunConformance_LocalFSDev(t *testing.T) {
 // conformance report or block the build.
 func TestRunConformance_PassedSummary(t *testing.T) {
 	cases := []struct {
-		name     string
-		ops      []conformance.OpResult
-		want     map[conformance.OpStatus]int
-		allPass  bool
+		name    string
+		ops     []conformance.OpResult
+		want    map[conformance.OpStatus]int
+		allPass bool
 	}{
 		{
 			name: "all passed",
