@@ -262,6 +262,46 @@ func runMFAStoreContract(t *testing.T, newStore mfaStoreFactory) {
 		}
 	})
 
+	t.Run("DisablePendingClearsOnlyPending", func(t *testing.T) {
+		s := newStore(t)
+		// No enrollment: nothing to clear, reported cleared=false.
+		if cleared, err := s.DisablePending("t-dp-none"); err != nil || cleared {
+			t.Fatalf("DisablePending(missing) = (%v, %v); want (false, nil)", cleared, err)
+		}
+		// Pending enrollment: cleared and removed.
+		if err := s.BeginEnrollment("t-dp", "SECRET"); err != nil {
+			t.Fatalf("BeginEnrollment: %v", err)
+		}
+		if cleared, err := s.DisablePending("t-dp"); err != nil || !cleared {
+			t.Fatalf("DisablePending(pending) = (%v, %v); want (true, nil)", cleared, err)
+		}
+		if _, ok, err := s.GetMFA("t-dp"); err != nil || ok {
+			t.Fatalf("GetMFA after DisablePending = (_, %v, %v); want (_, false, nil)", ok, err)
+		}
+	})
+
+	t.Run("DisablePendingRefusesActive", func(t *testing.T) {
+		s := newStore(t)
+		// This is the TOCTOU guard: an active enrollment must NOT be
+		// removed by the no-second-factor pending-clear path.
+		mustEnrollAndActivate(t, s, "t-dp-active", "SECRET", 42)
+		cleared, err := s.DisablePending("t-dp-active")
+		if err != nil {
+			t.Fatalf("DisablePending(active) err = %v; want nil", err)
+		}
+		if cleared {
+			t.Fatal("DisablePending must NOT clear an active enrollment")
+		}
+		// The active enrollment (secret + watermark) must survive intact.
+		rec, ok, err := s.GetMFA("t-dp-active")
+		if err != nil || !ok {
+			t.Fatalf("GetMFA after refused DisablePending = (_, %v, %v)", ok, err)
+		}
+		if !rec.Active || rec.Secret != "SECRET" || rec.LastStep != 42 {
+			t.Fatalf("active record altered by DisablePending: %+v", rec)
+		}
+	})
+
 	t.Run("ReEnrollPendingReplacesSecret", func(t *testing.T) {
 		s := newStore(t)
 		if err := s.BeginEnrollment("t-9", "FIRST"); err != nil {

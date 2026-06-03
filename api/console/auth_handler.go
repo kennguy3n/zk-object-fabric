@@ -1168,18 +1168,42 @@ func (h *AuthHandler) mfaDisable(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
 		return
 	}
-	if !found || !rec.Active {
-		// Already disabled or only a pending enrollment: clear any
-		// pending state and report the idempotent end state.
-		if found {
-			if err := h.cfg.MFA.Disable(tenantID); err != nil {
-				log.Printf("console: disable pending mfa for tenant %q failed: %v", tenantID, err)
-				writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
-				return
-			}
-		}
+	if !found {
+		// Nothing enrolled: disabling is an idempotent success.
 		writeJSON(w, http.StatusOK, map[string]any{"active": false})
 		return
+	}
+	if !rec.Active {
+		// Only a pending (unconfirmed) enrollment. Clear it without
+		// demanding a second factor — but atomically, so a concurrent
+		// Activate cannot turn this into a no-2FA strip of a now-active
+		// enrollment (the TOCTOU a plain GetMFA-then-Disable would leave).
+		cleared, err := h.cfg.MFA.DisablePending(tenantID)
+		if err != nil {
+			log.Printf("console: disable pending mfa for tenant %q failed: %v", tenantID, err)
+			writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
+			return
+		}
+		if cleared {
+			writeJSON(w, http.StatusOK, map[string]any{"active": false})
+			return
+		}
+		// The pending row was not cleared: it was either concurrently
+		// activated or concurrently disabled. Re-read to decide.
+		rec, found, err = h.cfg.MFA.GetMFA(tenantID)
+		if err != nil {
+			log.Printf("console: load mfa for tenant %q failed: %v", tenantID, err)
+			writeError(w, http.StatusServiceUnavailable, "disable temporarily unavailable; please retry")
+			return
+		}
+		if !found || !rec.Active {
+			// Concurrently disabled (or still pending and just cleared by
+			// another request): the tenant has no active MFA. Idempotent OK.
+			writeJSON(w, http.StatusOK, map[string]any{"active": false})
+			return
+		}
+		// Fell through to active: require a second factor below, using the
+		// re-read record.
 	}
 	valid, err := h.checkSecondFactor(tenantID, rec, req.TOTPCode, req.RecoveryCode)
 	if err != nil {

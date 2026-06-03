@@ -212,3 +212,39 @@ func (s *PostgresMFAStore) Disable(tenantID string) error {
 	}
 	return nil
 }
+
+// DisablePending implements MFAStore.
+func (s *PostgresMFAStore) DisablePending(tenantID string) (bool, error) {
+	tx, err := s.db.BeginTx(s.cx(), nil)
+	if err != nil {
+		return false, fmt.Errorf("console: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The active = FALSE predicate is the atomic guard: if a concurrent
+	// Activate already flipped the row active, this matches zero rows and
+	// the active enrollment survives — the handler then falls back to the
+	// second-factor-protected disable path.
+	res, err := tx.ExecContext(s.cx(),
+		`DELETE FROM mfa_credentials WHERE tenant_id = $1 AND active = FALSE`, tenantID)
+	if err != nil {
+		return false, fmt.Errorf("console: delete pending mfa credentials: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("console: rows affected: %w", err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+	// A pending enrollment carries no recovery codes (those are minted at
+	// Activate), but clear any defensively so a half-written enrollment
+	// cannot strand orphan hashes.
+	if _, err := tx.ExecContext(s.cx(),
+		`DELETE FROM mfa_recovery_codes WHERE tenant_id = $1`, tenantID); err != nil {
+		return false, fmt.Errorf("console: delete recovery codes: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("console: commit disable pending: %w", err)
+	}
+	return true, nil
+}

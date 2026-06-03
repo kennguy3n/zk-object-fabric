@@ -113,6 +113,16 @@ type MFAStore interface {
 	// Disable removes all MFA state for tenantID (pending or active).
 	// Disabling a tenant with no enrollment is a no-op, not an error.
 	Disable(tenantID string) error
+
+	// DisablePending removes a tenant's enrollment only while it is
+	// still pending (inactive), reporting cleared=true iff a pending
+	// row was actually removed. An active enrollment is left intact and
+	// reported cleared=false, as is a missing row. This lets the
+	// disable handler clear an unconfirmed enrollment without demanding
+	// a second factor while still refusing, atomically, to strip an
+	// enrollment that a concurrent Activate flipped active in between —
+	// closing the TOCTOU window a plain GetMFA-then-Disable would leave.
+	DisablePending(tenantID string) (cleared bool, err error)
 }
 
 // recoveryCodeEncoding is unpadded upper-case base32 (Crockford-free RFC
@@ -263,4 +273,16 @@ func (s *MemoryMFAStore) Disable(tenantID string) error {
 	defer s.mu.Unlock()
 	delete(s.rec, tenantID)
 	return nil
+}
+
+// DisablePending implements MFAStore.
+func (s *MemoryMFAStore) DisablePending(tenantID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.rec[tenantID]
+	if !ok || row.active {
+		return false, nil
+	}
+	delete(s.rec, tenantID)
+	return true, nil
 }
