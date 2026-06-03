@@ -47,6 +47,18 @@ export interface AuthResponse {
   accessKey?: string;
   secretKey?: string;
   createdAt?: string;
+  /**
+   * refreshToken is the long-lived token POSTed to
+   * /api/v1/auth/refresh to obtain a fresh access token without
+   * re-entering credentials. Present only when the gateway has a
+   * RefreshTokenStore configured. It rotates on every refresh: the
+   * value returned from refresh() replaces the prior one, and reusing
+   * a superseded token revokes the whole session server-side.
+   * refreshTokenExpiresAt is an ISO-8601 instant the client can use to
+   * schedule a refresh (or a re-login prompt) before it lapses.
+   */
+  refreshToken?: string;
+  refreshTokenExpiresAt?: string;
 }
 
 export async function login(input: LoginInput): Promise<AuthResponse> {
@@ -55,4 +67,19 @@ export async function login(input: LoginInput): Promise<AuthResponse> {
 
 export async function signup(input: SignupInput): Promise<AuthResponse> {
   return api.signup(input);
+}
+
+// refresh exchanges a refresh token for a fresh access token and a
+// rotated refresh token. Callers must persist the returned
+// refreshToken in place of the one they passed in — the old token is
+// single-use.
+export async function refresh(refreshToken: string): Promise<AuthResponse> {
+  return api.refresh(refreshToken);
+}
+
+// logout revokes a refresh token so it can no longer be rotated. It is
+// best-effort: the call resolves even if the token was already revoked
+// or never existed.
+export async function logout(refreshToken: string): Promise<void> {
+  return api.logout(refreshToken);
 }

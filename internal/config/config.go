@@ -401,6 +401,16 @@ type ConsoleConfig struct {
 	// Zero selects the console default (one hour). It only takes
 	// effect when JWTSigningKeyPath is set.
 	JWTTokenTTL Duration `json:"jwt_token_ttl"`
+
+	// RefreshTokenTTL bounds the lifetime of an issued refresh token
+	// — the long-lived token the SPA exchanges at
+	// /api/v1/auth/refresh for a fresh access token. Zero selects the
+	// console default (thirty days). The backend storing refresh
+	// tokens follows the same selection as the AuthStore: the
+	// embedded SQLite database under the embedded profile, Postgres
+	// when a metadata DSN is configured, and the process-local
+	// in-memory store otherwise (dev / single-node only).
+	RefreshTokenTTL Duration `json:"refresh_token_ttl"`
 }
 
 // UnmarshalJSON accepts both the canonical "rebalancer" key and the

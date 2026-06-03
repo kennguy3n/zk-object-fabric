@@ -225,6 +225,11 @@ func main() {
 	// store is selected when a metadata DSN is configured;
 	// otherwise the dev MemoryAuthStore is used.
 	authStore := buildAuthStore(metadataDB, embeddedDB)
+	// The refresh-token store follows the same backend selection as
+	// the AuthStore so login / signup / refresh share one persistence
+	// tier. Built here (rather than inside startConsoleAPI) so it sees
+	// both the metadata and embedded handles.
+	refreshStore := buildRefreshTokenStore(cfg, metadataDB, embeddedDB)
 	// authHooks is built once and shared between the console API
 	// and the S3 handler's email-verification gate. When
 	// SendVerificationEmail is nil (no SES / transactional email
@@ -420,7 +425,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -1859,6 +1864,7 @@ func startConsoleAPI(
 	metadataDB *sql.DB,
 	tenantStore auth.TenantStore,
 	authStore console.AuthStore,
+	refreshStore console.RefreshTokenStore,
 	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
 	billingProvider billing.BillingProvider,
@@ -1892,6 +1898,7 @@ func startConsoleAPI(
 		Placements:      placements,
 		Auth:            authStore,
 		Tokens:          tokens,
+		RefreshTokens:   refreshStore,
 		AuthHooks:       authHooks,
 		AdminAuth:       buildAdminAuth(cfg),
 		BillingSink:     billingSink,
@@ -1959,6 +1966,37 @@ func buildAuthStore(db, embeddedDB *sql.DB) console.AuthStore {
 		return console.NewMemoryAuthStore()
 	}
 	log.Printf("gateway: postgres auth store enabled")
+	return store
+}
+
+// buildRefreshTokenStore selects the console RefreshTokenStore using
+// the same backend precedence as buildAuthStore: Postgres when a
+// metadata DSN is configured, the embedded SQLite store under the
+// embedded profile, and the process-local in-memory store otherwise
+// (dev / single-node). A Postgres / SQLite build failure falls back to
+// the in-memory store with a loud log rather than wedging startup —
+// refresh tokens are an additive session convenience, and the access
+// token continues to work without them.
+func buildRefreshTokenStore(cfg config.Config, db, embeddedDB *sql.DB) console.RefreshTokenStore {
+	rcfg := console.RefreshConfig{TTL: cfg.Console.RefreshTokenTTL.ToDuration()}
+	if db == nil {
+		if embeddedDB != nil {
+			store, err := console.NewSQLiteRefreshTokenStore(embeddedDB, rcfg)
+			if err != nil {
+				log.Printf("gateway: build embedded refresh store: %v; falling back to in-memory", err)
+				return console.NewMemoryRefreshTokenStore(rcfg)
+			}
+			log.Printf("gateway: embedded SQLite refresh-token store enabled")
+			return store
+		}
+		return console.NewMemoryRefreshTokenStore(rcfg)
+	}
+	store, err := console.NewPostgresRefreshTokenStore(db, rcfg)
+	if err != nil {
+		log.Printf("gateway: build postgres refresh store: %v; falling back to in-memory", err)
+		return console.NewMemoryRefreshTokenStore(rcfg)
+	}
+	log.Printf("gateway: postgres refresh-token store enabled")
 	return store
 }
 
