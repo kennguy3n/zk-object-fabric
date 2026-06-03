@@ -103,6 +103,7 @@ type Config struct {
 	Compliance   ComplianceConfig   `json:"compliance"`
 	CrossCell    CrossCellConfig    `json:"cross_cell"`
 	Repair       RepairConfig       `json:"repair"`
+	Lifecycle    LifecycleConfig    `json:"lifecycle"`
 }
 
 // TracingConfig configures the OpenTelemetry-style request
@@ -996,6 +997,38 @@ func (r *RebalancerConfig) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// LifecycleConfig gates the background object-lifecycle evaluator
+// (WS8.2). When enabled the gateway runs a periodic sweep that, for
+// every bucket with a stored lifecycle configuration, expires aged
+// objects (delete marker when versioning is enabled, permanent +
+// Object-Lock-guarded otherwise) and aborts stale incomplete
+// multipart uploads. See lifecycle/evaluator for the semantics.
+//
+// Enabled defaults to true when the key is omitted (see
+// UnmarshalJSON) so a deployment that configures lifecycle rules
+// through the S3 API gets them enforced without an extra config
+// edit; a bucket with no rules is a no-op, so default-on is safe.
+// Setting it explicitly to false disables the worker. Interval is
+// the gap between full passes; zero defaults to 24h (cmd/gateway),
+// matching AWS's daily lifecycle cadence.
+type LifecycleConfig struct {
+	Enabled  bool     `json:"enabled"`
+	Interval Duration `json:"interval"`
+}
+
+// UnmarshalJSON decodes a LifecycleConfig, defaulting Enabled to
+// true when the "enabled" key is omitted. Explicit "enabled": false
+// still disables the worker. Mirrors RebalancerConfig.
+func (l *LifecycleConfig) UnmarshalJSON(data []byte) error {
+	type alias LifecycleConfig
+	tmp := alias{Enabled: true}
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	*l = LifecycleConfig(tmp)
+	return nil
+}
+
 // RebalancerTarget names a single (tenant, bucket) pair to
 // rebalance along with the source and destination backend names.
 // The backend names must resolve to entries in the gateway's
@@ -1093,6 +1126,18 @@ func Default() Config {
 			ReadHeaderTimeout: Duration(10 * time.Second),
 			IdleTimeout:       Duration(120 * time.Second),
 			MaxHeaderBytes:    DefaultMaxHeaderBytes,
+		},
+		// Lifecycle evaluator is on by default at AWS's daily
+		// cadence. It only acts on buckets that have a stored
+		// lifecycle configuration, so a deployment with no rules
+		// pays only an empty enumerate per day. Set
+		// lifecycle.enabled=false to disable it entirely. Mirrored
+		// in LifecycleConfig.UnmarshalJSON so an explicit but
+		// partial "lifecycle" block keeps Enabled=true unless it
+		// says otherwise.
+		Lifecycle: LifecycleConfig{
+			Enabled:  true,
+			Interval: Duration(24 * time.Hour),
 		},
 	}
 }
