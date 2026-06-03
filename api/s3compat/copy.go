@@ -259,15 +259,43 @@ func (h *Handler) copyReencrypt(
 		return
 	}
 
+	// Re-encrypting a v1 source needs the whole object resident:
+	// the ciphertext is read in full, decrypted to a full plaintext
+	// buffer, and re-encrypted to a full ciphertext buffer (~3x the
+	// object size live at once) because encryptForStorage consumes a
+	// []byte. Cap this the same way every other buffered path does
+	// (single-piece buffered GET, EC PUT, range GET) so a large v1
+	// object cannot OOM the gateway during a copy; the verbatim
+	// (legacy/convergent) copy path streams via copyViaGetPut and is
+	// unaffected. Streaming v1 re-encryption is the same Phase-4
+	// workstream that gates streaming EC.
+	if srcManifest.ObjectSize > MaxInMemoryObjectBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "CopyReencryptObjectTooLarge",
+			fmt.Sprintf("server-side copy of AAD v1 object of %d bytes exceeds in-memory re-encrypt ceiling of %d bytes; streaming re-encryption is not yet implemented",
+				srcManifest.ObjectSize, MaxInMemoryObjectBytes),
+			r.URL.Path)
+		return
+	}
+
 	body, err := srcProvider.GetPiece(r.Context(), srcPiece.PieceID, nil)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
 		return
 	}
-	ciphertext, rerr := io.ReadAll(body)
+	// Defence in depth against a backend (or a manifest with a stale
+	// ObjectSize) returning more than the ceiling check admitted:
+	// bound the read to one byte over the ceiling and reject if the
+	// body actually exceeds it, exactly like the EC PUT path.
+	ciphertext, rerr := io.ReadAll(io.LimitReader(body, MaxInMemoryObjectBytes+1))
 	_ = body.Close()
 	if rerr != nil {
 		writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
+		return
+	}
+	if int64(len(ciphertext)) > MaxInMemoryObjectBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "CopyReencryptObjectTooLarge",
+			fmt.Sprintf("server-side copy source ciphertext exceeds in-memory re-encrypt ceiling of %d bytes", MaxInMemoryObjectBytes),
+			r.URL.Path)
 		return
 	}
 

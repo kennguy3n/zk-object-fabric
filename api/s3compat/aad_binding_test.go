@@ -23,8 +23,11 @@ package s3compat
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,7 +37,64 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/encryption"
 	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/providers"
 )
+
+// guardProbeProvider fails the test if any backend read is attempted.
+// copyReencrypt's size guard must reject an over-ceiling object before
+// it ever calls GetPiece, so a single GetPiece call here means the
+// guard did not short-circuit.
+type guardProbeProvider struct{ t *testing.T }
+
+func (p guardProbeProvider) GetPiece(context.Context, string, *providers.ByteRange) (io.ReadCloser, error) {
+	p.t.Fatal("copyReencrypt read the backend despite exceeding the in-memory ceiling")
+	return nil, nil
+}
+func (p guardProbeProvider) PutPiece(context.Context, string, io.Reader, providers.PutOptions) (providers.PutResult, error) {
+	p.t.Fatal("copyReencrypt wrote the backend despite exceeding the in-memory ceiling")
+	return providers.PutResult{}, nil
+}
+func (p guardProbeProvider) HeadPiece(context.Context, string) (providers.PieceMetadata, error) {
+	return providers.PieceMetadata{}, nil
+}
+func (p guardProbeProvider) DeletePiece(context.Context, string) error { return nil }
+func (p guardProbeProvider) ListPieces(context.Context, string, string) (providers.ListResult, error) {
+	return providers.ListResult{}, nil
+}
+func (p guardProbeProvider) Capabilities() providers.ProviderCapabilities {
+	return providers.ProviderCapabilities{}
+}
+func (p guardProbeProvider) CostModel() providers.ProviderCostModel { return providers.ProviderCostModel{} }
+func (p guardProbeProvider) PlacementLabels() providers.PlacementLabels {
+	return providers.PlacementLabels{}
+}
+
+// TestCopyReencrypt_RejectsOversizeSource locks the in-memory ceiling
+// added to copyReencrypt. The v1 re-encrypt path holds ~3x the object
+// size resident (full ciphertext + plaintext + new ciphertext), so an
+// object above MaxInMemoryObjectBytes must be refused with 413 before
+// any backend byte is read — matching the EC PUT and buffered/range
+// GET paths — rather than being buffered into an OOM.
+func TestCopyReencrypt_RejectsOversizeSource(t *testing.T) {
+	h := newAADTestHandler(t)
+	srcManifest := &metadata.ObjectManifest{
+		TenantID:   "tenant-a",
+		Bucket:     "bucket-a",
+		ObjectKey:  "big.bin",
+		VersionID:  "v-src",
+		ObjectSize: MaxInMemoryObjectBytes + 1,
+		Encryption: metadata.EncryptionConfig{Mode: "managed", AADVersion: AADVersionV1},
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/bucket-a/big.bin", nil)
+
+	h.copyReencrypt(rec, req, "tenant-a", "bucket-a", "big.bin",
+		srcManifest, metadata.Piece{PieceID: "p-src", Backend: "test"}, guardProbeProvider{t: t})
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize copyReencrypt: status = %d, want 413", rec.Code)
+	}
+}
 
 // newAADTestHandler returns a Handler wired with a LocalFileWrapper
 // over a fresh random CMK — the minimum needed to drive

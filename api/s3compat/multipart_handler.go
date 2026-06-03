@@ -179,6 +179,12 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// One clock read for both CreatedAt and the version's timestamp
+	// component so the session's two timestamps agree exactly
+	// (mirrors the single-piece PUT, which mints its pieceID from a
+	// single Now()).
+	now := h.cfg.Now()
+
 	// Lay down the multipart session's encryption state up front:
 	// managed / public_distribution uploads generate one DEK here
 	// that every UploadPart reuses, so the frames all decrypt under
@@ -190,13 +196,13 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		ObjectKey: key,
 		Backend:   backend,
 		Policy:    policy,
-		CreatedAt: h.cfg.Now(),
+		CreatedAt: now,
 		EncMode:   policy.EncryptionMode,
 		// Fix the object version now so the managed AAD v1 binding
 		// can seal every part against the canonical identity at
 		// UploadPart time; Complete records this same value on the
 		// manifest so the GET path reproduces the identical AAD.
-		VersionID: newPieceID(tenantID, bucket, key, h.cfg.Now()),
+		VersionID: newPieceID(tenantID, bucket, key, now),
 	}
 	if IsGatewayEncrypted(policy.EncryptionMode) {
 		if h.cfg.Encryption == nil {
