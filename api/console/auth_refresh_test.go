@@ -184,3 +184,58 @@ func TestRefreshInfraErrorReturns503(t *testing.T) {
 		t.Fatalf("refresh on infra error status = %d, want 503; body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+// flakyTokenStore issues tokens normally until failAfter successful
+// issues, then fails every subsequent IssueToken. It lets a test let
+// signup succeed (one issue) and then force the refresh handler's
+// IssueToken to fail after Rotate has already consumed the token.
+type flakyTokenStore struct {
+	inner     *MemoryTokenStore
+	issued    int
+	failAfter int
+}
+
+func (s *flakyTokenStore) IssueToken(tenantID string) (string, error) {
+	if s.issued >= s.failAfter {
+		return "", errors.New("sign access token: key unavailable")
+	}
+	s.issued++
+	return s.inner.IssueToken(tenantID)
+}
+
+func (s *flakyTokenStore) ResolveToken(token string) (string, bool) {
+	return s.inner.ResolveToken(token)
+}
+
+// TestRefreshIssueTokenFailureReturns401 covers the rare path where
+// Rotate succeeds (predecessor consumed, successor minted) but the
+// paired access token can't be issued. The presented token is spent, so
+// the handler returns 401 (re-authenticate) rather than a misleading
+// 500/retry, and the undeliverable successor is revoked — replaying it
+// also 401s.
+func TestRefreshIssueTokenFailureReturns401(t *testing.T) {
+	tokens := &flakyTokenStore{inner: NewMemoryTokenStore(), failAfter: 1}
+	refresh := NewMemoryRefreshTokenStore(RefreshConfig{})
+	h := NewAuthHandler(AuthConfig{
+		Tenants:       newFakeTenantStore(),
+		Auth:          NewMemoryAuthStore(),
+		Tokens:        tokens,
+		RefreshTokens: refresh,
+	})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	signup := signupForRefresh(t, mux, "issuefail@example.com")
+	// signup consumed the one allowed IssueToken; the refresh below
+	// rotates the token fine but then fails to mint the access token.
+	rec := postJSON(t, mux, authPathRefresh, `{"refreshToken":"`+signup.RefreshToken+`"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh on IssueToken failure status = %d, want 401; body = %s", rec.Code, rec.Body.String())
+	}
+	// The minted-but-undeliverable successor was revoked; any later
+	// rotation attempt (predecessor is consumed, successor revoked)
+	// also fails closed with 401.
+	if rec := postJSON(t, mux, authPathRefresh, `{"refreshToken":"`+signup.RefreshToken+`"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("replay after IssueToken failure status = %d, want 401", rec.Code)
+	}
+}

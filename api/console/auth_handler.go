@@ -935,12 +935,19 @@ func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Rotate already committed (predecessor consumed, successor
 		// stored) but the access token we'd pair it with failed, so the
-		// successor will never reach the client. Revoke it to avoid
-		// leaving an undeliverable row in the store; the client retries
-		// with its consumed predecessor, which re-logs them in via the
-		// family-revocation path.
+		// successor can't be delivered. Revoke the undeliverable
+		// successor, then 401: the presented token is spent and the
+		// session can't continue, so the client's only correct move is
+		// to re-authenticate. A 500/503 would be misleading — it
+		// signals "retry", but retrying with the spent predecessor
+		// deterministically hits reuse detection and 401s anyway. We
+		// log the underlying cause since the 401 hides it from the
+		// client (IssueToken failure is a server-side fault — a rand
+		// failure for MemoryTokenStore or a signing-key error for the
+		// JWT store — not a bad token).
 		_ = h.cfg.RefreshTokens.Revoke(rotated.Raw)
-		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
+		log.Printf("console: issue access token during refresh for tenant %q failed: %v", rotated.TenantID, err)
+		writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 		return
 	}
 	writeJSON(w, http.StatusOK, AuthResponse{
