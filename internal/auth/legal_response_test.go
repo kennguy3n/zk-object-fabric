@@ -63,7 +63,13 @@ func TestMemoryLegalHoldStore_CreateReleaseList(t *testing.T) {
 	if err != nil || len(got) != 1 {
 		t.Fatalf("List = %v, err=%v", got, err)
 	}
-	if err := s.Release(ctx, "h1"); err != nil {
+	// A release scoped to the wrong tenant must not touch the hold and
+	// must report not-found (so the endpoint cannot enumerate holds
+	// across tenants).
+	if err := s.Release(ctx, "OTHER", "h1"); !errors.Is(err, ErrLegalHoldNotFound) {
+		t.Errorf("cross-tenant Release = %v, want ErrLegalHoldNotFound", err)
+	}
+	if err := s.Release(ctx, "T", "h1"); err != nil {
 		t.Fatal(err)
 	}
 	got2, _ := s.Active(ctx, "T", "any", "any")
@@ -72,12 +78,12 @@ func TestMemoryLegalHoldStore_CreateReleaseList(t *testing.T) {
 	}
 	// Releasing an unknown id reports the shared not-found sentinel, so
 	// errors.Is works uniformly across the memory/Postgres/SQLite stores.
-	if err := s.Release(ctx, "missing"); !errors.Is(err, ErrLegalHoldNotFound) {
+	if err := s.Release(ctx, "T", "missing"); !errors.Is(err, ErrLegalHoldNotFound) {
 		t.Errorf("Release(unknown) = %v, want ErrLegalHoldNotFound", err)
 	}
 	// A second release of an already-released hold is guarded the same way
 	// as the SQL-backed stores (WHERE released = 0 affects 0 rows).
-	if err := s.Release(ctx, "h1"); !errors.Is(err, ErrLegalHoldNotFound) {
+	if err := s.Release(ctx, "T", "h1"); !errors.Is(err, ErrLegalHoldNotFound) {
 		t.Errorf("second Release = %v, want ErrLegalHoldNotFound", err)
 	}
 }

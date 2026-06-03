@@ -92,14 +92,18 @@ func TestPostgresLegalHoldStore_CreateGetReleaseList(t *testing.T) {
 		t.Fatalf("list = %v, err=%v", listed, err)
 	}
 
-	if err := s.Release(ctx, "h-1"); err != nil {
+	// A release scoped to another tenant must not touch the row.
+	if err := s.Release(ctx, "OTHER", "h-1"); !errors.Is(err, ErrLegalHoldNotFound) {
+		t.Errorf("cross-tenant release = %v, want ErrLegalHoldNotFound", err)
+	}
+	if err := s.Release(ctx, "T", "h-1"); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	got, _ = s.Get(ctx, "h-1")
 	if !got.Released || got.ReleasedAt.IsZero() {
 		t.Errorf("post-release record missing flags: %+v", got)
 	}
-	if err := s.Release(ctx, "h-1"); !errors.Is(err, ErrLegalHoldNotFound) {
+	if err := s.Release(ctx, "T", "h-1"); !errors.Is(err, ErrLegalHoldNotFound) {
 		t.Errorf("re-release = %v, want ErrLegalHoldNotFound", err)
 	}
 

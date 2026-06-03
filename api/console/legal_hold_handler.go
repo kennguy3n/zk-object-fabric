@@ -118,30 +118,14 @@ func (h *LegalHoldHandler) list(w http.ResponseWriter, r *http.Request, tenantID
 }
 
 func (h *LegalHoldHandler) release(w http.ResponseWriter, r *http.Request, tenantID, id string) {
-	// Look up the hold first so an operator authenticated for
-	// tenant A cannot release tenant B's hold by guessing or
-	// scraping its ID. The path-level tenant must match the
-	// stored tenant on the hold.
-	hold, err := h.Store.Get(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, auth.ErrLegalHoldNotFound) {
-			http.Error(w, "legal hold not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if hold.TenantID != tenantID {
-		// Return 404 (not 403) so this endpoint cannot be used
-		// to enumerate hold IDs across tenants.
-		http.Error(w, "legal hold not found", http.StatusNotFound)
-		return
-	}
-	if err := h.Store.Release(r.Context(), id); err != nil {
-		// The hold existed at Get time but is already released (or was
-		// released by a concurrent request between Get and Release): the
-		// store reports this as ErrLegalHoldNotFound. Map it to 404, the
-		// same as the Get lookup above, instead of a misleading 500.
+	// Release is atomic and tenant-scoped, so this single call also
+	// authorizes the operator: a hold that does not exist, belongs to
+	// another tenant, or is already released all surface as
+	// ErrLegalHoldNotFound. Mapping every one to 404 (rather than 403)
+	// means this endpoint cannot be used to enumerate hold IDs across
+	// tenants, and there is no Get-then-Release window for a concurrent
+	// release to race against.
+	if err := h.Store.Release(r.Context(), tenantID, id); err != nil {
 		if errors.Is(err, auth.ErrLegalHoldNotFound) {
 			http.Error(w, "legal hold not found", http.StatusNotFound)
 			return
