@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -261,7 +262,7 @@ func TestSQLiteLegalHoldStore_ConcurrentCreate(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			h := sampleHold(string(rune('A'+i%26))+string(rune('0'+i/26)), "t1")
+			h := sampleHold(fmt.Sprintf("h-%d", i), "t1")
 			if err := s.Create(ctx, h); err != nil {
 				t.Errorf("concurrent Create: %v", err)
 			}
