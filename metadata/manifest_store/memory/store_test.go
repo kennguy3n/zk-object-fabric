@@ -3,6 +3,7 @@ package memory
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
@@ -313,5 +314,147 @@ func TestCloneManifest_NilWrappedDEKStaysNil(t *testing.T) {
 	if got.Encryption.WrappedDEK != nil {
 		t.Errorf("WrappedDEK = %x, want nil (client_side mode must not materialise an empty DEK)",
 			got.Encryption.WrappedDEK)
+	}
+}
+
+// TestScanManifests_PaginatesEveryVersionInKeyOrder verifies that
+// ScanManifests visits every manifest version (not just the latest)
+// across all tenants and buckets exactly once, in full-primary-key
+// order, and that the cursor resumes without gaps or repeats.
+func TestScanManifests_PaginatesEveryVersionInKeyOrder(t *testing.T) {
+	t.Parallel()
+	store := New()
+	ctx := context.Background()
+
+	// Seed two tenants, two buckets, and multiple versions per
+	// object so the scan must cross every key boundary and return
+	// older versions List would hide.
+	want := map[manifest_store.ManifestKey]bool{}
+	seed := func(tenant, bucket, key, version string) {
+		mk := manifest_store.ManifestKey{TenantID: tenant, Bucket: bucket, ObjectKeyHash: key, VersionID: version}
+		if err := store.Put(ctx, mk, &metadata.ObjectManifest{
+			TenantID: tenant, Bucket: bucket, ObjectKeyHash: key, VersionID: version,
+		}); err != nil {
+			t.Fatalf("seed %v: %v", mk, err)
+		}
+		want[mk] = true
+	}
+	seed("t1", "b1", "h1", "v1")
+	seed("t1", "b1", "h1", "v2") // older version of same object
+	seed("t1", "b1", "h2", "v1")
+	seed("t1", "b2", "h1", "v1")
+	seed("t2", "b1", "h1", "v1")
+
+	got := map[manifest_store.ManifestKey]int{}
+	var prev manifest_store.ManifestKey
+	var havePrev bool
+	cursor := ""
+	pages := 0
+	for {
+		page, err := store.ScanManifests(ctx, cursor, 2)
+		if err != nil {
+			t.Fatalf("ScanManifests: %v", err)
+		}
+		pages++
+		for _, sm := range page.Manifests {
+			got[sm.Key]++
+			if havePrev && !scanKeyLess(prev, sm.Key) {
+				t.Fatalf("scan not strictly increasing: %v then %v", prev, sm.Key)
+			}
+			prev, havePrev = sm.Key, true
+			if sm.Manifest == nil {
+				t.Fatalf("nil manifest for %v", sm.Key)
+			}
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(got) != len(want) {
+		t.Fatalf("scanned %d distinct keys, want %d", len(got), len(want))
+	}
+	for k := range want {
+		if got[k] != 1 {
+			t.Fatalf("key %v visited %d times, want exactly 1", k, got[k])
+		}
+	}
+	if pages < 2 {
+		t.Fatalf("expected multiple pages with limit=2 over %d keys, got %d", len(want), pages)
+	}
+}
+
+// TestScanManifests_RejectsMalformedCursor ensures a corrupted cursor
+// is an error rather than a silent restart from the beginning.
+func TestScanManifests_RejectsMalformedCursor(t *testing.T) {
+	t.Parallel()
+	store := New()
+	if _, err := store.ScanManifests(context.Background(), "!!!not-base64!!!", 10); err == nil {
+		t.Fatal("malformed cursor: want error, got nil")
+	}
+}
+
+// TestUpdateManifest_PreservesLatestPointer pins the WS8.1 contract:
+// amending a NON-latest version's body (e.g. tagging an old version)
+// must not promote it to latest. After Put(v1), Put(v2),
+// UpdateManifest(v1), the empty-VersionID "latest" read must still
+// resolve to v2.
+func TestUpdateManifest_PreservesLatestPointer(t *testing.T) {
+	t.Parallel()
+	store := New()
+	ctx := context.Background()
+
+	base := manifest_store.ManifestKey{TenantID: "t1", Bucket: "b1", ObjectKeyHash: "h1"}
+	kv1 := base
+	kv1.VersionID = "v1"
+	kv2 := base
+	kv2.VersionID = "v2"
+
+	if err := store.Put(ctx, kv1, &metadata.ObjectManifest{TenantID: "t1", Bucket: "b1", VersionID: "v1"}); err != nil {
+		t.Fatalf("Put v1: %v", err)
+	}
+	if err := store.Put(ctx, kv2, &metadata.ObjectManifest{TenantID: "t1", Bucket: "b1", VersionID: "v2"}); err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+
+	// Amend the OLD version v1 in place.
+	if err := store.UpdateManifest(ctx, kv1, &metadata.ObjectManifest{
+		TenantID: "t1", Bucket: "b1", VersionID: "v1",
+		Tags: map[string]string{"env": "prod"},
+	}); err != nil {
+		t.Fatalf("UpdateManifest v1: %v", err)
+	}
+
+	// Latest must still be v2.
+	latest, err := store.Get(ctx, base)
+	if err != nil {
+		t.Fatalf("Get latest: %v", err)
+	}
+	if latest.VersionID != "v2" {
+		t.Fatalf("latest VersionID = %q, want v2 (UpdateManifest must not promote v1)", latest.VersionID)
+	}
+	if len(latest.Tags) != 0 {
+		t.Fatalf("latest Tags = %v, want none", latest.Tags)
+	}
+
+	// And v1's body was actually amended.
+	got1, err := store.Get(ctx, kv1)
+	if err != nil {
+		t.Fatalf("Get v1: %v", err)
+	}
+	if got1.Tags["env"] != "prod" {
+		t.Fatalf("v1 Tags = %v, want env=prod", got1.Tags)
+	}
+}
+
+// TestUpdateManifest_NotFound verifies an amend to a non-existent
+// version returns ErrNotFound rather than silently inserting.
+func TestUpdateManifest_NotFound(t *testing.T) {
+	t.Parallel()
+	store := New()
+	key := manifest_store.ManifestKey{TenantID: "t1", Bucket: "b1", ObjectKeyHash: "h1", VersionID: "nope"}
+	err := store.UpdateManifest(context.Background(), key, &metadata.ObjectManifest{VersionID: "nope"})
+	if !errors.Is(err, manifest_store.ErrNotFound) {
+		t.Fatalf("UpdateManifest missing key err = %v, want ErrNotFound", err)
 	}
 }

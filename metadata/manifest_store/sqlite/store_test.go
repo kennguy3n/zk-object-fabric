@@ -306,3 +306,143 @@ func TestValidation(t *testing.T) {
 		t.Fatal("Put nil manifest: want error")
 	}
 }
+
+// scanKeyLess is the full-primary-key ordering the SQLite ScanManifests
+// query (ORDER BY tenant_id, bucket, object_key_hash, version_id) must
+// produce; the test asserts the rows come back strictly increasing.
+func scanKeyLess(a, b manifest_store.ManifestKey) bool {
+	if a.TenantID != b.TenantID {
+		return a.TenantID < b.TenantID
+	}
+	if a.Bucket != b.Bucket {
+		return a.Bucket < b.Bucket
+	}
+	if a.ObjectKeyHash != b.ObjectKeyHash {
+		return a.ObjectKeyHash < b.ObjectKeyHash
+	}
+	return a.VersionID < b.VersionID
+}
+
+// TestScanManifests_PaginatesEveryVersionInKeyOrder mirrors the memory
+// store's contract test: ScanManifests must visit every version (not
+// just the latest) across all tenants/buckets exactly once, in full
+// primary-key order, with a keyset cursor that resumes without gaps or
+// repeats. This also exercises the SQLite row-value comparison
+// (tenant_id, bucket, object_key_hash, version_id) > (?, ?, ?, ?)
+// against the modernc driver.
+func TestScanManifests_PaginatesEveryVersionInKeyOrder(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, nil)
+	ctx := context.Background()
+
+	want := map[manifest_store.ManifestKey]bool{}
+	seed := func(tenant, bucket, hash, version string) {
+		mk := key(tenant, bucket, hash, version)
+		if err := s.Put(ctx, mk, manifestFor(tenant, bucket, hash, version)); err != nil {
+			t.Fatalf("seed %v: %v", mk, err)
+		}
+		want[mk] = true
+	}
+	seed("t1", "b1", "h1", "v1")
+	seed("t1", "b1", "h1", "v2") // older version of same object
+	seed("t1", "b1", "h2", "v1")
+	seed("t1", "b2", "h1", "v1")
+	seed("t2", "b1", "h1", "v1")
+
+	got := map[manifest_store.ManifestKey]int{}
+	var prev manifest_store.ManifestKey
+	var havePrev bool
+	cursor := ""
+	pages := 0
+	for {
+		page, err := s.ScanManifests(ctx, cursor, 2)
+		if err != nil {
+			t.Fatalf("ScanManifests: %v", err)
+		}
+		pages++
+		for _, sm := range page.Manifests {
+			got[sm.Key]++
+			if havePrev && !scanKeyLess(prev, sm.Key) {
+				t.Fatalf("scan not strictly increasing: %v then %v", prev, sm.Key)
+			}
+			prev, havePrev = sm.Key, true
+			if sm.Manifest == nil {
+				t.Fatalf("nil manifest for %v", sm.Key)
+			}
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(got) != len(want) {
+		t.Fatalf("scanned %d distinct keys, want %d", len(got), len(want))
+	}
+	for k := range want {
+		if got[k] != 1 {
+			t.Fatalf("key %v visited %d times, want exactly 1", k, got[k])
+		}
+	}
+	if pages < 2 {
+		t.Fatalf("expected multiple pages with limit=2 over %d keys, got %d", len(want), pages)
+	}
+}
+
+// TestScanManifests_RejectsMalformedCursor ensures a corrupted cursor
+// is an error rather than a silent restart from the beginning.
+func TestScanManifests_RejectsMalformedCursor(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, nil)
+	if _, err := s.ScanManifests(context.Background(), "!!!not-base64!!!", 10); err == nil {
+		t.Fatal("malformed cursor: want error, got nil")
+	}
+}
+
+// TestUpdateManifest_PreservesLatestPointer pins the WS8.1 contract:
+// amending a non-latest version in place must not bump write_seq, so
+// the empty-VersionID "latest" read still resolves to the newest Put.
+func TestUpdateManifest_PreservesLatestPointer(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, nil)
+	ctx := context.Background()
+
+	if err := s.Put(ctx, key("t1", "b1", "h1", "v1"), manifestFor("t1", "b1", "h1", "v1")); err != nil {
+		t.Fatalf("Put v1: %v", err)
+	}
+	if err := s.Put(ctx, key("t1", "b1", "h1", "v2"), manifestFor("t1", "b1", "h1", "v2")); err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+
+	amended := manifestFor("t1", "b1", "h1", "v1")
+	amended.Tags = map[string]string{"env": "prod"}
+	if err := s.UpdateManifest(ctx, key("t1", "b1", "h1", "v1"), amended); err != nil {
+		t.Fatalf("UpdateManifest v1: %v", err)
+	}
+
+	latest, err := s.Get(ctx, key("t1", "b1", "h1", ""))
+	if err != nil {
+		t.Fatalf("Get latest: %v", err)
+	}
+	if latest.VersionID != "v2" {
+		t.Fatalf("latest VersionID = %q, want v2", latest.VersionID)
+	}
+
+	got1, err := s.Get(ctx, key("t1", "b1", "h1", "v1"))
+	if err != nil {
+		t.Fatalf("Get v1: %v", err)
+	}
+	if got1.Tags["env"] != "prod" {
+		t.Fatalf("v1 Tags = %v, want env=prod", got1.Tags)
+	}
+}
+
+// TestUpdateManifest_NotFound verifies an amend to a missing version
+// returns ErrNotFound rather than inserting a row.
+func TestUpdateManifest_NotFound(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, nil)
+	err := s.UpdateManifest(context.Background(), key("t1", "b1", "h1", "nope"), manifestFor("t1", "b1", "h1", "nope"))
+	if err != manifest_store.ErrNotFound {
+		t.Fatalf("UpdateManifest missing key err = %v, want ErrNotFound", err)
+	}
+}

@@ -9,6 +9,7 @@ package metadata
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // ObjectManifest is the provider-neutral description of a single
@@ -40,6 +41,48 @@ type ObjectManifest struct {
 	PlacementPolicy PlacementPolicy  `json:"placement_policy"`
 	Pieces          []Piece          `json:"pieces"`
 	MigrationState  MigrationState   `json:"migration_state"`
+
+	// DeleteMarker, when true, marks this manifest version as an S3
+	// delete marker rather than a real object version. It is created
+	// by DeleteObject on a versioning-enabled bucket (WS8.4): the
+	// marker becomes the latest version, hiding older versions from
+	// GET/HEAD/ListObjectsV2 while preserving them for
+	// ListObjectVersions and versionId-addressed reads. A delete
+	// marker carries no Pieces and no payload — GET of the latest
+	// version returns 404 NoSuchKey, and GET of the marker by
+	// versionId returns 405 MethodNotAllowed, matching AWS S3.
+	DeleteMarker bool `json:"delete_marker,omitempty"`
+
+	// Tags is the S3 object tag set (PutObjectTagging). It is a flat
+	// key→value map persisted as part of the manifest JSONB body — the
+	// control plane MUST continue to treat the body as opaque (see
+	// manifest_store.ManifestStore), so tags are addressed only through
+	// the S3 tagging sub-resource, never used for placement decisions.
+	// Empty/absent when the object has no tags. S3 limits (≤10 tags,
+	// ≤128-char keys, ≤256-char values) are enforced at the API
+	// boundary in api/s3compat, not here. See docs/PROPOSAL.md §15.1.1.
+	Tags map[string]string `json:"tags,omitempty"`
+
+	// RetentionMode and RetainUntil hold the S3 Object Lock retention
+	// for this object version (WS8.3), set by PutObjectRetention or
+	// inherited from the bucket default rule at PUT time. RetentionMode
+	// is "GOVERNANCE" or "COMPLIANCE" (object_lock.RetentionMode);
+	// empty means no retention. A version whose RetainUntil is in the
+	// future is protected from permanent deletion/overwrite — the API
+	// boundary in api/s3compat enforces this, never the manifest
+	// store. These fields are version-scoped, so they ride the
+	// manifest JSONB body and are amended in place via UpdateManifest
+	// (which never promotes a non-latest version). See docs/PROPOSAL.md
+	// §15.3.
+	RetentionMode string    `json:"retention_mode,omitempty"`
+	RetainUntil   time.Time `json:"retain_until,omitempty"`
+
+	// LegalHold, when true, marks this object version as under an S3
+	// Object Lock legal hold (WS8.3), set by PutObjectLegalHold. A
+	// held version cannot be permanently deleted or overwritten until
+	// the hold is turned off, independently of RetentionMode/RetainUntil
+	// and with no expiry. Enforced at the api/s3compat boundary.
+	LegalHold bool `json:"legal_hold,omitempty"`
 }
 
 // EncryptionConfig describes how the object is encrypted.

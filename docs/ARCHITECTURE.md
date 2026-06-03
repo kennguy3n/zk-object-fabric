@@ -94,6 +94,9 @@ zk-object-fabric/
     envelope.go           # Encryption envelope types
   metadata/
     manifest_store/       # Manifest persistence (memory + Postgres)
+    bucket_config/        # Per-bucket S3 config (versioning state +
+                          # Object Lock config; memory + Postgres +
+                          # SQLite) — WS8.4 / WS8.3
     placement_policy/     # Placement engine and policy DSL
     erasure_coding/       # EC profiles, encoder, registry
     content_index/        # Dedup ContentIndex (memory + Postgres)
@@ -153,8 +156,44 @@ zk-object-fabric/
     ARCHITECTURE.md       # As-built architecture overview (this file)
     INTEGRATION.md        # Dedup integration guide for external apps
     STORAGE_INFRA.md      # Deployment-model to storage mapping
+    S3_COMPATIBILITY.md   # ZKOF-vs-AWS-S3 compatibility matrix
     runbooks/             # Operational runbooks
 ```
+
+### Planned packages (Workstreams 8–9)
+
+The following packages are **planned, not yet built**. They are
+specified in [PROPOSAL.md §15](PROPOSAL.md) and tracked in
+[PROGRESS.md](PROGRESS.md); listed here so the as-built layout above
+stays the source of truth for what exists today.
+
+```
+api/s3compat/
+  tagging_handler.go      # WS8.1 Put/Get/DeleteObjectTagging
+  lifecycle_handler.go    # WS8.2 Put/Get/DeleteBucketLifecycleConfiguration
+  object_lock_handler.go  # WS8.3 lock / retention / legal-hold handlers
+  cors_handler.go         # WS8.5 Put/Get/DeleteBucketCors + CORS middleware
+  notification_handler.go # WS8.6 Put/GetBucketNotificationConfiguration
+  encryption_handler.go   # WS8.7 Put/Get/DeleteBucketEncryption
+metadata/
+  lifecycle/              # WS8.2 LifecycleRule + bucket_lifecycle table
+  object_lock/            # WS8.3 LockConfig + LegalHold
+internal/
+  notifications/          # WS8.6 async webhook dispatcher + DLQ
+encryption/
+  rust_sdk/               # WS9 byte-compatible Rust client-side SDK
+```
+
+New Postgres tables (WS8): `bucket_lifecycle`, plus per-bucket CORS,
+notification, and SSE-config rows (table names finalised per slice).
+Object tags are stored as JSONB on the existing manifest row rather
+than in a new table. Bucket versioning state (WS8.4, built) lives in
+the `bucket_versioning` table owned by the `metadata/bucket_config`
+package, keyed by `(tenant_id, bucket)`; the embedded SQLite profile
+self-creates an equivalent table. Bucket Object Lock config (WS8.3,
+built) lives in the `bucket_object_lock` table of the same package,
+while per-object-version retention mode / retain-until / legal-hold
+ride on the object manifest so they version with the object.
 
 ## Component overview
 
@@ -176,7 +215,9 @@ zk-object-fabric/
   consolidation for `managed` / `public_distribution` multipart
   uploads at `CompleteMultipartUpload` time.
 - Compliance hooks: residency pre-flight, audit trail emission,
-  legal-hold check on DELETE.
+  legal-hold check on DELETE. Object Lock / WORM (WS8.3) enforces
+  per-version retention (GOVERNANCE/COMPLIANCE) and legal holds in
+  the permanent-delete and PUT-overwrite paths.
 
 ### Console API — `api/console/`
 

@@ -24,8 +24,11 @@ import (
 	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
+	"github.com/kennguy3n/zk-object-fabric/encryption"
+	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 )
 
@@ -1004,5 +1007,55 @@ func TestBuildRefreshTokenStore_DisableOptOut(t *testing.T) {
 	cfg.Console.DisableRefreshTokens = false
 	if got := buildRefreshTokenStore(cfg, nil, nil); got == nil {
 		t.Fatal("DisableRefreshTokens=false: got nil store, want non-nil (refresh on by default)")
+	}
+}
+
+// TestStartAADMigrator_DisabledByDefault asserts the AAD v1 migration
+// worker stays off unless an operator sets an interval: with the
+// zero-value EncryptionConfig, startAADMigrator returns nil (no
+// goroutine, no work) and never dereferences the handler — so wiring
+// it into the gateway is safe for every existing deployment.
+func TestStartAADMigrator_DisabledByDefault(t *testing.T) {
+	if done := startAADMigrator(context.Background(), config.EncryptionConfig{}, nil); done != nil {
+		t.Fatal("startAADMigrator returned a non-nil channel with no interval configured")
+	}
+}
+
+// TestStartAADMigrator_EnabledRunsAndStops asserts that with an
+// interval set the worker starts and drains cleanly when its context
+// is cancelled (the shutdown path), and that a valid handler is
+// accepted.
+func TestStartAADMigrator_EnabledRunsAndStops(t *testing.T) {
+	cmkPath := filepath.Join(t.TempDir(), "cmk.key")
+	cmk := make([]byte, 32)
+	if _, err := rand.Read(cmk); err != nil {
+		t.Fatalf("rand cmk: %v", err)
+	}
+	if err := os.WriteFile(cmkPath, cmk, 0o600); err != nil {
+		t.Fatalf("write cmk: %v", err)
+	}
+	h := s3compat.New(s3compat.Config{
+		Manifests: memory.New(),
+		Encryption: &s3compat.GatewayEncryption{
+			Wrapper: client_sdk.LocalFileWrapper{Path: cmkPath},
+			CMK: encryption.CustomerMasterKeyRef{
+				URI:         "cmk://test/primary",
+				Version:     1,
+				HolderClass: "gateway_hsm",
+			},
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startAADMigrator(ctx, config.EncryptionConfig{
+		AADMigrationInterval: config.Duration(time.Hour),
+	}, h)
+	if done == nil {
+		t.Fatal("startAADMigrator returned nil with an interval configured")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("aad_migrator goroutine did not drain after context cancel")
 	}
 }

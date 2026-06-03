@@ -137,6 +137,19 @@ func (s *FaultManifestStore) Put(ctx context.Context, key manifest_store.Manifes
 	return s.Inner.Put(ctx, key, m)
 }
 
+// UpdateManifest dispatches through PutFault — it is a write to an
+// existing manifest, so the chaos suite treats it as a PUT for
+// fault-injection purposes.
+func (s *FaultManifestStore) UpdateManifest(ctx context.Context, key manifest_store.ManifestKey, m *metadata.ObjectManifest) error {
+	s.Calls.Add(1)
+	fail, err := s.shouldFail("PUT", s.PutFault)
+	if fail {
+		s.Failures.Add(1)
+		return err
+	}
+	return s.Inner.UpdateManifest(ctx, key, m)
+}
+
 // Get dispatches through GetFault.
 func (s *FaultManifestStore) Get(ctx context.Context, key manifest_store.ManifestKey) (*metadata.ObjectManifest, error) {
 	s.Calls.Add(1)
@@ -190,4 +203,17 @@ func (s *FaultManifestStore) ListVersions(ctx context.Context, tenantID, bucket,
 		return nil, err
 	}
 	return s.Inner.ListVersions(ctx, tenantID, bucket, objectKeyHash)
+}
+
+// ScanManifests dispatches through ListFault (the scan shares the
+// read-path fault knob with List rather than adding a new field; the
+// chaos suite exercises read failures generically).
+func (s *FaultManifestStore) ScanManifests(ctx context.Context, cursor string, limit int) (manifest_store.ScanResult, error) {
+	s.Calls.Add(1)
+	fail, err := s.shouldFail("SCAN", s.ListFault)
+	if fail {
+		s.Failures.Add(1)
+		return manifest_store.ScanResult{}, err
+	}
+	return s.Inner.ScanManifests(ctx, cursor, limit)
 }

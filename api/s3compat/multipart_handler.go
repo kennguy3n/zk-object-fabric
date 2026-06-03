@@ -414,6 +414,14 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "manifest store not configured", r.URL.Path)
 		return
 	}
+	// Object Lock (WS8.3) pre-flight: completing a multipart upload
+	// publishes a new manifest for the key, so on an Object-Lock bucket
+	// that is not versioning-Enabled it would overwrite the current
+	// (possibly locked) version. Mirror the Put/Copy guard and refuse
+	// before the upload session is consumed by Complete().
+	if !h.allowObjectLockOverwrite(w, r, tenantID, bucket, key) {
+		return
+	}
 	uploadID := r.URL.Query().Get("uploadId")
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // cap at 1 MiB of XML
 	if err != nil {
@@ -700,6 +708,15 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
+		// Mirror the manifest-Put refcount rollback; orphaned
+		// pieces (if any) are reclaimed by the background GC.
+		if manifest.ContentHash != "" && h.cfg.ContentIndex != nil {
+			_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, manifest.ContentHash)
+		}
+		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
+		return
+	}
 	mkey := manifest_store.ManifestKey{
 		TenantID:      tenantID,
 		Bucket:        bucket,

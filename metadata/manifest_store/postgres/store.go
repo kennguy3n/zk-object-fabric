@@ -111,6 +111,50 @@ func (s *Store) Put(ctx context.Context, key manifest_store.ManifestKey, m *meta
 	return nil
 }
 
+// UpdateManifest replaces an existing version's body without bumping
+// updated_at, so the row's position in the ORDER BY updated_at DESC
+// latest-resolution is preserved. Returns ErrNotFound if no row
+// matches the exact key.
+func (s *Store) UpdateManifest(ctx context.Context, key manifest_store.ManifestKey, m *metadata.ObjectManifest) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if m == nil {
+		return errors.New("postgres: manifest is nil")
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("postgres: marshal manifest: %w", err)
+	}
+	if s.encryptor != nil {
+		sealed, eerr := s.encryptor.Encrypt(body, BodyContext{
+			TenantID:      key.TenantID,
+			Bucket:        key.Bucket,
+			ObjectKeyHash: key.ObjectKeyHash,
+		})
+		if eerr != nil {
+			return fmt.Errorf("postgres: encrypt manifest body: %w", eerr)
+		}
+		body = sealed
+	}
+	q := fmt.Sprintf(`
+		UPDATE %s SET body = $5
+		WHERE tenant_id = $1 AND bucket = $2 AND object_key_hash = $3 AND version_id = $4
+	`, s.table)
+	res, err := s.db.ExecContext(ctx, q, key.TenantID, key.Bucket, key.ObjectKeyHash, key.VersionID, body)
+	if err != nil {
+		return fmt.Errorf("postgres: update manifest: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("postgres: update manifest rows affected: %w", err)
+	}
+	if n == 0 {
+		return manifest_store.ErrNotFound
+	}
+	return nil
+}
+
 // Get reads a manifest by exact key. If VersionID is empty, Get
 // returns the most recently updated version for the (tenant, bucket,
 // object_key_hash) triple.
@@ -251,6 +295,76 @@ func (s *Store) List(ctx context.Context, tenantID, bucket, cursor string, limit
 	}
 	if err := rows.Err(); err != nil {
 		return manifest_store.ListResult{}, fmt.Errorf("postgres: list iter: %w", err)
+	}
+	return out, nil
+}
+
+// ScanManifests paginates over every manifest version in the table
+// across all tenants and buckets, ordered by the full primary key, so
+// a background worker can visit every object exactly once. The cursor
+// is keyset-based: the WHERE clause uses a row-value comparison on the
+// (tenant_id, bucket, object_key_hash, version_id) tuple against the
+// decoded cursor, which matches the ORDER BY and lets Postgres serve
+// each page from the primary-key index without OFFSET. An empty
+// cursor decodes to the all-empty key, and because every persisted
+// row has non-empty key fields the first page admits every row.
+func (s *Store) ScanManifests(ctx context.Context, cursor string, limit int) (manifest_store.ScanResult, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	after, err := manifest_store.DecodeScanCursor(cursor)
+	if err != nil {
+		return manifest_store.ScanResult{}, err
+	}
+	q := fmt.Sprintf(`
+		SELECT tenant_id, bucket, object_key_hash, version_id, body
+		FROM %s
+		WHERE (tenant_id, bucket, object_key_hash, version_id) > ($1, $2, $3, $4)
+		ORDER BY tenant_id, bucket, object_key_hash, version_id
+		LIMIT $5
+	`, s.table)
+	rows, err := s.db.QueryContext(ctx, q, after.TenantID, after.Bucket, after.ObjectKeyHash, after.VersionID, limit+1)
+	if err != nil {
+		return manifest_store.ScanResult{}, fmt.Errorf("postgres: scan manifests: %w", err)
+	}
+	defer rows.Close()
+
+	out := manifest_store.ScanResult{}
+	var lastKey manifest_store.ManifestKey
+	count := 0
+	for rows.Next() {
+		count++
+		if count > limit {
+			out.NextCursor = manifest_store.EncodeScanCursor(lastKey)
+			break
+		}
+		var (
+			key  manifest_store.ManifestKey
+			body []byte
+		)
+		if err := rows.Scan(&key.TenantID, &key.Bucket, &key.ObjectKeyHash, &key.VersionID, &body); err != nil {
+			return manifest_store.ScanResult{}, fmt.Errorf("postgres: scan manifests row: %w", err)
+		}
+		if s.encryptor != nil {
+			opened, derr := s.encryptor.Decrypt(body, BodyContext{
+				TenantID:      key.TenantID,
+				Bucket:        key.Bucket,
+				ObjectKeyHash: key.ObjectKeyHash,
+			})
+			if derr != nil {
+				return manifest_store.ScanResult{}, fmt.Errorf("postgres: scan manifests decrypt: %w", derr)
+			}
+			body = opened
+		}
+		var m metadata.ObjectManifest
+		if err := json.Unmarshal(body, &m); err != nil {
+			return manifest_store.ScanResult{}, fmt.Errorf("postgres: scan manifests unmarshal: %w", err)
+		}
+		out.Manifests = append(out.Manifests, manifest_store.ScannedManifest{Key: key, Manifest: &m})
+		lastKey = key
+	}
+	if err := rows.Err(); err != nil {
+		return manifest_store.ScanResult{}, fmt.Errorf("postgres: scan manifests iter: %w", err)
 	}
 	return out, nil
 }

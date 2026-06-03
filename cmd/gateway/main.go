@@ -311,7 +311,7 @@ func main() {
 	log.Printf("gateway: build version=%s commit=%s built=%s go=%s/%s",
 		version.Version, version.GitCommit, version.BuildDate, runtime.GOOS, runtime.GOARCH)
 	complianceHooks := buildComplianceHooks(cfg.Compliance, metadataDB)
-	s3compat.New(s3compat.Config{
+	s3Handler := s3compat.New(s3compat.Config{
 		Manifests:                store,
 		Providers:                registry,
 		Placement:                placement,
@@ -339,7 +339,9 @@ func main() {
 		// InternalAuthMisconfigured instead of silently writing
 		// data under the anonymous tenant.
 		RequireAuth: cfg.Env == "production",
-	}).Register(mux)
+	})
+	s3Handler.Register(mux)
+	aadMigratorDone := startAADMigrator(workerCtx, cfg.Encryption, s3Handler)
 
 	handler := http.Handler(mux)
 	if cfg.Tracing.Enabled {
@@ -480,6 +482,9 @@ func main() {
 	}
 	if repairDone != nil {
 		<-repairDone
+	}
+	if aadMigratorDone != nil {
+		<-aadMigratorDone
 	}
 }
 
@@ -994,6 +999,41 @@ func startOrphanGC(
 	go func() {
 		defer close(done)
 		gc.Run(ctx)
+	}()
+	return done
+}
+
+// startAADMigrator spins up the background AAD v1 migration worker
+// when an interval is configured. The worker re-encrypts legacy
+// gateway-encrypted objects (manifests with AADVersion == "") under
+// the modern v1 per-chunk AAD binding, in place. It is off by default
+// (zero interval) so existing deployments are unaffected until an
+// operator opts in. Returns nil when no worker is started. The worker
+// shares workerCtx with the other background sweeps, so a SIGTERM that
+// cancels workerCtx also stops it.
+func startAADMigrator(
+	ctx context.Context,
+	enc config.EncryptionConfig,
+	h *s3compat.Handler,
+) <-chan struct{} {
+	if enc.AADMigrationInterval.ToDuration() <= 0 {
+		return nil
+	}
+	mig, err := s3compat.NewAADMigrator(h, s3compat.AADMigratorConfig{
+		Interval:       enc.AADMigrationInterval.ToDuration(),
+		PerObjectDelay: enc.AADMigrationPerObject.ToDuration(),
+		Logger:         log.New(os.Stdout, "aad_migrator ", log.LstdFlags),
+	})
+	if err != nil {
+		log.Printf("gateway: aad_migrator disabled — config error: %v", err)
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if rerr := mig.Run(ctx); rerr != nil && !errors.Is(rerr, context.Canceled) {
+			log.Printf("gateway: aad_migrator stopped: %v", rerr)
+		}
 	}()
 	return done
 }

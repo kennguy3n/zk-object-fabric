@@ -40,6 +40,18 @@ const (
 	// DeleteRequests counts successful DELETE requests.
 	DeleteRequests Dimension = "delete_requests"
 
+	// TaggingRequests counts successful object-tagging operations
+	// (PutObjectTagging, GetObjectTagging, DeleteObjectTagging).
+	// These are metadata-only requests that never read or write a
+	// backend piece, so they are metered on their own dimension
+	// rather than folded into Put/Get/DeleteRequests — that keeps
+	// object-I/O request counts (and the storage they imply) clean
+	// while still capturing tagging traffic for billing. AWS bills
+	// tagging as standard Tier-1/Tier-2 requests; operators that
+	// want that behaviour can price TaggingRequests at the same
+	// per-request rate.
+	TaggingRequests Dimension = "tagging_requests"
+
 	// EgressBytes counts ciphertext bytes served to clients.
 	EgressBytes Dimension = "egress_bytes"
 

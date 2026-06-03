@@ -73,6 +73,25 @@ func (f *fakeProvider) GetPiece(_ context.Context, pieceID string, r *providers.
 func (f *fakeProvider) HeadPiece(context.Context, string) (providers.PieceMetadata, error) {
 	return providers.PieceMetadata{}, nil
 }
+
+// setPiece seeds a backend piece under the same lock the provider's
+// own methods hold. Tests use it instead of writing f.pieces directly
+// so test setup stays consistent with PutPiece/GetPiece and a future
+// contributor adding concurrent setup cannot trip the race detector.
+func (f *fakeProvider) setPiece(pieceID string, b []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pieces[pieceID] = b
+}
+
+// pieceBytes returns a stored piece (and whether it exists) under
+// lock, for assertions that inspect backend state after a sweep.
+func (f *fakeProvider) pieceBytes(pieceID string) ([]byte, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.pieces[pieceID]
+	return b, ok
+}
 func (f *fakeProvider) DeletePiece(_ context.Context, pieceID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -127,6 +146,28 @@ func newTestHandler() (*Handler, *fakeProvider, *recordingBilling, manifest_stor
 		Now:       func() time.Time { return time.Unix(1700000000, 0) },
 	})
 	return h, fake, bill, store
+}
+
+// newAdvancingClockTestHandler is like newTestHandler but its clock
+// advances one second per Now() call, so successive PUTs of the same
+// key get distinct version ids (newPieceID mixes the timestamp).
+// Tests that need two real versions of one object use this.
+func newAdvancingClockTestHandler() (*Handler, manifest_store.ManifestStore) {
+	store := memory.New()
+	fake := newFakeProvider("test")
+	now := time.Unix(1700000000, 0)
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fake},
+		Placement: fixedPlacement{backend: "test"},
+		Billing:   &recordingBilling{},
+		Now: func() time.Time {
+			t := now
+			now = now.Add(time.Second)
+			return t
+		},
+	})
+	return h, store
 }
 
 func TestPutGetHeadDelete_Roundtrip(t *testing.T) {
@@ -852,6 +893,51 @@ func TestCopyObject_MissingSource(t *testing.T) {
 	h.Copy(cw, cr)
 	if cw.Code != http.StatusNotFound {
 		t.Fatalf("Copy missing: %d %s", cw.Code, cw.Body.String())
+	}
+}
+
+// TestCopyObject_DeleteMarkerSource guards the WS8.4 fix where a copy
+// source resolving to a delete marker must mirror GET/HEAD semantics
+// (404 when resolved as latest, 405 when addressed by explicit
+// versionId) rather than surfacing the marker's empty Pieces list as
+// a misleading 500 EmptyManifest.
+func TestCopyObject_DeleteMarkerSource(t *testing.T) {
+	h, _, _, store := newTestHandler()
+	const vid = "v-marker-1"
+	marker := &metadata.ObjectManifest{
+		TenantID:      "anonymous",
+		Bucket:        "bucket",
+		ObjectKey:     "gone.txt",
+		ObjectKeyHash: hashObjectKey("gone.txt"),
+		VersionID:     vid,
+		DeleteMarker:  true,
+	}
+	mkey := manifest_store.ManifestKey{
+		TenantID:      "anonymous",
+		Bucket:        "bucket",
+		ObjectKeyHash: hashObjectKey("gone.txt"),
+		VersionID:     vid,
+	}
+	if err := store.Put(context.Background(), mkey, marker); err != nil {
+		t.Fatalf("seed delete marker: %v", err)
+	}
+
+	// Latest resolves to the marker → 404 NoSuchKey.
+	cr := httptest.NewRequest(http.MethodPut, "/bucket/dst.txt", nil)
+	cr.Header.Set("x-amz-copy-source", "/bucket/gone.txt")
+	cw := httptest.NewRecorder()
+	h.Copy(cw, cr)
+	if cw.Code != http.StatusNotFound {
+		t.Fatalf("Copy from delete-marker latest = %d, want 404; body=%s", cw.Code, cw.Body)
+	}
+
+	// Explicit versionId pointing at the marker → 405 MethodNotAllowed.
+	cr = httptest.NewRequest(http.MethodPut, "/bucket/dst.txt", nil)
+	cr.Header.Set("x-amz-copy-source", "/bucket/gone.txt?versionId="+vid)
+	cw = httptest.NewRecorder()
+	h.Copy(cw, cr)
+	if cw.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("Copy from delete-marker versionId = %d, want 405; body=%s", cw.Code, cw.Body)
 	}
 }
 

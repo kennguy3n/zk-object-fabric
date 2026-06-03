@@ -1,0 +1,38 @@
+-- Per-bucket S3 configuration sub-resources (WS8.4+).
+--
+-- Today this holds bucket versioning state and Object Lock config;
+-- future sub-resources (CORS, lifecycle, notifications) can add columns
+-- or sibling tables.
+-- Buckets are implicit in the fabric, so the row is keyed by
+-- (tenant_id, bucket) directly rather than referencing a bucket table.
+--
+-- The Postgres deployment applies this via the standard migration
+-- runner; the embedded SQLite profile self-creates an equivalent
+-- table at store construction (see metadata/bucket_config/sqlite).
+
+CREATE TABLE IF NOT EXISTS bucket_versioning (
+    tenant_id  TEXT NOT NULL,
+    bucket     TEXT NOT NULL,
+    -- 'Enabled' or 'Suspended'. The never-configured state is the
+    -- absence of a row, surfaced to callers as VersioningUnset.
+    state      TEXT NOT NULL CHECK (state IN ('Enabled', 'Suspended')),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, bucket)
+);
+
+-- Per-bucket S3 Object Lock configuration (WS8.3). The never-configured
+-- state is the absence of a row, surfaced as a zero object_lock.Config
+-- (Enabled false). When enabled WITH a default retention rule,
+-- default_mode is set and exactly one of default_days/default_years is
+-- > 0; new object versions inherit that retention at PUT time. Enabling
+-- Object Lock requires bucket versioning, enforced at the API layer.
+CREATE TABLE IF NOT EXISTS bucket_object_lock (
+    tenant_id     TEXT NOT NULL,
+    bucket        TEXT NOT NULL,
+    enabled       BOOLEAN NOT NULL,
+    default_mode  TEXT NOT NULL DEFAULT '' CHECK (default_mode IN ('', 'GOVERNANCE', 'COMPLIANCE')),
+    default_days  INTEGER NOT NULL DEFAULT 0,
+    default_years INTEGER NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, bucket)
+);
