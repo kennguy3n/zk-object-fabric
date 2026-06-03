@@ -205,6 +205,18 @@ func main() {
 	// the console is disabled (ListenAddr empty), since no TokenStore
 	// is built then — see checkProductionTokenStore.
 	enforceProductionTokenStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.JWTSigningKeyPath)
+	// Production safety net for the refresh-token store, the sibling of
+	// the access-token guard above. buildRefreshTokenStore falls back to
+	// the process-local MemoryRefreshTokenStore when neither a metadata
+	// DSN (Postgres) nor the embedded SQLite profile is configured;
+	// that store loses every refresh token on restart and is not shared
+	// across replicas, so /api/v1/auth/refresh would 401 against any
+	// replica other than the issuer. Refuse to boot in production unless
+	// a persistent backend is wired or the operator deliberately opted
+	// out via console.disable_refresh_tokens (pure stateless-JWT
+	// sessions). Skipped when the console is disabled — see
+	// checkProductionRefreshTokenStore.
+	enforceProductionRefreshTokenStore(cfg.Env, cfg.Console.ListenAddr, cfg.Console.DisableRefreshTokens, metadataDB != nil || embeddedDB != nil)
 	authenticator := auth.NewHMACAuthenticator(tenantStore)
 	metricsRegistry := metrics.NewRegistry()
 	tracer := buildTracer(cfg.Tracing)
@@ -225,6 +237,11 @@ func main() {
 	// store is selected when a metadata DSN is configured;
 	// otherwise the dev MemoryAuthStore is used.
 	authStore := buildAuthStore(metadataDB, embeddedDB)
+	// The refresh-token store follows the same backend selection as
+	// the AuthStore so login / signup / refresh share one persistence
+	// tier. Built here (rather than inside startConsoleAPI) so it sees
+	// both the metadata and embedded handles.
+	refreshStore := buildRefreshTokenStore(cfg, metadataDB, embeddedDB)
 	// authHooks is built once and shared between the console API
 	// and the S3 handler's email-verification gate. When
 	// SendVerificationEmail is nil (no SES / transactional email
@@ -422,7 +439,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -761,6 +778,67 @@ func checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string)
 // the sentinel without forking the test binary.
 func enforceProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath string) {
 	if err := checkProductionTokenStore(env, consoleListenAddr, jwtSigningKeyPath); err != nil {
+		log.Fatalf("%s", err)
+	}
+}
+
+// errProductionRefreshTokenStoreRequired is returned by
+// checkProductionRefreshTokenStore when the gateway is started with
+// env=production and the console enabled but no persistent backend
+// (Postgres DSN or embedded SQLite) is configured, so
+// buildRefreshTokenStore would fall back to the process-local
+// MemoryRefreshTokenStore. Exposed as a sentinel so cmd/gateway can log
+// a friendly message and main_test.go can errors.Is against it.
+var errProductionRefreshTokenStoreRequired = errors.New("gateway: env=production but no persistent refresh-token backend is configured (no control_plane.metadata_dsn and no embedded SQLite); the console would fall back to the in-memory MemoryRefreshTokenStore, whose refresh tokens are lost on restart and are not shared across replicas behind a load balancer, so /api/v1/auth/refresh would 401 against any replica other than the issuer. Configure a metadata DSN or the embedded profile, set console.disable_refresh_tokens=true to run pure stateless-JWT sessions, or use env=development")
+
+// checkProductionRefreshTokenStore refuses to start the gateway when
+// cfg.Env == "production", the console API is enabled, the operator has
+// not explicitly disabled refresh tokens, and no persistent backend is
+// configured — i.e. buildRefreshTokenStore would select the
+// process-local MemoryRefreshTokenStore. That store is exactly as
+// production-unsafe as the access-token MemoryTokenStore the sibling
+// checkProductionTokenStore guards against: refresh tokens vanish on
+// restart and two replicas behind a load balancer cannot validate each
+// other's tokens, so a user whose refresh lands on a different replica
+// is logged out with a spurious 401.
+//
+// The guard is gated like its siblings:
+//   - consoleListenAddr == "" means the console is disabled and no
+//     refresh store is ever built, so there is nothing to be unsafe.
+//   - disableRefresh is the deliberate operator opt-out into pure
+//     stateless-JWT sessions (Console.DisableRefreshTokens), where
+//     buildRefreshTokenStore returns nil by design and the refresh
+//     endpoint replies 503 — that is an intentional configuration, not
+//     the accidental memory fallback this guard exists to catch.
+//   - persistent is metadataDB != nil || embeddedDB != nil, the same
+//     "a Postgres or SQLite store will be selected" signal the
+//     manifest-encryption guard uses.
+//
+// Returns a sentinel error rather than calling log.Fatalf so tests can
+// exercise both branches in-process.
+func checkProductionRefreshTokenStore(env, consoleListenAddr string, disableRefresh, persistent bool) error {
+	if env != "production" {
+		return nil
+	}
+	if consoleListenAddr == "" {
+		return nil
+	}
+	if disableRefresh {
+		return nil
+	}
+	if persistent {
+		return nil
+	}
+	return errProductionRefreshTokenStoreRequired
+}
+
+// enforceProductionRefreshTokenStore wraps
+// checkProductionRefreshTokenStore at the startup callsite: a non-nil
+// error is fatal. Tests should call checkProductionRefreshTokenStore
+// directly so they can errors.Is against the sentinel without forking
+// the test binary.
+func enforceProductionRefreshTokenStore(env, consoleListenAddr string, disableRefresh, persistent bool) {
+	if err := checkProductionRefreshTokenStore(env, consoleListenAddr, disableRefresh, persistent); err != nil {
 		log.Fatalf("%s", err)
 	}
 }
@@ -1899,6 +1977,7 @@ func startConsoleAPI(
 	metadataDB *sql.DB,
 	tenantStore auth.TenantStore,
 	authStore console.AuthStore,
+	refreshStore console.RefreshTokenStore,
 	authHooks console.AuthHooks,
 	billingSink billing.BillingSink,
 	billingProvider billing.BillingProvider,
@@ -1932,6 +2011,7 @@ func startConsoleAPI(
 		Placements:      placements,
 		Auth:            authStore,
 		Tokens:          tokens,
+		RefreshTokens:   refreshStore,
 		AuthHooks:       authHooks,
 		AdminAuth:       buildAdminAuth(cfg),
 		BillingSink:     billingSink,
@@ -1999,6 +2079,61 @@ func buildAuthStore(db, embeddedDB *sql.DB) console.AuthStore {
 		return console.NewMemoryAuthStore()
 	}
 	log.Printf("gateway: postgres auth store enabled")
+	return store
+}
+
+// buildRefreshTokenStore selects the console RefreshTokenStore using
+// the same backend precedence as buildAuthStore: Postgres when a
+// metadata DSN is configured, the embedded SQLite store under the
+// embedded profile, and the process-local in-memory store otherwise
+// (dev / single-node).
+//
+// A persistent-store *construction* failure (e.g. the embedded SQLite
+// ensureSchema DDL erroring) is fatal under env=production and a
+// dev-friendly in-memory fallback otherwise. This closes the gap
+// enforceProductionRefreshTokenStore alone leaves: that guard checks a
+// persistent backend is *configured*, but a silent memory downgrade
+// here would still strand production on a non-replica-safe store after
+// the guard passed — exactly the outcome the guard exists to prevent.
+// Outside production the loud-log fallback keeps single-node and dev
+// profiles booting even if the embedded DB is briefly unavailable.
+//
+// Returns nil when the operator sets Console.DisableRefreshTokens, which
+// the auth handler reads as "refresh disabled": login / signup omit the
+// refresh token and /api/v1/auth/refresh replies 503.
+func buildRefreshTokenStore(cfg config.Config, db, embeddedDB *sql.DB) console.RefreshTokenStore {
+	if cfg.Console.DisableRefreshTokens {
+		log.Printf("gateway: refresh tokens disabled by config; access token is the only session credential")
+		return nil
+	}
+	rcfg := console.RefreshConfig{TTL: cfg.Console.RefreshTokenTTL.ToDuration()}
+	// memoryFallback downgrades to the process-local store outside
+	// production, but in production a persistent backend was demanded by
+	// enforceProductionRefreshTokenStore, so a construction failure must
+	// be fatal rather than a silent, non-replica-safe downgrade.
+	memoryFallback := func(what string, err error) console.RefreshTokenStore {
+		if cfg.Env == "production" {
+			log.Fatalf("gateway: %s: %v; refusing to fall back to the in-memory refresh-token store under env=production (it is lost on restart and not shared across replicas). Fix the backend or set console.disable_refresh_tokens=true", what, err)
+		}
+		log.Printf("gateway: %s: %v; falling back to in-memory", what, err)
+		return console.NewMemoryRefreshTokenStore(rcfg)
+	}
+	if db == nil {
+		if embeddedDB != nil {
+			store, err := console.NewSQLiteRefreshTokenStore(embeddedDB, rcfg)
+			if err != nil {
+				return memoryFallback("build embedded refresh store", err)
+			}
+			log.Printf("gateway: embedded SQLite refresh-token store enabled")
+			return store
+		}
+		return console.NewMemoryRefreshTokenStore(rcfg)
+	}
+	store, err := console.NewPostgresRefreshTokenStore(db, rcfg)
+	if err != nil {
+		return memoryFallback("build postgres refresh store", err)
+	}
+	log.Printf("gateway: postgres refresh-token store enabled")
 	return store
 }
 

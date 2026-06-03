@@ -8,6 +8,22 @@ import type {
   UsageSnapshot,
 } from "./types";
 
+// AuthWire is the JSON shape api/console/auth_handler.go's
+// AuthResponse marshals to. It is defined here (rather than imported
+// from auth.ts) because auth.ts imports this module, and a circular
+// import would force both into one file. auth.ts re-exports the same
+// fields as its public AuthResponse, so the two stay structurally
+// identical.
+export interface AuthWire {
+  tenant: Tenant;
+  token: string;
+  accessKey?: string;
+  secretKey?: string;
+  createdAt?: string;
+  refreshToken?: string;
+  refreshTokenExpiresAt?: string;
+}
+
 // ApiClient is the thin wrapper the SPA uses to reach the gateway's
 // management API. Auth endpoints live under `${rootBaseUrl}/v1/auth`
 // (e.g. `/api/v1/auth`); tenant-scoped routes live under
@@ -49,7 +65,7 @@ export class ApiClient {
   // api/console/auth_handler.go is preserved even if the tenant
   // routes ever drop or bump their own version prefix.
 
-  async login(email: string, password: string): Promise<{ tenant: Tenant; token: string }> {
+  async login(email: string, password: string): Promise<AuthWire> {
     return this.requestAt("POST", `${this.authBaseUrl}/login`, { email, password });
   }
 
@@ -58,8 +74,21 @@ export class ApiClient {
     password: string;
     tenantName: string;
     captchaToken?: string;
-  }): Promise<{ tenant: Tenant; token: string }> {
+  }): Promise<AuthWire> {
     return this.requestAt("POST", `${this.authBaseUrl}/signup`, input);
+  }
+
+  // refresh exchanges a refresh token for a fresh access token and a
+  // rotated refresh token. The presented token is single-use, so the
+  // caller must persist the returned refreshToken in its place.
+  async refresh(refreshToken: string): Promise<AuthWire> {
+    return this.requestAt("POST", `${this.authBaseUrl}/refresh`, { refreshToken });
+  }
+
+  // logout revokes a refresh token. The endpoint returns 204 and is
+  // idempotent, so an unknown or already-revoked token still resolves.
+  async logout(refreshToken: string): Promise<void> {
+    await this.requestAt("POST", `${this.authBaseUrl}/logout`, { refreshToken });
   }
 
   // --- usage & dashboard ---------------------------------------

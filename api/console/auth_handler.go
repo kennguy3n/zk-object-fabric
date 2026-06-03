@@ -311,6 +311,16 @@ type AuthConfig struct {
 	Auth    AuthStore
 	Tokens  TokenStore
 
+	// RefreshTokens issues and rotates the long-lived refresh tokens
+	// the SPA exchanges for fresh access tokens at
+	// /api/v1/auth/refresh. When nil, login / signup still succeed
+	// but return no refresh token and the refresh endpoint replies
+	// 503. The gateway wires a store by default and produces nil only
+	// when the operator sets Console.DisableRefreshTokens — i.e. a
+	// deliberate opt-out into pure stateless-JWT sessions, not an
+	// accidental default.
+	RefreshTokens RefreshTokenStore
+
 	// NewTenantID returns a fresh tenant ID. Defaults to a 16-byte
 	// hex-encoded identifier prefixed with "t-".
 	NewTenantID func() (string, error)
@@ -403,6 +413,15 @@ type AuthResponse struct {
 	AccessKey string        `json:"accessKey,omitempty"`
 	SecretKey string        `json:"secretKey,omitempty"`
 	CreatedAt time.Time     `json:"createdAt,omitempty"`
+
+	// RefreshToken is the long-lived token the SPA stores and later
+	// POSTs to /api/v1/auth/refresh to obtain a fresh access token
+	// without re-entering credentials. Empty when no
+	// RefreshTokenStore is configured. RefreshTokenExpiresAt lets the
+	// client schedule a refresh (or a re-login prompt) before the
+	// token lapses.
+	RefreshToken          string    `json:"refreshToken,omitempty"`
+	RefreshTokenExpiresAt time.Time `json:"refreshTokenExpiresAt,omitempty"`
 }
 
 // AuthHandler routes POST /api/v1/auth/signup and POST
@@ -440,9 +459,11 @@ func (h *AuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 const (
-	authPathSignup = "/api/v1/auth/signup"
-	authPathLogin  = "/api/v1/auth/login"
-	authPathVerify = "/api/v1/auth/verify"
+	authPathSignup  = "/api/v1/auth/signup"
+	authPathLogin   = "/api/v1/auth/login"
+	authPathVerify  = "/api/v1/auth/verify"
+	authPathRefresh = "/api/v1/auth/refresh"
+	authPathLogout  = "/api/v1/auth/logout"
 )
 
 // maxAuthBodyBytes caps the request body the auth endpoints decode.
@@ -473,6 +494,18 @@ func (h *AuthHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.verify(w, r)
+	case authPathRefresh:
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.refresh(w, r)
+	case authPathLogout:
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.logout(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "unknown auth path "+r.URL.Path)
 	}
@@ -740,13 +773,37 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 				h.cfg.BillingProvider.Name(), tenantID, err)
 		}
 	}
+	refreshToken, refreshExpiresAt := h.issueRefreshToken(tenantID)
 	writeJSON(w, http.StatusCreated, AuthResponse{
-		Tenant:    summarizeTenantAt(newTenant, createdAt),
-		Token:     token,
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-		CreatedAt: createdAt,
+		Tenant:                summarizeTenantAt(newTenant, createdAt),
+		Token:                 token,
+		AccessKey:             accessKey,
+		SecretKey:             secretKey,
+		CreatedAt:             createdAt,
+		RefreshToken:          refreshToken,
+		RefreshTokenExpiresAt: refreshExpiresAt,
 	})
+}
+
+// issueRefreshToken mints a refresh token for tenantID when a
+// RefreshTokenStore is configured. It is intentionally best-effort: a
+// nil store (refresh sessions not enabled) or a transient mint failure
+// returns an empty token rather than failing the login / signup the
+// caller has already committed. The access token alone keeps the SPA
+// authenticated for its (short) TTL; the client simply re-logs in when
+// it lapses instead of refreshing. A mint failure is logged so an
+// operator can spot a misconfigured or unreachable refresh-token
+// backend.
+func (h *AuthHandler) issueRefreshToken(tenantID string) (string, time.Time) {
+	if h.cfg.RefreshTokens == nil {
+		return "", time.Time{}
+	}
+	rt, err := h.cfg.RefreshTokens.Issue(tenantID)
+	if err != nil {
+		log.Printf("console: issue refresh token for tenant %q failed: %v", tenantID, err)
+		return "", time.Time{}
+	}
+	return rt.Raw, rt.ExpiresAt
 }
 
 // loginRequest is the payload accepted by POST /api/v1/auth/login.
@@ -799,10 +856,158 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
 		return
 	}
+	refreshToken, refreshExpiresAt := h.issueRefreshToken(tenantID)
 	writeJSON(w, http.StatusOK, AuthResponse{
-		Tenant: summarizeTenant(t),
-		Token:  token,
+		Tenant:                summarizeTenant(t),
+		Token:                 token,
+		RefreshToken:          refreshToken,
+		RefreshTokenExpiresAt: refreshExpiresAt,
 	})
+}
+
+// refreshRequest is the payload accepted by POST /api/v1/auth/refresh
+// and POST /api/v1/auth/logout. The RefreshToken is the opaque secret
+// returned to the client at login / signup (or the previous refresh).
+type refreshRequest struct {
+	RefreshToken string `json:"refreshToken"`
+}
+
+// refresh exchanges a valid refresh token for a fresh access token and
+// a rotated refresh token. Rotation means the presented token is
+// single-use: every successful refresh invalidates the old token and
+// returns its successor, so a stolen-and-replayed token is detected
+// (the store revokes the whole family) the next time either copy is
+// used.
+func (h *AuthHandler) refresh(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.RefreshTokens == nil {
+		writeError(w, http.StatusServiceUnavailable, "refresh tokens not configured")
+		return
+	}
+	if h.cfg.Tenants == nil || h.cfg.Tokens == nil {
+		writeError(w, http.StatusServiceUnavailable, "auth store not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodyBytes)
+	var req refreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("refresh payload exceeds %d bytes", maxAuthBodyBytes))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "decode refresh: "+err.Error())
+		return
+	}
+	refreshToken := strings.TrimSpace(req.RefreshToken)
+	if refreshToken == "" {
+		writeError(w, http.StatusBadRequest, "refreshToken is required")
+		return
+	}
+	rotated, err := h.cfg.RefreshTokens.Rotate(refreshToken)
+	if err != nil {
+		// Only the two auth sentinels mean "this token can never work,
+		// re-authenticate": errRefreshTokenInvalid (unknown/expired)
+		// and errRefreshTokenReuse (replay — the family is already
+		// revoked server-side inside Rotate). Both collapse to a
+		// uniform 401 so a prober cannot tell "expired" from "reused".
+		// Any other error is an infrastructure failure (DB timeout,
+		// commit error): surfacing it as 503 tells the SPA to retry the
+		// same token rather than discarding a still-live session, so a
+		// transient Postgres blip doesn't log the whole fleet out. The
+		// detail (which may name hosts / DSNs) is logged server-side, not
+		// returned on the wire — the client only needs to know to retry.
+		if errors.Is(err, errRefreshTokenInvalid) || errors.Is(err, errRefreshTokenReuse) {
+			writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
+			return
+		}
+		log.Printf("console: rotate refresh token failed (infrastructure): %v", err)
+		writeError(w, http.StatusServiceUnavailable, "refresh temporarily unavailable; please retry")
+		return
+	}
+	t, ok := h.cfg.Tenants.LookupTenant(rotated.TenantID)
+	if !ok {
+		// The token resolved to a tenant that no longer exists
+		// (deleted between issue and refresh). Revoke every token for
+		// the gone tenant — not just the successor we minted — so the
+		// consumed predecessor and any sibling-device tokens are swept
+		// in one call rather than lingering until they expire or are
+		// replayed. Then 401.
+		_ = h.cfg.RefreshTokens.RevokeAllForTenant(rotated.TenantID)
+		writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
+		return
+	}
+	token, err := h.cfg.Tokens.IssueToken(rotated.TenantID)
+	if err != nil {
+		// Rotate already committed (predecessor consumed, successor
+		// stored) but the access token we'd pair it with failed, so the
+		// successor can't be delivered. Revoke the undeliverable
+		// successor, then 401: the presented token is spent and the
+		// session can't continue, so the client's only correct move is
+		// to re-authenticate. A 500/503 would be misleading — it
+		// signals "retry", but retrying with the spent predecessor
+		// deterministically hits reuse detection and 401s anyway. We
+		// log the underlying cause since the 401 hides it from the
+		// client (IssueToken failure is a server-side fault — a rand
+		// failure for MemoryTokenStore or a signing-key error for the
+		// JWT store — not a bad token).
+		if rerr := h.cfg.RefreshTokens.Revoke(rotated.Raw); rerr != nil {
+			// The successor was never sent to any client and carries 256
+			// bits of entropy, so an un-revoked orphan is unguessable and
+			// expires on its own — log it for observability rather than
+			// failing the response we're already returning.
+			log.Printf("console: revoke undeliverable successor for tenant %q failed: %v", rotated.TenantID, rerr)
+		}
+		log.Printf("console: issue access token during refresh for tenant %q failed: %v", rotated.TenantID, err)
+		writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
+		return
+	}
+	writeJSON(w, http.StatusOK, AuthResponse{
+		Tenant:                summarizeTenant(t),
+		Token:                 token,
+		RefreshToken:          rotated.Raw,
+		RefreshTokenExpiresAt: rotated.ExpiresAt,
+	})
+}
+
+// logout revokes a refresh token so it can no longer be rotated. It is
+// best-effort and idempotent: an unknown or already-revoked token still
+// returns 204, so a double logout (or a logout after the token already
+// expired) is not an error. Access tokens are stateless JWTs and cannot
+// be revoked server-side; they simply lapse at their short TTL.
+func (h *AuthHandler) logout(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.RefreshTokens == nil {
+		// Nothing to revoke without a refresh store; report success
+		// so the SPA's logout flow completes uniformly.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodyBytes)
+	var req refreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if _, tooLarge := err.(*http.MaxBytesError); tooLarge {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("logout payload exceeds %d bytes", maxAuthBodyBytes))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "decode logout: "+err.Error())
+		return
+	}
+	// Trim like the refresh handler so a whitespace-padded copy/paste
+	// resolves to the same lookup; an empty token is a no-op Revoke.
+	if err := h.cfg.RefreshTokens.Revoke(strings.TrimSpace(req.RefreshToken)); err != nil {
+		// Mirror the refresh handler exactly: a Revoke failure is a
+		// transient infrastructure fault (DB timeout / connection
+		// refused), so it returns 503 — the same retryable status the
+		// refresh handler uses for its non-sentinel Rotate errors — not
+		// 500. A status-specific SPA ("retry only on 503") then retries
+		// the logout so the server-side token is actually revoked rather
+		// than silently left live. The detail (which may name hosts /
+		// DSNs) is logged server-side, not returned on the wire.
+		log.Printf("console: revoke refresh token on logout failed (infrastructure): %v", err)
+		writeError(w, http.StatusServiceUnavailable, "logout temporarily unavailable; please retry")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // defaultB2CTenant builds the Tenant record written for a new

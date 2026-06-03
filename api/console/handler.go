@@ -232,6 +232,12 @@ type Config struct {
 	// deployments do not need to set it explicitly.
 	Tokens TokenStore
 
+	// RefreshTokens issues and rotates the long-lived refresh tokens
+	// the SPA exchanges for fresh access tokens at
+	// /api/v1/auth/refresh. When nil, login / signup succeed without
+	// returning a refresh token and the refresh endpoint replies 503.
+	RefreshTokens RefreshTokenStore
+
 	// AuthHooks are the optional production integrations the
 	// signup flow needs (CAPTCHA, verification email). All hooks
 	// are no-ops by default.
@@ -332,6 +338,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 			Tenants:         h.cfg.Tenants,
 			Auth:            h.cfg.Auth,
 			Tokens:          tokens,
+			RefreshTokens:   h.cfg.RefreshTokens,
 			GenerateKey:     h.cfg.GenerateKey,
 			NewTenantID:     h.cfg.NewTenantID,
 			Hooks:           h.cfg.AuthHooks,
