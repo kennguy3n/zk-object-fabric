@@ -65,6 +65,18 @@ type MigratorLogger interface {
 }
 
 // AADMigratorConfig configures the background AAD v1 migration sweep.
+//
+// Operator note — run a SINGLE instance. The worker has no
+// distributed lock or compare-and-swap on the manifest: it relies on
+// processing each object once, sequentially. Running concurrent
+// sweeps across a multi-node fleet is safe for data integrity (both
+// nodes re-encrypt the same plaintext under the same preserved
+// identity, so whichever manifest Put wins yields a valid, decryptable
+// v1 object) but can leak a backend piece — the losing node's freshly
+// written piece becomes an orphan. Orphans are logged and never
+// corrupt the object; they are independently reclaimable. Because this
+// is a one-time, opt-in fleet upgrade, schedule it on one node during
+// a low-traffic window rather than on every gateway.
 type AADMigratorConfig struct {
 	// Interval is the cadence between full sweeps. A value <= 0
 	// disables the worker entirely (Run returns immediately); the
