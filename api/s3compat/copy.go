@@ -106,6 +106,12 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "manifest store not configured", r.URL.Path)
 		return
 	}
+	// Object Lock overwrite enforcement (WS8.3): a copy that would
+	// replace a locked destination version in place is refused, just
+	// like a regular PUT overwrite.
+	if !h.allowObjectLockOverwrite(w, r, tenantID, dstBucket, dstKey) {
+		return
+	}
 	srcBucket, srcKey, srcVersion, perr := parseCopySource(r.Header.Get("x-amz-copy-source"))
 	if perr != nil {
 		writeError(w, http.StatusBadRequest, "InvalidArgument", perr.Error(), r.URL.Path)
@@ -475,13 +481,7 @@ func (h *Handler) writeCopyManifest(
 			PrimaryBackend: backend,
 		},
 	}
-	mkey := manifest_store.ManifestKey{
-		TenantID:      tenantID,
-		Bucket:        dstBucket,
-		ObjectKeyHash: dstHash,
-		VersionID:     dstVersion,
-	}
-	if err := h.cfg.Manifests.Put(r.Context(), mkey, manifest); err != nil {
+	rollbackCopyPiece := func() {
 		// Best-effort rollback for non-dedup copy: drop the
 		// freshly-uploaded destination piece. For dedup copy
 		// we'd also want to decrement the refcount, but the
@@ -494,6 +494,22 @@ func (h *Handler) writeCopyManifest(
 		} else if h.cfg.ContentIndex != nil && srcManifest.ContentHash != "" {
 			_, _ = h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, srcManifest.ContentHash)
 		}
+	}
+	// The copy destination is a new object version, so it inherits the
+	// bucket's default Object Lock retention (WS8.3) like any PUT.
+	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, dstBucket, manifest); err != nil {
+		rollbackCopyPiece()
+		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+	mkey := manifest_store.ManifestKey{
+		TenantID:      tenantID,
+		Bucket:        dstBucket,
+		ObjectKeyHash: dstHash,
+		VersionID:     dstVersion,
+	}
+	if err := h.cfg.Manifests.Put(r.Context(), mkey, manifest); err != nil {
+		rollbackCopyPiece()
 		writeError(w, http.StatusInternalServerError, "ManifestPutFailed", err.Error(), r.URL.Path)
 		return
 	}

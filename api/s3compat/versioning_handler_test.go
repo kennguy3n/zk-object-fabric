@@ -118,6 +118,37 @@ func TestPutBucketVersioning_Rejections(t *testing.T) {
 	}
 }
 
+// TestPutBucketVersioning_CannotSuspendWithObjectLock verifies the
+// AWS invariant that once Object Lock is enabled on a bucket,
+// versioning can no longer be suspended (Object Lock relies on
+// immutable versions). The transition must be refused with 409.
+func TestPutBucketVersioning_CannotSuspendWithObjectLock(t *testing.T) {
+	h, _ := newVersioningTestHandler()
+	setVersioning(t, h, "bucket", "Enabled")
+	enableObjectLock(t, h, "bucket", objectLockEnabledNoRule)
+
+	req := httptest.NewRequest(http.MethodPut, "/bucket?versioning",
+		strings.NewReader("<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>"))
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("suspend with Object Lock = %d, want 409; body=%s", rec.Code, rec.Body)
+	}
+
+	// The bucket must still report Enabled (the suspend was a no-op).
+	req = httptest.NewRequest(http.MethodGet, "/bucket?versioning", nil)
+	rec = httptest.NewRecorder()
+	h.dispatch(rec, req)
+	var doc versioningConfiguration
+	_ = xml.Unmarshal(rec.Body.Bytes(), &doc)
+	if doc.Status != "Enabled" {
+		t.Fatalf("Status after rejected suspend = %q, want Enabled", doc.Status)
+	}
+
+	// Re-affirming Enabled is still allowed (idempotent).
+	setVersioning(t, h, "bucket", "Enabled")
+}
+
 func TestBucketVersioning_NotImplementedWithoutStore(t *testing.T) {
 	h, _, _, _ := newTestHandler() // no BucketConfig wired
 	for _, method := range []string{http.MethodGet, http.MethodPut} {

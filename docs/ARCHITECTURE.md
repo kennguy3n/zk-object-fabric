@@ -94,8 +94,9 @@ zk-object-fabric/
     envelope.go           # Encryption envelope types
   metadata/
     manifest_store/       # Manifest persistence (memory + Postgres)
-    bucket_config/        # Per-bucket S3 config (versioning state;
-                          # memory + Postgres + SQLite) — WS8.4
+    bucket_config/        # Per-bucket S3 config (versioning state +
+                          # Object Lock config; memory + Postgres +
+                          # SQLite) — WS8.4 / WS8.3
     placement_policy/     # Placement engine and policy DSL
     erasure_coding/       # EC profiles, encoder, registry
     content_index/        # Dedup ContentIndex (memory + Postgres)
@@ -189,7 +190,10 @@ Object tags are stored as JSONB on the existing manifest row rather
 than in a new table. Bucket versioning state (WS8.4, built) lives in
 the `bucket_versioning` table owned by the `metadata/bucket_config`
 package, keyed by `(tenant_id, bucket)`; the embedded SQLite profile
-self-creates an equivalent table.
+self-creates an equivalent table. Bucket Object Lock config (WS8.3,
+built) lives in the `bucket_object_lock` table of the same package,
+while per-object-version retention mode / retain-until / legal-hold
+ride on the object manifest so they version with the object.
 
 ## Component overview
 
@@ -211,7 +215,9 @@ self-creates an equivalent table.
   consolidation for `managed` / `public_distribution` multipart
   uploads at `CompleteMultipartUpload` time.
 - Compliance hooks: residency pre-flight, audit trail emission,
-  legal-hold check on DELETE.
+  legal-hold check on DELETE. Object Lock / WORM (WS8.3) enforces
+  per-version retention (GOVERNANCE/COMPLIANCE) and legal holds in
+  the permanent-delete and PUT-overwrite paths.
 
 ### Console API — `api/console/`
 

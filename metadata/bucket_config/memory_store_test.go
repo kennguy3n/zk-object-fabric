@@ -3,6 +3,8 @@ package bucket_config
 import (
 	"context"
 	"testing"
+
+	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
 func TestMemoryStore_GetUnsetIsDefault(t *testing.T) {
@@ -72,6 +74,55 @@ func TestMemoryStore_RequiresTenantAndBucket(t *testing.T) {
 	}
 	if err := s.SetVersioning(ctx, "t1", "", VersioningEnabled); err == nil {
 		t.Fatal("SetVersioning(empty bucket): want error")
+	}
+}
+
+func TestMemoryStore_ObjectLockRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	// Unconfigured bucket → zero Config (disabled), nil error.
+	got, err := s.GetObjectLock(ctx, "t1", "b1")
+	if err != nil {
+		t.Fatalf("GetObjectLock: %v", err)
+	}
+	if got.Enabled {
+		t.Fatalf("unconfigured bucket = %+v, want disabled", got)
+	}
+
+	cfg := object_lock.Config{Enabled: true, DefaultMode: object_lock.ModeGovernance, DefaultDays: 30}
+	if err := s.SetObjectLock(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetObjectLock: %v", err)
+	}
+	got, _ = s.GetObjectLock(ctx, "t1", "b1")
+	if got != cfg {
+		t.Fatalf("round-trip = %+v, want %+v", got, cfg)
+	}
+
+	// Tenant/bucket isolation.
+	if other, _ := s.GetObjectLock(ctx, "t1", "b2"); other.Enabled {
+		t.Fatalf("t1/b2 leaked config: %+v", other)
+	}
+	if other, _ := s.GetObjectLock(ctx, "t2", "b1"); other.Enabled {
+		t.Fatalf("t2/b1 leaked config: %+v", other)
+	}
+}
+
+func TestMemoryStore_ObjectLockValidatesAndRequiresKeys(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+	// Invalid config is rejected.
+	bad := object_lock.Config{Enabled: true, DefaultMode: object_lock.ModeGovernance, DefaultDays: 1, DefaultYears: 1}
+	if err := s.SetObjectLock(ctx, "t1", "b1", bad); err == nil {
+		t.Fatal("SetObjectLock(invalid): want error")
+	}
+	if _, err := s.GetObjectLock(ctx, "", "b1"); err == nil {
+		t.Fatal("GetObjectLock(empty tenant): want error")
+	}
+	if err := s.SetObjectLock(ctx, "t1", "", object_lock.Config{Enabled: true}); err == nil {
+		t.Fatal("SetObjectLock(empty bucket): want error")
 	}
 }
 

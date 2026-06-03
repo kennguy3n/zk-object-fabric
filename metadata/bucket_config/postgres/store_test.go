@@ -1,10 +1,25 @@
 package postgres
 
-import "testing"
+import (
+	"database/sql"
+	"testing"
+)
 
 func TestNew_RejectsInvalidTable(t *testing.T) {
 	if _, err := New(Config{DB: nil}); err == nil {
 		t.Fatal("New(nil DB) = nil error, want error")
+	}
+}
+
+func TestNew_RejectsInvalidLockTable(t *testing.T) {
+	// A non-nil DB handle (never used) lets New get past the DB check
+	// so we exercise the lockTable ident validation.
+	db := &sql.DB{}
+	if _, err := New(Config{DB: db, LockTable: "bad;name"}); err == nil {
+		t.Fatal("New(invalid LockTable) = nil error, want error")
+	}
+	if _, err := New(Config{DB: db, Table: "1bad"}); err == nil {
+		t.Fatal("New(invalid Table) = nil error, want error")
 	}
 }
 

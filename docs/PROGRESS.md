@@ -615,8 +615,15 @@ independent PR; check the box when the handler is wired and covered by
       tags on the manifest row.
 - [ ] WS8.2 Object lifecycle (`?lifecycle`) — `metadata/lifecycle/`,
       `bucket_lifecycle` table, daily evaluator, console editor.
-- [ ] WS8.3 Object Lock / WORM (`?object-lock`, `?retention`,
-      `?legal-hold`) — `metadata/object_lock/`; depends on WS8.4.
+- [x] WS8.3 Object Lock / WORM (`?object-lock`, `?retention`,
+      `?legal-hold`) — `metadata/object_lock/` domain types,
+      `bucket_object_lock` config in `metadata/bucket_config`
+      (memory + Postgres + SQLite), per-object-version retention /
+      legal-hold on the manifest, default-retention inheritance at
+      PUT, and enforcement in the permanent-delete + PUT-overwrite
+      paths (GOVERNANCE bypassable, COMPLIANCE + legal hold absolute).
+      Depends on WS8.4. Covered by domain, store, and handler/
+      enforcement unit tests.
 - [x] WS8.4 Bucket versioning (`?versioning`) — Put/GetBucketVersioning
       config endpoints (`api/s3compat/versioning_handler.go`),
       `metadata/bucket_config` store (memory + Postgres + SQLite), and

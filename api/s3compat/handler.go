@@ -488,8 +488,7 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //   inventory          Bucket inventory configuration
 //   metrics            Bucket metrics configuration
 //   analytics          Bucket analytics configuration
-//   intelligent-tiering, object-lock, retention, legal-hold:
-//                      Object Lock surface (immutability)
+//   intelligent-tiering Auto-tiering configuration
 //   publicAccessBlock  Block-public-access settings
 //   ownershipControls  Object Ownership settings
 //
@@ -499,7 +498,9 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // routing in the dispatch switch below. Object tagging (WS8.1) and
 // bucket versioning (WS8.4) both followed exactly this path: their
 // keys (`tagging`, `versioning`) were removed here and `?tagging` /
-// `?versioning` routing was added to the dispatch switch.
+// `?versioning` routing was added to the dispatch switch. Object
+// Lock (WS8.3) followed the same path for `object-lock`, `retention`,
+// and `legal-hold`.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -536,9 +537,6 @@ var unsupportedSubresources = map[string]string{
 	"inventory":           "NotImplemented",
 	"metrics":             "NotImplemented",
 	"analytics":           "NotImplemented",
-	"object-lock":         "NotImplemented",
-	"retention":           "NotImplemented",
-	"legal-hold":          "NotImplemented",
 	"publicAccessBlock":   "NotImplemented",
 	"ownershipControls":   "NotImplemented",
 	"intelligent-tiering": "NotImplemented",
@@ -613,6 +611,23 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutBucketVersioning(w, r)
 			return
 		}
+		// Object Lock sub-resources (WS8.3) route before the
+		// implicit-CreateBucket / CopyObject / Put branches because
+		// they are distinct config operations, not object writes.
+		// ?object-lock is bucket-level; ?retention and ?legal-hold are
+		// object-level (their handlers validate the path).
+		if q.Has("object-lock") {
+			h.PutObjectLockConfiguration(w, r)
+			return
+		}
+		if q.Has("retention") {
+			h.PutObjectRetention(w, r)
+			return
+		}
+		if q.Has("legal-hold") {
+			h.PutObjectLegalHold(w, r)
+			return
+		}
 		// Bucket-level PUT (s3 mb / CreateBucket). Buckets in this
 		// gateway are implicit — they come into existence the first
 		// time an object is written to them — so CreateBucket is a
@@ -646,6 +661,22 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// Object tagging (?tagging) — WS8.1.
 		if q.Has("tagging") {
 			h.GetObjectTagging(w, r)
+			return
+		}
+		// Object Lock sub-resources (WS8.3). ?object-lock is
+		// bucket-level (guard key=="" so GET /{bucket}/{key}?object-lock
+		// falls through to the object GET); ?retention and ?legal-hold
+		// are object-level.
+		if key == "" && q.Has("object-lock") {
+			h.GetObjectLockConfiguration(w, r, bucket)
+			return
+		}
+		if key != "" && q.Has("retention") {
+			h.GetObjectRetention(w, r)
+			return
+		}
+		if key != "" && q.Has("legal-hold") {
+			h.GetObjectLegalHold(w, r)
 			return
 		}
 		if key == "" && q.Has("uploads") {
@@ -755,6 +786,18 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.cfg.Manifests == nil || h.cfg.Placement == nil {
 		writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "manifest store or placement engine not configured", r.URL.Path)
+		return
+	}
+
+	// Object Lock overwrite enforcement (WS8.3): when versioning is
+	// NOT Enabled, a PUT replaces the current version in place, which
+	// would destroy a locked version. Refuse the overwrite up-front
+	// (before touching the backend) if the current version is locked.
+	// With versioning Enabled the PUT creates a new version and the
+	// locked one is preserved, so no check is needed — and Object Lock
+	// requires versioning, so this guard only bites the suspended/unset
+	// edge. The helper writes the response on block/error.
+	if !h.allowObjectLockOverwrite(w, r, tenantID, bucket, key) {
 		return
 	}
 
@@ -900,6 +943,11 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			Generation:     1,
 			PrimaryBackend: backendName,
 		},
+	}
+	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
+		_ = provider.DeletePiece(r.Context(), pieceID)
+		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
+		return
 	}
 	mkey := manifest_store.ManifestKey{
 		TenantID:      tenantID,
@@ -2259,6 +2307,17 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "ManifestGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+	// Object Lock enforcement (WS8.3): a version under an active
+	// retention or a legal hold cannot be permanently deleted.
+	// GOVERNANCE retention can be bypassed with the bypass header;
+	// COMPLIANCE and legal holds cannot. This applies to permanent
+	// version deletes only — a versioning-enabled DELETE that inserts
+	// a delete marker (handled above) preserves the locked version and
+	// is always allowed.
+	if msg, locked := objectLockBlocksDelete(manifest, h.cfg.Now(), governanceBypassRequested(r)); locked {
+		writeError(w, http.StatusForbidden, "AccessDenied", msg, r.URL.Path)
 		return
 	}
 	// Delete the manifest first so a mid-delete failure leaves orphan

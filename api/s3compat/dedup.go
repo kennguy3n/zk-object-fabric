@@ -523,6 +523,13 @@ func (h *Handler) putDeduped(
 			PrimaryBackend: pieceBackend,
 		},
 	}
+	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
+		if _, derr := h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, res.ContentHash); derr != nil {
+			_ = derr
+		}
+		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
+		return
+	}
 	mkey := manifest_store.ManifestKey{
 		TenantID:      tenantID,
 		Bucket:        bucket,

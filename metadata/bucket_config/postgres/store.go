@@ -13,18 +13,22 @@ import (
 	"fmt"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
+	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 )
 
-// Config is the store wiring. Table defaults to "bucket_versioning".
+// Config is the store wiring. Table defaults to "bucket_versioning"
+// and LockTable to "bucket_object_lock".
 type Config struct {
-	DB    *sql.DB
-	Table string
+	DB        *sql.DB
+	Table     string
+	LockTable string
 }
 
-// Store is a bucket_config.Store backed by a Postgres table.
+// Store is a bucket_config.Store backed by Postgres tables.
 type Store struct {
-	db    *sql.DB
-	table string
+	db        *sql.DB
+	table     string
+	lockTable string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
@@ -42,7 +46,14 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(table) {
 		return nil, fmt.Errorf("postgres: invalid table name %q", table)
 	}
-	return &Store{db: cfg.DB, table: table}, nil
+	lockTable := cfg.LockTable
+	if lockTable == "" {
+		lockTable = "bucket_object_lock"
+	}
+	if !isSafeIdent(lockTable) {
+		return nil, fmt.Errorf("postgres: invalid lock table name %q", lockTable)
+	}
+	return &Store{db: cfg.DB, table: table, lockTable: lockTable}, nil
 }
 
 // GetVersioning returns the state for (tenantID, bucket) or
@@ -78,6 +89,55 @@ func (s *Store) SetVersioning(ctx context.Context, tenantID, bucket string, stat
 	`, s.table)
 	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, string(state)); err != nil {
 		return fmt.Errorf("postgres: bucket_versioning set: %w", err)
+	}
+	return nil
+}
+
+// GetObjectLock returns the Object Lock config for (tenantID, bucket)
+// or the zero Config when no row exists.
+func (s *Store) GetObjectLock(ctx context.Context, tenantID, bucket string) (object_lock.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return object_lock.Config{}, errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT enabled, default_mode, default_days, default_years FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.lockTable)
+	var (
+		enabled     bool
+		defaultMode string
+		defaultDays int
+		defaultYrs  int
+	)
+	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&enabled, &defaultMode, &defaultDays, &defaultYrs); {
+	case errors.Is(err, sql.ErrNoRows):
+		return object_lock.Config{}, nil
+	case err != nil:
+		return object_lock.Config{}, fmt.Errorf("postgres: bucket_object_lock get: %w", err)
+	}
+	return object_lock.Config{
+		Enabled:      enabled,
+		DefaultMode:  object_lock.RetentionMode(defaultMode),
+		DefaultDays:  defaultDays,
+		DefaultYears: defaultYrs,
+	}, nil
+}
+
+// SetObjectLock upserts the Object Lock config for (tenantID, bucket).
+func (s *Store) SetObjectLock(ctx context.Context, tenantID, bucket string, cfg object_lock.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, enabled, default_mode, default_days, default_years, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, now())
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET enabled = EXCLUDED.enabled, default_mode = EXCLUDED.default_mode,
+			default_days = EXCLUDED.default_days, default_years = EXCLUDED.default_years,
+			updated_at = now()
+	`, s.lockTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, cfg.Enabled, string(cfg.DefaultMode), cfg.DefaultDays, cfg.DefaultYears); err != nil {
+		return fmt.Errorf("postgres: bucket_object_lock set: %w", err)
 	}
 	return nil
 }

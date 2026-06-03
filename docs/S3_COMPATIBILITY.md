@@ -30,8 +30,8 @@ deployment probe. The authoritative reject list is
 | `CopyObject`                       | Supported       | Server-side copy within same tenant                                |
 | Presigned GET/PUT                  | Supported       | Phase-independent URL format                                       |
 | `Put/Get/DeleteObjectTagging`      | Supported       | Tags as JSONB on manifest; 10 tags/object, 128/256-char limits     |
-| `Put/GetObjectRetention`           | Planned (WS8.3) | Governance/compliance retain-until-date                            |
-| `Put/GetObjectLegalHold`           | Planned (WS8.3) | On/off legal hold per object                                       |
+| `Put/GetObjectRetention`           | Supported       | Governance/compliance retain-until-date; per object version        |
+| `Put/GetObjectLegalHold`           | Supported       | On/off legal hold per object version                               |
 | `GetObjectAttributes`              | Out of scope    | Covered by `HeadObject` + tagging                                  |
 | S3 Select                          | Out of scope    | SQL-on-objects excluded                                            |
 
@@ -45,7 +45,7 @@ deployment probe. The authoritative reject list is
 | `ListObjectVersions`                           | Supported       | Returns manifest versions                                   |
 | `Put/GetBucketVersioning`                      | Supported       | Bucket-level Enabled/Suspended config; delete markers       |
 | `Put/Get/DeleteBucketLifecycleConfiguration`   | Planned (WS8.2) | Per-bucket rules + daily evaluator                          |
-| `Put/GetObjectLockConfiguration`               | Planned (WS8.3) | Requires versioning (WS8.4)                                 |
+| `Put/GetObjectLockConfiguration`               | Supported       | Default retention rule; requires versioning (WS8.4)         |
 | `Put/Get/DeleteBucketCors`                     | Planned (WS8.5) | Enables browser direct-upload via presigned URLs            |
 | `Put/GetBucketNotificationConfiguration`       | Planned (WS8.6) | Webhook transport; `ObjectCreated`/`ObjectRemoved`          |
 | `Put/Get/DeleteBucketEncryption`               | Planned (WS8.7) | Maps SSE header to ZKOF encryption modes                    |
