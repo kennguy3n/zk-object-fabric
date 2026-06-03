@@ -2273,12 +2273,13 @@ func buildMFAStore(cfg config.Config, db, embeddedDB *sql.DB) console.MFAStore {
 		log.Printf("gateway: %s: %v; falling back to in-memory", what, err)
 		return console.NewMemoryMFAStore()
 	}
-	// The persistent backends seal the TOTP secret at rest under the
-	// gateway's at-rest key (see buildMFASecretSealer). The in-memory
-	// store needs no sealer — it never touches disk.
-	sealer := console.WithSecretSealer(buildMFASecretSealer(cfg))
+	// Only the persistent backends seal the TOTP secret at rest under the
+	// gateway's at-rest key (see buildMFASecretSealer); the sealer is built
+	// inside those branches so the in-memory path — which never touches
+	// disk and needs no sealer — does not load the at-rest key.
 	if db == nil {
 		if embeddedDB != nil {
+			sealer := console.WithSecretSealer(buildMFASecretSealer(cfg))
 			store, err := console.NewSQLiteMFAStore(embeddedDB, sealer)
 			if err != nil {
 				return memoryFallback("build embedded mfa store", err)
@@ -2288,6 +2289,7 @@ func buildMFAStore(cfg config.Config, db, embeddedDB *sql.DB) console.MFAStore {
 		}
 		return console.NewMemoryMFAStore()
 	}
+	sealer := console.WithSecretSealer(buildMFASecretSealer(cfg))
 	store, err := console.NewPostgresMFAStore(db, sealer)
 	if err != nil {
 		return memoryFallback("build postgres mfa store", err)
