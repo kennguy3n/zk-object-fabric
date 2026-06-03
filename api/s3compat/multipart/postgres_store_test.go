@@ -90,6 +90,7 @@ func requireMultipartPostgres(t *testing.T) *sql.DB {
 	if _, err := db.ExecContext(ctx, `
 		CREATE TABLE multipart_parts_test (
 			upload_id           TEXT NOT NULL REFERENCES multipart_uploads_test(upload_id) ON DELETE CASCADE,
+			tenant_id           TEXT,
 			part_number         INTEGER NOT NULL,
 			piece_id            TEXT NOT NULL,
 			backend             TEXT NOT NULL,
@@ -142,7 +143,7 @@ func TestPostgresStore_CreateGetCompleteAbort(t *testing.T) {
 	}
 
 	// Round-trip Get.
-	got, err := store.Get("u1")
+	got, err := store.Get("tenant-a", "u1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -153,7 +154,7 @@ func TestPostgresStore_CreateGetCompleteAbort(t *testing.T) {
 	// PutPart with a hash captured on the upload pointer (matches
 	// the multipart_handler flow).
 	got.SetPartHash(1, []byte("hash-1"))
-	if err := store.PutPart("u1", Part{
+	if err := store.PutPart("tenant-a", "u1", Part{
 		PartNumber: 1, PieceID: "p1", Backend: "be0", ETag: "etag1", SizeBytes: 10,
 	}); err != nil {
 		t.Fatalf("PutPart: %v", err)
@@ -172,7 +173,7 @@ func TestPostgresStore_CreateGetCompleteAbort(t *testing.T) {
 	}
 
 	// After Complete the upload is gone.
-	if _, err := store.Get("u1"); err != ErrNotFound {
+	if _, err := store.Get("tenant-a", "u1"); err != ErrNotFound {
 		t.Errorf("post-complete Get err = %v, want ErrNotFound", err)
 	}
 
@@ -184,15 +185,16 @@ func TestPostgresStore_CreateGetCompleteAbort(t *testing.T) {
 	if _, _, err := store.Abort("u2", "tenant-a"); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if _, err := store.Get("u2"); err != ErrNotFound {
+	if _, err := store.Get("tenant-a", "u2"); err != ErrNotFound {
 		t.Errorf("post-abort Get err = %v, want ErrNotFound", err)
 	}
 }
 
-// TestPostgresStore_TenantMismatch verifies that Abort / Complete
-// against the wrong tenant return ErrTenantMismatch and leave the
-// upload intact for the legitimate owner.
-func TestPostgresStore_TenantMismatch(t *testing.T) {
+// TestPostgresStore_CrossTenantAbortIsNotFound verifies that Abort
+// against the wrong tenant is reported as ErrNotFound (the foreign
+// upload is invisible under the caller's tenant binding — no 403
+// existence oracle) and leaves the upload intact for its real owner.
+func TestPostgresStore_CrossTenantAbortIsNotFound(t *testing.T) {
 	db := requireMultipartPostgres(t)
 	store, err := NewPostgresStore(PostgresConfig{
 		DB:                  db,
@@ -207,10 +209,11 @@ func TestPostgresStore_TenantMismatch(t *testing.T) {
 	if err := store.Create(&Upload{ID: "u3", TenantID: "tenant-a", Bucket: "b", ObjectKey: "k"}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, _, err := store.Abort("u3", "wrong-tenant"); err != ErrTenantMismatch {
-		t.Errorf("Abort wrong tenant err = %v, want ErrTenantMismatch", err)
+	if _, _, err := store.Abort("u3", "wrong-tenant"); err != ErrNotFound {
+		t.Errorf("Abort wrong tenant err = %v, want ErrNotFound", err)
 	}
-	if _, err := store.Get("u3"); err != nil {
+	// The real owner can still see and abort it.
+	if _, err := store.Get("tenant-a", "u3"); err != nil {
 		t.Errorf("Get after wrong-tenant Abort err = %v, want nil", err)
 	}
 }
@@ -246,7 +249,7 @@ func TestPostgresStore_ExpirySweeper(t *testing.T) {
 	if sweeperCalls != 1 {
 		t.Errorf("cleanup callback fired %d times, want 1", sweeperCalls)
 	}
-	if _, err := store.Get("u-old"); err != ErrNotFound {
+	if _, err := store.Get("t", "u-old"); err != ErrNotFound {
 		t.Errorf("post-sweep Get err = %v, want ErrNotFound", err)
 	}
 }

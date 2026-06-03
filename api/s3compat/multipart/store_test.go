@@ -19,10 +19,10 @@ func TestMemoryStore_CreatePutComplete(t *testing.T) {
 	if err := store.Create(upload); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := store.PutPart("u1", Part{PartNumber: 2, PieceID: "p2", ETag: "e2", SizeBytes: 10}); err != nil {
+	if err := store.PutPart("t1", "u1", Part{PartNumber: 2, PieceID: "p2", ETag: "e2", SizeBytes: 10}); err != nil {
 		t.Fatalf("PutPart 2: %v", err)
 	}
-	if err := store.PutPart("u1", Part{PartNumber: 1, PieceID: "p1", ETag: "e1", SizeBytes: 20}); err != nil {
+	if err := store.PutPart("t1", "u1", Part{PartNumber: 1, PieceID: "p1", ETag: "e1", SizeBytes: 20}); err != nil {
 		t.Fatalf("PutPart 1: %v", err)
 	}
 
@@ -39,7 +39,7 @@ func TestMemoryStore_CreatePutComplete(t *testing.T) {
 	if final.ObjectKey != "k1" {
 		t.Fatalf("unexpected final upload: ObjectKey=%q", final.ObjectKey)
 	}
-	if _, err := store.Get("u1"); !errors.Is(err, ErrNotFound) {
+	if _, err := store.Get("t1", "u1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after complete, got %v", err)
 	}
 }
@@ -47,13 +47,13 @@ func TestMemoryStore_CreatePutComplete(t *testing.T) {
 func TestMemoryStore_CompleteETagMismatch(t *testing.T) {
 	store := NewMemoryStore()
 	_ = store.Create(&Upload{ID: "u1", TenantID: "t", Bucket: "b", ObjectKey: "k", Backend: "x"})
-	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "p1", ETag: "actual"})
+	_ = store.PutPart("t", "u1", Part{PartNumber: 1, PieceID: "p1", ETag: "actual"})
 	_, _, err := store.Complete("u1", "t", "b", "k", []PartReference{{PartNumber: 1, ETag: "wrong"}})
 	if !errors.Is(err, ErrPartETagMismatch) {
 		t.Fatalf("expected ErrPartETagMismatch, got %v", err)
 	}
 	// Upload must still be live so the client can retry.
-	if _, err := store.Get("u1"); err != nil {
+	if _, err := store.Get("t", "u1"); err != nil {
 		t.Fatalf("upload must survive a bad complete: %v", err)
 	}
 }
@@ -61,7 +61,7 @@ func TestMemoryStore_CompleteETagMismatch(t *testing.T) {
 func TestMemoryStore_CompleteMissingPart(t *testing.T) {
 	store := NewMemoryStore()
 	_ = store.Create(&Upload{ID: "u1", TenantID: "t", Bucket: "b", ObjectKey: "k", Backend: "x"})
-	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "p1", ETag: "e1"})
+	_ = store.PutPart("t", "u1", Part{PartNumber: 1, PieceID: "p1", ETag: "e1"})
 	_, _, err := store.Complete("u1", "t", "b", "k", []PartReference{
 		{PartNumber: 1, ETag: "e1"},
 		{PartNumber: 2, ETag: "e2"},
@@ -69,7 +69,7 @@ func TestMemoryStore_CompleteMissingPart(t *testing.T) {
 	if !errors.Is(err, ErrPartNotFound) {
 		t.Fatalf("expected ErrPartNotFound, got %v", err)
 	}
-	if _, err := store.Get("u1"); err != nil {
+	if _, err := store.Get("t", "u1"); err != nil {
 		t.Fatalf("upload must survive a missing-part complete: %v", err)
 	}
 }
@@ -77,8 +77,8 @@ func TestMemoryStore_CompleteMissingPart(t *testing.T) {
 func TestMemoryStore_AbortReturnsParts(t *testing.T) {
 	store := NewMemoryStore()
 	_ = store.Create(&Upload{ID: "u1", TenantID: "t", Bucket: "b", ObjectKey: "k", Backend: "x"})
-	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "p1"})
-	_ = store.PutPart("u1", Part{PartNumber: 2, PieceID: "p2"})
+	_ = store.PutPart("t", "u1", Part{PartNumber: 1, PieceID: "p1"})
+	_ = store.PutPart("t", "u1", Part{PartNumber: 2, PieceID: "p2"})
 	_, parts, err := store.Abort("u1", "t")
 	if err != nil {
 		t.Fatalf("Abort: %v", err)
@@ -86,7 +86,7 @@ func TestMemoryStore_AbortReturnsParts(t *testing.T) {
 	if len(parts) != 2 {
 		t.Fatalf("expected 2 parts from abort, got %d", len(parts))
 	}
-	if _, err := store.Get("u1"); !errors.Is(err, ErrNotFound) {
+	if _, err := store.Get("t", "u1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected upload to be gone after abort: %v", err)
 	}
 }
@@ -94,14 +94,34 @@ func TestMemoryStore_AbortReturnsParts(t *testing.T) {
 func TestMemoryStore_PutPartOverwrite(t *testing.T) {
 	store := NewMemoryStore()
 	_ = store.Create(&Upload{ID: "u1"})
-	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "first", ETag: "1"})
-	_ = store.PutPart("u1", Part{PartNumber: 1, PieceID: "second", ETag: "2"})
-	u, err := store.Get("u1")
+	_ = store.PutPart("", "u1", Part{PartNumber: 1, PieceID: "first", ETag: "1"})
+	_ = store.PutPart("", "u1", Part{PartNumber: 1, PieceID: "second", ETag: "2"})
+	u, err := store.Get("", "u1")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if u.Parts()[1].PieceID != "second" {
 		t.Fatalf("re-uploaded part should win: %+v", u.Parts()[1])
+	}
+}
+
+// TestMemoryStore_CrossTenantIsScopedToNotFound verifies that Get and
+// PutPart against an upload owned by a different tenant report
+// ErrNotFound — the in-memory mirror of the Postgres store's RLS
+// behaviour, so a caller cannot probe for another tenant's upload.
+func TestMemoryStore_CrossTenantIsScopedToNotFound(t *testing.T) {
+	store := NewMemoryStore()
+	_ = store.Create(&Upload{ID: "u1", TenantID: "owner", Bucket: "b", ObjectKey: "k", Backend: "x"})
+
+	if _, err := store.Get("intruder", "u1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant Get err = %v, want ErrNotFound", err)
+	}
+	if err := store.PutPart("intruder", "u1", Part{PartNumber: 1, PieceID: "p"}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant PutPart err = %v, want ErrNotFound", err)
+	}
+	// The legitimate owner is unaffected.
+	if _, err := store.Get("owner", "u1"); err != nil {
+		t.Errorf("owner Get err = %v, want nil", err)
 	}
 }
 

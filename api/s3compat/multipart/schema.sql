@@ -70,6 +70,17 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     upload_id           TEXT        NOT NULL
                                       REFERENCES multipart_uploads(upload_id)
                                       ON DELETE CASCADE,
+    -- tenant_id mirrors the owning upload's tenant_id. It is
+    -- denormalised onto every part row so the uniform Row-Level
+    -- Security policy (internal/rlsdb.Statements) can scope parts the
+    -- same way it scopes every other tenant table — on a tenant_id
+    -- column against the zkof.tenant_id GUC. Without it the parts
+    -- table could not carry the tenant_isolation policy, and the
+    -- cascade delete from multipart_uploads would not be RLS-visible
+    -- under a tenant-bound transaction. PutPart populates it from the
+    -- session's upload; the ALTER + backfill below arms pre-existing
+    -- deployments.
+    tenant_id           TEXT,
     part_number         INTEGER     NOT NULL,
     piece_id            TEXT        NOT NULL,
     backend             TEXT        NOT NULL,
@@ -87,3 +98,21 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     uploaded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (upload_id, part_number)
 );
+
+-- Backfill multipart_parts.tenant_id for deployments whose parts table
+-- predates Row-Level Security: CREATE TABLE IF NOT EXISTS above is a no-op
+-- on an existing table, so it would NOT add the column. This idempotent
+-- ALTER does, and the UPDATE copies each part's tenant from its owning
+-- upload so previously-stored in-flight parts become RLS-visible under a
+-- tenant-bound transaction. Both are no-ops on a fresh DB (the column
+-- exists from CREATE TABLE and no rows yet need backfilling) and on an
+-- already-migrated DB. Apply before rolling out the RLS-aware gateway so
+-- the parts of an in-flight legacy upload are not orphaned (fail-closed
+-- invisible) mid-deploy.
+ALTER TABLE multipart_parts ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+
+UPDATE multipart_parts p
+   SET tenant_id = u.tenant_id
+  FROM multipart_uploads u
+ WHERE p.upload_id = u.upload_id
+   AND p.tenant_id IS NULL;

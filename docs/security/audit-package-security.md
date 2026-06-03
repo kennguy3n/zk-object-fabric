@@ -416,26 +416,33 @@ should attempt:
   The application layer enforces tenant scoping on every query
   (`metadata/manifest_store/postgres/store.go`); the audit should
   look for any path that bypasses the `Store` wrapper. RLS is now
-  armed as defence-in-depth on the **manifests**, **content_index**, and
-  **bucket_config** (versioning, object lock, CORS, lifecycle) tables:
+  armed as defence-in-depth on the **manifests**, **content_index**,
+  **bucket_config** (versioning, object lock, CORS, lifecycle), and
+  **multipart** (`multipart_uploads` + `multipart_parts`) tables:
   each tenant-scoped statement runs in a transaction that binds
   a transaction-local `zkof.tenant_id` GUC, and a FORCE'd
   `tenant_isolation` policy re-checks it. The mechanism is centralised
   in `internal/rlsdb` (GUC binding + the single-source policy
   DDL), with per-table operator references in
   `metadata/manifest_store/postgres/rls.sql`,
-  `metadata/content_index/postgres/rls.sql`, and
-  `metadata/bucket_config/postgres/rls.sql`. The audited cross-tenant
+  `metadata/content_index/postgres/rls.sql`,
+  `metadata/bucket_config/postgres/rls.sql`, and
+  `api/s3compat/multipart/rls.sql`. The audited cross-tenant
   readers (`ScanManifests` for the AAD migration sweep, `ListTenants`
-  for orphan GC, `ListLifecycle` for the background lifecycle evaluator)
+  for orphan GC, `ListLifecycle` for the background lifecycle evaluator,
+  and the multipart expiry sweeper's `sweepExpired` enumeration)
   bind a `zkof.scan_all` read-only bypass that the
   `WITH CHECK` clause deliberately omits, so no sweep can write across
-  tenants. RLS only applies to a non-superuser, non-`BYPASSRLS` role,
+  tenants — the multipart sweeper re-binds each upload's own tenant
+  before deleting it. `multipart_parts` carries a denormalised
+  `tenant_id` (copied from its owning upload) so the same uniform policy
+  applies; a cross-tenant `UploadPart`/`Complete`/`Abort` therefore sees
+  zero rows and returns `NoSuchUpload` (404) rather than a 403 existence
+  oracle. RLS only applies to a non-superuser, non-`BYPASSRLS` role,
   so the gateway refuses to boot in production on a privileged metadata
   connection (`cmd/gateway/main.go` `checkProductionRLSRole`). The
-  remaining tenant tables (the `api/s3compat/multipart` store and the
-  console auth/refresh/mfa stores) reuse the same substrate in
-  follow-ups.
+  remaining tenant tables (the console auth/refresh/mfa stores) reuse the
+  same substrate in follow-ups.
 - **CMK is held by the gateway process in `ManagedEncrypted` mode.**
   This is the documented trust model — in Strict ZK mode the
   gateway never sees the CMK; in `ManagedEncrypted` mode the

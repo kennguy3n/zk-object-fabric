@@ -240,12 +240,25 @@ func (u *Upload) SortedParts() []Part {
 //
 // Complete and Abort take the caller's tenant / bucket / object-key
 // claim so the authorization check is atomic with the state-changing
-// delete: a tenant mismatch returns ErrTenantMismatch without
-// removing the upload.
+// delete. On a cross-tenant upload ID the upload is always left
+// intact; the error differs by backing store: the in-memory store
+// returns ErrTenantMismatch (403), while the Postgres store returns
+// ErrNotFound (404) because RLS makes the foreign row invisible under
+// the caller's tenant binding — the same no-existence-oracle posture
+// as Get/PutPart. A same-tenant bucket/object-key mismatch returns
+// ErrUploadMismatch from both.
+//
+// Get and PutPart take the caller's tenantID so the lookup is scoped
+// to the owning tenant. An upload ID that belongs to a different
+// tenant is reported as ErrNotFound (a 404 NoSuchUpload), not a 403:
+// this removes the cross-tenant existence oracle and lets the Postgres
+// store rely on the same RLS-bound transaction that scopes every other
+// metadata read. The Postgres store binds tenantID to the zkof.tenant_id
+// GUC for the lookup; MemoryStore enforces the equivalent check in-process.
 type Store interface {
 	Create(upload *Upload) error
-	Get(uploadID string) (*Upload, error)
-	PutPart(uploadID string, part Part) error
+	Get(tenantID, uploadID string) (*Upload, error)
+	PutPart(tenantID, uploadID string, part Part) error
 	Complete(uploadID, tenantID, bucket, objectKey string, expected []PartReference) ([]Part, *Upload, error)
 	Abort(uploadID, tenantID string) (*Upload, []Part, error)
 	// List returns all in-flight uploads for (tenantID, bucket).
@@ -291,21 +304,26 @@ func (s *MemoryStore) Create(upload *Upload) error {
 	return nil
 }
 
-// Get returns the upload keyed by ID or ErrNotFound.
-func (s *MemoryStore) Get(uploadID string) (*Upload, error) {
+// Get returns the upload keyed by ID, scoped to tenantID. An upload
+// owned by a different tenant is reported as ErrNotFound (not a tenant
+// mismatch) so the caller cannot distinguish "exists, other tenant"
+// from "does not exist" — the same fail-closed, no-existence-oracle
+// behaviour the Postgres store gets from its tenant-bound RLS query.
+func (s *MemoryStore) Get(tenantID, uploadID string) (*Upload, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u, ok := s.uploads[uploadID]
-	if !ok {
+	if !ok || u.TenantID != tenantID {
 		return nil, ErrNotFound
 	}
 	return u, nil
 }
 
-// PutPart records (or overwrites) a part for an in-flight upload. S3
-// semantics allow re-uploading a part; the latest write wins.
-func (s *MemoryStore) PutPart(uploadID string, part Part) error {
-	u, err := s.Get(uploadID)
+// PutPart records (or overwrites) a part for an in-flight upload,
+// scoped to tenantID. S3 semantics allow re-uploading a part; the
+// latest write wins. A cross-tenant upload ID returns ErrNotFound.
+func (s *MemoryStore) PutPart(tenantID, uploadID string, part Part) error {
+	u, err := s.Get(tenantID, uploadID)
 	if err != nil {
 		return err
 	}

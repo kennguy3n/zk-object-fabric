@@ -33,6 +33,9 @@
 //	    upload_id           TEXT NOT NULL
 //	                          REFERENCES multipart_uploads(upload_id)
 //	                          ON DELETE CASCADE,
+//	    tenant_id           TEXT,  -- denormalised from the owning
+//	                               -- upload so the uniform RLS policy
+//	                               -- keys on it (see rls.sql)
 //	    part_number         INTEGER NOT NULL,
 //	    piece_id            TEXT NOT NULL,
 //	    backend             TEXT NOT NULL,
@@ -74,7 +77,17 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/encryption"
 	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
+	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 )
+
+// rowQuerier is the read surface shared by *sql.DB and *sql.Tx.
+// loadUpload / loadParts take it so the same scan code runs both
+// inside a tenant-bound transaction (request paths) and inside a
+// scan_all transaction (the expiry sweeper).
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
 
 // DefaultUploadTTL is the default time-to-live for an in-flight
 // multipart upload before the expiry sweeper deletes it. Mirrors
@@ -264,7 +277,14 @@ func (s *PostgresStore) Create(upload *Upload) error {
 			created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, s.uploadsTable)
-	if _, err := s.db.ExecContext(context.Background(), q,
+	// Bind the upload's tenant so the RLS WITH CHECK clause admits the
+	// INSERT (it rejects any row whose tenant_id != the bound GUC).
+	tx, err := rlsdb.BeginTenant(context.Background(), s.db, upload.TenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(context.Background(), q,
 		upload.ID,
 		upload.TenantID,
 		upload.Bucket,
@@ -280,6 +300,9 @@ func (s *PostgresStore) Create(upload *Upload) error {
 		upload.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("multipart: insert upload: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("multipart: commit create: %w", err)
 	}
 
 	// Initialise the in-process session cache so subsequent Get
@@ -309,15 +332,42 @@ func (s *PostgresStore) Create(upload *Upload) error {
 // with gateway-side encryption against a store missing a Wrapper
 // surface a clear error rather than silently returning an empty
 // DEKMaterial.
-func (s *PostgresStore) Get(uploadID string) (*Upload, error) {
+func (s *PostgresStore) Get(tenantID, uploadID string) (*Upload, error) {
 	if cached, ok := s.sessions.Load(uploadID); ok {
-		return cached.(*Upload), nil
+		u := cached.(*Upload)
+		// Defence-in-depth: the cache is keyed by upload_id alone, so a
+		// cached pointer could belong to another tenant. Cross-check the
+		// owner and treat a mismatch as a miss (ErrNotFound), mirroring
+		// the RLS query below — a cross-tenant caller must not even learn
+		// the upload exists.
+		if u.TenantID != tenantID {
+			return nil, ErrNotFound
+		}
+		return u, nil
 	}
-	upload, err := s.loadUpload(uploadID)
+	// Bind the caller's tenant so the row + parts are only visible if
+	// they belong to tenantID. A cross-tenant upload_id returns zero
+	// rows -> ErrNotFound (404 NoSuchUpload), with no 403 existence
+	// oracle.
+	tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.loadParts(uploadID, upload); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	upload, err := s.loadUpload(tx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	// Application-layer tenant predicate (layer 1), redundant with the
+	// RLS binding above (layer 2): loadUpload selects on upload_id alone,
+	// so on a superuser / unarmed dev database — where Postgres bypasses
+	// RLS — this is what keeps a cross-tenant upload_id fail-closed
+	// (ErrNotFound, no 403 oracle). Under a non-superuser production role
+	// RLS already returned zero rows, so this never fires there.
+	if upload.TenantID != tenantID {
+		return nil, ErrNotFound
+	}
+	if err := s.loadParts(tx, uploadID, upload); err != nil {
 		return nil, err
 	}
 	s.sessions.Store(uploadID, upload)
@@ -327,14 +377,14 @@ func (s *PostgresStore) Get(uploadID string) (*Upload, error) {
 // loadUpload reads the single upload row, unmarshals the policy,
 // and (when wrapped_dek is populated) unwraps the DEK back into
 // DEKMaterial. Returns ErrNotFound when the row is missing.
-func (s *PostgresStore) loadUpload(uploadID string) (*Upload, error) {
-	q := fmt.Sprintf(`
+func (s *PostgresStore) loadUpload(q rowQuerier, uploadID string) (*Upload, error) {
+	query := fmt.Sprintf(`
 		SELECT tenant_id, bucket, object_key, version_id, backend, policy,
 		       enc_mode, wrapped_dek, wrapped_key_id, wrap_algorithm,
 		       content_algorithm, created_at
 		FROM %s WHERE upload_id = $1
 	`, s.uploadsTable)
-	row := s.db.QueryRowContext(context.Background(), q, uploadID)
+	row := q.QueryRowContext(context.Background(), query, uploadID)
 	var (
 		policyJSON       []byte
 		wrappedDEK       []byte
@@ -411,13 +461,13 @@ func (s *PostgresStore) loadUpload(uploadID string) (*Upload, error) {
 
 // loadParts populates upload.parts and the hash maps from the
 // multipart_parts table.
-func (s *PostgresStore) loadParts(uploadID string, upload *Upload) error {
-	q := fmt.Sprintf(`
+func (s *PostgresStore) loadParts(q rowQuerier, uploadID string, upload *Upload) error {
+	query := fmt.Sprintf(`
 		SELECT part_number, piece_id, backend, etag, size_bytes,
 		       part_hash, plaintext_part_hash, uploaded_at
 		FROM %s WHERE upload_id = $1 ORDER BY part_number
 	`, s.partsTable)
-	rows, err := s.db.QueryContext(context.Background(), q, uploadID)
+	rows, err := q.QueryContext(context.Background(), query, uploadID)
 	if err != nil {
 		return fmt.Errorf("multipart: query parts: %w", err)
 	}
@@ -462,11 +512,11 @@ func (s *PostgresStore) loadParts(uploadID string, upload *Upload) error {
 // current PartHash / PlaintextPartHash for partNumber so the row
 // reflects whatever the handler captured on the in-memory Upload
 // before this call.
-func (s *PostgresStore) PutPart(uploadID string, part Part) error {
+func (s *PostgresStore) PutPart(tenantID, uploadID string, part Part) error {
 	if part.PartNumber <= 0 {
 		return errors.New("multipart: part_number must be positive")
 	}
-	upload, err := s.Get(uploadID)
+	upload, err := s.Get(tenantID, uploadID)
 	if err != nil {
 		return err
 	}
@@ -482,9 +532,9 @@ func (s *PostgresStore) PutPart(uploadID string, part Part) error {
 	}
 	q := fmt.Sprintf(`
 		INSERT INTO %s (
-			upload_id, part_number, piece_id, backend,
+			upload_id, tenant_id, part_number, piece_id, backend,
 			etag, size_bytes, part_hash, plaintext_part_hash, uploaded_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (upload_id, part_number) DO UPDATE SET
 			piece_id            = EXCLUDED.piece_id,
 			backend             = EXCLUDED.backend,
@@ -498,8 +548,17 @@ func (s *PostgresStore) PutPart(uploadID string, part Part) error {
 	if uploadedAt.IsZero() {
 		uploadedAt = s.clock()
 	}
-	if _, err := s.db.ExecContext(context.Background(), q,
+	// Bind the tenant so the parts RLS WITH CHECK admits the row. The
+	// part's tenant_id is the caller's tenant — identical to the owning
+	// upload's tenant, which Get above has already confirmed.
+	tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(context.Background(), q,
 		uploadID,
+		tenantID,
 		part.PartNumber,
 		part.PieceID,
 		part.Backend,
@@ -510,6 +569,9 @@ func (s *PostgresStore) PutPart(uploadID string, part Part) error {
 		uploadedAt,
 	); err != nil {
 		return fmt.Errorf("multipart: upsert part: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("multipart: commit put part: %w", err)
 	}
 	upload.mu.Lock()
 	upload.parts[part.PartNumber] = Part{
@@ -531,12 +593,12 @@ func (s *PostgresStore) PutPart(uploadID string, part Part) error {
 // transaction so a Complete that races an Abort cannot leak a
 // half-deleted record.
 func (s *PostgresStore) Complete(uploadID, tenantID, bucket, objectKey string, expected []PartReference) ([]Part, *Upload, error) {
-	upload, err := s.Get(uploadID)
+	// Scoped to tenantID: a cross-tenant upload_id is invisible under
+	// RLS, so Get returns ErrNotFound (404) rather than a 403 oracle,
+	// and the upload is left intact for its real owner.
+	upload, err := s.Get(tenantID, uploadID)
 	if err != nil {
 		return nil, nil, err
-	}
-	if upload.TenantID != tenantID {
-		return nil, nil, ErrTenantMismatch
 	}
 	if upload.Bucket != bucket || upload.ObjectKey != objectKey {
 		return nil, nil, ErrUploadMismatch
@@ -558,9 +620,11 @@ func (s *PostgresStore) Complete(uploadID, tenantID, bucket, objectKey string, e
 	upload.mu.Unlock()
 	sort.Slice(result, func(i, j int) bool { return result[i].PartNumber < result[j].PartNumber })
 
-	q := fmt.Sprintf(`DELETE FROM %s WHERE upload_id = $1`, s.uploadsTable)
-	if _, err := s.db.ExecContext(context.Background(), q, uploadID); err != nil {
-		return nil, nil, fmt.Errorf("multipart: delete upload: %w", err)
+	// Tenant-bound DELETE: under RLS an unscoped DELETE would match zero
+	// rows (fail-closed), silently leaving the upload behind. Bind the
+	// tenant so the row is visible; the parts cascade with it.
+	if err := s.deleteUpload(tenantID, uploadID); err != nil {
+		return nil, nil, err
 	}
 	s.sessions.Delete(uploadID)
 	return result, upload, nil
@@ -569,12 +633,12 @@ func (s *PostgresStore) Complete(uploadID, tenantID, bucket, objectKey string, e
 // Abort removes the upload row (cascading parts) and returns the
 // parts list so the caller can DeletePiece each one.
 func (s *PostgresStore) Abort(uploadID, tenantID string) (*Upload, []Part, error) {
-	upload, err := s.Get(uploadID)
+	// Scoped to tenantID like Complete: a cross-tenant upload_id is
+	// invisible under RLS, so Get returns ErrNotFound (404) and the
+	// upload is left intact for its real owner.
+	upload, err := s.Get(tenantID, uploadID)
 	if err != nil {
 		return nil, nil, err
-	}
-	if upload.TenantID != tenantID {
-		return nil, nil, ErrTenantMismatch
 	}
 	upload.mu.Lock()
 	parts := make([]Part, 0, len(upload.parts))
@@ -584,12 +648,30 @@ func (s *PostgresStore) Abort(uploadID, tenantID string) (*Upload, []Part, error
 	upload.mu.Unlock()
 	sort.Slice(parts, func(i, j int) bool { return parts[i].PartNumber < parts[j].PartNumber })
 
-	q := fmt.Sprintf(`DELETE FROM %s WHERE upload_id = $1`, s.uploadsTable)
-	if _, err := s.db.ExecContext(context.Background(), q, uploadID); err != nil {
-		return nil, nil, fmt.Errorf("multipart: delete upload: %w", err)
+	if err := s.deleteUpload(tenantID, uploadID); err != nil {
+		return nil, nil, err
 	}
 	s.sessions.Delete(uploadID)
 	return upload, parts, nil
+}
+
+// deleteUpload removes the upload row (cascading its parts) inside a
+// transaction bound to tenantID, so RLS admits the row. Shared by
+// Complete and Abort.
+func (s *PostgresStore) deleteUpload(tenantID, uploadID string) error {
+	tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := fmt.Sprintf(`DELETE FROM %s WHERE upload_id = $1`, s.uploadsTable)
+	if _, err := tx.ExecContext(context.Background(), q, uploadID); err != nil {
+		return fmt.Errorf("multipart: delete upload: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("multipart: commit delete upload: %w", err)
+	}
+	return nil
 }
 
 // List returns all uploads scoped to (tenantID, bucket). Loads
@@ -607,7 +689,16 @@ func (s *PostgresStore) List(tenantID, bucket string) []*Upload {
 		  AND ($2 = '' OR bucket = $2)
 		ORDER BY created_at
 	`, s.uploadsTable)
-	rows, err := s.db.QueryContext(context.Background(), q, tenantID, bucket)
+	// Bind the tenant so RLS scopes the listing even though the WHERE
+	// clause already filters on tenant_id (defence-in-depth, matching
+	// the other tenant-scoped stores).
+	tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
+	if err != nil {
+		s.logf("list uploads begin: %v", err)
+		return nil
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(context.Background(), q, tenantID, bucket)
 	if err != nil {
 		s.logf("list uploads: %v", err)
 		return nil
@@ -688,29 +779,41 @@ func (s *PostgresStore) runExpirySweeper() {
 func (s *PostgresStore) sweepExpired() error {
 	cutoff := s.clock().Add(-s.uploadTTL)
 	q := fmt.Sprintf(`
-		SELECT upload_id FROM %s WHERE created_at < $1
+		SELECT upload_id, tenant_id FROM %s WHERE created_at < $1
 		ORDER BY created_at
 		LIMIT 1000
 	`, s.uploadsTable)
-	rows, err := s.db.QueryContext(context.Background(), q, cutoff)
+	// The expiry enumeration crosses tenants by design, so it runs under
+	// the audited scan_all bypass. expireOne then re-binds each upload's
+	// own tenant for the load + delete, so no cross-tenant write is ever
+	// performed (the policy's WITH CHECK does not honour scan_all anyway).
+	enum, err := rlsdb.BeginScanAll(context.Background(), s.db)
+	if err != nil {
+		return fmt.Errorf("multipart: begin expiry scan: %w", err)
+	}
+	defer func() { _ = enum.Rollback() }()
+	rows, err := enum.QueryContext(context.Background(), q, cutoff)
 	if err != nil {
 		return fmt.Errorf("multipart: query expired: %w", err)
 	}
-	var ids []string
+	type expired struct{ id, tenantID string }
+	var victims []expired
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var e expired
+		if err := rows.Scan(&e.id, &e.tenantID); err != nil {
 			rows.Close()
 			return fmt.Errorf("multipart: scan expired id: %w", err)
 		}
-		ids = append(ids, id)
+		victims = append(victims, e)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("multipart: iterate expired: %w", err)
 	}
-	for _, id := range ids {
-		s.expireOne(id)
+	// Release the scan_all transaction before re-binding per-tenant.
+	_ = enum.Rollback()
+	for _, v := range victims {
+		s.expireOne(v.tenantID, v.id)
 	}
 	return nil
 }
@@ -720,13 +823,22 @@ func (s *PostgresStore) sweepExpired() error {
 // upload row. Failures in cleanup are logged but do not block the
 // row deletion — the alternative would be an infinitely retrying
 // sweep on a single broken upload.
-func (s *PostgresStore) expireOne(uploadID string) {
-	upload, err := s.loadUpload(uploadID)
+func (s *PostgresStore) expireOne(tenantID, uploadID string) {
+	// Bind the upload's own tenant so the load + delete (and the parts
+	// cascade) are RLS-visible; the sweeper never deletes across tenants
+	// in a single transaction.
+	tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
+	if err != nil {
+		s.logf("expire begin %s: %v", uploadID, err)
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	upload, err := s.loadUpload(tx, uploadID)
 	if err != nil {
 		s.logf("expire load upload %s: %v", uploadID, err)
 		return
 	}
-	if err := s.loadParts(uploadID, upload); err != nil {
+	if err := s.loadParts(tx, uploadID, upload); err != nil {
 		s.logf("expire load parts %s: %v", uploadID, err)
 		return
 	}
@@ -748,8 +860,12 @@ func (s *PostgresStore) expireOne(uploadID string) {
 		}()
 	}
 	q := fmt.Sprintf(`DELETE FROM %s WHERE upload_id = $1`, s.uploadsTable)
-	if _, err := s.db.ExecContext(context.Background(), q, uploadID); err != nil {
+	if _, err := tx.ExecContext(context.Background(), q, uploadID); err != nil {
 		s.logf("expire delete %s: %v", uploadID, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		s.logf("expire commit %s: %v", uploadID, err)
 		return
 	}
 	s.sessions.Delete(uploadID)
