@@ -104,14 +104,34 @@ type ScanResult struct {
 	NextCursor string
 }
 
+// scanCursor is the on-the-wire form of a scan cursor. It carries
+// explicit, stable JSON tags so the cursor format is decoupled from
+// ManifestKey's own struct layout: ManifestKey is currently untagged
+// (it marshals to PascalCase keys), and if it later gains json tags
+// for some other use, that must NOT silently change the cursor wire
+// format and invalidate an in-flight sweep's cursor mid-page. Encoding
+// through this dedicated type makes the cursor contract independent of
+// ManifestKey's reflection.
+type scanCursor struct {
+	TenantID      string `json:"t"`
+	Bucket        string `json:"b"`
+	ObjectKeyHash string `json:"h"`
+	VersionID     string `json:"v"`
+}
+
 // EncodeScanCursor serialises a ManifestKey into the opaque cursor
 // token ScanManifests returns. The four key fields are arbitrary
 // byte-strings (object keys and hashes can contain any character), so
 // a delimiter-joined form would be ambiguous; JSON + base64 sidesteps
-// escaping entirely and keeps the token URL-safe. Both the memory and
-// Postgres stores use this codec so a cursor is portable across them.
+// escaping entirely and keeps the token URL-safe. All stores (memory,
+// Postgres, SQLite) use this codec so a cursor is portable across them.
 func EncodeScanCursor(key ManifestKey) string {
-	b, _ := json.Marshal(key)
+	b, _ := json.Marshal(scanCursor{
+		TenantID:      key.TenantID,
+		Bucket:        key.Bucket,
+		ObjectKeyHash: key.ObjectKeyHash,
+		VersionID:     key.VersionID,
+	})
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
@@ -127,9 +147,14 @@ func DecodeScanCursor(cursor string) (ManifestKey, error) {
 	if err != nil {
 		return ManifestKey{}, errors.New("manifest_store: malformed scan cursor")
 	}
-	var key ManifestKey
-	if err := json.Unmarshal(raw, &key); err != nil {
+	var c scanCursor
+	if err := json.Unmarshal(raw, &c); err != nil {
 		return ManifestKey{}, errors.New("manifest_store: malformed scan cursor")
 	}
-	return key, nil
+	return ManifestKey{
+		TenantID:      c.TenantID,
+		Bucket:        c.Bucket,
+		ObjectKeyHash: c.ObjectKeyHash,
+		VersionID:     c.VersionID,
+	}, nil
 }

@@ -88,7 +88,10 @@ func putLegacyObject(t *testing.T, h *Handler, fake *fakeProvider, store manifes
 		ObjectKeyHash: hash,
 		VersionID:     version,
 		ObjectSize:    int64(len(plaintext)),
-		ChunkSize:     int64(len(plaintext)),
+		// Mirror production: the single-piece PUT path records the
+		// stored chunk size from putRes.SizeBytes (ciphertext, which
+		// includes AEAD overhead), not the plaintext length.
+		ChunkSize:     int64(len(ciphertext)),
 		Encryption:    legacyEnc,
 		Pieces:        []metadata.Piece{{PieceID: pieceID, Backend: "test", State: "active", SizeBytes: int64(len(ciphertext))}},
 	}
