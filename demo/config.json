@@ -22,6 +22,7 @@
     "clickhouse_url": ""
   },
   "control_plane": {
-    "metadata_dsn": ""
+    "metadata_dsn": "",
+    "embedded_db_path": "/data/metadata/embedded.db"
   }
 }

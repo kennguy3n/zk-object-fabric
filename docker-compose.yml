@@ -2,13 +2,17 @@
 #
 # Builds the multi-stage Dockerfile at the repo root and runs the
 # gateway in dev mode: local_fs_dev backend rooted at /data/objects,
-# in-memory manifest / tenant store, logger billing sink, S3 API on
-# :8080, console API on :8081. Tenant bindings are pre-loaded from
-# demo/tenants.json.
+# embedded SQLite metadata store at /data/metadata/embedded.db,
+# logger billing sink, S3 API on :8080, console API on :8081. Tenant
+# bindings are pre-loaded from demo/tenants.json.
 #
 # See demo/README.md for downstream integration examples (kmail,
-# zk-drive). Object data persists in the zk-data volume; manifest
-# and tenant state are in-memory and reset on container restart.
+# zk-drive). Object data persists in the zk-data volume; manifest,
+# content-index, auth, and billing state persist in the embedded
+# SQLite database on the zk-metadata volume, so they now survive a
+# container restart (control_plane.embedded_db_path in
+# demo/config.json). Point control_plane.metadata_dsn at a Postgres
+# to switch the whole control plane to Postgres instead.
 
 services:
   zk-fabric:
@@ -21,6 +25,7 @@ services:
       - "8081:8081"
     volumes:
       - zk-data:/data/objects
+      - zk-metadata:/data/metadata
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "8080"]
       interval: 5s
@@ -31,3 +36,4 @@ services:
 
 volumes:
   zk-data:
+  zk-metadata:

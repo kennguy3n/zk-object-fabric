@@ -6,6 +6,7 @@ package metrics
 
 import (
 	"context"
+	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
 )
@@ -62,4 +63,26 @@ func (s *MetricsBillingSink) Close(ctx context.Context) error {
 		return c.Close(ctx)
 	}
 	return nil
+}
+
+// TenantUsage forwards to the wrapped sink when it implements the
+// console's UsageQuery interface (e.g. *billing.SQLiteSink in the
+// embedded profile). Without this, wrapping the billing sink for
+// metrics would hide the usage-query capability and the console
+// usage page would silently report no data whenever metrics are
+// enabled.
+//
+// When the inner sink does not support usage queries this returns an
+// empty (non-nil) map, matching the gateway's noopUsageQuery so the
+// console renders a dashboard shell with zero counters rather than a
+// JSON null.
+func (s *MetricsBillingSink) TenantUsage(ctx context.Context, tenantID string, start, end time.Time) (map[string]uint64, error) {
+	if s != nil && s.Inner != nil {
+		if q, ok := s.Inner.(interface {
+			TenantUsage(context.Context, string, time.Time, time.Time) (map[string]uint64, error)
+		}); ok {
+			return q.TenantUsage(ctx, tenantID, start, end)
+		}
+	}
+	return map[string]uint64{}, nil
 }
