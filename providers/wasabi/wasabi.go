@@ -125,11 +125,11 @@ func (p *Provider) Capabilities() providers.ProviderCapabilities {
 // TB-month with a fair-use egress policy (<=1× stored).
 func (p *Provider) CostModel() providers.ProviderCostModel {
 	return providers.ProviderCostModel{
-		StorageUSDPerTBMonth:  6.99,
+		StorageUSDPerTBMonth:  WasabiStorageUSDPerTBMonth,
 		EgressUSDPerGB:        0.0,
 		PutRequestUSDPer1000:  0.0,
 		GetRequestUSDPer1000:  0.0,
-		MinStorageDurationDay: 90,
+		MinStorageDurationDay: WasabiMinStorageDays,
 		FreeEgressRatio:       1.0,
 	}
 }
@@ -181,16 +181,15 @@ func startsWith(s, prefix string) bool {
 // age: the contract with the caller is that they asked for a delete,
 // not that the piece must be free-and-clear to remove.
 func (p *Provider) DeletePiece(ctx context.Context, pieceID string) error {
-	minDuration := WasabiMinStorageDays * 24 * time.Hour
 	if p.AgeLookup != nil {
-		if age, ok := p.AgeLookup(ctx, pieceID); ok && age < minDuration {
+		if age, ok := p.AgeLookup(ctx, pieceID); ok && age < minStorageDuration {
 			p.logger().Warn(
 				"wasabi: deleting piece before 90-day minimum storage duration; billing continues for the residual window",
 				slog.String("piece_id", pieceID),
 				slog.String("bucket", p.cfg.Bucket),
 				slog.String("region", p.cfg.Region),
 				slog.Duration("age", age),
-				slog.Duration("residual", minDuration-age),
+				slog.Duration("residual", minStorageDuration-age),
 			)
 		}
 	}

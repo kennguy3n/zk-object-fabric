@@ -17,6 +17,7 @@ package wasabi
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -25,6 +26,17 @@ import (
 // storage. The data plane must not write short-TTL objects to Wasabi;
 // those belong in the Linode cache (see cache/hot_object_cache).
 const WasabiMinStorageDays = 90
+
+// WasabiStorageUSDPerTBMonth is Wasabi's headline storage price per
+// TB-month (docs/PROPOSAL.md §2.1). It is the single source of truth
+// for the storage rate: CostModel() in wasabi.go reports it to the
+// placement engine, and MinStorageWarning uses it to estimate the
+// residual charge of an early delete. A "TB" here is 1e12 bytes and a
+// "month" is 30 days, matching how Wasabi bills.
+const WasabiStorageUSDPerTBMonth = 6.99
+
+// minStorageDuration is WasabiMinStorageDays expressed as a duration.
+const minStorageDuration = WasabiMinStorageDays * 24 * time.Hour
 
 // FairUseEgressBudget describes the monthly Wasabi origin egress
 // allowance for a single tenant.
@@ -158,7 +170,7 @@ func DefaultGuardrails(tenantID string) Guardrails {
 			CacheHitRatioAlertMin:     0.85,
 			ThrottlePolicy:            "slowdown_origin_reads",
 		},
-		MinStorage: WasabiMinStorageDays * 24 * time.Hour,
+		MinStorage: minStorageDuration,
 	}
 }
 
@@ -217,4 +229,73 @@ func (m MinStorageTracker) BillableAge(now time.Time) time.Duration {
 		return m.MinStorageDuration
 	}
 	return age
+}
+
+// MinStorageWarning describes the early-delete cost consequence of
+// removing a Wasabi-resident object at a given instant. It is the
+// public contract the placement engine, the S3 DELETE path, and the
+// console use to surface Wasabi's otherwise-invisible 90-day minimum
+// storage charge to operators.
+type MinStorageWarning struct {
+	// WithinMinStorageWindow is true when the object is younger than
+	// the 90-day minimum, i.e. deleting it now would still incur
+	// billable storage for the remainder of the window.
+	WithinMinStorageWindow bool `json:"within_min_storage_window"`
+
+	// RemainingDays is the whole number of days left before the
+	// 90-day minimum elapses, rounded up so any partial day still
+	// counts as remaining. It is 0 once the window has elapsed (and
+	// whenever WithinMinStorageWindow is false). This is the value
+	// surfaced as X-Zkof-Wasabi-Min-Storage-Remaining-Days and the
+	// console's wasabi_min_storage_remaining_days field.
+	RemainingDays int `json:"remaining_days"`
+
+	// BillableRemainder is the residual storage time that Wasabi would
+	// still bill if the object were deleted now: MinStorageDuration
+	// minus the object's current age, clamped to [0, MinStorageDuration].
+	// It is zero once the window has elapsed.
+	BillableRemainder time.Duration `json:"billable_remainder"`
+}
+
+// MinStorageDurationWarning reports whether an object created at
+// storedAt is still inside Wasabi's 90-day minimum storage window as
+// of now, along with the residual billable time. Callers that know
+// the object size can turn the residual into a dollar figure with
+// EstimatedEarlyDeleteCostUSD.
+//
+// A zero storedAt yields an empty (not-within-window) warning: the
+// age is unknown, so no early-delete charge can be asserted. Clock
+// skew where now precedes storedAt is treated as a freshly written
+// object (age 0), i.e. the full window remains.
+func MinStorageDurationWarning(storedAt, now time.Time) MinStorageWarning {
+	if storedAt.IsZero() {
+		return MinStorageWarning{}
+	}
+	age := now.Sub(storedAt)
+	if age < 0 {
+		age = 0
+	}
+	if age >= minStorageDuration {
+		return MinStorageWarning{}
+	}
+	remainder := minStorageDuration - age
+	return MinStorageWarning{
+		WithinMinStorageWindow: true,
+		RemainingDays:          int(math.Ceil(remainder.Hours() / 24)),
+		BillableRemainder:      remainder,
+	}
+}
+
+// EstimatedEarlyDeleteCostUSD estimates the residual storage charge,
+// in USD, of deleting an object of sizeBytes now. It is the cost of
+// storing those bytes on Wasabi for BillableRemainder at the headline
+// per-TB-month rate. It returns 0 once the object is past the 90-day
+// minimum (BillableRemainder == 0) or for a non-positive size.
+func (w MinStorageWarning) EstimatedEarlyDeleteCostUSD(sizeBytes int64) float64 {
+	if sizeBytes <= 0 || w.BillableRemainder <= 0 {
+		return 0
+	}
+	sizeTB := float64(sizeBytes) / 1e12
+	months := w.BillableRemainder.Hours() / (24 * 30)
+	return sizeTB * WasabiStorageUSDPerTBMonth * months
 }

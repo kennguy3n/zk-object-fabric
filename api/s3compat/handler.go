@@ -38,6 +38,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/pieceintegrity"
 	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
+	"github.com/kennguy3n/zk-object-fabric/providers/wasabi"
 	"github.com/zeebo/blake3"
 	"golang.org/x/sync/semaphore"
 )
@@ -2531,6 +2532,12 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	// count reaches zero. Manifests that predate Phase 3.5 (no
 	// ContentHash) take the original path and delete pieces
 	// directly.
+	// piecesDeleted records whether bytes were actually removed from
+	// the backend. It gates the Wasabi early-delete warning below: a
+	// refcount decrement that leaves the piece in place (still
+	// referenced by another manifest) incurs no early-delete charge,
+	// so emitting the warning then would be a false positive.
+	piecesDeleted := false
 	if manifest.ContentHash != "" && h.cfg.ContentIndex != nil {
 		newCount, derr := h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, manifest.ContentHash)
 		switch {
@@ -2539,6 +2546,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			// pointed at it — fall through to a
 			// best-effort piece delete to clean up.
 			h.deletePiecesBestEffort(r, manifest)
+			piecesDeleted = true
 		case derr != nil:
 			writeError(w, http.StatusInternalServerError, "ContentIndexDecrementFailed", derr.Error(), r.URL.Path)
 			return
@@ -2555,6 +2563,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case delErr == nil:
 				h.deletePiecesBestEffort(r, manifest)
+				piecesDeleted = true
 			case errors.Is(delErr, content_index.ErrNotFound):
 				// Row vanished out from under us (e.g.
 				// background GC). The piece may still
@@ -2576,6 +2585,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		h.deletePiecesBestEffort(r, manifest)
+		piecesDeleted = true
 	}
 
 	h.emit(tenantID, bucket, billing.DeleteRequests, 1)
@@ -2587,8 +2597,50 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 		h.audit(r, "DELETE", tenantID, bucket, key, p.PieceID, p.Backend, country)
 	}
+	// Warn-only: if bytes were actually removed from a Wasabi backend
+	// and the object is still inside the 90-day minimum storage
+	// window, surface the otherwise-hidden early-delete charge as
+	// response headers. Skipped when content-dedup kept the pieces in
+	// place (no charge applies). The delete already succeeded above;
+	// this never blocks it.
+	if piecesDeleted {
+		h.setWasabiEarlyDeleteWarning(w, manifest)
+	}
 	h.notify(r, eventObjectRemovedDelete, tenantID, bucket, key, "", manifest.VersionID, 0)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// setWasabiEarlyDeleteWarning sets informational response headers when
+// a just-deleted object resided on a Wasabi backend and is still
+// within Wasabi's 90-day minimum storage window. Operators billed for
+// the residual window otherwise have no signal that the delete was
+// "early". The headers are advisory only: callers must NOT treat them
+// as an error, and the DELETE is never blocked on their account.
+//
+// Backend identity is resolved through the provider's PlacementLabels
+// (Provider == "wasabi") rather than the registry key, so region-
+// qualified keys such as "wasabi-ap-southeast-1" are matched too.
+func (h *Handler) setWasabiEarlyDeleteWarning(w http.ResponseWriter, manifest *metadata.ObjectManifest) {
+	if manifest == nil {
+		return
+	}
+	onWasabi := false
+	for _, piece := range manifest.Pieces {
+		prov, ok := h.cfg.Providers[piece.Backend]
+		if ok && prov.PlacementLabels().Provider == "wasabi" {
+			onWasabi = true
+			break
+		}
+	}
+	if !onWasabi {
+		return
+	}
+	warn := wasabi.MinStorageDurationWarning(manifest.CreatedAt, h.cfg.Now())
+	if !warn.WithinMinStorageWindow {
+		return
+	}
+	w.Header().Set("X-Zkof-Wasabi-Early-Delete-Warning", "true")
+	w.Header().Set("X-Zkof-Wasabi-Min-Storage-Remaining-Days", strconv.Itoa(warn.RemainingDays))
 }
 
 // deletePiecesBestEffort removes every piece referenced by the
