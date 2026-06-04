@@ -521,6 +521,7 @@ func (h *Handler) writeCopyManifest(
 		copyCountry = prov.PlacementLabels().Country
 	}
 	h.audit(r, "COPY", tenantID, dstBucket, dstKey, piece.PieceID, backend, copyCountry)
+	h.notify(r, eventObjectCreatedCopy, tenantID, dstBucket, dstKey, pieceETag(piece), manifest.VersionID, manifest.ObjectSize)
 
 	res := CopyObjectResult{
 		ETag:         quote(pieceETag(piece)),

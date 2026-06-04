@@ -774,6 +774,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		country = prov.PlacementLabels().Country
 	}
 	h.audit(r, "PUT", tenantID, bucket, key, auditPieceID, auditBackend, country)
+	h.notify(r, eventObjectCreatedCompleteMPU, tenantID, bucket, key, aggregateETag, manifest.VersionID, manifest.ObjectSize)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
