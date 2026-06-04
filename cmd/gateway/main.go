@@ -2880,11 +2880,26 @@ func buildAuditStore(cfg config.ComplianceConfig, db, embeddedDB *sql.DB) compli
 func buildComplianceHooks(cfg config.ComplianceConfig, db, embeddedDB *sql.DB, auditStore compliance.AuditStore) s3compat.ComplianceHooks {
 	hooks := s3compat.ComplianceHooks{}
 	if cfg.ResidencyEnabled {
+		// Backend selection mirrors the legal hold store below:
+		// explicit static config wins, then Postgres in the fleet
+		// profile, then the embedded SQLite allowlist (persists and
+		// is operator-seedable across restart). Only when none is
+		// present does lookup stay nil (allow-all) — closing the
+		// two-tier vs three-tier asymmetry the #106 review flagged.
 		var lookup compliance.AllowlistLookup
-		if len(cfg.StaticAllowlist) > 0 {
+		switch {
+		case len(cfg.StaticAllowlist) > 0:
 			lookup = compliance.StaticAllowlist(cfg.StaticAllowlist)
-		} else if db != nil {
+		case db != nil:
 			lookup = postgresAllowlistLookup(db)
+		case embeddedDB != nil:
+			store, err := compliance.NewSQLiteAllowlistStore(embeddedDB)
+			if err != nil {
+				log.Printf("gateway: embedded residency allowlist store: %v; residency enforcement disabled (allow-all)", err)
+			} else {
+				log.Printf("gateway: embedded SQLite residency allowlist enabled (allowlist persists locally across restart)")
+				lookup = store.Lookup
+			}
 		}
 		hooks.Residency = compliance.NewResidencyEnforcer(lookup)
 	}
