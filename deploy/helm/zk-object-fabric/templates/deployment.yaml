@@ -1,0 +1,183 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "zk-object-fabric.fullname" . }}
+  labels:
+    {{- include "zk-object-fabric.labels" . | nindent 4 }}
+spec:
+  {{- /* Let the HPA own replicas when autoscaling is enabled. */}}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "zk-object-fabric.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- /* Roll pods when the rendered config changes. */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.config.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.config.gateway.port | quote }}
+        prometheus.io/path: {{ .Values.config.metrics.path | quote }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "zk-object-fabric.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "zk-object-fabric.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      initContainers:
+        - name: render-config
+          image: {{ include "zk-object-fabric.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # Materialise the final gateway config from the ConfigMap template
+          # by expanding the ${SECRET} placeholders with the Secret env vars.
+          # envsubst ships in the alpine runtime image (gettext, see Dockerfile).
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              envsubst < /etc/zk-object-fabric/config.json.tmpl > /run/zk-object-fabric/config.json
+          envFrom:
+            - secretRef:
+                name: {{ include "zk-object-fabric.secretName" . }}
+          volumeMounts:
+            - name: config-template
+              mountPath: /etc/zk-object-fabric
+              readOnly: true
+            - name: rendered-config
+              mountPath: /run/zk-object-fabric
+      containers:
+        - name: gateway
+          image: {{ include "zk-object-fabric.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # Override the image's demo entrypoint and run the gateway directly
+          # against the rendered config.
+          command:
+            - gateway
+          args:
+            - -config
+            - /run/zk-object-fabric/config.json
+          envFrom:
+            - secretRef:
+                name: {{ include "zk-object-fabric.secretName" . }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: s3
+              containerPort: {{ .Values.config.gateway.port }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ .Values.config.health.port }}
+              protocol: TCP
+            {{- if .Values.config.console.enabled }}
+            - name: console
+              containerPort: {{ .Values.config.console.port }}
+              protocol: TCP
+            {{- end }}
+          # Readiness gates Service/LB traffic: /internal/ready returns 503
+          # unless the node is StateReady (internal/health.handleReady).
+          readinessProbe:
+            httpGet:
+              path: /internal/ready
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Liveness restarts a wedged process. NOTE: the gateway mounts the
+          # liveness handler at /internal/health (internal/health.ServeMux),
+          # not /internal/healthz.
+          livenessProbe:
+            httpGet:
+              path: /internal/health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Graceful drain for rolling deploys: POST /internal/drain flips
+              # the node NotReady so the Service drains in-flight requests
+              # before SIGTERM. The endpoint is POST-only, so use wget
+              # --post-data (httpGet probes cannot issue POST).
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    wget -q -O- --post-data='' --timeout={{ regexFind "[0-9]+" .Values.config.health.drainTimeout | default "30" }}
+                    http://127.0.0.1:{{ .Values.config.health.port }}/internal/drain || true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: rendered-config
+              mountPath: /run/zk-object-fabric
+              readOnly: true
+            - name: cache
+              mountPath: {{ .Values.cache.path }}
+      volumes:
+        - name: config-template
+          configMap:
+            name: {{ include "zk-object-fabric.fullname" . }}-config
+        - name: rendered-config
+          emptyDir: {}
+        - name: cache
+          {{- if eq .Values.cache.mode "ephemeral" }}
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  {{- include "zk-object-fabric.selectorLabels" . | nindent 18 }}
+              spec:
+                accessModes:
+                  {{- toYaml .Values.cache.ephemeral.accessModes | nindent 18 }}
+                {{- if .Values.cache.ephemeral.storageClass }}
+                storageClassName: {{ .Values.cache.ephemeral.storageClass }}
+                {{- end }}
+                resources:
+                  requests:
+                    storage: {{ .Values.cache.ephemeral.size }}
+          {{- else if eq .Values.cache.mode "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.cache.pvc.existingClaim | default (printf "%s-cache" (include "zk-object-fabric.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

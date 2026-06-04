@@ -1,0 +1,27 @@
+{{- if and (eq .Values.cache.mode "pvc") (not .Values.cache.pvc.existingClaim) }}
+{{- /*
+Single shared NVMe / block-storage hot-object cache claim, mounted at
+gateway.cache_path. Rendered only for cache.mode=pvc.
+
+WARNING: a Deployment shares this one PVC across all replicas. With the
+default ReadWriteOnce access mode every pod must land on the node holding
+the volume, which breaks HPA scale-out. Use this mode only for a single
+replica or with a ReadWriteMany storage class. For an autoscaled fleet use
+cache.mode=ephemeral (per-pod volume) instead — see deploy/helm/README.md.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "zk-object-fabric.fullname" . }}-cache
+  labels:
+    {{- include "zk-object-fabric.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.cache.pvc.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.cache.pvc.size }}
+  {{- if .Values.cache.pvc.storageClass }}
+  storageClassName: {{ .Values.cache.pvc.storageClass }}
+  {{- end }}
+{{- end }}

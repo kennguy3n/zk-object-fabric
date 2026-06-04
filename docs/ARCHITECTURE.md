@@ -410,6 +410,26 @@ See [STORAGE_INFRA.md](STORAGE_INFRA.md) for the full
 deployment-model → storage-backend mapping and the per-adapter
 status table.
 
+### Kubernetes (Helm + HPA)
+
+- The same gateway binary runs as a Kubernetes `Deployment` fronted by
+  a `HorizontalPodAutoscaler`, replacing the hand-sized Linode fleet
+  (`deploy/linode/`) with auto-scaling and self-healing. Shipped as a
+  Helm chart under `deploy/helm/zk-object-fabric/`.
+- An init container renders the gateway `config.json` from a ConfigMap
+  template by expanding `${...}` placeholders with values from the
+  `Secret` (`envsubst`), mirroring the Wasabi production convention in
+  `deploy/wasabi/`. `internal/config.Load` reads a single JSON file and
+  does not expand env vars, so credentials are injected this way rather
+  than as plain env vars.
+- Readiness (`GET /internal/ready`) gates Service traffic; liveness
+  (`GET /internal/health`) restarts wedged pods; a `preStop` hook POSTs
+  `/internal/drain` so rolling deploys drain in-flight requests before
+  SIGTERM. The HPA targets 70 % CPU (min 2 / max 20 by default).
+- The NVMe hot-object cache is a per-pod ephemeral volume by default so
+  no replica is pinned to a single node; a `PodDisruptionBudget` keeps
+  `minAvailable: 1`. See [../deploy/helm/README.md](../deploy/helm/README.md).
+
 ## Port mapping
 
 | Port    | Service                |

@@ -1,0 +1,86 @@
+{{- /*
+Renders the gateway JSON config (internal/config.Config) from values.
+
+Secret fields are emitted as ${ENV} placeholders, NOT real values, because
+internal/config.Load does no env expansion — templates/deployment.yaml runs
+an `envsubst` init container that materialises the final config from the
+Secret's env vars. This mirrors the repo's own production convention
+(deploy/wasabi/gateway_config.example.json + deploy/wasabi/README.md).
+
+The config object is assembled as a dict and serialised with toPrettyJson so
+the output is always valid JSON regardless of which optional blocks are on.
+*/}}
+{{- $gw := dict
+    "listen_addr" (printf ":%d" (int .Values.config.gateway.port))
+    "read_timeout" .Values.config.gateway.readTimeout
+    "write_timeout" .Values.config.gateway.writeTimeout
+    "read_header_timeout" .Values.config.gateway.readHeaderTimeout
+    "idle_timeout" .Values.config.gateway.idleTimeout
+    "max_request_bytes" (int64 .Values.config.gateway.maxRequestBytes)
+    "max_header_bytes" (int .Values.config.gateway.maxHeaderBytes)
+    "cache_path" .Values.cache.path -}}
+{{- $health := dict
+    "listen_addr" (printf ":%d" (int .Values.config.health.port))
+    "cell_id" .Values.config.health.cellId
+    "poll_interval" .Values.config.health.pollInterval
+    "poll_timeout" .Values.config.health.pollTimeout
+    "drain_timeout" .Values.config.health.drainTimeout -}}
+{{- if .Values.config.health.peers -}}
+{{- $_ := set $health "peers" .Values.config.health.peers -}}
+{{- end -}}
+{{- $cp := dict
+    "embedded_db_path" .Values.config.controlPlane.embeddedDbPath
+    "max_open_conns" (int .Values.config.controlPlane.maxOpenConns)
+    "max_idle_conns" (int .Values.config.controlPlane.maxIdleConns)
+    "conn_max_lifetime" .Values.config.controlPlane.connMaxLifetime
+    "conn_max_idle_time" .Values.config.controlPlane.connMaxIdleTime -}}
+{{- if .Values.config.controlPlane.metadataDsnFromSecret -}}
+{{- $_ := set $cp "metadata_dsn" "${METADATA_DSN}" -}}
+{{- end -}}
+{{- $enc := dict
+    "cmk_uri" .Values.config.encryption.cmkUri
+    "kms_region" .Values.config.encryption.kmsRegion
+    "vault_addr" .Values.config.encryption.vaultAddr
+    "vault_transit_mount" .Values.config.encryption.vaultTransitMount
+    "vault_token" "${VAULT_TOKEN}" -}}
+{{- $providers := dict -}}
+{{- if .Values.config.providers.wasabi.enabled -}}
+{{- $_ := set $providers "wasabi" (dict
+    "endpoint" .Values.config.providers.wasabi.endpoint
+    "region" .Values.config.providers.wasabi.region
+    "bucket" .Values.config.providers.wasabi.bucket
+    "access_key" "${WASABI_ACCESS_KEY}"
+    "secret_key" "${WASABI_SECRET_KEY}") -}}
+{{- end -}}
+{{- if .Values.config.providers.localFsDev.enabled -}}
+{{- $_ := set $providers "local_fs_dev" (dict "root_path" .Values.config.providers.localFsDev.rootPath) -}}
+{{- end -}}
+{{- $cfg := dict
+    "env" .Values.config.env
+    "gateway" $gw
+    "health" $health
+    "control_plane" $cp
+    "encryption" $enc
+    "providers" $providers -}}
+{{- if .Values.config.metrics.enabled -}}
+{{- $_ := set $cfg "metrics" (dict "enabled" true "path" .Values.config.metrics.path) -}}
+{{- end -}}
+{{- if .Values.config.console.enabled -}}
+{{- $_ := set $cfg "console" (dict
+    "listen_addr" (printf ":%d" (int .Values.config.console.port))
+    "read_timeout" .Values.config.console.readTimeout
+    "write_timeout" .Values.config.console.writeTimeout
+    "read_header_timeout" .Values.config.console.readHeaderTimeout
+    "idle_timeout" .Values.config.console.idleTimeout
+    "max_header_bytes" (int .Values.config.console.maxHeaderBytes)
+    "admin_token" "${CONSOLE_ADMIN_TOKEN}") -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "zk-object-fabric.fullname" . }}-config
+  labels:
+    {{- include "zk-object-fabric.labels" . | nindent 4 }}
+data:
+  config.json.tmpl: |-
+    {{- $cfg | toPrettyJson | nindent 4 }}
