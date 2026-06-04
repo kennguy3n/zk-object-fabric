@@ -2,11 +2,14 @@ package s3compat
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/content_index"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
 	"github.com/kennguy3n/zk-object-fabric/providers"
@@ -124,5 +127,67 @@ func TestDelete_NonWasabiNoWarning(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Zkof-Wasabi-Early-Delete-Warning"); got != "" {
 		t.Errorf("non-Wasabi backend got warning header %q, want absent", got)
+	}
+}
+
+// TestDelete_WasabiDedupRetainedNoWarning verifies the warning is NOT
+// emitted when content-dedup keeps the piece on Wasabi (refcount stays
+// > 0 after the decrement): no bytes are removed, so no early-delete
+// charge applies and a warning would be a false positive — even though
+// the object is squarely inside the 90-day window.
+func TestDelete_WasabiDedupRetainedNoWarning(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	const (
+		bucket      = "bkt"
+		key         = "obj"
+		contentHash = "blake3:dedup-shared"
+	)
+
+	store := memory.New()
+	idx := content_index.NewMemoryStore()
+	fake := &fakeWasabiProvider{newFakeProvider("wasabi-ap-southeast-1")}
+	h := New(Config{
+		Manifests:    store,
+		ContentIndex: idx,
+		Providers:    map[string]providers.StorageProvider{"wasabi-ap-southeast-1": fake},
+		Placement:    fixedPlacement{backend: "wasabi-ap-southeast-1"},
+		Billing:      &recordingBilling{},
+		Now:          func() time.Time { return now },
+	})
+
+	// Two manifests share this content hash: refcount = 2, so deleting
+	// one leaves the piece (and one reference) in place.
+	if err := idx.Register(ctx, content_index.ContentIndexEntry{
+		TenantID: AnonymousTenant, ContentHash: contentHash, RefCount: 2,
+	}); err != nil {
+		t.Fatalf("register content index: %v", err)
+	}
+
+	mkey := manifest_store.ManifestKey{
+		TenantID: AnonymousTenant, Bucket: bucket,
+		ObjectKeyHash: hashObjectKey(key), VersionID: "v-1",
+	}
+	if err := store.Put(ctx, mkey, &metadata.ObjectManifest{
+		TenantID: AnonymousTenant, Bucket: bucket, ObjectKey: key,
+		ObjectKeyHash: mkey.ObjectKeyHash, VersionID: "v-1",
+		ContentHash: contentHash,
+		CreatedAt:   now, // squarely within the 90-day window
+		Pieces:      []metadata.Piece{{PieceID: "shared-piece", Backend: "wasabi-ap-southeast-1", State: "active"}},
+	}); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/"+bucket+"/"+key, nil)
+	rec := httptest.NewRecorder()
+	h.Delete(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d, want 204", rec.Code)
+	}
+	if got := rec.Header().Get("X-Zkof-Wasabi-Early-Delete-Warning"); got != "" {
+		t.Errorf("dedup-retained piece got warning header %q, want absent (no bytes removed)", got)
+	}
+	if got := rec.Header().Get("X-Zkof-Wasabi-Min-Storage-Remaining-Days"); got != "" {
+		t.Errorf("dedup-retained piece got remaining-days header %q, want absent", got)
 	}
 }

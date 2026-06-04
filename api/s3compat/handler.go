@@ -2532,6 +2532,12 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	// count reaches zero. Manifests that predate Phase 3.5 (no
 	// ContentHash) take the original path and delete pieces
 	// directly.
+	// piecesDeleted records whether bytes were actually removed from
+	// the backend. It gates the Wasabi early-delete warning below: a
+	// refcount decrement that leaves the piece in place (still
+	// referenced by another manifest) incurs no early-delete charge,
+	// so emitting the warning then would be a false positive.
+	piecesDeleted := false
 	if manifest.ContentHash != "" && h.cfg.ContentIndex != nil {
 		newCount, derr := h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, manifest.ContentHash)
 		switch {
@@ -2540,6 +2546,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			// pointed at it — fall through to a
 			// best-effort piece delete to clean up.
 			h.deletePiecesBestEffort(r, manifest)
+			piecesDeleted = true
 		case derr != nil:
 			writeError(w, http.StatusInternalServerError, "ContentIndexDecrementFailed", derr.Error(), r.URL.Path)
 			return
@@ -2556,6 +2563,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case delErr == nil:
 				h.deletePiecesBestEffort(r, manifest)
+				piecesDeleted = true
 			case errors.Is(delErr, content_index.ErrNotFound):
 				// Row vanished out from under us (e.g.
 				// background GC). The piece may still
@@ -2577,6 +2585,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		h.deletePiecesBestEffort(r, manifest)
+		piecesDeleted = true
 	}
 
 	h.emit(tenantID, bucket, billing.DeleteRequests, 1)
@@ -2588,11 +2597,15 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 		h.audit(r, "DELETE", tenantID, bucket, key, p.PieceID, p.Backend, country)
 	}
-	// Warn-only: if this object lived on Wasabi and is still inside
-	// the 90-day minimum storage window, surface the otherwise-hidden
-	// early-delete charge as response headers. The delete already
-	// succeeded above; this never blocks it.
-	h.setWasabiEarlyDeleteWarning(w, manifest)
+	// Warn-only: if bytes were actually removed from a Wasabi backend
+	// and the object is still inside the 90-day minimum storage
+	// window, surface the otherwise-hidden early-delete charge as
+	// response headers. Skipped when content-dedup kept the pieces in
+	// place (no charge applies). The delete already succeeded above;
+	// this never blocks it.
+	if piecesDeleted {
+		h.setWasabiEarlyDeleteWarning(w, manifest)
+	}
 	h.notify(r, eventObjectRemovedDelete, tenantID, bucket, key, "", manifest.VersionID, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
