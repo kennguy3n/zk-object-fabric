@@ -608,7 +608,16 @@ func (h *Handler) writeCopyManifest(
 	// piece is ciphertext, larger than the plaintext source, so pinning
 	// to piece.SizeBytes keeps the ChunkSize == Pieces[0].SizeBytes
 	// invariant that cache-warming budgets and the migrator rely on.
+	//
+	// Fall back to the source ChunkSize when the stored piece size is
+	// unknown: a server-side CopyPiece can succeed yet report SizeBytes==0
+	// if its post-copy HEAD fails (s3_generic.CopyPiece). In that degraded
+	// case the verbatim destination is byte-identical to the source, so the
+	// source ChunkSize is the correct estimate — better than recording 0.
 	chunkSize := piece.SizeBytes
+	if chunkSize == 0 {
+		chunkSize = srcManifest.ChunkSize
+	}
 	manifest := &metadata.ObjectManifest{
 		TenantID:        tenantID,
 		Bucket:          dstBucket,
