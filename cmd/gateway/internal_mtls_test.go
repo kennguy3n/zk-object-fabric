@@ -62,6 +62,21 @@ func TestApplyInternalTLSToPostgresDSN_URLForm(t *testing.T) {
 		assertParam(t, q, "sslmode", "require") // preserved, not overridden
 	})
 
+	t.Run("explicitly-empty operator param is preserved, not overwritten", func(t *testing.T) {
+		// "?sslcert=" is a deliberate empty value; q.Has must keep it so
+		// the operator's explicit choice wins over the injected cert.
+		got, _, err := applyInternalTLSToPostgresDSN("postgres://u@db/meta?sslcert=", c)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		q := mustQuery(t, got)
+		if !q.Has("sslcert") || q.Get("sslcert") != "" {
+			t.Errorf("explicit empty sslcert should be preserved, got %q", q.Get("sslcert"))
+		}
+		// sslkey/sslrootcert (truly absent) are still filled in.
+		assertParam(t, q, "sslkey", c.KeyFile)
+	})
+
 	t.Run("postgresql scheme also handled", func(t *testing.T) {
 		got, _, err := applyInternalTLSToPostgresDSN("postgresql://u@db/meta", c)
 		if err != nil {
@@ -111,6 +126,22 @@ func TestApplyInternalTLSToPostgresDSN_KeywordForm(t *testing.T) {
 		// keywordDSNValue must round-trip the quoted value back intact.
 		if v, ok := keywordDSNValue(got, "sslcert"); !ok || v != spaced.CertFile {
 			t.Errorf("keywordDSNValue(sslcert) = (%q, %v), want (%q, true)", v, ok, spaced.CertFile)
+		}
+	})
+
+	t.Run("backslash and quote in cert path round-trip through the DSN", func(t *testing.T) {
+		tricky := config.InternalTLSConfig{
+			Enabled:  true,
+			CertFile: `/etc/o'brien/a\b/client.pem`,
+			KeyFile:  "/etc/zkof/key.pem",
+			CAFile:   "/etc/zkof/ca.pem",
+		}
+		got, _, err := applyInternalTLSToPostgresDSN("host=db user=u", tricky)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if v, ok := keywordDSNValue(got, "sslcert"); !ok || v != tricky.CertFile {
+			t.Errorf("sslcert round-trip = (%q, %v), want (%q, true)", v, ok, tricky.CertFile)
 		}
 	})
 
@@ -179,6 +210,20 @@ func TestKeywordDSNValue(t *testing.T) {
 		{"host=db user=u", "sslmode", "", false},
 		// must not match a substring key (e.g. xsslmode)
 		{"host=db xsslmode=require", "sslmode", "", false},
+		// a bare "key=" is present with an empty value
+		{"host=db sslmode=", "sslmode", "", true},
+		// quoted empty value is present and empty
+		{"host=db sslmode=''", "sslmode", "", true},
+		// later duplicate wins, matching libpq
+		{"sslmode=require sslmode=verify-full", "sslmode", "verify-full", true},
+		// a key name appearing *inside* another key's quoted value must
+		// NOT be picked up (quoting context is respected)
+		{"sslcert='/etc/x sslkey=fake' host=db", "sslkey", "", false},
+		{"sslcert='/etc/x sslkey=fake' host=db", "sslcert", "/etc/x sslkey=fake", true},
+		// backslash-escaped quote inside a quoted value round-trips
+		{`sslcert='/etc/o\'brien/c.pem'`, "sslcert", "/etc/o'brien/c.pem", true},
+		// escaped backslash round-trips to a single backslash
+		{`sslcert='/etc/a\\b/c.pem'`, "sslcert", `/etc/a\b/c.pem`, true},
 	}
 	for _, tc := range cases {
 		got, present := keywordDSNValue(tc.dsn, tc.key)

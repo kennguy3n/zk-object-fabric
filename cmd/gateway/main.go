@@ -24,7 +24,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -1625,20 +1624,91 @@ func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 }
 
 // keywordDSNValue extracts the value of key from a libpq
-// keyword/value DSN. It matches the key at the start of the string
-// or after whitespace, tolerates spaces around the `=`, and accepts
-// either a single-quoted value or a bare (whitespace-delimited)
-// token. The bool reports whether the key was present at all.
+// keyword/value DSN, honouring single-quoting and backslash escapes
+// exactly as libpq's own parser does. Because it understands quoting,
+// it never false-matches a key name that happens to appear inside
+// another key's quoted value (e.g. a cert path "/etc/x sslkey=y"), and
+// it unescapes the value so it round-trips with quoteKeywordDSNValue.
+// The bool reports whether key was present at all (a bare "key=" counts
+// as present with an empty value).
 func keywordDSNValue(dsn, key string) (string, bool) {
-	re := regexp.MustCompile(`(?:^|\s)` + regexp.QuoteMeta(key) + `\s*=\s*(?:'([^']*)'|([^'\s]+))`)
-	m := re.FindStringSubmatch(dsn)
-	if m == nil {
-		return "", false
+	v, ok := parseKeywordDSN(dsn)[key]
+	return v, ok
+}
+
+// parseKeywordDSN tokenises a libpq keyword/value connection string
+// into its key→value pairs. It mirrors libpq's parser: keys and values
+// are whitespace-separated, '=' may be surrounded by whitespace, a
+// value may be single-quoted to embed whitespace, and a backslash
+// escapes the next character in either a quoted or a bare value. Later
+// duplicates win, matching libpq. Malformed trailing input (a key with
+// no '=') is ignored rather than guessed at.
+func parseKeywordDSN(dsn string) map[string]string {
+	out := map[string]string{}
+	i, n := 0, len(dsn)
+	skipSpace := func() {
+		for i < n && isDSNSpace(dsn[i]) {
+			i++
+		}
 	}
-	if m[1] != "" {
-		return m[1], true
+	for i < n {
+		skipSpace()
+		if i >= n {
+			break
+		}
+		start := i
+		for i < n && dsn[i] != '=' && !isDSNSpace(dsn[i]) {
+			i++
+		}
+		key := dsn[start:i]
+		skipSpace()
+		if i >= n || dsn[i] != '=' {
+			break
+		}
+		i++ // consume '='
+		skipSpace()
+		var b strings.Builder
+		if i < n && dsn[i] == '\'' {
+			i++ // opening quote
+			for i < n {
+				if dsn[i] == '\\' && i+1 < n {
+					b.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				if dsn[i] == '\'' {
+					i++ // closing quote
+					break
+				}
+				b.WriteByte(dsn[i])
+				i++
+			}
+		} else {
+			for i < n && !isDSNSpace(dsn[i]) {
+				if dsn[i] == '\\' && i+1 < n {
+					b.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				b.WriteByte(dsn[i])
+				i++
+			}
+		}
+		if key != "" {
+			out[key] = b.String()
+		}
 	}
-	return m[2], true
+	return out
+}
+
+// isDSNSpace reports whether c is whitespace for libpq DSN tokenisation.
+func isDSNSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
 }
 
 // quoteKeywordDSNValue renders v as a value in a libpq keyword/value
@@ -1702,14 +1772,25 @@ func applyInternalTLSToPostgresDSN(dsn string, c config.InternalTLSConfig) (stri
 			return "", false, fmt.Errorf("parse postgres URL DSN: %w", err)
 		}
 		q := u.Query()
+		// Use q.Has, not q.Get()=="": an operator who explicitly pins a
+		// param to an empty value (e.g. "?sslcert=") has made a choice,
+		// and the precedence contract says operator values win. q.Get
+		// can't tell "absent" from "present-but-empty", so it would
+		// clobber that explicit choice.
 		setIfAbsent := func(key, val string) {
-			if q.Get(key) == "" {
+			if !q.Has(key) {
 				q.Set(key, val)
 			}
 		}
 		setIfAbsent("sslcert", c.CertFile)
 		setIfAbsent("sslkey", c.KeyFile)
 		setIfAbsent("sslrootcert", c.CAFile)
+		// sslmode is the one exception to "present-but-empty wins": an
+		// empty sslmode is never a meaningful verifying choice, and once
+		// the operator has armed internal mTLS we default to verify-full
+		// so the pinned CA is actually checked. A non-empty sslmode the
+		// operator set (e.g. verify-ca, or even a non-verifying one) is
+		// preserved and surfaced via the returned weak-mode bool.
 		if q.Get("sslmode") == "" {
 			q.Set("sslmode", "verify-full")
 		}
