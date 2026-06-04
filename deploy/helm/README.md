@@ -56,9 +56,9 @@ single merged file the gateway needs.
 | Readiness | `GET /internal/ready` (503 unless `StateReady`) | `internal/health/health.go` `handleReady` |
 | Drain | `POST /internal/drain` | `internal/health/health.go` `handleDrain` |
 
-> The liveness path is `/internal/health`, **not** `/internal/healthz`.
-> (`docs/ARCHITECTURE.md` historically documented `healthz`; the chart uses
-> the path the code actually mounts.)
+> The liveness path is `/internal/health`, **not** `/internal/healthz`. The
+> chart uses the path the code actually mounts
+> (`internal/health/health.go` `ServeMux`).
 
 | Port | Service | Default |
 | --- | --- | --- |
@@ -69,10 +69,13 @@ single merged file the gateway needs.
 
 The `preStop` hook POSTs to `/internal/drain` (via `wget --post-data`, since
 HTTP probes can only issue GET) to flip the pod `NotReady` and let the
-Service drain in-flight requests before SIGTERM.
-`terminationGracePeriodSeconds` (default 45s) is kept above
-`config.health.drainTimeout` (default 30s) so the kubelet does not kill the
-pod mid-drain.
+Service drain in-flight requests before SIGTERM. The hook's wget timeout is
+`terminationDrainTimeoutSeconds` (default 35), a plain integer kept separate
+from the Go-duration `config.health.drainTimeout` (default 30s) so it never
+has to parse formats like `1m`/`2m30s`. Keep the ordering
+`config.health.drainTimeout ≤ terminationDrainTimeoutSeconds <
+terminationGracePeriodSeconds` (default 45s) so wget waits for the
+server-side drain to finish and the kubelet does not kill the pod mid-drain.
 
 ## The hot-object cache and autoscaling
 
@@ -89,6 +92,15 @@ losing it on reschedule is harmless — the gateway cold-starts.
 - `pvc` — one shared `PersistentVolumeClaim`. Only safe for a single replica
   or a `ReadWriteMany` storage class.
 - `emptyDir` — throwaway node storage.
+
+The cache volume is mounted at `cache.dataDir` (default
+`/var/lib/zk-object-fabric`), the gateway's single writable directory when
+`securityContext.readOnlyRootFilesystem: true` (the default). The hot-object
+cache (`cache.path`) lives under it, as do the single-node embedded SQLite DB
+(`config.controlPlane.embeddedDbPath`) and the `local_fs_dev` backend
+(`config.providers.localFsDev.rootPath`) — so those dev/single-node writes
+succeed against a read-only root filesystem. The embedded DB only persists
+across reschedule when `cache.mode=pvc`.
 
 ## Install
 
@@ -153,6 +165,10 @@ cache:
 secret:
   create: true   # empty placeholders are fine in development
 ```
+
+This works with the default `readOnlyRootFilesystem: true`: the embedded
+SQLite DB and `local_fs_dev` root both sit under `cache.dataDir`, which is
+the (writable) `emptyDir` mount here.
 
 ## Validate before installing
 

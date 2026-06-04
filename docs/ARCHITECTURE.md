@@ -351,7 +351,7 @@ adapter status matrix.
   (`Check(...)` returns `403 DataResidencyViolation`).
 - `config/` — gateway configuration (providers, encryption,
   control plane, abuse, dedup, compliance, console).
-- `health/` — `/internal/healthz`, `/internal/ready`,
+- `health/` — `/internal/health`, `/internal/ready`,
   `/internal/drain`.
 - `metrics/` — self-contained Prometheus text-format exporter
   (`zkof_request_duration_seconds`, `zkof_cache_hit_total`,
@@ -444,7 +444,7 @@ access it through the AWS control plane VPC or a bastion host.
 
 Internal endpoints exposed by `internal/health/`:
 
-- `GET /internal/healthz` — liveness
+- `GET /internal/health` — liveness
 - `GET /internal/ready` — readiness (used by NodeBalancer health check)
 - `POST /internal/drain` — graceful drain for rolling deploys
 

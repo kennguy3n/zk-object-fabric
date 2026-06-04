@@ -109,8 +109,10 @@ config:
     # back to the embedded SQLite store at embeddedDbPath (single-node).
     # rendered into config as control_plane.metadata_dsn.
     metadataDsnFromSecret: true
-    # -- Embedded SQLite path used when no metadata DSN is set. Lives on
-    # the cache PVC so single-node state survives a pod restart.
+    # -- Embedded SQLite path used when no metadata DSN is set. Kept under
+    # cache.dataDir (the only writable mount when readOnlyRootFilesystem is
+    # true). It only survives a pod restart/reschedule when cache.mode=pvc;
+    # with ephemeral/emptyDir it is single-pod scratch state.
     embeddedDbPath: /var/lib/zk-object-fabric/embedded.db
     maxOpenConns: 32
     maxIdleConns: 8
@@ -147,9 +149,16 @@ config:
 # NVMe / block-storage hot-object cache (gateway.cache_path).
 # ---------------------------------------------------------------------------
 cache:
-  # -- Mount path for the disk cache; rendered into config as
-  # gateway.cache_path. Production nodes must point this at fast local
-  # block storage for the L0/L1 hot-object cache.
+  # -- Writable data directory mounted into the pod. This is the volume
+  # mountPath and, when securityContext.readOnlyRootFilesystem is true, the
+  # only writable location in the container. It holds the hot-object cache
+  # (cache.path) and, for single-node/dev profiles, the embedded SQLite DB
+  # (config.controlPlane.embeddedDbPath) and the local_fs_dev backend
+  # (config.providers.localFsDev.rootPath). Keep those paths under this dir.
+  dataDir: /var/lib/zk-object-fabric
+  # -- Disk cache directory; rendered into config as gateway.cache_path.
+  # Must live under cache.dataDir. Production nodes back dataDir with fast
+  # local block storage for the L0/L1 hot-object cache.
   path: /var/lib/zk-object-fabric/cache
 
   # -- How the cache volume is provisioned:
@@ -272,8 +281,17 @@ extraEnv: []
 #    value: us-east-1
 
 # -- Seconds the kubelet waits after SIGTERM before SIGKILL. Must exceed
-# config.health.drainTimeout so the preStop drain can complete.
+# terminationDrainTimeoutSeconds (and therefore config.health.drainTimeout)
+# so the preStop drain can complete.
 terminationGracePeriodSeconds: 45
+
+# -- wget --timeout (whole seconds) for the preStop POST /internal/drain.
+# Kept as a plain integer so it never has to parse a Go duration string:
+# deriving it from config.health.drainTimeout (e.g. "1m", "2m30s") would be
+# error-prone. Set this >= the numeric value of config.health.drainTimeout
+# (so wget waits for the server-side drain to finish) and <
+# terminationGracePeriodSeconds (so the kubelet does not SIGKILL mid-drain).
+terminationDrainTimeoutSeconds: 35
 
 podAnnotations: {}
 podLabels: {}

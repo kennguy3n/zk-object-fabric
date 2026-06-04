@@ -48,12 +48,16 @@ spec:
           # Materialise the final gateway config from the ConfigMap template
           # by expanding the ${SECRET} placeholders with the Secret env vars.
           # envsubst ships in the alpine runtime image (gettext, see Dockerfile).
+          # Restrict substitution to the known secret vars so a stray '$' in an
+          # operator-supplied value (endpoint, bucket, DSN) or a Kubernetes
+          # service-link env var (HOSTNAME, KUBERNETES_*) is never expanded.
           command:
             - /bin/sh
             - -c
             - |
               set -eu
-              envsubst < /etc/zk-object-fabric/config.json.tmpl > /run/zk-object-fabric/config.json
+              envsubst '${WASABI_ACCESS_KEY} ${WASABI_SECRET_KEY} ${METADATA_DSN} ${VAULT_TOKEN} ${CONSOLE_ADMIN_TOKEN}' \
+                < /etc/zk-object-fabric/config.json.tmpl > /run/zk-object-fabric/config.json
           envFrom:
             - secretRef:
                 name: {{ include "zk-object-fabric.secretName" . }}
@@ -121,13 +125,15 @@ spec:
               # Graceful drain for rolling deploys: POST /internal/drain flips
               # the node NotReady so the Service drains in-flight requests
               # before SIGTERM. The endpoint is POST-only, so use wget
-              # --post-data (httpGet probes cannot issue POST).
+              # --post-data (httpGet probes cannot issue POST). The timeout is
+              # a plain integer value (terminationDrainTimeoutSeconds) rather
+              # than parsed from the Go-duration drainTimeout.
               exec:
                 command:
                   - /bin/sh
                   - -c
                   - >-
-                    wget -q -O- --post-data='' --timeout={{ regexFind "[0-9]+" .Values.config.health.drainTimeout | default "30" }}
+                    wget -q -O- --post-data='' --timeout={{ .Values.terminationDrainTimeoutSeconds }}
                     http://127.0.0.1:{{ .Values.config.health.port }}/internal/drain || true
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -136,7 +142,7 @@ spec:
               mountPath: /run/zk-object-fabric
               readOnly: true
             - name: cache
-              mountPath: {{ .Values.cache.path }}
+              mountPath: {{ .Values.cache.dataDir }}
       volumes:
         - name: config-template
           configMap:
