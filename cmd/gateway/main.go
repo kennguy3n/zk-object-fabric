@@ -2895,7 +2895,7 @@ func buildComplianceHooks(cfg config.ComplianceConfig, db, embeddedDB *sql.DB, a
 		case embeddedDB != nil:
 			store, err := compliance.NewSQLiteAllowlistStore(embeddedDB)
 			if err != nil {
-				log.Printf("gateway: embedded residency allowlist store: %v; residency enforcement disabled (allow-all)", err)
+				log.Printf("gateway: embedded residency allowlist store: %v; per-tenant allowlist enforcement disabled (per-object placement residency hints are still enforced)", err)
 			} else {
 				log.Printf("gateway: embedded SQLite residency allowlist enabled (allowlist persists locally across restart)")
 				lookup = store.Lookup
