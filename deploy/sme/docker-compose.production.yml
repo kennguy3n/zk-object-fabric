@@ -1,0 +1,244 @@
+# SME Single-Pool production deployment.
+#
+#   docker compose -f deploy/sme/docker-compose.production.yml up -d
+#
+# Reduces the operational surface to "one VM + Wasabi": the gateway data
+# plane (2 replicas), its Postgres control plane, a ClickHouse billing
+# sink, and a Traefik edge that terminates TLS via Let's Encrypt all run
+# on a single host. Wasabi is the only external dependency. All secrets
+# come from the sibling .env file (see .env.example).
+#
+# One-shot init jobs do the privileged setup the gateway cannot do
+# itself (it connects to Postgres as a least-privilege, non-superuser
+# role in env=production):
+#   * bootstrap     — generates key material, applies every schema,
+#                     arms Row-Level Security, creates the ClickHouse db.
+#   * frontend-init — copies the console SPA out of the gateway image so
+#                     nginx can serve it.
+
+name: zkof-sme
+
+services:
+  # --------------------------------------------------------------- edge
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    command:
+      - --configfile=/etc/traefik/traefik.yml
+    environment:
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL:?set LETSENCRYPT_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - traefik-acme:/letsencrypt
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ------------------------------------------------------ control plane
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-zkof}
+      # Encrypt the data directory at rest by initialising the cluster
+      # with data checksums and letting the host's full-disk encryption
+      # (LUKS on the volume mount, see README) protect the bytes. The
+      # named volume keeps state across restarts.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-zkof}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-zkof}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - chdata:/var/lib/clickhouse
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8123/ping >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  # -------------------------------------------------------- init (once)
+  bootstrap:
+    image: alpine:3.20
+    restart: "no"
+    entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-zkof}
+      ZKOF_APP_PASSWORD: ${ZKOF_APP_PASSWORD:?set ZKOF_APP_PASSWORD in .env}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-zkof_billing}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-zkof}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+    volumes:
+      - ../../:/repo:ro
+      - ./bootstrap:/bootstrap:ro
+      - gateway-secrets:/run/sme/secrets
+    networks:
+      # edge gives the one-shot apk fetch outbound access; backend
+      # reaches Postgres and ClickHouse.
+      - edge
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  frontend-init:
+    # Copies the console SPA bundle baked into the gateway image onto a
+    # volume nginx serves. Uses the same image so the bundle always
+    # matches the running gateway version.
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${ZKOF_IMAGE:-zkof-gateway:local}
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c", "rm -rf /dist/* && cp -a /app/frontend/. /dist/ && echo 'frontend copied'"]
+    volumes:
+      - console-dist:/dist
+    networks:
+      - backend
+
+  # ----------------------------------------------------------- gateways
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${ZKOF_IMAGE:-zkof-gateway:local}
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/zkof/entrypoint.sh"]
+    env_file:
+      - .env
+    environment:
+      # Derived wiring the gateway config template consumes via envsubst.
+      METADATA_DSN: postgres://zkof_app:${ZKOF_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-zkof}?sslmode=disable
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-zkof_billing}
+      CONSOLE_HOST: ${DOMAIN_NAME}
+      ZKOF_CELL_ID: ${ZKOF_CELL_ID:-sme-cell-1}
+    volumes:
+      - ./gateway/config.json.tmpl:/etc/zkof/config.json.tmpl:ro
+      - ./gateway/entrypoint.sh:/etc/zkof/entrypoint.sh:ro
+      - gateway-secrets:/run/sme/secrets:ro
+    networks:
+      - edge
+      - backend
+    deploy:
+      replicas: 2
+    healthcheck:
+      # Readiness lives on the dedicated internal listener (:8082), not
+      # the S3 port. wget exits non-zero on the 503 the gateway returns
+      # until the node is in quorum and serving.
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8082/internal/ready >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: sme_edge
+      # S3 data plane.
+      traefik.http.routers.s3.rule: Host(`s3.${DOMAIN_NAME}`)
+      traefik.http.routers.s3.entrypoints: websecure
+      traefik.http.routers.s3.tls.certresolver: le
+      traefik.http.routers.s3.service: gw-s3
+      traefik.http.routers.s3.middlewares: sme-ratelimit@file,sme-secure-headers@file
+      # Block /internal/* (metrics, version) from the public internet.
+      traefik.http.routers.s3-internal.rule: Host(`s3.${DOMAIN_NAME}`) && PathPrefix(`/internal`)
+      traefik.http.routers.s3-internal.entrypoints: websecure
+      traefik.http.routers.s3-internal.tls.certresolver: le
+      traefik.http.routers.s3-internal.service: gw-s3
+      traefik.http.routers.s3-internal.priority: "100"
+      traefik.http.routers.s3-internal.middlewares: sme-internal-allowlist@file
+      traefik.http.services.gw-s3.loadbalancer.server.port: "8080"
+      traefik.http.services.gw-s3.loadbalancer.healthcheck.path: /internal/ready
+      traefik.http.services.gw-s3.loadbalancer.healthcheck.port: "8082"
+      traefik.http.services.gw-s3.loadbalancer.healthcheck.interval: 10s
+
+  # -------------------------------------------------------- console web
+  console-web:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx/console.conf:/etc/nginx/conf.d/default.conf:ro
+      - console-dist:/usr/share/nginx/html:ro
+    networks:
+      - edge
+      - backend
+    depends_on:
+      frontend-init:
+        condition: service_completed_successfully
+      gateway:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:80/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: sme_edge
+      traefik.http.routers.console.rule: Host(`${DOMAIN_NAME}`) || Host(`console.${DOMAIN_NAME}`)
+      traefik.http.routers.console.entrypoints: websecure
+      traefik.http.routers.console.tls.certresolver: le
+      traefik.http.routers.console.service: console-web
+      traefik.http.routers.console.middlewares: sme-ratelimit@file,sme-secure-headers@file
+      traefik.http.services.console-web.loadbalancer.server.port: "80"
+
+networks:
+  edge:
+    name: sme_edge
+  backend:
+    name: sme_backend
+    internal: true
+
+volumes:
+  pgdata:
+  chdata:
+  gateway-secrets:
+  console-dist:
+  traefik-acme:

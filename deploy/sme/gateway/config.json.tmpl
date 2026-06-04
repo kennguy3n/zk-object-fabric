@@ -1,0 +1,63 @@
+{
+  "env": "production",
+  "gateway": {
+    "listen_addr": ":8080",
+    "read_timeout": "300s",
+    "write_timeout": "300s",
+    "read_header_timeout": "10s",
+    "idle_timeout": "120s",
+    "max_request_bytes": 5368709120,
+    "cache_path": "/data/cache"
+  },
+  "console": {
+    "listen_addr": ":8081",
+    "read_timeout": "30s",
+    "write_timeout": "30s",
+    "read_header_timeout": "10s",
+    "idle_timeout": "120s",
+    "admin_token": "${ADMIN_TOKEN}",
+    "jwt_signing_key_path": "/run/sme/secrets/jwt_signing_key.pem"
+  },
+  "health": {
+    "listen_addr": ":8082",
+    "cell_id": "${ZKOF_CELL_ID}",
+    "read_header_timeout": "10s",
+    "drain_timeout": "30s"
+  },
+  "metrics": {
+    "enabled": true
+  },
+  "providers": {
+    "wasabi": {
+      "endpoint": "${WASABI_ENDPOINT}",
+      "region": "${WASABI_REGION}",
+      "bucket": "${WASABI_BUCKET}",
+      "access_key": "${WASABI_ACCESS_KEY}",
+      "secret_key": "${WASABI_SECRET_KEY}"
+    }
+  },
+  "billing": {
+    "clickhouse_url": "${CLICKHOUSE_URL}",
+    "clickhouse_database": "${CLICKHOUSE_DATABASE}",
+    "clickhouse_table": "usage_events",
+    "clickhouse_username": "${CLICKHOUSE_USER}",
+    "clickhouse_password": "${CLICKHOUSE_PASSWORD}",
+    "batch_size": 256,
+    "flush_interval": "10s"
+  },
+  "control_plane": {
+    "metadata_dsn": "${METADATA_DSN}",
+    "auth_issuer": "${CONSOLE_HOST}",
+    "max_open_conns": 20,
+    "max_idle_conns": 10,
+    "conn_max_lifetime": "30m",
+    "conn_max_idle_time": "5m"
+  },
+  "encryption": {
+    "cmk_uri": "${KMS_CMK_URI}",
+    "kms_region": "${KMS_REGION}",
+    "vault_addr": "${VAULT_ADDR}",
+    "vault_token": "${VAULT_TOKEN}",
+    "manifest_body_key_path": "/run/sme/secrets/manifest_body.key"
+  }
+}

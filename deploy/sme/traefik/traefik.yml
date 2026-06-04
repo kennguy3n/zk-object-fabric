@@ -1,0 +1,61 @@
+# Traefik v3 static configuration for the SME single-pool deployment.
+# Routers and services are attached as labels on the gateway and
+# console-web containers (see docker-compose.production.yml); the
+# reusable middlewares and TLS options live in the file provider
+# (dynamic.yml).
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+# Access logs are useful for an SME operator debugging a 4xx/5xx; keep
+# them on stdout so `docker compose logs traefik` is the single pane.
+accessLog: {}
+
+entryPoints:
+  web:
+    address: ":80"
+    # Every plaintext request is redirected to HTTPS. ACME HTTP-01
+    # challenges are served on :80 before the redirect fires.
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: le
+
+providers:
+  docker:
+    # Only containers that explicitly set `traefik.enable=true` are
+    # routed — Postgres, ClickHouse, and the init jobs stay private.
+    exposedByDefault: false
+    network: sme_edge
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+# Let's Encrypt via the HTTP-01 challenge. acme.json is persisted on a
+# named volume so certificates survive restarts and stay well under the
+# rate limit. Point CA at the staging directory first if you are testing
+# the DNS/firewall path (see README).
+certificatesResolvers:
+  le:
+    acme:
+      email: "${LETSENCRYPT_EMAIL}"
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
+
+api:
+  dashboard: false
+  insecure: false
+
+ping: {}

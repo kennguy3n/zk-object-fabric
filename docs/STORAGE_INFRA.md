@@ -18,6 +18,7 @@ It answers two questions:
 | **B2C**  | ZK Object Fabric      | ZK Object Fabric | Wasabi (Phase 1 primary) → Ceph RGW pooled cells (Phase 2+) | Backblaze B2 or Cloudflare R2 | Linode NVMe (L0 / L1) | Object-level (intra-tenant, ContentIndex) |
 | **B2B**  | ZK Object Fabric (dedicated cell) | ZK Object Fabric | Ceph RGW dedicated cell with EC 8+3 or 10+4 | Second Ceph cell in a different failure domain | Co-located NVMe per cell | Object-level + block-level (Ceph dedup tier) |
 | **BYOC** | Customer | ZK Object Fabric (SaaS) | Customer's own S3-compatible backend (AWS S3, GCP, Azure via S3 shim) | Customer responsibility | Customer responsibility | Object-level (intra-tenant, if dedup policy enabled) |
+| **SME Single-Pool** | ZK Object Fabric (single VM, 2 gateway replicas) | ZK Object Fabric (Postgres on the same VM) | Wasabi | Wasabi versioning / cross-region (operator policy) | Local SSD hot cache (per replica) | Object-level (intra-tenant, ContentIndex) |
 | **Dev / Demo** | Developer laptop (Docker) | ZK Object Fabric (in-memory) | `local_fs_dev` (filesystem) | None | In-memory LRU (L0) | Object-level (in-memory ContentIndex) |
 
 ### B2C — multi-tenant shared fabric

@@ -1,0 +1,2 @@
+# Operator-provided secrets — never commit.
+.env
