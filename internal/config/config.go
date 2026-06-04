@@ -5,6 +5,7 @@ package config
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -105,6 +106,13 @@ type Config struct {
 	Repair        RepairConfig        `json:"repair"`
 	Lifecycle     LifecycleConfig     `json:"lifecycle"`
 	Notifications NotificationsConfig `json:"notifications"`
+
+	// InternalTLS configures mutual TLS on the gateway's *outbound*
+	// connections to internal backends (Postgres metadata, ClickHouse
+	// billing). It is independent of the per-listener TLSConfig under
+	// Gateway/Console/Health, which only does server-side TLS for the
+	// gateway's inbound HTTPS listeners. See InternalTLSConfig.
+	InternalTLS InternalTLSConfig `json:"internal_tls"`
 }
 
 // NotificationsConfig configures the bucket event-notification
@@ -722,6 +730,115 @@ func (t TLSConfig) BuildGoTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
+// InternalTLSConfig configures mutual TLS (client authentication)
+// for the gateway's *outbound* connections to internal backends —
+// Postgres (control-plane metadata) and ClickHouse (billing).
+//
+// It is deliberately separate from TLSConfig: TLSConfig configures
+// the gateway's inbound HTTPS *listeners* and is server-auth only
+// (it presents a cert to clients). InternalTLSConfig is the mirror
+// image — the gateway is the *client*, so it presents a client cert
+// (CertFile/KeyFile) and pins the backends' issuing CA (CAFile) to
+// verify the server it dials. This closes the "no mTLS between
+// gateway and Postgres / billing" gap: a compromised internal
+// network can neither read metadata in transit nor impersonate a
+// backend, because both ends authenticate with certificates.
+//
+// The same cert/key/CA material is shared by every internal backend
+// connection; which connections actually use it is gated by the
+// per-connection toggles (ControlPlane.MetadataTLS for Postgres,
+// Billing.ClickHouseTLS for ClickHouse) so an operator can roll the
+// feature out one backend at a time.
+//
+// When Enabled is false the toggles are ignored and the gateway
+// connects to backends exactly as it did before this feature
+// landed (DSN-driven sslmode for Postgres, plain transport for
+// ClickHouse), so leaving InternalTLS unset is fully backwards
+// compatible.
+type InternalTLSConfig struct {
+	// Enabled is the master switch. When false the per-connection
+	// toggles are ignored and no internal mTLS is applied anywhere.
+	Enabled bool `json:"enabled"`
+
+	// CertFile and KeyFile are the PEM-encoded client certificate
+	// and its private key the gateway presents to backends. Both are
+	// required when Enabled.
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
+
+	// CAFile is the PEM bundle of certificate authorities used to
+	// verify backend server certificates. Required when Enabled:
+	// leaving it empty would silently fall back to the host's system
+	// root store, which defeats the purpose of pinning an internal
+	// CA and would let any publicly-trusted cert impersonate a
+	// backend.
+	CAFile string `json:"ca_file"`
+}
+
+// Validate reports operator misconfiguration of the internal-mTLS
+// section. It is a no-op when Enabled is false (the whole feature is
+// off). When Enabled is true all three file paths must be set —
+// a half-populated config would otherwise either fail to load the
+// client identity or silently drop CA pinning. Validate does not
+// read the files; BuildClientTLSConfig surfaces unreadable or
+// malformed material at wiring time with a path-qualified error.
+func (c InternalTLSConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	var missing []string
+	if strings.TrimSpace(c.CertFile) == "" {
+		missing = append(missing, "cert_file")
+	}
+	if strings.TrimSpace(c.KeyFile) == "" {
+		missing = append(missing, "key_file")
+	}
+	if strings.TrimSpace(c.CAFile) == "" {
+		missing = append(missing, "ca_file")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("config: internal_tls.enabled is true but %s must be set", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// BuildClientTLSConfig loads the client certificate/key pair and the
+// CA bundle and returns the *tls.Config the gateway uses as a client
+// when dialing internal backends. The returned config presents the
+// client certificate (for the backend to authenticate the gateway)
+// and verifies the backend against CAFile only (RootCAs), pinning
+// the internal CA rather than trusting the host's system roots.
+// MinVersion is TLS 1.2, matching the listener default.
+//
+// It returns an error (rather than nil) when Enabled is false so
+// callers never accidentally apply a zero-value config; callers
+// gate on Enabled before calling.
+func (c InternalTLSConfig) BuildClientTLSConfig() (*tls.Config, error) {
+	if !c.Enabled {
+		return nil, fmt.Errorf("config: internal_tls is not enabled")
+	}
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("config: internal_tls load client keypair (cert_file=%s key_file=%s): %w", c.CertFile, c.KeyFile, err)
+	}
+	caPEM, err := os.ReadFile(c.CAFile)
+	if err != nil {
+		return nil, fmt.Errorf("config: internal_tls read ca_file=%s: %w", c.CAFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("config: internal_tls ca_file=%s contains no PEM certificates", c.CAFile)
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+	}, nil
+}
+
 // ControlPlaneConfig configures the AWS-hosted control plane surface
 // the gateway talks to.
 //
@@ -768,6 +885,13 @@ type ControlPlaneConfig struct {
 	// ConnMaxIdleTime caps how long an idle connection may sit in
 	// the pool before retirement. Zero means no limit.
 	ConnMaxIdleTime Duration `json:"conn_max_idle_time"`
+
+	// MetadataTLS opts the metadata Postgres connection into the
+	// shared internal-mTLS material (InternalTLS). It only takes
+	// effect when InternalTLS.Enabled is also true; otherwise it is
+	// ignored and the connection uses whatever sslmode the
+	// MetadataDSN already specifies. See docs/runbooks/internal-mtls.md.
+	MetadataTLS bool `json:"metadata_tls"`
 }
 
 // BillingConfig configures the metering sink. When ClickHouseURL is
@@ -787,6 +911,14 @@ type BillingConfig struct {
 	ClickHousePassword string   `json:"clickhouse_password"`
 	BatchSize          int      `json:"batch_size"`
 	FlushInterval      Duration `json:"flush_interval"`
+
+	// ClickHouseTLS opts the ClickHouse billing connection into the
+	// shared internal-mTLS material (InternalTLS). It only takes
+	// effect when InternalTLS.Enabled is also true; otherwise it is
+	// ignored and the sink dials ClickHouse with the default
+	// transport. The ClickHouse endpoint must be an https:// URL for
+	// mTLS to apply. See docs/runbooks/internal-mtls.md.
+	ClickHouseTLS bool `json:"clickhouse_tls"`
 
 	// Provider selects the BillingProvider integration. Empty
 	// (or "noop") wires the no-op default that logs every call
@@ -1264,6 +1396,9 @@ func (c *Config) Validate() error {
 		if err := validateTimeoutOrder("health", c.Health.ReadHeaderTimeout, c.Health.ReadTimeout); err != nil {
 			return err
 		}
+	}
+	if err := c.InternalTLS.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
