@@ -68,10 +68,10 @@ func (s *SQLiteAllowlistStore) ensureSchema(ctx context.Context) error {
 }
 
 // Lookup returns the country codes a tenant is permitted to land data
-// in, or an empty slice when the tenant has no rows. An empty list
-// means "no restriction": the enforcer treats it as allow-all so
-// tenants without an allowlist do not regress. Countries are stored
-// normalized (trimmed, upper-cased) so the result is stable.
+// in, or a nil slice when the tenant has no rows. A zero-length result
+// (nil or empty) means "no restriction": the enforcer treats it as
+// allow-all so tenants without an allowlist do not regress. Countries
+// are stored normalized (trimmed, upper-cased) so the result is stable.
 //
 // The signature (no context) matches AllowlistLookup and the Postgres
 // lookup in cmd/gateway; it uses context.Background internally.
