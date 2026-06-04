@@ -6,8 +6,10 @@ import (
 	"time"
 )
 
-// gibibyte is 1 GiB in bytes; storage volumes are priced per
-// GiB-month so the reader divides the metered byte figures by this.
+// gibibyte is 1 GiB in bytes and the package's single source of truth
+// for that magnitude; storage volumes are priced per GiB-month so the
+// reader divides the metered byte figures by this. forecasting.go's
+// bytesPerGiB is derived from it so the two cannot drift apart.
 const gibibyte = 1 << 30
 
 // WindowedUsageSource is the metering read-side the cost reader

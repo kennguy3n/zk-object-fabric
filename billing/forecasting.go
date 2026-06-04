@@ -191,8 +191,10 @@ func (f *Forecaster) now() time.Time {
 const secondsPerProjectedMonth = float64(30 * 24 * 60 * 60)
 
 // bytesPerGiB is the divisor that turns a ciphertext byte count into
-// GiB so it can be multiplied by a $/GiB-month rate.
-const bytesPerGiB = float64(1 << 30)
+// GiB so it can be multiplied by a $/GiB-month rate. Derived from the
+// package's single gibibyte constant (cost_usage_reader.go) so the two
+// representations cannot drift apart.
+const bytesPerGiB = float64(gibibyte)
 
 // MonthlyCostProjection is one point on the forward storage-cost
 // curve emitted by ProjectedMonthlyCost. MonthsFromNow is 1-based:
