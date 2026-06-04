@@ -812,7 +812,17 @@ func TestChaos_ConcurrentMigration(t *testing.T) {
 		wg.Add(1)
 		go func(o seeded) {
 			defer wg.Done()
-			m := latestManifest(t, store, bucket, o.key)
+			// Look up the manifest inline (not via latestManifest,
+			// which calls t.Fatalf): t.Fatal from a non-test
+			// goroutine only kills the calling goroutine via
+			// runtime.Goexit and silently swallows the failure, so
+			// errors are funnelled through errCh like the reader and
+			// writer goroutines below.
+			m, err := store.Get(ctx, o.mkey)
+			if err != nil {
+				errCh <- fmt.Errorf("load manifest for repair %s: %w", o.key, err)
+				return
+			}
 			if _, err := rr.Repair(ctx, o.mkey, m, 0); err != nil {
 				errCh <- fmt.Errorf("repair %s: %w", o.key, err)
 			}
@@ -979,9 +989,9 @@ func newChaosGateway(t *testing.T, cfg s3compat.Config) *s3compat.Handler {
 		cfg.Now = func() time.Time {
 			mu.Lock()
 			defer mu.Unlock()
-			t := now
+			cur := now
 			now = now.Add(time.Second)
-			return t
+			return cur
 		}
 	}
 	return s3compat.New(cfg)
