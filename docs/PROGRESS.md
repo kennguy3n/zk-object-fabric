@@ -533,15 +533,41 @@ not production validation. The following items are explicitly **not yet
 validated** against this codebase and should be completed before any
 external load is run on it:
 
-- **Load testing** — harness wired ([`tests/benchmark`](../tests/benchmark/),
+> **CI automation (WS S10).** The portions of this checklist that do
+> not require paid infrastructure now run on demand via the
+> `staging-validation` job in
+> [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (trigger it
+> from the Actions tab — it is gated on `workflow_dispatch` so it does
+> not run on every PR). That job runs the full `-race` suite
+> (`make test`), `go vet` + `staticcheck` + `govulncheck`, the chaos
+> suite (`tests/chaos/`), the DR verifier (`tests/dr/`), and the live
+> Ceph RGW S3 conformance run (`TestSuite_CephRGW`). It **deliberately
+> excludes Tier 3** (the paid Linode + Wasabi staging load), which
+> still requires a human operator and real infrastructure — see
+> [`docs/runbooks/load-testing.md`](runbooks/load-testing.md) §4. The
+> table below marks each item **[CI-automated]**,
+> **[partially CI-automated]**, or **[manual staging only]**
+> accordingly.
+
+- **Load testing** — *[partially CI-automated]* — harness wired
+  ([`tests/benchmark`](../tests/benchmark/),
   CLI at [`cmd/benchmark-runner`](../cmd/benchmark-runner/), runbook at
   [`docs/runbooks/load-testing.md`](runbooks/load-testing.md)). Numeric
-  targets published below. **Real-deployment runs** against the
-  Linode + Wasabi staging gateway are still pending and must be
-  attached as JSON reports under `docs/reports/load/` before this
-  item closes.
-- **Chaos / failure-injection testing** — single-node loss, zone loss,
-  metadata-DB failover, provider-side outages, cache partition.
+  targets published below. A reduced-scale smoke run
+  (`TestSmoke_LocalFSLatencyTargets`, ~10s at ~1000 RPS against
+  `local_fs_dev`) plus a constant-drift guard
+  (`TestTargetConstants_MatchRunbook`, which parses the runbook SLA
+  table) run in CI on every PR, and the `load-test-smoke` job exercises
+  the CLI. **Real-deployment Tier 3 runs** against the Linode + Wasabi
+  staging gateway are still **[manual staging only]** and must be
+  attached as JSON reports under
+  [`docs/reports/load/`](reports/load/README.md) before this item
+  closes.
+- **Chaos / failure-injection testing** — *[CI-automated]* — single-node
+  loss, zone loss, metadata-DB failover, provider-side outages, cache
+  partition. The in-process scenarios in [`tests/chaos/`](../tests/chaos/)
+  run in the `staging-validation` workflow job; full-fleet exercises
+  against real infrastructure remain manual.
 - **External security review** — independent review of the auth path
   (HMAC, presigned URLs, IAM-style policies), the encryption envelope,
   manifest sealing, and DEK handling.
@@ -562,10 +588,14 @@ external load is run on it:
     `encryption/client_sdk/`, `encryption/envelope.go`, and
     `metadata/manifest_store/postgres/body_encryptor.go`. Same bundle
     target as above; specialist crypto auditor engagement still TBD.
-- **S3 conformance report** — a published conformance matrix against
-  the AWS S3 API surface (PUT, GET, HEAD, DELETE, LIST, multipart,
-  range, ACL, versioning, lifecycle) using an external conformance
-  harness, not only the in-repo `tests/s3_compat` suite.
+- **S3 conformance report** — *[partially CI-automated]* — a published
+  conformance matrix against the AWS S3 API surface (PUT, GET, HEAD,
+  DELETE, LIST, multipart, range, ACL, versioning, lifecycle). The
+  in-repo [`tests/s3_compat`](../tests/s3_compat/) suite runs against
+  the in-process backends on every PR and against a **live Ceph RGW
+  Docker demo container** (`TestSuite_CephRGW`) in the
+  `staging-validation` workflow job; an external conformance harness
+  is still pending.
 - **Disaster-recovery exercises** — restore-from-backup runbooks
   exercised end-to-end, cross-cell replication failover, manifest-DB
   restore-and-resume, and customer-visible RPO / RTO measurement.
@@ -573,7 +603,9 @@ external load is run on it:
   WS1.6 (see [`docs/runbooks/dr.md`](runbooks/dr.md) and
   [`tests/dr/verifier.go`](../tests/dr/verifier.go) — Postgres /
   cross-cell / manifest-resume drills still require operator-led
-  external exercises against real infrastructure).*
+  external exercises against real infrastructure).* *[partially
+  CI-automated]* — the in-process DR verifier runs in the
+  `staging-validation` workflow job.
 - **Multi-tenant abuse / quota validation** — abuse-control trip
   thresholds tested under adversarial workloads (slowloris, key-space
   flood, egress-budget exhaustion).

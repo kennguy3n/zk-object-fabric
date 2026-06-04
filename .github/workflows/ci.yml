@@ -11,6 +11,12 @@ on:
   push:
     branches:
       - main
+  # staging-validation below is dispatch-only: it runs the heavy
+  # production-validation checklist (race suite, chaos, DR verifier,
+  # live Ceph RGW S3 conformance) on demand from the Actions tab. It
+  # does NOT run Tier 3 (paid Linode + Wasabi) load — that stays a
+  # manual staging run (docs/runbooks/load-testing.md §4).
+  workflow_dispatch:
 
 jobs:
   go:
@@ -198,3 +204,115 @@ jobs:
           name: load-test-smoke-reports
           path: load-smoke-*.json
           retention-days: 14
+
+  staging-validation:
+    name: staging-validation
+    # Dispatch-only: this job is the CI-automatable portion of the
+    # production-validation checklist. It is gated on the manual
+    # workflow_dispatch event so it never runs on PRs or pushes (the
+    # lighter `go`, `static-analysis`, `govulncheck`, and
+    # `load-test-smoke` jobs above cover those). Tier 3 staging load
+    # (paid infra + a human operator) is intentionally excluded.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      # (a) Full race-enabled test suite. `make test` is
+      # `go test -race -count=1 ./...` (see Makefile).
+      - name: make test (race)
+        run: make test
+
+      # (b) Static analysis + vulnerability scan, matching the
+      # dedicated CI jobs so the dispatch run is self-contained.
+      - name: go vet
+        run: go vet ./...
+
+      - name: Install staticcheck + govulncheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: staticcheck
+        run: staticcheck ./...
+
+      - name: govulncheck
+        run: govulncheck ./...
+
+      # (c) Chaos suite: fault-injection scenarios.
+      - name: Chaos suite
+        run: go test ./tests/chaos/ -v
+
+      # (d) Disaster-recovery verifier.
+      - name: DR verifier
+        run: go test ./tests/dr/ -v
+
+      # (e) Full S3 conformance against the Ceph RGW Docker demo
+      # container. This is the live-backend conformance run
+      # (TestSuite_CephRGW); the in-process backends are already
+      # covered by `go test ./tests/s3_compat/` in the `go` job and
+      # the race suite above. Boot params mirror the operator runbook
+      # / environment blueprint exactly.
+      - name: Start Ceph RGW demo container
+        run: |
+          docker rm -f ceph-demo 2>/dev/null || true
+          sudo rm -rf /var/lib/ceph-demo
+          sudo mkdir -p /var/lib/ceph-demo/etc /var/lib/ceph-demo/lib
+          docker run -d --name ceph-demo --restart=no \
+            -e MON_IP=127.0.0.1 \
+            -e CEPH_PUBLIC_NETWORK=127.0.0.0/8 \
+            -e CEPH_DEMO_UID=zkof \
+            -e CEPH_DEMO_ACCESS_KEY=zkof-test-ak \
+            -e CEPH_DEMO_SECRET_KEY=zkof-test-sk-0000000000000000000000000 \
+            -e RGW_NAME=ceph-demo \
+            -e RGW_FRONTEND_PORT=8888 \
+            -e NETWORK_AUTO_DETECT=0 \
+            -p 8888:8888 \
+            -v /var/lib/ceph-demo/etc:/etc/ceph \
+            -v /var/lib/ceph-demo/lib:/var/lib/ceph \
+            quay.io/ceph/demo:latest-reef demo
+
+      - name: Wait for RGW + create compliance bucket
+        run: |
+          # Poll until RGW answers, bounded by a real elapsed-time
+          # deadline (bash $SECONDS) so the reported timing is accurate
+          # and the step fails fast if the container never comes up.
+          deadline=$((SECONDS + 180))
+          until curl -sf http://127.0.0.1:8888/ >/dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "RGW did not come up within 180s" >&2
+              docker logs ceph-demo | tail -50 >&2 || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "RGW is up after ${SECONDS}s"
+          AWS_ACCESS_KEY_ID=zkof-test-ak \
+          AWS_SECRET_ACCESS_KEY=zkof-test-sk-0000000000000000000000000 \
+          AWS_DEFAULT_REGION=us-east-1 \
+            aws --endpoint-url http://127.0.0.1:8888 s3api create-bucket \
+              --bucket zkof-ceph-compliance 2>/dev/null || true
+
+      - name: S3 conformance suite (live Ceph RGW)
+        env:
+          CEPH_RGW_ENDPOINT: http://127.0.0.1:8888
+          CEPH_RGW_BUCKET: zkof-ceph-compliance
+          CEPH_RGW_ACCESS_KEY: zkof-test-ak
+          CEPH_RGW_SECRET_KEY: zkof-test-sk-0000000000000000000000000
+          # Match the region the bucket is created with above and the
+          # us-east-1 region the rest of the conformance suite uses.
+          CEPH_RGW_REGION: us-east-1
+        run: go test -v -run TestSuite_CephRGW ./tests/s3_compat/ -timeout 15m
+
+      - name: Tear down Ceph RGW demo container
+        if: always()
+        run: docker rm -f ceph-demo 2>/dev/null || true
