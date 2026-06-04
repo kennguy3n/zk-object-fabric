@@ -295,11 +295,13 @@ type AbuseConfig struct {
 
 	// RateLimitFailClosed makes the per-tenant rate limiter reject
 	// requests whose tenant budget cannot be resolved (the
-	// RateLimiter.Allow path where the budget lookup returns ok=false
-	// or a non-positive rps) instead of letting them through. This
-	// closes the fail-open hole where a budget-directory outage during
-	// a flood silently disables rate limiting for every tenant the
-	// limiter cannot price.
+	// RateLimiter.Allow path where the budget lookup returns ok=false)
+	// instead of letting them through. A tenant the directory
+	// positively resolves with no ceiling (rps <= 0, ok=true) is an
+	// intentional "unlimited" signal and stays fail-open regardless of
+	// this flag. This closes the fail-open hole where a budget-directory
+	// outage during a flood silently disables rate limiting for every
+	// tenant the limiter cannot price.
 	//
 	// The effective posture is environment-driven and must be read
 	// through Config.RateLimitFailClosedEnabled rather than this field
