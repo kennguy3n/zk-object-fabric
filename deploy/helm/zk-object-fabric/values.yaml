@@ -233,6 +233,13 @@ secret:
   # Inline values — used only when create is true. Leave blank and rely on
   # `--set`/`-f` overrides or an existingSecret in real deployments; never
   # commit real credentials.
+  #
+  # NOTE: these values are substituted into the JSON config by the init
+  # container's envsubst, so they must be JSON-string-safe: a literal '"',
+  # '\' or newline in a value (most likely a METADATA_DSN password) would
+  # produce malformed config.json and crash-loop the gateway on parse. Keep
+  # DSN passwords URL-encoded (the standard for libpq URIs) and avoid raw
+  # quotes/backslashes; alphanumeric Wasabi keys and UUID/JWT tokens are safe.
   wasabiAccessKey: ""
   wasabiSecretKey: ""
   metadataDsn: ""
@@ -301,6 +308,19 @@ resources:
   limits:
     cpu: "2"
     memory: 2Gi
+
+# -- render-config init container. Its only job is a one-shot envsubst, so the
+# defaults are deliberately tiny. They exist mainly so the pod is admitted in
+# clusters whose LimitRange requires requests/limits on every container,
+# init containers included. Set initContainer.resources: {} to omit the block.
+initContainer:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
 
 # -- Extra non-secret env vars the gateway reads directly from the process
 # environment (os.Getenv), e.g. AWS_REGION, CONSOLE_VERIFY_BASE_URL.

@@ -51,6 +51,22 @@ mounts the Secret as env vars (it needs them for `envsubst`); the gateway
 container has no `envFrom`, so the credentials are not exposed in its process
 environment — it reads them from the rendered `config.json`.
 
+Two consequences of the `envsubst` approach to be aware of:
+
+- **Secret values must be JSON-string-safe.** They are substituted verbatim
+  into a JSON document, so a literal `"`, `\`, or newline in a value (most
+  likely a `METADATA_DSN` password) produces malformed `config.json` and the
+  gateway crash-loops on parse. Keep DSN passwords URL-encoded (the libpq URI
+  standard); alphanumeric Wasabi keys and UUID/JWT tokens are inherently safe.
+- **Rotating credentials needs a pod roll.** The values are baked into
+  `config.json` by the init container at start-up, so the pod template carries
+  a `checksum/secret` annotation: when `secret.create: true`, a
+  `helm upgrade` that changes a credential rolls the pods automatically. When
+  credentials live in an externally-managed Secret (`secret.create: false` /
+  `existingSecret`), Helm cannot hash its contents, so rotate with a reloader
+  (e.g. [Stakater Reloader](https://github.com/stakater/Reloader)) or
+  `kubectl rollout restart deploy/<release>-zk-object-fabric`.
+
 ## Manifest-body encryption key (required in production)
 
 With `config.env: production` and a persistent metadata store (a Postgres
@@ -64,7 +80,10 @@ flow above; the chart mounts it from a Secret instead.
 Provide a 32-byte XChaCha20-Poly1305 key via `config.encryption.manifestBodyKey`:
 
 - `value` — base64 of the 32 raw bytes (`head -c 32 /dev/urandom | base64`).
-  The chart stores it in the gateway Secret (needs `secret.create: true`).
+  The chart stores it in the gateway Secret, so this requires
+  `secret.create: true`. Setting `value` together with `secret.create: false`
+  is rejected at install time (the key would have nowhere to live and the pod
+  would crash-loop on a missing file) — use `existingSecret` in that case.
 - `existingSecret` / `existingSecretKey` — reference a key in a Secret you
   manage out-of-band (recommended for production).
 

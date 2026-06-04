@@ -17,6 +17,17 @@ spec:
       annotations:
         {{- /* Roll pods when the rendered config changes. */}}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- /*
+        Roll pods when the chart-created Secret changes so credential rotation
+        via `helm upgrade` takes effect: the config.json placeholders are baked
+        in by the init container's envsubst at start-up, so a Secret change alone
+        would otherwise leave running pods on the old credentials. This covers
+        the chart-managed Secret (secret.create=true). When credentials live in
+        an externally-managed Secret (secret.create=false / existingSecret) Helm
+        cannot see its contents to hash, so use a reloader (e.g. Stakater
+        Reloader) or `kubectl rollout restart` after rotating it.
+        */}}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
         {{- if .Values.config.metrics.enabled }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.config.gateway.port | quote }}
@@ -45,6 +56,13 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.initContainer.resources }}
+          # Explicit (small) requests/limits so the pod is admitted in clusters
+          # whose LimitRange requires resources on every container, init ones
+          # included. envsubst is trivial, so the defaults are deliberately tiny.
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           # Materialise the final gateway config from the ConfigMap template
           # by expanding the ${SECRET} placeholders with the Secret env vars.
           # envsubst ships in the alpine runtime image (gettext, see Dockerfile).

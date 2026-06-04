@@ -105,6 +105,17 @@ misconfiguration surfaces at `helm install` instead of as a pod crash-loop.
 {{- if and (eq .Values.config.env "production") $persistent (not (include "zk-object-fabric.manifestBodyKeyConfigured" .)) -}}
 {{- fail "config.env=production with a persistent metadata store (controlPlane.metadataDsnFromSecret or controlPlane.embeddedDbPath) requires config.encryption.manifestBodyKey.value or .existingSecret: the gateway refuses to boot without manifest_body_key_path (manifest JSON would be stored as plaintext). Set the key, or use config.env=development for a no-dependency trial." -}}
 {{- end -}}
+{{- /*
+An inline manifestBodyKey.value is stored in the chart-created Secret (secret.yaml).
+With secret.create=false that Secret is never rendered, so the key has nowhere to
+live: the Deployment would mount manifest-body.key from the external credentials
+Secret (which does not contain it) and the pod would crash-loop on a missing file.
+Fail at install time and steer the operator to manifestBodyKey.existingSecret.
+*/}}
+{{- $mbk := .Values.config.encryption.manifestBodyKey -}}
+{{- if and $mbk.value (not $mbk.existingSecret) (not .Values.secret.create) -}}
+{{- fail "config.encryption.manifestBodyKey.value is set but secret.create=false, so the chart-created Secret that would hold the key is not rendered and the gateway pod would crash-loop on a missing key file. Put the key into the externally-managed Secret and reference it via config.encryption.manifestBodyKey.existingSecret (+ existingSecretKey) instead of inlining .value." -}}
+{{- end -}}
 {{- end }}
 
 {{/*
