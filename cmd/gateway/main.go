@@ -1811,8 +1811,15 @@ func applyInternalTLSToPostgresDSN(dsn string, c config.InternalTLSConfig) (stri
 	appendIfAbsent("sslcert", c.CertFile)
 	appendIfAbsent("sslkey", c.KeyFile)
 	appendIfAbsent("sslrootcert", c.CAFile)
+	// Default sslmode to verify-full when it is absent OR present but
+	// empty, mirroring the URL-form branch: an empty sslmode (sslmode=
+	// or sslmode='') is never a meaningful verifying choice, so once
+	// internal mTLS is armed we upgrade it so the pinned CA is checked.
+	// A non-empty operator sslmode is preserved and surfaced via the
+	// returned weak-mode bool. (libpq honours the last duplicate, so
+	// appending wins over an earlier empty value.)
 	mode, hadSSLMode := keywordDSNValue(trimmed, "sslmode")
-	if !hadSSLMode {
+	if !hadSSLMode || mode == "" {
 		b.WriteString(" sslmode=verify-full")
 		mode = "verify-full"
 	}

@@ -172,6 +172,22 @@ func TestApplyInternalTLSToPostgresDSN_KeywordForm(t *testing.T) {
 		}
 	})
 
+	t.Run("present-but-empty sslmode is upgraded to verify-full like URL form", func(t *testing.T) {
+		for _, in := range []string{"host=db user=u sslmode=", "host=db user=u sslmode=''"} {
+			got, weak, err := applyInternalTLSToPostgresDSN(in, c)
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if weak {
+				t.Errorf("%q: empty sslmode should be upgraded to verifying, got weak=true", in)
+			}
+			// libpq honours the last duplicate, so verify-full must be appended.
+			if !strings.HasSuffix(got, "sslmode=verify-full") {
+				t.Errorf("%q: expected verify-full appended, got %q", in, got)
+			}
+		}
+	})
+
 	t.Run("quoted value is parsed", func(t *testing.T) {
 		_, weak, err := applyInternalTLSToPostgresDSN("host=db sslmode='verify-ca'", c)
 		if err != nil {
