@@ -644,7 +644,11 @@ func (h *Handler) getUsage(w http.ResponseWriter, r *http.Request, tenantID stri
 	}
 	counters, err := h.cfg.Usage.TenantUsage(r.Context(), tenantID, start, end)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "usage query failed: "+err.Error())
+		// 502 (not 500): the metering backend is the failing
+		// upstream. Sanitize like the 500 paths — the query error
+		// can carry the backend DSN or SQL text — while keeping the
+		// distinct BadGateway status.
+		writeSanitizedError(w, http.StatusBadGateway, "usage query failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, UsageResponse{
@@ -1049,15 +1053,23 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
 }
 
-// writeInternalError logs the underlying error server-side and
-// returns an opaque 500 to the client. A backend error string can
-// carry connection strings, query text, or stack traces, so it must
-// never cross the API boundary; operators read the detail from the
-// server log instead. clientMsg is a short, stable, non-sensitive
-// description of the failing operation (e.g. "list keys failed").
-func writeInternalError(w http.ResponseWriter, clientMsg string, err error) {
+// writeSanitizedError logs the underlying error server-side and
+// returns status with only the opaque clientMsg. A backend error
+// string can carry connection strings, query text, or stack traces,
+// so it must never cross the API boundary; operators read the detail
+// from the server log instead. clientMsg is a short, stable,
+// non-sensitive description of the failing operation (e.g. "list keys
+// failed"). Use it for any error-status response whose underlying
+// error originates server-side (500s via writeInternalError, the 502
+// metering-backend path, etc.).
+func writeSanitizedError(w http.ResponseWriter, status int, clientMsg string, err error) {
 	log.Printf("console: %s: %v", clientMsg, err)
-	writeError(w, http.StatusInternalServerError, clientMsg)
+	writeError(w, status, clientMsg)
+}
+
+// writeInternalError is the 500 specialization of writeSanitizedError.
+func writeInternalError(w http.ResponseWriter, clientMsg string, err error) {
+	writeSanitizedError(w, http.StatusInternalServerError, clientMsg, err)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
