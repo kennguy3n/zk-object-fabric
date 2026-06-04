@@ -1,0 +1,46 @@
+# Traefik v3 dynamic configuration (file provider). Holds the reusable
+# middlewares and TLS options the docker-label routers reference by name.
+
+http:
+  middlewares:
+    # Token-bucket rate limit on the S3 data plane and console. average
+    # is the sustained per-source rate (req/s); burst is the bucket
+    # depth. Tune for your tenant count — the defaults are a sane SME
+    # starting point that the in-process abuse limiter sits behind.
+    sme-ratelimit:
+      rateLimit:
+        average: 200
+        burst: 400
+        period: 1s
+
+    # Defence-in-depth security headers. TLS is terminated here, so HSTS
+    # is asserted at the edge.
+    sme-secure-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        frameDeny: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+
+    # The gateway exposes /internal/metrics and /internal/version on the
+    # S3 port. They must never be reachable from the public internet, so
+    # the s3 router pins this allow-list (private + loopback ranges only)
+    # in front of any /internal/* path. The health/ready/drain endpoints
+    # live on a separate, unpublished listener (:8082) and are not routed
+    # by Traefik at all.
+    sme-internal-allowlist:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+      sniStrict: true

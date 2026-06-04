@@ -125,6 +125,18 @@ B2B paths, plus a first local DC cell for early hybrid customers.
 
 See [PROGRESS.md](PROGRESS.md) for the detailed checklist.
 
+> **SME Single-Pool deployment mode.** Not every Phase 3 customer needs
+> the full AWS + Linode + managed-ClickHouse footprint. `deploy/sme/`
+> collapses the same production gateway image into a single-VM pool —
+> Traefik (auto-TLS) + two gateway replicas + Postgres 16 + ClickHouse,
+> with Wasabi as the only external dependency — brought up with one
+> `docker compose -f deploy/sme/docker-compose.production.yml up -d`. It
+> runs the gateway in `env=production` (least-privilege Postgres role,
+> RLS armed, manifest body encryption, console JWT signing key), so it is
+> the low-operational-surface entry point for SME operators (~5K pooled
+> tenants) rather than a separate code path. See
+> [deploy/sme/README.md](../deploy/sme/README.md).
+
 ---
 
 ## Phase 3.5: Intra-Tenant Deduplication
