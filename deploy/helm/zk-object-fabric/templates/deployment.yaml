@@ -80,9 +80,12 @@ spec:
           args:
             - -config
             - /run/zk-object-fabric/config.json
-          envFrom:
-            - secretRef:
-                name: {{ include "zk-object-fabric.secretName" . }}
+          # No envFrom here: the gateway reads every credential from the
+          # rendered config.json (the init container baked the Secret values
+          # in via envsubst), so mounting the Secret as env vars on this
+          # container would only widen exposure (/proc/<pid>/environ, `kubectl
+          # exec -- env`) without being read. The init container keeps envFrom
+          # because envsubst needs the values as env vars.
           {{- with .Values.extraEnv }}
           env:
             {{- toYaml . | nindent 12 }}
@@ -143,12 +146,26 @@ spec:
               readOnly: true
             - name: cache
               mountPath: {{ .Values.cache.dataDir }}
+            {{- if (include "zk-object-fabric.manifestBodyKeyConfigured" .) }}
+            - name: manifest-body-key
+              mountPath: {{ dir .Values.config.encryption.manifestBodyKey.mountPath }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config-template
           configMap:
             name: {{ include "zk-object-fabric.fullname" . }}-config
         - name: rendered-config
           emptyDir: {}
+        {{- if (include "zk-object-fabric.manifestBodyKeyConfigured" .) }}
+        - name: manifest-body-key
+          secret:
+            secretName: {{ include "zk-object-fabric.manifestBodyKeySecretName" . }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.config.encryption.manifestBodyKey.existingSecretKey }}
+                path: {{ base .Values.config.encryption.manifestBodyKey.mountPath }}
+        {{- end }}
         - name: cache
           {{- if eq .Values.cache.mode "ephemeral" }}
           ephemeral:

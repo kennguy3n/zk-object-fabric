@@ -10,6 +10,7 @@ Secret's env vars. This mirrors the repo's own production convention
 The config object is assembled as a dict and serialised with toPrettyJson so
 the output is always valid JSON regardless of which optional blocks are on.
 */}}
+{{- include "zk-object-fabric.validateManifestBodyKey" . -}}
 {{- $gw := dict
     "listen_addr" (printf ":%d" (int .Values.config.gateway.port))
     "read_timeout" .Values.config.gateway.readTimeout
@@ -43,6 +44,9 @@ the output is always valid JSON regardless of which optional blocks are on.
     "vault_addr" .Values.config.encryption.vaultAddr
     "vault_transit_mount" .Values.config.encryption.vaultTransitMount
     "vault_token" "${VAULT_TOKEN}" -}}
+{{- if (include "zk-object-fabric.manifestBodyKeyConfigured" .) -}}
+{{- $_ := set $enc "manifest_body_key_path" .Values.config.encryption.manifestBodyKey.mountPath -}}
+{{- end -}}
 {{- $providers := dict -}}
 {{- if .Values.config.providers.wasabi.enabled -}}
 {{- $_ := set $providers "wasabi" (dict
@@ -52,8 +56,18 @@ the output is always valid JSON regardless of which optional blocks are on.
     "access_key" "${WASABI_ACCESS_KEY}"
     "secret_key" "${WASABI_SECRET_KEY}") -}}
 {{- end -}}
+{{- /*
+Always emit local_fs_dev so an explicit empty root_path overrides the
+non-empty default in internal/config.Default(): config.Load starts from
+Default() and json.Unmarshal does not zero fields for absent keys, so a
+missing key would leave the default RootPath set and cmd/gateway's
+buildProviderRegistry would register the loopback backend (root_path != "")
+even when localFsDev.enabled is false.
+*/}}
 {{- if .Values.config.providers.localFsDev.enabled -}}
 {{- $_ := set $providers "local_fs_dev" (dict "root_path" .Values.config.providers.localFsDev.rootPath) -}}
+{{- else -}}
+{{- $_ := set $providers "local_fs_dev" (dict "root_path" "") -}}
 {{- end -}}
 {{- $cfg := dict
     "env" .Values.config.env

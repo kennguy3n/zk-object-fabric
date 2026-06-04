@@ -49,8 +49,13 @@ serviceAccount:
 config:
   # -- gateway env. "production" enables the fail-closed safety checks in
   # cmd/gateway (refuses to boot with a local-file CMK, an in-memory tenant
-  # store, etc.). Use "development" for a no-dependency local trial.
-  env: production
+  # store, or a persistent manifest store without encryption.manifestBodyKey).
+  # Defaults to "development" so a zero-config `helm install` renders a safe,
+  # runnable trial; set env=production (with real credentials and
+  # encryption.manifestBodyKey) for a production deployment. The chart fails
+  # fast at template time if env=production is set without the manifest body
+  # key, so the gateway never crash-loops on the fail-closed guard.
+  env: development
 
   gateway:
     # -- S3 data-plane bind port (GatewayConfig.listen_addr; default :8080).
@@ -130,6 +135,29 @@ config:
     # -- Vault server URL when cmkUri selects the transit wrapper.
     vaultAddr: ""
     vaultTransitMount: transit
+    # -- Manifest-body-at-rest encryption key (XChaCha20-Poly1305, 32 raw
+    # bytes). REQUIRED when config.env=production with a persistent metadata
+    # store (Postgres DSN or the embedded SQLite store): cmd/gateway refuses
+    # to boot (enforceProductionManifestEncryption) because manifest JSON
+    # would otherwise be written as plaintext. The gateway reads it as a FILE
+    # (os.ReadFile), not an env var, so the chart mounts it from a Secret and
+    # points encryption.manifest_body_key_path at the mount path automatically
+    # when either value or existingSecret is set.
+    manifestBodyKey:
+      # -- Base64 of the 32 raw key bytes. Stored in the gateway Secret (only
+      # when secret.create is true). Generate with:
+      #   head -c 32 /dev/urandom | base64
+      # This key is durable: rotating it makes previously sealed manifests
+      # unreadable, so set it once and manage it out-of-band. For production
+      # prefer existingSecret over inlining the material here.
+      value: ""
+      # -- Instead of value, reference a key in an existing Secret that holds
+      # the raw 32-byte material. Takes precedence over value for the mount.
+      existingSecret: ""
+      existingSecretKey: manifest-body.key
+      # -- Path the key is mounted at inside the container and written into
+      # the rendered config as encryption.manifest_body_key_path.
+      mountPath: /etc/zk-object-fabric/keys/manifest-body.key
 
   providers:
     wasabi:

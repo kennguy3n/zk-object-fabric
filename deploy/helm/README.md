@@ -16,7 +16,7 @@ Chart location: `deploy/helm/zk-object-fabric`.
 | `HorizontalPodAutoscaler` | Scales 2–20 replicas at 70 % CPU (all configurable). |
 | `Service` | ClusterIP (default) exposing the S3 port, plus the console port when enabled. |
 | `ConfigMap` | Gateway `config.json` template rendered from values, with `${...}` placeholders for secret fields. |
-| `Secret` | Wasabi keys, metadata DSN, Vault token, console admin token. |
+| `Secret` | Wasabi keys, metadata DSN, Vault token, console admin token, and (when set inline) the manifest-body encryption key. |
 | `PersistentVolumeClaim` | NVMe hot-object cache (only for `cache.mode=pvc`). |
 | `PodDisruptionBudget` | Keeps `minAvailable: 1` during voluntary disruptions. |
 | `ServiceAccount` | Dedicated SA (annotate for AWS IRSA → KMS). |
@@ -46,7 +46,37 @@ boot"*):
    `gateway -config /run/zk-object-fabric/config.json`.
 
 This keeps secret values out of the ConfigMap while still producing the
-single merged file the gateway needs.
+single merged file the gateway needs. Only the `render-config` init container
+mounts the Secret as env vars (it needs them for `envsubst`); the gateway
+container has no `envFrom`, so the credentials are not exposed in its process
+environment — it reads them from the rendered `config.json`.
+
+## Manifest-body encryption key (required in production)
+
+With `config.env: production` and a persistent metadata store (a Postgres
+`metadataDsn` **or** the embedded SQLite store, which is on by default),
+`cmd/gateway` refuses to boot unless `encryption.manifest_body_key_path` is
+set — otherwise tenant manifest JSON would be stored as plaintext
+(`enforceProductionManifestEncryption`). The gateway reads that key as a
+**file** (`os.ReadFile`), so it cannot be injected through the `envsubst`
+flow above; the chart mounts it from a Secret instead.
+
+Provide a 32-byte XChaCha20-Poly1305 key via `config.encryption.manifestBodyKey`:
+
+- `value` — base64 of the 32 raw bytes (`head -c 32 /dev/urandom | base64`).
+  The chart stores it in the gateway Secret (needs `secret.create: true`).
+- `existingSecret` / `existingSecretKey` — reference a key in a Secret you
+  manage out-of-band (recommended for production).
+
+When either is set, the chart mounts the key (read-only, mode `0400`) at
+`manifestBodyKey.mountPath` and points `encryption.manifest_body_key_path`
+at it automatically. The key is **durable**: rotating it makes previously
+sealed manifests unreadable, so set it once and manage it out-of-band.
+
+To surface the misconfiguration early, the chart **fails at `helm install`/
+`helm template` time** (not as a pod crash-loop) when `env: production` is set
+with a persistent store but no key. The default `config.env` is `development`
+so a zero-config render stays valid; production is an explicit opt-in.
 
 ## Health, ports & drain (grounded in the code)
 
@@ -120,6 +150,11 @@ config:
   encryption:
     cmkUri: "cmk://aws-kms/arn:aws:kms:us-east-1:123456789012:key/abcd-…"
     kmsRegion: us-east-1
+    # Required in production with a persistent metadata store. Reference a
+    # Secret holding the raw 32-byte key (recommended), or set value: <base64>.
+    manifestBodyKey:
+      existingSecret: zk-fabric-manifest-key
+      existingSecretKey: manifest-body.key
   providers:
     wasabi:
       enabled: true
@@ -147,8 +182,12 @@ secret:
   #   --set secret.metadataDsn='postgres://…'
 ```
 
-The `existingSecret` must expose these keys: `WASABI_ACCESS_KEY`,
-`WASABI_SECRET_KEY`, `METADATA_DSN`, `VAULT_TOKEN`, `CONSOLE_ADMIN_TOKEN`.
+The credentials `existingSecret` must expose these keys: `WASABI_ACCESS_KEY`,
+`WASABI_SECRET_KEY`, `METADATA_DSN`, `VAULT_TOKEN`, `CONSOLE_ADMIN_TOKEN`. The
+manifest-body key lives in its own Secret (`manifestBodyKey.existingSecret`)
+because it is mounted as a file, not an env var; create it with e.g.
+`kubectl create secret generic zk-fabric-manifest-key
+--from-file=manifest-body.key=<(head -c 32 /dev/urandom)`.
 
 ### Dev / no-credentials trial
 

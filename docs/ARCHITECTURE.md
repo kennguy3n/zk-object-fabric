@@ -421,7 +421,14 @@ status table.
   `Secret` (`envsubst`), mirroring the Wasabi production convention in
   `deploy/wasabi/`. `internal/config.Load` reads a single JSON file and
   does not expand env vars, so credentials are injected this way rather
-  than as plain env vars.
+  than as plain env vars. Only the init container mounts the `Secret` as
+  env vars (for `envsubst`); the gateway container reads them from the
+  rendered config, so they are not exposed in its process environment.
+- A production deploy (`config.env: production`) with a persistent
+  metadata store must set the manifest-body encryption key
+  (`config.encryption.manifestBodyKey`); the gateway refuses to boot
+  otherwise (`enforceProductionManifestEncryption`). The key is mounted
+  as a file and the chart fails fast at template time if it is missing.
 - Readiness (`GET /internal/ready`) gates Service traffic; liveness
   (`GET /internal/health`) restarts wedged pods; a `preStop` hook POSTs
   `/internal/drain` so rolling deploys drain in-flight requests before
