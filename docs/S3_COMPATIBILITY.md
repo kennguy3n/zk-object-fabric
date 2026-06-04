@@ -48,7 +48,7 @@ deployment probe. The authoritative reject list is
 | `Put/GetObjectLockConfiguration`               | Supported       | Default retention rule; requires versioning (WS8.4)         |
 | `Put/Get/DeleteBucketCors`                     | Supported       | Per-bucket rules + preflight (OPTIONS) and response headers  |
 | `Put/GetBucketNotificationConfiguration`       | Supported       | Webhook transport; `ObjectCreated`/`ObjectRemoved` events, async dispatcher |
-| `Put/Get/DeleteBucketEncryption`               | Planned (WS8.7) | Maps SSE header to ZKOF encryption modes                    |
+| `Put/Get/DeleteBucketEncryption`               | Supported       | Bucket default SSE (`AES256`/`aws:kms`) → gateway ManagedEncrypted; layered onto object writes (WS8.7) |
 | `Get/PutBucketAcl`, `Get/PutObjectAcl`         | Out of scope    | Replaced by tenant IAM + placement policy                   |
 | `Get/PutBucketPolicy`                          | Out of scope    | Replaced by ZK placement policies (§3.10)                   |
 | `Get/PutBucketReplication`                     | Out of scope    | Replaced by the ZK migration engine (§4)                    |

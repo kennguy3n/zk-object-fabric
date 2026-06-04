@@ -652,8 +652,17 @@ independent PR; check the box when the handler is wired and covered by
       `ObjectCreated:*`/`ObjectRemoved:*` events on PUT/COPY/
       CompleteMultipartUpload/DELETE success paths. Covered by domain,
       dispatcher, and handler/emission unit tests.
-- [ ] WS8.7 Server-side encryption config (`?encryption`) — SSE header
-      → ZKOF encryption modes.
+- [x] WS8.7 Server-side encryption config (`?encryption`) —
+      `Put/Get/DeleteBucketEncryption` with `metadata/sse` domain types
+      and the `bucket_config` store (memory + Postgres + SQLite,
+      `bucket_encryption` table). Both default algorithms (`AES256`,
+      `aws:kms`) map to gateway-side ManagedEncrypted; the write path
+      (`effectiveEncryptionMode`) promotes an otherwise-empty object
+      mode to managed when a bucket default is configured, leaving an
+      explicit placement mode (e.g. Strict ZK `client_side`)
+      authoritative. Fail-closed: a default cannot be stored without a
+      gateway keyring. Covered by domain, store, handler, write-path,
+      and SDK conformance tests.
 - [x] WS8.8 Docs — PROPOSAL §3.2.2 + §15.1, ARCHITECTURE.md packages,
       S3_COMPATIBILITY.md matrix updated to reflect the shipped slices
       (8.1–8.5) and the remaining planned ones (8.6–8.7).
@@ -664,7 +673,10 @@ ticker so all WS8 sub-resource handlers go live (#101); NodeID
 resolution is unified on `os.Hostname()` so billing/audit
 `SourceNodeID` is per-node (#103); and the embedded single-node
 profile persists the compliance audit trail to local SQLite (#104).
-Remaining future feature slice: WS8.7 (SSE config sub-resource).
+All WS8 feature slices (8.1–8.7) are now shipped; the SSE config
+sub-resource (WS8.7) routes `?encryption` through the same
+`bucket_config` store as versioning/CORS/lifecycle/Object Lock and
+layers the bucket default onto the object write path.
 
 **WS9 — Rust client-side encryption SDK**
 
