@@ -10,6 +10,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -244,6 +245,93 @@ func TestSQLite_LifecycleRoundTrip(t *testing.T) {
 	}
 	if err := s.DeleteLifecycle(ctx, "t1", "b1"); err != nil {
 		t.Fatalf("DeleteLifecycle (no-op): %v", err)
+	}
+}
+
+func TestSQLite_EncryptionRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if got, err := s.GetEncryption(ctx, "t1", "b1"); err != nil || !got.Empty() {
+		t.Fatalf("unconfigured get = (%+v, %v), want (empty, nil)", got, err)
+	}
+
+	cfg := sse.Config{Algorithm: sse.AWSKMS, KMSMasterKeyID: "arn:aws:kms:k", BucketKeyEnabled: true}
+	if err := s.SetEncryption(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetEncryption: %v", err)
+	}
+	if got, _ := s.GetEncryption(ctx, "t1", "b1"); got != cfg {
+		t.Fatalf("round-trip = %+v, want %+v", got, cfg)
+	}
+
+	// Upsert to AES256 clears the KMS key id.
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{Algorithm: sse.AES256}); err != nil {
+		t.Fatalf("SetEncryption(upsert): %v", err)
+	}
+	if got, _ := s.GetEncryption(ctx, "t1", "b1"); got.Algorithm != sse.AES256 || got.KMSMasterKeyID != "" || got.BucketKeyEnabled {
+		t.Fatalf("upsert result = %+v, want bare AES256", got)
+	}
+
+	// Delete clears it; deleting again is a no-op.
+	if err := s.DeleteEncryption(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteEncryption: %v", err)
+	}
+	if got, _ := s.GetEncryption(ctx, "t1", "b1"); !got.Empty() {
+		t.Fatalf("after delete = %+v, want empty", got)
+	}
+	if err := s.DeleteEncryption(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteEncryption (no-op): %v", err)
+	}
+}
+
+// TestSQLite_EncryptionPersistsAcrossReopen pins the embedded-profile
+// guarantee: a bucket default written before a restart is still present
+// after the gateway reopens the same database file.
+func TestSQLite_EncryptionPersistsAcrossReopen(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "persist.db")
+	cfg := sse.Config{Algorithm: sse.AWSKMS, KMSMasterKeyID: "arn:key", BucketKeyEnabled: true}
+
+	db1, err := embeddeddb.Open(path)
+	if err != nil {
+		t.Fatalf("open db (1): %v", err)
+	}
+	s1, err := New(Config{DB: db1})
+	if err != nil {
+		t.Fatalf("new store (1): %v", err)
+	}
+	if err := s1.SetEncryption(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetEncryption: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db (1): %v", err)
+	}
+
+	db2, err := embeddeddb.Open(path)
+	if err != nil {
+		t.Fatalf("reopen db (2): %v", err)
+	}
+	t.Cleanup(func() { _ = db2.Close() })
+	s2, err := New(Config{DB: db2})
+	if err != nil {
+		t.Fatalf("new store (2): %v", err)
+	}
+	if got, _ := s2.GetEncryption(ctx, "t1", "b1"); got != cfg {
+		t.Fatalf("after reopen = %+v, want %+v (config lost across restart)", got, cfg)
+	}
+}
+
+func TestSQLite_EncryptionRejectsInvalid(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{}); err == nil {
+		t.Fatal("SetEncryption(empty config): want error")
+	}
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{Algorithm: sse.AES256, KMSMasterKeyID: "arn:key"}); err == nil {
+		t.Fatal("SetEncryption(AES256 + KMS key): want error")
 	}
 }
 
