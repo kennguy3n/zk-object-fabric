@@ -2435,11 +2435,23 @@ func buildCostReporter(cfg config.Config, billingSink billing.BillingSink, tenan
 	return &billing.DefaultCostAggregator{
 		Usage: billing.NewMeteredStorageUsageReader(src),
 		Model: model,
-		// Size() is the count of API-key bindings, used here as the
-		// amortization divisor for the fixed Linode / AWS spend. The
-		// aggregator floors it at 1, so a bootstrap deploy with no
-		// bindings lands the whole fixed cost on the lone tenant
-		// rather than dividing by zero.
+		// ActiveTenants is the divisor that amortizes the fixed
+		// Linode / AWS spend across tenants. Size() is the count of
+		// API-key bindings, which is the only tenant-cardinality
+		// signal the auth.TenantStore interface exposes — there is no
+		// distinct-tenant count or enumerate-all method. It is exact
+		// for the common one-key-per-tenant deploy; a tenant holding
+		// N keys is counted N times, inflating the divisor and so
+		// UNDER-reporting that tenant's amortized fixed share. This is
+		// a deliberate best-available approximation: the alternative
+		// (a nil resolver) floors the divisor at 1 and charges every
+		// tenant the FULL fixed cost, which is worse for any
+		// multi-tenant deploy. The correct fix is a distinct-tenant
+		// count on the TenantStore interface (e.g. CountTenants()),
+		// which lives in internal/auth — out of this change's scope —
+		// at which point ActiveTenants should switch to it. The
+		// aggregator floors the value at 1 so a bootstrap deploy with
+		// no bindings does not divide by zero.
 		ActiveTenants: tenantStore.Size,
 	}
 }
