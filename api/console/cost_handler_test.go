@@ -189,3 +189,64 @@ func TestCostHandler_RegisterRouting(t *testing.T) {
 		t.Errorf("routing extracted (%q,%q), want (t-42,2026-01)", rep.gotID, rep.gotMo)
 	}
 }
+
+// TestConsoleRegister_MountsCostRouteWhenReporterSet verifies the
+// console Handler.Register wiring: the cost route is mounted only
+// when Config.CostReporter is set, and it inherits the console's
+// AdminAuth gate.
+func TestConsoleRegister_MountsCostRouteWhenReporterSet(t *testing.T) {
+	rep := &fakeReporter{}
+	admitted := false
+	mux := http.NewServeMux()
+	New(Config{
+		CostReporter: rep,
+		AdminAuth:    func(*http.Request) bool { return admitted },
+	}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// AdminAuth denies → 401 and the reporter is never consulted.
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-9/cost-breakdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("denied status = %d, want 401", resp.StatusCode)
+	}
+	if rep.calls != 0 {
+		t.Fatalf("reporter called %d times despite admin denial", rep.calls)
+	}
+
+	// AdminAuth admits → route serves the breakdown.
+	admitted = true
+	resp2, err := http.Get(srv.URL + "/api/v1/tenants/t-9/cost-breakdown?month=2026-06")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("admitted status = %d, want 200", resp2.StatusCode)
+	}
+	if rep.gotID != "t-9" || rep.gotMo != "2026-06" {
+		t.Errorf("reporter called with (%q,%q), want (t-9,2026-06)", rep.gotID, rep.gotMo)
+	}
+}
+
+// TestConsoleRegister_SkipsCostRouteWhenReporterNil verifies the
+// route is absent (404, not 503) when no reporter is configured, so a
+// deployment without a cost model does not advertise the endpoint.
+func TestConsoleRegister_SkipsCostRouteWhenReporterNil(t *testing.T) {
+	mux := http.NewServeMux()
+	New(Config{}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-1/cost-breakdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (route should be unmounted)", resp.StatusCode)
+	}
+}

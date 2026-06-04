@@ -101,10 +101,10 @@ func (h *CostHandler) serve(w http.ResponseWriter, r *http.Request, tenantID str
 	breakdown, err := h.Reporter.GetCostBreakdown(r.Context(), tenantID, month)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			writeError(w, 499, err.Error())
+			writeError(w, 499, "client closed request")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, "cost breakdown failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, breakdown)

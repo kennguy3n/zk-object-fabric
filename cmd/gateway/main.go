@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -2361,6 +2362,7 @@ func startConsoleAPI(
 		CellProvisioner: cellProvisioner,
 		DedupPolicies:   console.NewMemoryDedupPolicyStore(),
 		Orchestrator:    orchestrator,
+		CostReporter:    buildCostReporter(cfg, billingSink, tenantStore),
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -2394,6 +2396,90 @@ func startConsoleAPI(
 		}
 	}()
 	return srv
+}
+
+// Cost-model keys read out of BillingConfig.ProviderConfig. The
+// cost-model inputs (Wasabi $/GiB-month, amortized Linode / AWS
+// monthly spend) live in the free-form ProviderConfig map rather
+// than as dedicated BillingConfig fields so the cost surface adds
+// no vendor-specific schema; an operator opts in by setting these
+// keys. WasabiUSDPerGiBMonth is required to mount the route — the
+// other two default to zero (no amortized component).
+const (
+	costKeyWasabiUSDPerGiBMonth   = "cost_wasabi_usd_per_gib_month"
+	costKeyLinodeMonthlyUSD       = "cost_linode_monthly_usd"
+	costKeyAWSControlPlaneMonthly = "cost_aws_control_plane_monthly_usd"
+)
+
+// buildCostReporter wires the unified per-tenant cost view. It
+// returns nil — leaving the /cost-breakdown route unmounted — unless
+// both a metering read-side and a cost model are available, mirroring
+// the gateway's other opt-in console surfaces (Usage, Orchestrator).
+// It deliberately does NOT fall back to zero-valued inputs, which
+// would report a confidently-wrong cost.
+func buildCostReporter(cfg config.Config, billingSink billing.BillingSink, tenantStore auth.TenantStore) billing.CostReporter {
+	// The storage component is metered, so the route is only
+	// meaningful when the configured sink can answer windowed
+	// per-tenant reads (the embedded SQLite sink does; a
+	// ClickHouse-only deploy whose sink does not expose reads gets
+	// no route rather than a storage figure of zero).
+	src, ok := billingSink.(billing.WindowedUsageSource)
+	if !ok {
+		return nil
+	}
+	model, ok := parseCostModel(cfg.Billing.ProviderConfig)
+	if !ok {
+		log.Printf("gateway: console cost-breakdown route disabled; set %s in billing.provider_config to enable it", costKeyWasabiUSDPerGiBMonth)
+		return nil
+	}
+	return &billing.DefaultCostAggregator{
+		Usage: billing.NewMeteredStorageUsageReader(src),
+		Model: model,
+		// Size() is the count of API-key bindings, used here as the
+		// amortization divisor for the fixed Linode / AWS spend. The
+		// aggregator floors it at 1, so a bootstrap deploy with no
+		// bindings lands the whole fixed cost on the lone tenant
+		// rather than dividing by zero.
+		ActiveTenants: tenantStore.Size,
+	}
+}
+
+// parseCostModel reads the cost-model inputs out of the billing
+// provider-config map. It returns ok=false when the required Wasabi
+// rate is absent or unparseable so the caller can skip mounting the
+// route entirely.
+func parseCostModel(pc map[string]string) (billing.CostModel, bool) {
+	raw, present := pc[costKeyWasabiUSDPerGiBMonth]
+	if !present {
+		return billing.CostModel{}, false
+	}
+	wasabi, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || wasabi < 0 {
+		log.Printf("gateway: ignoring console cost-breakdown route; %s=%q is not a non-negative number", costKeyWasabiUSDPerGiBMonth, raw)
+		return billing.CostModel{}, false
+	}
+	return billing.CostModel{
+		WasabiUSDPerGiBMonth:      wasabi,
+		LinodeMonthlyUSD:          parseOptionalUSD(pc, costKeyLinodeMonthlyUSD),
+		AWSControlPlaneMonthlyUSD: parseOptionalUSD(pc, costKeyAWSControlPlaneMonthly),
+	}, true
+}
+
+// parseOptionalUSD parses a non-negative dollar amount from the
+// provider-config map, defaulting to 0 when the key is absent,
+// empty, or malformed (a malformed amortized input should not block
+// the route the way a missing storage rate does).
+func parseOptionalUSD(pc map[string]string, key string) float64 {
+	raw, ok := pc[key]
+	if !ok {
+		return 0
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || v < 0 {
+		log.Printf("gateway: cost-model %s=%q is not a non-negative number; treating as 0", key, raw)
+		return 0
+	}
+	return v
 }
 
 // buildAuthStore returns the Postgres-backed AuthStore when a
