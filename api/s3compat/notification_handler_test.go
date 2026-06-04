@@ -12,6 +12,7 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
+	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
@@ -233,5 +234,42 @@ func TestObjectEventsEmittedOnMutations(t *testing.T) {
 	emit.mu.Unlock()
 	if put.Bucket != "bucket" || put.ObjectKey != "obj" || put.SizeBytes != int64(len(body)) {
 		t.Fatalf("put event = %+v", put)
+	}
+}
+
+// TestHandlerEventNamesMatchNotificationConstants pins the handler's
+// leaf event-name string constants to the canonical
+// metadata/notification.EventType constants. The handler keeps its own
+// plain-string copies so the package need not thread the notification
+// types through every emit site, but a silent divergence (a typo or a
+// renamed AWS event) would make rules stop matching with no compile
+// error. This test fails the moment the two drift apart.
+func TestHandlerEventNamesMatchNotificationConstants(t *testing.T) {
+	cases := []struct {
+		handler   string
+		canonical notification.EventType
+	}{
+		{eventObjectCreatedPut, notification.ObjectCreatedPut},
+		{eventObjectCreatedCopy, notification.ObjectCreatedCopy},
+		{eventObjectCreatedCompleteMPU, notification.ObjectCreatedCompleteMultipartUpload},
+		{eventObjectRemovedDelete, notification.ObjectRemovedDelete},
+		{eventObjectRemovedDeleteMarker, notification.ObjectRemovedDeleteMarkerCreated},
+	}
+	for _, c := range cases {
+		if c.handler != string(c.canonical) {
+			t.Errorf("handler event name %q != canonical %q", c.handler, c.canonical)
+		}
+	}
+	// Every handler-emitted leaf name must be one notification.Match
+	// recognises, so a configured rule can actually fire on it.
+	for _, c := range cases {
+		cfg := notification.Config{Rules: []notification.Rule{{
+			ID:       "r",
+			Events:   []notification.EventType{c.canonical},
+			Endpoint: "https://hook.example/x",
+		}}}
+		if matched := cfg.Match(notification.EventType(c.handler), "key"); len(matched) != 1 {
+			t.Errorf("event %q did not match a rule subscribed to %q", c.handler, c.canonical)
+		}
 	}
 }

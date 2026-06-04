@@ -54,11 +54,13 @@ func buildNotificationDispatcher(cfg config.NotificationsConfig, store bucket_co
 		return nil, nil
 	}
 	return notifications.New(notifications.Config{
-		Source:          store,
-		Workers:         cfg.Workers,
-		QueueSize:       cfg.QueueSize,
-		MaxAttempts:     cfg.MaxAttempts,
-		BackoffBase:     cfg.BackoffBase.ToDuration(),
-		DeliveryTimeout: cfg.DeliveryTimeout.ToDuration(),
+		Source:                   store,
+		Workers:                  cfg.Workers,
+		QueueSize:                cfg.QueueSize,
+		MaxAttempts:              cfg.MaxAttempts,
+		BackoffBase:              cfg.BackoffBase.ToDuration(),
+		DeliveryTimeout:          cfg.DeliveryTimeout.ToDuration(),
+		ShutdownGrace:            cfg.ShutdownGrace.ToDuration(),
+		AllowPrivateDestinations: cfg.AllowPrivateDestinations,
 	})
 }

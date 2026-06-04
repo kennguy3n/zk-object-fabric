@@ -3,6 +3,7 @@ package notifications
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -335,4 +336,144 @@ func TestNotifyDuringCloseNoPanic(t *testing.T) {
 	wg.Wait()
 	// Notify after Close must also be a safe no-op (drops).
 	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "k"})
+}
+
+// firstBlockDoer blocks the very first Do call until release is closed,
+// signalling via started, and answers every call (including the first,
+// once released) with status. It lets a test occupy the single worker
+// so subsequent Notify calls land in the queue, then exercise the
+// shutdown drain.
+type firstBlockDoer struct {
+	calls   atomic.Int64
+	started chan struct{}
+	release chan struct{}
+	status  int
+}
+
+func (d *firstBlockDoer) Do(req *http.Request) (*http.Response, error) {
+	_, _ = io.ReadAll(req.Body)
+	if d.calls.Add(1) == 1 {
+		close(d.started)
+		<-d.release
+	}
+	s := d.status
+	if s == 0 {
+		s = http.StatusOK
+	}
+	return &http.Response{StatusCode: s, Body: io.NopCloser(http.NoBody)}, nil
+}
+
+// errorBlockDoer is firstBlockDoer that always fails the delivery, so a
+// test can assert queued events are dead-lettered (not silently dropped)
+// when the dispatcher shuts down mid-drain.
+type errorBlockDoer struct {
+	calls   atomic.Int64
+	started chan struct{}
+	release chan struct{}
+}
+
+func (d *errorBlockDoer) Do(req *http.Request) (*http.Response, error) {
+	_, _ = io.ReadAll(req.Body)
+	if d.calls.Add(1) == 1 {
+		close(d.started)
+		<-d.release
+	}
+	return nil, errors.New("connection refused")
+}
+
+// TestShutdownDeliversQueuedEvents proves Close drains already-queued
+// events instead of abandoning them: events enqueued while a worker is
+// busy are still delivered during the graceful drain.
+func TestShutdownDeliversQueuedEvents(t *testing.T) {
+	doer := &firstBlockDoer{started: make(chan struct{}), release: make(chan struct{})}
+	d, err := New(Config{
+		Source:      stubSource{cfg: putRule("https://hook.example/x")},
+		HTTPClient:  doer,
+		Workers:     1,
+		MaxAttempts: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First event occupies the sole worker.
+	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "a"})
+	<-doer.started
+	// Two more queue up behind the blocked worker.
+	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "b"})
+	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "c"})
+
+	close(doer.release)
+	d.Close() // must drain b and c, not abandon them
+
+	if s := d.Stats(); s.Delivered != 3 {
+		t.Errorf("delivered = %d, want 3 (queued events must drain on shutdown); stats=%+v", s.Delivered, s)
+	}
+	if s := d.Stats(); s.Dropped != 0 || s.Failed != 0 {
+		t.Errorf("unexpected drop/fail on graceful drain: %+v", s)
+	}
+}
+
+// TestShutdownDeadLettersUndeliverableQueuedEvents proves that when a
+// queued event cannot be delivered during shutdown it is dead-lettered
+// rather than silently dropped (the WS8.6 review's #7 finding).
+func TestShutdownDeadLettersUndeliverableQueuedEvents(t *testing.T) {
+	doer := &errorBlockDoer{started: make(chan struct{}), release: make(chan struct{})}
+	dead := &recordingDeadLetters{}
+	d, err := New(Config{
+		Source:      stubSource{cfg: putRule("https://hook.example/x")},
+		HTTPClient:  doer,
+		Workers:     1,
+		MaxAttempts: 4,
+		BackoffBase: time.Millisecond,
+		DeadLetters: dead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "a"})
+	<-doer.started
+	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "b"})
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		close(doer.release)
+	}()
+	d.Close()
+
+	if got := dead.len(); got != 2 {
+		t.Errorf("dead letters = %d, want 2 (queued events must be dead-lettered, never silently dropped)", got)
+	}
+	if s := d.Stats(); s.Dropped != 0 {
+		t.Errorf("dropped = %d, want 0 (the drain dead-letters; it never silently drops)", s.Dropped)
+	}
+}
+
+// TestProcessConfigLookupFailureDeadLetters proves a config-lookup error
+// surfaces as a dead letter instead of a silent drop + misleading WARN.
+func TestProcessConfigLookupFailureDeadLetters(t *testing.T) {
+	dead := &recordingDeadLetters{}
+	d, err := New(Config{
+		Source:      stubSource{err: errors.New("backend down")},
+		HTTPClient:  &capturingDoer{},
+		Workers:     1,
+		DeadLetters: dead,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "k"})
+	waitFor(t, func() bool { return dead.len() == 1 })
+	dead.mu.Lock()
+	dl := dead.dead[0]
+	dead.mu.Unlock()
+	if dl.Endpoint != "" {
+		t.Errorf("config-lookup dead letter Endpoint = %q, want empty (destination unknown)", dl.Endpoint)
+	}
+	if s := d.Stats(); s.Failed != 1 {
+		t.Errorf("failed = %d, want 1", s.Failed)
+	}
 }

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -90,6 +91,21 @@ type Config struct {
 	// DeliveryTimeout bounds a single webhook POST. Defaults to 5s.
 	DeliveryTimeout time.Duration
 
+	// ShutdownGrace bounds how long Close spends draining already-queued
+	// events. Events still queued when the grace elapses are
+	// dead-lettered rather than delivered, so a backlog of unreachable
+	// destinations cannot stall shutdown. Defaults to 10s (and is never
+	// shorter than DeliveryTimeout).
+	ShutdownGrace time.Duration
+
+	// AllowPrivateDestinations disables the SSRF guard that, by default,
+	// refuses to deliver to loopback, link-local, and private (RFC 1918 /
+	// ULA) addresses. It only takes effect when HTTPClient is nil (the
+	// dispatcher builds its own guarded client); an injected HTTPClient
+	// is used as-is. Leave false in production; set true for local
+	// development against localhost webhooks.
+	AllowPrivateDestinations bool
+
 	// DeadLetters receives exhausted/dropped deliveries. Defaults to a
 	// sink that logs at WARN.
 	DeadLetters DeadLetterSink
@@ -108,13 +124,18 @@ type Dispatcher struct {
 	maxAttempts int
 	backoffBase time.Duration
 	timeout     time.Duration
+	grace       time.Duration
 	dead        DeadLetterSink
 	now         func() time.Time
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	closed    chan struct{}
-	seq       atomic.Uint64
+	// drainDeadline bounds the post-Close drain. It is written once in
+	// Close before closed is closed, and only read by workers after they
+	// observe closed, so the channel close provides the happens-before.
+	drainDeadline time.Time
+	seq           atomic.Uint64
 
 	// mu guards the queue against the send-after-close race: Notify
 	// takes it for reading around the channel send, Close takes it for
@@ -164,9 +185,16 @@ func New(cfg Config) (*Dispatcher, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	grace := cfg.ShutdownGrace
+	if grace <= 0 {
+		grace = 10 * time.Second
+	}
+	if grace < timeout {
+		grace = timeout
+	}
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = newGuardedClient(timeout, cfg.AllowPrivateDestinations)
 	}
 	dead := cfg.DeadLetters
 	if dead == nil {
@@ -183,6 +211,7 @@ func New(cfg Config) (*Dispatcher, error) {
 		maxAttempts: maxAttempts,
 		backoffBase: backoff,
 		timeout:     timeout,
+		grace:       grace,
 		dead:        dead,
 		now:         now,
 		closed:      make(chan struct{}),
@@ -226,15 +255,21 @@ func (d *Dispatcher) Notify(evt Event) {
 	}
 }
 
-// Close stops accepting events and waits for in-flight deliveries to
-// drain. It is safe to call multiple times.
+// Close stops accepting events and drains the queue within ShutdownGrace.
+// Already-queued events are still delivered (one attempt each, no retry
+// backoff); any that cannot be delivered before the grace deadline are
+// dead-lettered rather than silently dropped. It is safe to call
+// multiple times.
 func (d *Dispatcher) Close() {
 	if d == nil {
 		return
 	}
 	d.closeOnce.Do(func() {
-		close(d.closed)
 		d.mu.Lock()
+		// drainDeadline must be set before closing closed: workers only
+		// read it after observing the close, so the close orders the write.
+		d.drainDeadline = time.Now().Add(d.grace)
+		close(d.closed)
 		d.isClosed = true
 		close(d.queue)
 		d.mu.Unlock()
@@ -264,27 +299,38 @@ func (d *Dispatcher) worker() {
 
 // process resolves the bucket's notification configuration, matches the
 // event against its rules, and delivers the rendered payload to each
-// matching destination.
+// matching destination. The config lookup uses opContext, which is
+// bounded by DeliveryTimeout (and the drain deadline during shutdown)
+// but is NOT tied to the shutdown signal itself, so an already-queued
+// event still resolves its rules and is delivered during a graceful
+// drain instead of being abandoned.
 func (d *Dispatcher) process(evt Event) {
-	ctx, cancel := d.shutdownContext()
-	defer cancel()
-
+	ctx, cancel := d.opContext()
 	cfg, err := d.source.GetNotification(ctx, evt.TenantID, evt.Bucket)
+	cancel()
 	if err != nil {
-		log.Printf("notifications: WARN config_lookup_failed: tenant=%s bucket=%s err=%v", evt.TenantID, evt.Bucket, err)
+		// The rules are unknown, so there is no destination endpoint to
+		// target; record the loss through the dead-letter sink (with an
+		// empty Endpoint) rather than only logging, so a graceful restart
+		// or a backend blip never silently drops a queued event.
+		d.failed.Add(1)
+		d.dead.Dead(DeadLetter{Event: evt, Attempts: 0, LastErr: fmt.Sprintf("config lookup failed: %v", err)})
 		return
 	}
 	if cfg.Empty() {
 		return
 	}
 	for _, rule := range cfg.Match(evt.Name, evt.ObjectKey) {
-		d.deliver(ctx, evt, rule)
+		d.deliver(evt, rule)
 	}
 }
 
 // deliver POSTs the event to one destination, retrying with
-// exponential backoff up to maxAttempts before dead-lettering.
-func (d *Dispatcher) deliver(ctx context.Context, evt Event, rule notification.Rule) {
+// exponential backoff up to maxAttempts before dead-lettering. During
+// shutdown the backoff is short-circuited, so an in-flight delivery gets
+// at most one more attempt and is then dead-lettered with the actual
+// number of attempts made.
+func (d *Dispatcher) deliver(evt Event, rule notification.Rule) {
 	body, err := json.Marshal(evt.render(rule.ID))
 	if err != nil {
 		d.failed.Add(1)
@@ -292,29 +338,31 @@ func (d *Dispatcher) deliver(ctx context.Context, evt Event, rule notification.R
 		return
 	}
 	var lastErr string
+	completed := 0
 	for attempt := 1; attempt <= d.maxAttempts; attempt++ {
 		if attempt > 1 {
-			if !d.sleep(ctx, d.backoff(attempt-1)) {
+			if !d.sleep(d.backoff(attempt - 1)) {
 				lastErr = "dispatcher shutting down"
 				break
 			}
 		}
-		lastErr = d.attempt(ctx, rule.Endpoint, evt.Name, body)
+		completed = attempt
+		lastErr = d.attempt(rule.Endpoint, evt.Name, body)
 		if lastErr == "" {
 			d.delivered.Add(1)
 			return
 		}
 	}
 	d.failed.Add(1)
-	d.dead.Dead(DeadLetter{Event: evt, Endpoint: rule.Endpoint, Attempts: d.maxAttempts, LastErr: lastErr})
+	d.dead.Dead(DeadLetter{Event: evt, Endpoint: rule.Endpoint, Attempts: completed, LastErr: lastErr})
 }
 
 // attempt performs a single webhook POST. It returns an empty string on
 // success (2xx) or a description of the failure otherwise.
-func (d *Dispatcher) attempt(ctx context.Context, endpoint string, name notification.EventType, body []byte) string {
-	reqCtx, cancel := context.WithTimeout(ctx, d.timeout)
+func (d *Dispatcher) attempt(endpoint string, name notification.EventType, body []byte) string {
+	ctx, cancel := d.opContext()
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Sprintf("build request: %v", err)
 	}
@@ -325,7 +373,13 @@ func (d *Dispatcher) attempt(ctx context.Context, endpoint string, name notifica
 	if err != nil {
 		return err.Error()
 	}
-	defer func() { _ = resp.Body.Close() }()
+	// Drain the body before closing so the underlying transport can
+	// reuse the keep-alive connection for the next POST to this
+	// destination instead of opening a fresh TCP (and TLS) connection.
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Sprintf("status %d", resp.StatusCode)
 	}
@@ -343,29 +397,37 @@ func (d *Dispatcher) backoff(n int) time.Duration {
 }
 
 // sleep waits for the given delay, returning false if the dispatcher is
-// shutting down before the delay elapses.
-func (d *Dispatcher) sleep(ctx context.Context, delay time.Duration) bool {
+// shutting down before the delay elapses. It selects on the long-lived
+// closed channel directly, so it adds no per-event goroutine.
+func (d *Dispatcher) sleep(delay time.Duration) bool {
 	t := time.NewTimer(delay)
 	defer t.Stop()
 	select {
 	case <-t.C:
 		return true
-	case <-ctx.Done():
+	case <-d.closed:
 		return false
 	}
 }
 
-// shutdownContext returns a context cancelled when Close is called, so
-// an in-flight delivery (and its backoff sleeps) abort promptly on
-// shutdown.
-func (d *Dispatcher) shutdownContext() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-d.closed:
-			cancel()
-		case <-ctx.Done():
+// opContext returns the context for one config lookup or webhook POST.
+// It is bounded by DeliveryTimeout in steady state. Once Close has run,
+// it is additionally capped by the drain deadline so a backlog of
+// unreachable destinations cannot stall shutdown past ShutdownGrace;
+// when the grace is already exhausted the returned context is
+// already-expired, so the operation fails fast and the event is
+// dead-lettered.
+func (d *Dispatcher) opContext() (context.Context, context.CancelFunc) {
+	timeout := d.timeout
+	select {
+	case <-d.closed:
+		if remaining := time.Until(d.drainDeadline); remaining < timeout {
+			timeout = remaining
 		}
-	}()
-	return ctx, cancel
+	default:
+	}
+	if timeout < 0 {
+		timeout = 0
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }

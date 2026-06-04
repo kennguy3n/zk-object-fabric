@@ -138,6 +138,17 @@ type NotificationsConfig struct {
 	// DeliveryTimeout bounds a single webhook POST. Defaults to 5s
 	// when zero.
 	DeliveryTimeout Duration `json:"delivery_timeout"`
+
+	// ShutdownGrace bounds how long graceful shutdown spends draining
+	// already-queued events before dead-lettering the remainder.
+	// Defaults to 10s (never shorter than DeliveryTimeout).
+	ShutdownGrace Duration `json:"shutdown_grace"`
+
+	// AllowPrivateDestinations disables the SSRF guard that refuses to
+	// deliver webhooks to loopback, link-local, and private addresses.
+	// Leave false in production; set true only for local development
+	// against localhost webhook receivers.
+	AllowPrivateDestinations bool `json:"allow_private_destinations"`
 }
 
 // TracingConfig configures the OpenTelemetry-style request
