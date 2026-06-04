@@ -143,20 +143,43 @@ services:
     image: ${ZKOF_IMAGE:-zkof-gateway:local}
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/etc/zkof/entrypoint.sh"]
-    env_file:
-      - .env
+    # Deliberately NOT using `env_file: .env` here. That would inject the
+    # whole .env — including the Postgres *superuser* POSTGRES_PASSWORD,
+    # which only the bootstrap job needs — into the data-plane process. The
+    # gateway connects as the least-privilege zkof_app role precisely so a
+    # compromised gateway cannot bypass RLS; handing it the superuser
+    # password would defeat that. So we enumerate exactly the variables the
+    # config template + entrypoint consume (values still come from .env via
+    # compose interpolation). POSTGRES_PASSWORD / POSTGRES_USER /
+    # LETSENCRYPT_EMAIL are intentionally absent.
     environment:
-      # Derived wiring the gateway config template consumes via envsubst.
-      # The Postgres DSN is assembled by entrypoint.sh (it percent-encodes
-      # ZKOF_APP_PASSWORD so URL-reserved characters survive lib/pq's URL
-      # parser); it reads ZKOF_APP_PASSWORD/POSTGRES_DB from the .env file
-      # loaded above. Set METADATA_DSN here only to target an external
-      # Postgres instead of the in-pool one.
-      ZKOF_DB_NAME: ${POSTGRES_DB:-zkof}
-      CLICKHOUSE_URL: http://clickhouse:8123
-      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-zkof_billing}
+      # Console + identity.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
       CONSOLE_HOST: ${DOMAIN_NAME}
       ZKOF_CELL_ID: ${ZKOF_CELL_ID:-sme-cell-1}
+      # Wasabi object backend.
+      WASABI_ENDPOINT: ${WASABI_ENDPOINT}
+      WASABI_REGION: ${WASABI_REGION}
+      WASABI_BUCKET: ${WASABI_BUCKET}
+      WASABI_ACCESS_KEY: ${WASABI_ACCESS_KEY}
+      WASABI_SECRET_KEY: ${WASABI_SECRET_KEY}
+      # ClickHouse billing sink.
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-zkof_billing}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-zkof}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      # Encryption / CMK custody.
+      KMS_CMK_URI: ${KMS_CMK_URI:-}
+      KMS_REGION: ${KMS_REGION:-}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      # Postgres control plane. entrypoint.sh assembles METADATA_DSN from
+      # these (percent-encoding ZKOF_APP_PASSWORD so URL-reserved characters
+      # survive lib/pq's URL parser). Only the least-privilege role password
+      # is passed — never the superuser one. Set METADATA_DSN directly to
+      # target an external Postgres instead of the in-pool one.
+      ZKOF_APP_PASSWORD: ${ZKOF_APP_PASSWORD:?set ZKOF_APP_PASSWORD in .env}
+      ZKOF_DB_NAME: ${POSTGRES_DB:-zkof}
     volumes:
       - ./gateway/config.json.tmpl:/etc/zkof/config.json.tmpl:ro
       - ./gateway/entrypoint.sh:/etc/zkof/entrypoint.sh:ro
@@ -216,8 +239,12 @@ services:
     depends_on:
       frontend-init:
         condition: service_completed_successfully
+      # Wait for the gateway to be *healthy* (console listener up on :8081),
+      # not merely started. Otherwise nginx comes up and proxies /api/ to a
+      # gateway that is still booting, returning a transient 502 until the
+      # first replica passes its readiness check.
       gateway:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:80/ >/dev/null 2>&1 || exit 1"]
       interval: 10s
