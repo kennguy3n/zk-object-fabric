@@ -1,6 +1,7 @@
 package wasabi
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +96,115 @@ func TestMinStorageTracker_BillableAge(t *testing.T) {
 				t.Fatalf("BillableAge = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestMinStorageDurationWarning(t *testing.T) {
+	day := 24 * time.Hour
+	stored := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name          string
+		storedAt      time.Time
+		now           time.Time
+		wantWithin    bool
+		wantRemaining int
+		wantRemainder time.Duration
+	}{
+		{
+			name:          "inside window, fresh write",
+			storedAt:      stored,
+			now:           stored,
+			wantWithin:    true,
+			wantRemaining: WasabiMinStorageDays,
+			wantRemainder: minStorageDuration,
+		},
+		{
+			name:          "inside window, mid",
+			storedAt:      stored,
+			now:           stored.Add(10 * day),
+			wantWithin:    true,
+			wantRemaining: 80,
+			wantRemainder: 80 * day,
+		},
+		{
+			name:          "inside window, partial day rounds up",
+			storedAt:      stored,
+			now:           stored.Add(89*day + 12*time.Hour),
+			wantWithin:    true,
+			wantRemaining: 1,
+			wantRemainder: 12 * time.Hour,
+		},
+		{
+			name:          "boundary: exactly 90 days is outside",
+			storedAt:      stored,
+			now:           stored.Add(90 * day),
+			wantWithin:    false,
+			wantRemaining: 0,
+			wantRemainder: 0,
+		},
+		{
+			name:          "outside window",
+			storedAt:      stored,
+			now:           stored.Add(120 * day),
+			wantWithin:    false,
+			wantRemaining: 0,
+			wantRemainder: 0,
+		},
+		{
+			name:          "clock skew: now before storedAt is treated as fresh",
+			storedAt:      stored,
+			now:           stored.Add(-5 * day),
+			wantWithin:    true,
+			wantRemaining: WasabiMinStorageDays,
+			wantRemainder: minStorageDuration,
+		},
+		{
+			name:          "zero storedAt yields empty warning",
+			storedAt:      time.Time{},
+			now:           stored,
+			wantWithin:    false,
+			wantRemaining: 0,
+			wantRemainder: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MinStorageDurationWarning(tc.storedAt, tc.now)
+			if got.WithinMinStorageWindow != tc.wantWithin {
+				t.Errorf("WithinMinStorageWindow = %v, want %v", got.WithinMinStorageWindow, tc.wantWithin)
+			}
+			if got.RemainingDays != tc.wantRemaining {
+				t.Errorf("RemainingDays = %d, want %d", got.RemainingDays, tc.wantRemaining)
+			}
+			if got.BillableRemainder != tc.wantRemainder {
+				t.Errorf("BillableRemainder = %v, want %v", got.BillableRemainder, tc.wantRemainder)
+			}
+		})
+	}
+}
+
+func TestMinStorageWarning_EstimatedEarlyDeleteCostUSD(t *testing.T) {
+	day := 24 * time.Hour
+	stored := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// Deleting a 1 TB object on day 0 still owes the full 90-day
+	// minimum: 90/30 months * $6.99/TB-month = $20.97.
+	w := MinStorageDurationWarning(stored, stored)
+	got := w.EstimatedEarlyDeleteCostUSD(1e12)
+	want := WasabiStorageUSDPerTBMonth * (90.0 / 30.0)
+	if math.Abs(got-want) > 1e-9 {
+		t.Errorf("cost on day 0 = %v, want %v", got, want)
+	}
+
+	// Past the window there is no residual charge.
+	wOut := MinStorageDurationWarning(stored, stored.Add(120*day))
+	if c := wOut.EstimatedEarlyDeleteCostUSD(1e12); c != 0 {
+		t.Errorf("cost past window = %v, want 0", c)
+	}
+
+	// Non-positive size has no cost even inside the window.
+	if c := w.EstimatedEarlyDeleteCostUSD(0); c != 0 {
+		t.Errorf("cost for zero size = %v, want 0", c)
 	}
 }

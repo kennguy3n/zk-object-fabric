@@ -125,11 +125,11 @@ func (p *Provider) Capabilities() providers.ProviderCapabilities {
 // TB-month with a fair-use egress policy (<=1× stored).
 func (p *Provider) CostModel() providers.ProviderCostModel {
 	return providers.ProviderCostModel{
-		StorageUSDPerTBMonth:  6.99,
+		StorageUSDPerTBMonth:  WasabiStorageUSDPerTBMonth,
 		EgressUSDPerGB:        0.0,
 		PutRequestUSDPer1000:  0.0,
 		GetRequestUSDPer1000:  0.0,
-		MinStorageDurationDay: 90,
+		MinStorageDurationDay: WasabiMinStorageDays,
 		FreeEgressRatio:       1.0,
 	}
 }
