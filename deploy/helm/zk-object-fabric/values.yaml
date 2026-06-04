@@ -1,0 +1,361 @@
+# Default values for the zk-object-fabric gateway chart.
+# Every value below is consumed by a template in templates/. See
+# deploy/helm/README.md for an install walk-through.
+
+# -- Number of gateway replicas when autoscaling is disabled. When
+# autoscaling.enabled is true the HPA owns the replica count and this
+# value is ignored (the Deployment omits .spec.replicas so the HPA is
+# the sole authority and a `helm upgrade` does not fight it).
+replicaCount: 2
+
+image:
+  # -- Gateway image repository. Build/push from the repo Dockerfile.
+  repository: ghcr.io/kennguy3n/zk-object-fabric
+  # -- Image tag. Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Override chart name in resource names.
+nameOverride: ""
+# -- Override the full release-qualified name.
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a dedicated ServiceAccount for the gateway pods.
+  create: true
+  # -- Annotations for the ServiceAccount (e.g. IRSA role ARN for AWS KMS).
+  annotations: {}
+  # -- Name to use; generated from the fullname when empty.
+  name: ""
+
+# ---------------------------------------------------------------------------
+# Gateway runtime configuration.
+#
+# The gateway reads a single JSON config file passed via `-config`
+# (cmd/gateway/main.go: flag.String("config", ...); internal/config.Load).
+# config.Load does NOT expand environment variables, so secrets cannot be
+# injected as plain env vars into the JSON. Instead this chart follows the
+# repo's own production convention (deploy/wasabi/gateway_config.example.json
+# uses ${...} placeholders; deploy/wasabi/README.md: "let the gateway init
+# container pull them at boot"): templates/configmap.yaml renders a
+# config.json with ${ENV} placeholders for the secret fields, and an init
+# container runs `envsubst` (shipped in the alpine runtime image via
+# gettext, see Dockerfile) to materialise the final config from the Secret's
+# env vars before the gateway starts.
+# ---------------------------------------------------------------------------
+config:
+  # -- gateway env. "production" enables the fail-closed safety checks in
+  # cmd/gateway (refuses to boot with a local-file CMK, an in-memory tenant
+  # store, or a persistent manifest store without encryption.manifestBodyKey).
+  # Defaults to "development" so a zero-config `helm install` renders a safe,
+  # runnable trial; set env=production (with real credentials and
+  # encryption.manifestBodyKey) for a production deployment. The chart fails
+  # fast at template time if env=production is set without the manifest body
+  # key, so the gateway never crash-loops on the fail-closed guard.
+  env: development
+
+  gateway:
+    # -- S3 data-plane bind port (GatewayConfig.listen_addr; default :8080).
+    port: 8080
+    readTimeout: 30s
+    writeTimeout: 30s
+    readHeaderTimeout: 10s
+    idleTimeout: 120s
+    # -- Max request body. Default 5 GiB (config.Default()).
+    maxRequestBytes: 5368709120
+    maxHeaderBytes: 65536
+
+  console:
+    # -- Enable the tenant/admin console listener. Off by default; the
+    # console listener is opt-in (ConsoleConfig.listen_addr defaults to "").
+    enabled: false
+    # -- Console bind port (conventionally :8081; main.go comment).
+    port: 8081
+    readTimeout: 30s
+    writeTimeout: 30s
+    readHeaderTimeout: 10s
+    idleTimeout: 120s
+    maxHeaderBytes: 65536
+
+  health:
+    # -- Internal health/ready/drain bind port. Must be set for the
+    # liveness/readiness/drain endpoints to be exposed (HealthConfig.
+    # listen_addr; cmd/gateway only mounts the server when non-empty).
+    # Conventionally :29090 (config.go HealthConfig.ListenAddr comment).
+    port: 29090
+    # -- Logical cell id, surfaced in health logs (HealthConfig.cell_id).
+    cellId: ""
+    # -- Peer gateway list for cross-node quorum. Left empty for Kubernetes:
+    # each pod is an independent quorum voter (the monitor counts the local
+    # node), so a pod is Ready whenever it is locally healthy and not
+    # draining — exactly the per-pod semantics a Service/HPA wants. Set
+    # peers only for a static fleet that needs cell-wide quorum.
+    peers: []
+    pollInterval: 2s
+    pollTimeout: 1s
+    # -- Drain budget. The preStop hook POSTs /internal/drain; keep this
+    # below terminationGracePeriodSeconds so the kubelet does not SIGKILL
+    # mid-drain.
+    drainTimeout: 30s
+
+  metrics:
+    # -- Expose the Prometheus exporter at metrics.path on the gateway
+    # (S3) port. When enabled, pod scrape annotations are added too.
+    enabled: true
+    path: /internal/metrics
+
+  controlPlane:
+    # -- Postgres RDS DSN for the metadata/control plane. Treated as a
+    # secret (it carries the DB password) — set via secret.metadataDsn or
+    # an existing Secret, never inline here. When empty the gateway falls
+    # back to the embedded SQLite store at embeddedDbPath (single-node).
+    # rendered into config as control_plane.metadata_dsn.
+    metadataDsnFromSecret: true
+    # -- Embedded SQLite path used when no metadata DSN is set. Kept under
+    # cache.dataDir (the only writable mount when readOnlyRootFilesystem is
+    # true). It only survives a pod restart/reschedule when cache.mode=pvc;
+    # with ephemeral/emptyDir it is single-pod scratch state.
+    embeddedDbPath: /var/lib/zk-object-fabric/embedded.db
+    maxOpenConns: 32
+    maxIdleConns: 8
+    connMaxLifetime: 4m
+    connMaxIdleTime: 2m
+
+  encryption:
+    # -- CMK URI for the managed-encryption envelope (encryption.cmk_uri).
+    # e.g. "cmk://aws-kms/arn:aws:kms:us-east-1:123:key/abc" or
+    # "cmk://vault/transit/keys/zkof". Leave empty for strict-ZK only.
+    cmkUri: ""
+    # -- AWS region for the KMS client when cmkUri selects aws-kms. Falls
+    # back to the AWS_REGION env var when empty.
+    kmsRegion: ""
+    # -- Vault server URL when cmkUri selects the transit wrapper.
+    vaultAddr: ""
+    vaultTransitMount: transit
+    # -- Manifest-body-at-rest encryption key (XChaCha20-Poly1305, 32 raw
+    # bytes). REQUIRED when config.env=production with a persistent metadata
+    # store (Postgres DSN or the embedded SQLite store): cmd/gateway refuses
+    # to boot (enforceProductionManifestEncryption) because manifest JSON
+    # would otherwise be written as plaintext. The gateway reads it as a FILE
+    # (os.ReadFile), not an env var, so the chart mounts it from a Secret and
+    # points encryption.manifest_body_key_path at the mount path automatically
+    # when either value or existingSecret is set.
+    manifestBodyKey:
+      # -- Base64 of the 32 raw key bytes. Stored in the gateway Secret (only
+      # when secret.create is true). Generate with:
+      #   head -c 32 /dev/urandom | base64
+      # This key is durable: rotating it makes previously sealed manifests
+      # unreadable, so set it once and manage it out-of-band. For production
+      # prefer existingSecret over inlining the material here.
+      value: ""
+      # -- Instead of value, reference a key in an existing Secret that holds
+      # the raw 32-byte material. Takes precedence over value for the mount.
+      existingSecret: ""
+      existingSecretKey: manifest-body.key
+      # -- Path the key is mounted at inside the container and written into
+      # the rendered config as encryption.manifest_body_key_path.
+      mountPath: /etc/zk-object-fabric/keys/manifest-body.key
+
+  providers:
+    wasabi:
+      # -- Register the Wasabi backend. access_key/secret_key come from the
+      # Secret (rendered as ${WASABI_ACCESS_KEY}/${WASABI_SECRET_KEY}).
+      enabled: true
+      endpoint: https://s3.us-east-1.wasabisys.com
+      region: us-east-1
+      bucket: zkof-us-east-1-prod
+    localFsDev:
+      # -- Developer loopback filesystem backend. Enable only for env:
+      # development trials with no Wasabi credentials.
+      enabled: false
+      rootPath: /var/lib/zk-object-fabric/local_fs_dev
+
+# ---------------------------------------------------------------------------
+# NVMe / block-storage hot-object cache (gateway.cache_path).
+# ---------------------------------------------------------------------------
+cache:
+  # -- Writable data directory mounted into the pod. This is the volume
+  # mountPath and, when securityContext.readOnlyRootFilesystem is true, the
+  # only writable location in the container. It holds the hot-object cache
+  # (cache.path) and, for single-node/dev profiles, the embedded SQLite DB
+  # (config.controlPlane.embeddedDbPath) and the local_fs_dev backend
+  # (config.providers.localFsDev.rootPath). Keep those paths under this dir.
+  dataDir: /var/lib/zk-object-fabric
+  # -- Disk cache directory; rendered into config as gateway.cache_path.
+  # Must live under cache.dataDir. Production nodes back dataDir with fast
+  # local block storage for the L0/L1 hot-object cache.
+  path: /var/lib/zk-object-fabric/cache
+
+  # -- How the cache volume is provisioned:
+  #   ephemeral : a per-pod generic ephemeral volume (a PVC bound to each
+  #               pod's lifetime). This is the right model for an
+  #               HPA-scaled Deployment — every replica gets its own NVMe
+  #               cache and no pod is pinned to a single node. (default)
+  #   pvc       : one shared PersistentVolumeClaim (templates/pvc.yaml).
+  #               Only safe for a single replica or a ReadWriteMany class;
+  #               a shared ReadWriteOnce PVC pins all replicas to one node
+  #               and breaks scale-out.
+  #   emptyDir  : throwaway node storage, lost on reschedule.
+  mode: ephemeral
+
+  # Settings for mode: ephemeral (per-pod PVC).
+  ephemeral:
+    # -- StorageClass for the per-pod cache volume; "" uses the cluster
+    # default. Use an NVMe-backed class in production.
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 50Gi
+
+  # Settings for mode: pvc (single shared PVC).
+  pvc:
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 50Gi
+    # -- Reuse an existing PVC instead of creating one.
+    existingClaim: ""
+
+# ---------------------------------------------------------------------------
+# Secrets (Wasabi keys, metadata DSN, CMK material).
+# ---------------------------------------------------------------------------
+secret:
+  # -- Create the Secret from the values below. Set false and supply
+  # existingSecret to manage credentials out-of-band (Vault, SOPS, ESO).
+  create: true
+  # -- Name of an existing Secret to source credentials from. The Secret
+  # must expose the same env keys (WASABI_ACCESS_KEY, WASABI_SECRET_KEY,
+  # METADATA_DSN, VAULT_TOKEN, CONSOLE_ADMIN_TOKEN).
+  existingSecret: ""
+  # Inline values — used only when create is true. Leave blank and rely on
+  # `--set`/`-f` overrides or an existingSecret in real deployments; never
+  # commit real credentials.
+  #
+  # NOTE: these values are substituted into the JSON config by the init
+  # container's envsubst, so they must be JSON-string-safe: a literal '"',
+  # '\' or newline in a value (most likely a METADATA_DSN password) would
+  # produce malformed config.json and crash-loop the gateway on parse. Keep
+  # DSN passwords URL-encoded (the standard for libpq URIs) and avoid raw
+  # quotes/backslashes; alphanumeric Wasabi keys and UUID/JWT tokens are safe.
+  wasabiAccessKey: ""
+  wasabiSecretKey: ""
+  metadataDsn: ""
+  vaultToken: ""
+  consoleAdminToken: ""
+
+# ---------------------------------------------------------------------------
+# Service.
+# ---------------------------------------------------------------------------
+service:
+  # -- ClusterIP | NodePort | LoadBalancer.
+  type: ClusterIP
+  # -- S3 data-plane service port.
+  s3Port: 8080
+  # -- Console service port (exposed only when config.console.enabled).
+  consolePort: 8081
+  annotations: {}
+  # -- NodePorts (used only when type is NodePort).
+  s3NodePort: ""
+  consoleNodePort: ""
+
+# ---------------------------------------------------------------------------
+# Ingress (optional, gated by enabled).
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: s3.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: zk-object-fabric-tls
+  #    hosts:
+  #      - s3.example.com
+
+# ---------------------------------------------------------------------------
+# Horizontal Pod Autoscaler.
+# ---------------------------------------------------------------------------
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+  # -- Optional memory target (set to enable a memory metric).
+  targetMemoryUtilizationPercentage: 0
+  # -- Optional scaling behavior block passed through verbatim.
+  behavior: {}
+
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget.
+# ---------------------------------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  # maxUnavailable: ""  # set one of minAvailable/maxUnavailable, not both
+
+# -- Resource requests/limits. Requests must be set for the CPU-target HPA
+# to compute utilisation.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# -- render-config init container. Its only job is a one-shot envsubst, so the
+# defaults are deliberately tiny. They exist mainly so the pod is admitted in
+# clusters whose LimitRange requires requests/limits on every container,
+# init containers included. Set initContainer.resources: {} to omit the block.
+initContainer:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# -- Extra non-secret env vars the gateway reads directly from the process
+# environment (os.Getenv), e.g. AWS_REGION, CONSOLE_VERIFY_BASE_URL.
+extraEnv: []
+#  - name: AWS_REGION
+#    value: us-east-1
+
+# -- Seconds the kubelet waits after SIGTERM before SIGKILL. Must exceed
+# terminationDrainTimeoutSeconds (and therefore config.health.drainTimeout)
+# so the preStop drain can complete.
+terminationGracePeriodSeconds: 45
+
+# -- wget --timeout (whole seconds) for the preStop POST /internal/drain.
+# Kept as a plain integer so it never has to parse a Go duration string:
+# deriving it from config.health.drainTimeout (e.g. "1m", "2m30s") would be
+# error-prone. Set this >= the numeric value of config.health.drainTimeout
+# (so wget waits for the server-side drain to finish) and <
+# terminationGracePeriodSeconds (so the kubelet does not SIGKILL mid-drain).
+terminationDrainTimeoutSeconds: 35
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# -- Spread replicas across nodes/zones for resilience.
+topologySpreadConstraints: []

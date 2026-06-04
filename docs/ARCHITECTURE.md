@@ -351,7 +351,7 @@ adapter status matrix.
   (`Check(...)` returns `403 DataResidencyViolation`).
 - `config/` — gateway configuration (providers, encryption,
   control plane, abuse, dedup, compliance, console).
-- `health/` — `/internal/healthz`, `/internal/ready`,
+- `health/` — `/internal/health`, `/internal/ready`,
   `/internal/drain`.
 - `metrics/` — self-contained Prometheus text-format exporter
   (`zkof_request_duration_seconds`, `zkof_cache_hit_total`,
@@ -410,6 +410,33 @@ See [STORAGE_INFRA.md](STORAGE_INFRA.md) for the full
 deployment-model → storage-backend mapping and the per-adapter
 status table.
 
+### Kubernetes (Helm + HPA)
+
+- The same gateway binary runs as a Kubernetes `Deployment` fronted by
+  a `HorizontalPodAutoscaler`, replacing the hand-sized Linode fleet
+  (`deploy/linode/`) with auto-scaling and self-healing. Shipped as a
+  Helm chart under `deploy/helm/zk-object-fabric/`.
+- An init container renders the gateway `config.json` from a ConfigMap
+  template by expanding `${...}` placeholders with values from the
+  `Secret` (`envsubst`), mirroring the Wasabi production convention in
+  `deploy/wasabi/`. `internal/config.Load` reads a single JSON file and
+  does not expand env vars, so credentials are injected this way rather
+  than as plain env vars. Only the init container mounts the `Secret` as
+  env vars (for `envsubst`); the gateway container reads them from the
+  rendered config, so they are not exposed in its process environment.
+- A production deploy (`config.env: production`) with a persistent
+  metadata store must set the manifest-body encryption key
+  (`config.encryption.manifestBodyKey`); the gateway refuses to boot
+  otherwise (`enforceProductionManifestEncryption`). The key is mounted
+  as a file and the chart fails fast at template time if it is missing.
+- Readiness (`GET /internal/ready`) gates Service traffic; liveness
+  (`GET /internal/health`) restarts wedged pods; a `preStop` hook POSTs
+  `/internal/drain` so rolling deploys drain in-flight requests before
+  SIGTERM. The HPA targets 70 % CPU (min 2 / max 20 by default).
+- The NVMe hot-object cache is a per-pod ephemeral volume by default so
+  no replica is pinned to a single node; a `PodDisruptionBudget` keeps
+  `minAvailable: 1`. See [../deploy/helm/README.md](../deploy/helm/README.md).
+
 ## Port mapping
 
 | Port    | Service                |
@@ -424,7 +451,7 @@ access it through the AWS control plane VPC or a bastion host.
 
 Internal endpoints exposed by `internal/health/`:
 
-- `GET /internal/healthz` — liveness
+- `GET /internal/health` — liveness
 - `GET /internal/ready` — readiness (used by NodeBalancer health check)
 - `POST /internal/drain` — graceful drain for rolling deploys
 

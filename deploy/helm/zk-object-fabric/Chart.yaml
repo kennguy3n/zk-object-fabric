@@ -1,0 +1,26 @@
+apiVersion: v2
+name: zk-object-fabric
+description: |
+  Helm chart for the zk-object-fabric S3-compatible gateway. Deploys the
+  gateway as a horizontally auto-scaled, self-healing Kubernetes workload
+  (Deployment + HorizontalPodAutoscaler) so SME SaaS operators no longer
+  have to size a fixed Terraform/cloud-init fleet by hand.
+type: application
+
+# Chart version. Bump on every change to the chart itself.
+version: 0.1.0
+
+# appVersion tracks the gateway image this chart was validated against.
+# It matches internal/version.Version (0.1.0).
+appVersion: "0.1.0"
+
+home: https://github.com/kennguy3n/zk-object-fabric
+sources:
+  - https://github.com/kennguy3n/zk-object-fabric
+keywords:
+  - s3
+  - object-storage
+  - zero-knowledge
+  - gateway
+maintainers:
+  - name: zk-object-fabric maintainers

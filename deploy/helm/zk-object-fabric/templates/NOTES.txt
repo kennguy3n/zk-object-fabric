@@ -1,0 +1,23 @@
+zk-object-fabric gateway "{{ .Release.Name }}" has been deployed.
+
+S3 data plane:   service {{ include "zk-object-fabric.fullname" . }}:{{ .Values.service.s3Port }}
+{{- if .Values.config.console.enabled }}
+Console / admin: service {{ include "zk-object-fabric.fullname" . }}:{{ .Values.service.consolePort }}
+{{- end }}
+Internal health endpoints (port {{ .Values.config.health.port }}):
+  GET  /internal/health  (liveness)
+  GET  /internal/ready   (readiness)
+  POST /internal/drain   (graceful drain, used by the preStop hook)
+
+Autoscaling: {{ if .Values.autoscaling.enabled }}enabled (min {{ .Values.autoscaling.minReplicas }} / max {{ .Values.autoscaling.maxReplicas }}, target {{ .Values.autoscaling.targetCPUUtilizationPercentage }}% CPU){{ else }}disabled (fixed {{ .Values.replicaCount }} replicas){{ end }}
+
+{{- if and .Values.secret.create (not .Values.secret.wasabiSecretKey) (.Values.config.providers.wasabi.enabled) }}
+
+WARNING: Wasabi is enabled but secret.wasabiSecretKey is empty. Set the
+credentials via -f my-values.yaml / --set, or point secret.existingSecret
+at an externally managed Secret. See deploy/helm/README.md.
+{{- end }}
+
+Check rollout:
+  kubectl rollout status deploy/{{ include "zk-object-fabric.fullname" . }}
+  kubectl get hpa {{ include "zk-object-fabric.fullname" . }}
