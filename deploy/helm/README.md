@@ -208,6 +208,13 @@ fails at `helm install`/`helm template` time otherwise (without it the init
 container would reference a Secret that is never created and the pod would fail
 with `CreateContainerConfigError`).
 
+Setting `secret.create: true` **and** `secret.existingSecret` together is
+accepted but probably not what you want: the chart then renders its own Secret
+under the `existingSecret` name (from the `secret.*` values), rather than
+reading a pre-existing externally-managed Secret. Use exactly one of the two:
+`create: true` with `secret.*` values for chart-managed credentials, or
+`create: false` with `existingSecret` to consume a Secret you manage out-of-band.
+
 The credentials `existingSecret` must expose these keys: `WASABI_ACCESS_KEY`,
 `WASABI_SECRET_KEY`, `METADATA_DSN`, `VAULT_TOKEN`, `CONSOLE_ADMIN_TOKEN`. The
 manifest-body key lives in its own Secret (`manifestBodyKey.existingSecret`)
