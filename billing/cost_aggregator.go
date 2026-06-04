@@ -67,8 +67,10 @@ type StorageUsage struct {
 	// DedupSavedGiBMonth is the GiB-month NOT written to Wasabi
 	// because the gateway recognized convergent ciphertext. The
 	// physically-stored volume is LogicalGiBMonth -
-	// DedupSavedGiBMonth; this value must not exceed
-	// LogicalGiBMonth.
+	// DedupSavedGiBMonth, so this value is expected to lie in
+	// [0, LogicalGiBMonth]. The aggregator defensively clamps it to
+	// that range, but the metering pipeline should uphold the
+	// invariant at the source.
 	DedupSavedGiBMonth float64
 }
 
@@ -162,9 +164,28 @@ func (a *DefaultCostAggregator) GetCostBreakdown(ctx context.Context, tenantID, 
 		return CostBreakdown{}, err
 	}
 
+	// Clamp the metered volumes to the documented invariant
+	// 0 <= DedupSavedGiBMonth <= LogicalGiBMonth before pricing.
+	// A metering pipeline that violates it (negative volume, or
+	// dedup savings exceeding the logical volume) would otherwise
+	// drive the net Wasabi line (WasabiStorageUSD - DedupSavingsUSD)
+	// negative and mislead the operator; clamping keeps every line
+	// item non-negative and internally consistent.
+	logical := usage.LogicalGiBMonth
+	saved := usage.DedupSavedGiBMonth
+	if logical < 0 {
+		logical = 0
+	}
+	if saved < 0 {
+		saved = 0
+	}
+	if saved > logical {
+		saved = logical
+	}
+
 	rate := a.Model.WasabiUSDPerGiBMonth
-	wasabi := usage.LogicalGiBMonth * rate
-	dedup := usage.DedupSavedGiBMonth * rate
+	wasabi := logical * rate
+	dedup := saved * rate
 
 	n := float64(a.activeTenants())
 	linode := a.Model.LinodeMonthlyUSD / n

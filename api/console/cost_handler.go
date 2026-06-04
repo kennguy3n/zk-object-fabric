@@ -35,11 +35,6 @@ type CostHandler struct {
 	// AdminAuth gates every request when non-nil. Nil disables the
 	// check (dev only).
 	AdminAuth func(r *http.Request) bool
-
-	// Clock defaults to time.Now. Used only to validate that an
-	// explicit ?month= is well-formed; month resolution itself is
-	// delegated to the Reporter.
-	Clock func() time.Time
 }
 
 // Register mounts the cost-breakdown route on mux. It uses the

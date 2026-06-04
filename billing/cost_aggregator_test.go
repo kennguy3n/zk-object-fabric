@@ -109,6 +109,33 @@ func TestCostAggregator_NoDedupNoSavings(t *testing.T) {
 	approx(t, "TotalUSD", got.TotalUSD, 5)
 }
 
+func TestCostAggregator_ClampsDedupToLogical(t *testing.T) {
+	// A buggy reader reports dedup savings exceeding the logical
+	// volume. Savings must clamp to the logical volume so the net
+	// Wasabi line never goes negative, and the storage/dedup line
+	// items cancel exactly.
+	usage := &fakeUsage{usage: StorageUsage{LogicalGiBMonth: 100, DedupSavedGiBMonth: 250}}
+	a := &DefaultCostAggregator{Usage: usage, Model: CostModel{WasabiUSDPerGiBMonth: 0.01}}
+	got, err := a.GetCostBreakdown(context.Background(), "t", "2026-06")
+	if err != nil {
+		t.Fatal(err)
+	}
+	approx(t, "WasabiStorageUSD", got.WasabiStorageUSD, 1.0)
+	approx(t, "DedupSavingsUSD", got.DedupSavingsUSD, 1.0) // clamped to logical, not 2.5
+	if got.WasabiStorageUSD-got.DedupSavingsUSD < 0 {
+		t.Errorf("net wasabi must not be negative, got %f", got.WasabiStorageUSD-got.DedupSavingsUSD)
+	}
+
+	// Negative volumes floor at zero.
+	usage.usage = StorageUsage{LogicalGiBMonth: -5, DedupSavedGiBMonth: -5}
+	got, err = a.GetCostBreakdown(context.Background(), "t", "2026-06")
+	if err != nil {
+		t.Fatal(err)
+	}
+	approx(t, "WasabiStorageUSD (neg)", got.WasabiStorageUSD, 0)
+	approx(t, "DedupSavingsUSD (neg)", got.DedupSavingsUSD, 0)
+}
+
 func TestCostAggregator_MonthlyCostUsesCurrentMonth(t *testing.T) {
 	now := time.Date(2026, 3, 9, 12, 0, 0, 0, time.UTC)
 	usage := &fakeUsage{usage: StorageUsage{LogicalGiBMonth: 100}}
