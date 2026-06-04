@@ -159,6 +159,70 @@ func TestRateLimiter_FailClosedDoesNotAffectResolvedBudget(t *testing.T) {
 	}
 }
 
+// TestRateLimiter_AllowEgressFailClosed pins the egress guard's
+// fail-closed posture: when EgressLookup cannot resolve the tenant
+// (ok=false), FailClosed=true rejects so a directory outage cannot
+// silently disable egress enforcement, while the non-outage cases
+// (feature off, or a positively-reported zero budget) stay fail-open
+// regardless of the flag.
+func TestRateLimiter_AllowEgressFailClosed(t *testing.T) {
+	resolver := func(*http.Request) (string, bool) { return "t1", true }
+
+	t.Run("lookup outage fails closed when FailClosed", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.FailClosed = true
+		l.EgressLookup = func(string) (int64, bool) { return 0, false }
+		if l.AllowEgress("t1") {
+			t.Fatal("FailClosed=true with an unresolvable egress budget should reject")
+		}
+	})
+
+	t.Run("lookup outage fails open by default", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.EgressLookup = func(string) (int64, bool) { return 0, false }
+		if !l.AllowEgress("t1") {
+			t.Fatal("default (fail-open) with an unresolvable egress budget should allow")
+		}
+	})
+
+	t.Run("zero budget stays fail-open under FailClosed", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.FailClosed = true
+		// ok=true with a non-positive budget is an intentional
+		// "no enforcement for this tenant" signal, not an outage.
+		l.EgressLookup = func(string) (int64, bool) { return 0, true }
+		if !l.AllowEgress("t1") {
+			t.Fatal("a positively-reported zero budget must stay fail-open even with FailClosed=true")
+		}
+	})
+
+	t.Run("nil EgressLookup stays fail-open under FailClosed", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.FailClosed = true
+		// EgressLookup unset: egress enforcement is not configured.
+		if !l.AllowEgress("t1") {
+			t.Fatal("nil EgressLookup must stay fail-open (feature off) even with FailClosed=true")
+		}
+	})
+
+	t.Run("resolved budget enforcement unaffected by FailClosed", func(t *testing.T) {
+		now := time.Unix(0, 0).UTC()
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.Clock = func() time.Time { return now }
+		l.FailClosed = true
+		const budget = int64(1024)
+		l.EgressLookup = func(string) (int64, bool) { return budget, true }
+
+		if !l.AllowEgress("t1") {
+			t.Fatal("fresh tenant within budget should be allowed")
+		}
+		l.Observe("t1", budget)
+		if l.AllowEgress("t1") {
+			t.Fatal("tenant over budget should be rejected via the normal exhaustion path, not the flag")
+		}
+	})
+}
+
 func TestRateLimiter_BudgetExhaustionRejects(t *testing.T) {
 	now := time.Unix(0, 0).UTC()
 	clock := func() time.Time { return now }

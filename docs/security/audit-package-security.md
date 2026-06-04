@@ -377,14 +377,27 @@ sets this from `Config.RateLimitFailClosedEnabled()`
 fail-closed, while other environments opt in via
 `abuse.rate_limit_fail_closed`.
 
-Note the scope of `FailClosed`: it governs `Allow` only, which the
-`Middleware` reaches **after** it has resolved a tenant. Requests
-the `Resolver` cannot attribute to a tenant (unauthenticated /
-anonymous callers) skip `Allow` entirely and are passed to the
-handler so it can return the appropriate 401/403 — fail-closed
-does not turn the rate limiter into an authenticator. The closed
-path therefore applies to *identified tenants whose budget cannot
-be priced*, not to unidentified traffic.
+`FailClosed` governs both budget-resolution guards that share the
+tenant directory: the request-rate `Allow` (`Lookup` returns
+`ok=false` or non-positive `rps`) and the monthly-egress
+`AllowEgress` (`EgressLookup` returns `ok=false`). A single
+directory outage therefore closes both rather than leaving egress
+enforcement silently disabled while rate limiting fails closed.
+Two cases stay fail-open by design even under `FailClosed`: a nil
+`EgressLookup` (egress enforcement not configured) and a budget the
+directory *positively* reports as zero (`budget <= 0` with
+`ok=true`, an intentional "skip enforcement for this tenant"
+signal) — only an unresolved lookup (`ok=false`) is treated as an
+outage.
+
+Note the scope relative to the `Middleware`, which reaches these
+guards **after** it has resolved a tenant. Requests the `Resolver`
+cannot attribute to a tenant (unauthenticated / anonymous callers)
+skip `Allow`/`AllowEgress` entirely and are passed to the handler
+so it can return the appropriate 401/403 — fail-closed does not
+turn the rate limiter into an authenticator. The closed paths apply
+to *identified tenants whose budget cannot be priced*, not to
+unidentified traffic.
 
 The auditor should:
 

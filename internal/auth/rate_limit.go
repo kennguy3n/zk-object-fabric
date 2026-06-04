@@ -38,8 +38,11 @@ type RateLimitLookup func(tenantID string) (rps int, burst int, ok bool)
 // EgressBudgetLookup resolves a tenant ID to its monthly egress
 // budget in bytes. A zero return means the tenant has no configured
 // budget and egress enforcement is skipped for them. ok=false means
-// the tenant is unknown to the directory; callers treat that as "no
-// enforcement" as well so misconfiguration cannot lock users out.
+// the tenant could not be resolved (unknown to the directory or a
+// directory outage); by default callers treat that as "no
+// enforcement" so misconfiguration cannot lock users out, but a
+// limiter constructed with FailClosed rejects on ok=false so an
+// outage cannot silently disable egress enforcement.
 type EgressBudgetLookup func(tenantID string) (bytesPerMonth int64, ok bool)
 
 // TenantResolver is the function the middleware uses to identify the
@@ -115,16 +118,18 @@ type RateLimiter struct {
 	// cooldown window. When false the limiter only alerts.
 	ThrottleOnAnomaly bool
 
-	// FailClosed controls Allow's behaviour when a tenant's budget
-	// cannot be resolved (Lookup returns ok=false, or a non-positive
-	// rps). When false (the default) such requests pass through so a
-	// misconfigured or not-yet-provisioned tenant is not locked out
-	// and the Authenticator gets the final say — this is the
-	// fail-open posture. When true the limiter rejects those requests
-	// instead, so that a directory/budget-resolution outage during a
-	// flood cannot silently disable rate limiting for every tenant it
-	// cannot price. The normal token-bucket path (budget resolved) is
-	// unaffected either way.
+	// FailClosed controls behaviour when a tenant's budget cannot be
+	// resolved: the Allow path where Lookup returns ok=false or a
+	// non-positive rps, and the AllowEgress path where EgressLookup
+	// returns ok=false. When false (the default) such requests pass
+	// through so a misconfigured or not-yet-provisioned tenant is not
+	// locked out and the Authenticator gets the final say — this is
+	// the fail-open posture. When true both guards reject those
+	// requests instead, so that a directory/budget-resolution outage
+	// during a flood cannot silently disable rate limiting or egress
+	// enforcement for tenants the limiter cannot price. The resolved
+	// paths (token bucket with a real rps; egress with a positive or
+	// explicitly-zero budget) are unaffected either way.
 	FailClosed bool
 
 	mu      sync.Mutex
@@ -272,15 +277,32 @@ func (l *RateLimiter) Allow(tenantID string) bool {
 }
 
 // AllowEgress reports whether tenantID has any monthly egress budget
-// left. It returns true when the tenant has no configured budget (so
-// misconfigured tenants fail open) and emits an AbuseBudgetExhausted
-// alert each time an already-exhausted tenant is rejected.
+// left. It returns true when egress enforcement is not configured
+// (nil EgressLookup) or the tenant has no configured budget, and
+// emits an AbuseBudgetExhausted alert each time an already-exhausted
+// tenant is rejected.
+//
+// When the budget directory cannot resolve the tenant (ok=false) the
+// behaviour mirrors Allow: fail open by default, fail closed when
+// FailClosed is set, so the same directory outage that closes the
+// request-rate guard also closes the egress guard rather than
+// silently disabling it. A tenant the directory positively reports
+// as having no budget (budget <= 0 with ok=true) is an intentional
+// "skip enforcement" signal and stays fail-open regardless.
 func (l *RateLimiter) AllowEgress(tenantID string) bool {
 	if l.EgressLookup == nil {
 		return true
 	}
 	budget, ok := l.EgressLookup(tenantID)
-	if !ok || budget <= 0 {
+	if !ok {
+		// Budget directory could not resolve the tenant (unknown or
+		// outage). Fail closed when configured so a directory outage
+		// cannot silently disable egress enforcement.
+		return !l.FailClosed
+	}
+	if budget <= 0 {
+		// Tenant positively has no configured egress budget:
+		// enforcement is intentionally skipped for them.
 		return true
 	}
 	now := l.now()
