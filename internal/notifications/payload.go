@@ -101,8 +101,13 @@ type s3BucketEntity struct {
 }
 
 type s3ObjectEntity struct {
-	Key       string `json:"key"`
-	Size      int64  `json:"size,omitempty"`
+	Key string `json:"key"`
+	// Size is a pointer so the field tracks AWS exactly: every
+	// ObjectCreated record carries size (a *int64 to 0 still
+	// serialises as "size":0 for a 0-byte object), while ObjectRemoved
+	// records omit it entirely (nil → dropped by omitempty). A plain
+	// int64 could not distinguish "0-byte create" from "remove".
+	Size      *int64 `json:"size,omitempty"`
 	ETag      string `json:"eTag,omitempty"`
 	VersionID string `json:"versionId,omitempty"`
 	Sequencer string `json:"sequencer"`
@@ -111,6 +116,14 @@ type s3ObjectEntity struct {
 // render builds the single-record S3 event document for one matched
 // rule. configurationID is the matched rule's ID (may be empty).
 func (e Event) render(configurationID string) s3EventEnvelope {
+	// AWS includes object size only on ObjectCreated records (even for
+	// a 0-byte object); ObjectRemoved records omit it. Bind a pointer
+	// for creates so a true 0 is emitted, and leave it nil otherwise.
+	var size *int64
+	if e.Name.IsObjectCreated() {
+		s := e.SizeBytes
+		size = &s
+	}
 	return s3EventEnvelope{
 		Records: []s3EventRecord{{
 			EventVersion: "2.1",
@@ -127,7 +140,7 @@ func (e Event) render(configurationID string) s3EventEnvelope {
 				Bucket:          s3BucketEntity{Name: e.Bucket},
 				Object: s3ObjectEntity{
 					Key:       e.ObjectKey,
-					Size:      e.SizeBytes,
+					Size:      size,
 					ETag:      e.ETag,
 					VersionID: e.VersionID,
 					Sequencer: e.Sequencer,

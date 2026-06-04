@@ -870,6 +870,19 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.DeleteBucketLifecycleConfiguration(w, r)
 			return
 		}
+		// Bucket event notifications (DELETE /{bucket}?notification) —
+		// WS8.6. S3 has no DeleteBucketNotification operation; a
+		// configuration is cleared by PUTting an empty
+		// <NotificationConfiguration/>. Intercept the bucket-level case
+		// (key=="") so it returns this explicit guidance instead of
+		// falling through to h.Delete, which would reject it with the
+		// generic "path must be /{bucket}/{key...}" 400.
+		if bucket, key := parseBucketKey(r.URL.Path); key == "" && q.Has("notification") {
+			writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
+				"S3 has no DeleteBucketNotification; clear the configuration by PUT /"+bucket+"?notification with an empty <NotificationConfiguration/>",
+				r.URL.Path)
+			return
+		}
 		h.Delete(w, r)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "method not allowed", r.URL.Path)

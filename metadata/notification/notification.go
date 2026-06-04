@@ -83,6 +83,16 @@ func (e EventType) class() string {
 	return s[:i]
 }
 
+// IsObjectCreated reports whether the event is one of the
+// s3:ObjectCreated:* leaves (Put/Copy/CompleteMultipartUpload) or the
+// wildcard class. The delivered payload uses this to decide whether the
+// s3.object entity carries a size field: AWS includes size for every
+// ObjectCreated record (including a 0-byte object) and omits it
+// entirely for ObjectRemoved records.
+func (e EventType) IsObjectCreated() bool {
+	return e.class() == "s3:ObjectCreated"
+}
+
 // covers reports whether a rule subscribed to event `sub` should fire
 // for an emitted leaf event `emitted`. A wildcard subscription matches
 // any leaf in its class; otherwise the names must be equal.

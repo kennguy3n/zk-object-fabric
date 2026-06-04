@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -137,8 +138,8 @@ func TestDispatcherDeliversMatchingEvent(t *testing.T) {
 	if rec.S3.Object.Key != "photos/cat.jpg" {
 		t.Errorf("key = %q", rec.S3.Object.Key)
 	}
-	if rec.S3.Object.Size != 1234 || rec.S3.Object.ETag != "etag-abc" {
-		t.Errorf("size/etag = %d/%q", rec.S3.Object.Size, rec.S3.Object.ETag)
+	if rec.S3.Object.Size == nil || *rec.S3.Object.Size != 1234 || rec.S3.Object.ETag != "etag-abc" {
+		t.Errorf("size/etag = %v/%q", rec.S3.Object.Size, rec.S3.Object.ETag)
 	}
 	if rec.S3.Object.Sequencer == "" {
 		t.Error("sequencer not filled in")
@@ -534,5 +535,76 @@ func TestAttemptBoundsResponseBodyDrain(t *testing.T) {
 	// NOT read the unbounded body to exhaustion.
 	if got := body.read.Load(); got > maxDrainBytes+32<<10 {
 		t.Errorf("drained %d bytes, want <= %d (bounded drain)", got, maxDrainBytes+32<<10)
+	}
+}
+
+// TestRenderObjectSizePresence pins the AWS-compatible rule that the
+// s3.object.size field is present on every ObjectCreated record (even a
+// 0-byte object, where it must serialise as "size":0) and absent on
+// ObjectRemoved records. It marshals the rendered envelope and inspects
+// the raw JSON so the presence/absence of the key is asserted directly,
+// not via the *int64 round-trip.
+func TestRenderObjectSizePresence(t *testing.T) {
+	objectJSON := func(e Event) string {
+		raw, err := json.Marshal(e.render(""))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var env struct {
+			Records []struct {
+				S3 struct {
+					Object json.RawMessage `json:"object"`
+				} `json:"s3"`
+			} `json:"Records"`
+		}
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(env.Records) != 1 {
+			t.Fatalf("Records len = %d", len(env.Records))
+		}
+		return string(env.Records[0].S3.Object)
+	}
+
+	cases := []struct {
+		name      string
+		event     Event
+		wantSize  string // substring that must be present
+		omitsSize bool
+	}{
+		{
+			name:     "create nonzero carries size",
+			event:    Event{Name: notification.ObjectCreatedPut, ObjectKey: "k", SizeBytes: 1234},
+			wantSize: `"size":1234`,
+		},
+		{
+			name:     "create zero-byte still carries size:0",
+			event:    Event{Name: notification.ObjectCreatedCompleteMultipartUpload, ObjectKey: "k", SizeBytes: 0},
+			wantSize: `"size":0`,
+		},
+		{
+			name:      "remove omits size entirely",
+			event:     Event{Name: notification.ObjectRemovedDelete, ObjectKey: "k", SizeBytes: 0},
+			omitsSize: true,
+		},
+		{
+			name:      "delete-marker omits size entirely",
+			event:     Event{Name: notification.ObjectRemovedDeleteMarkerCreated, ObjectKey: "k"},
+			omitsSize: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := objectJSON(tc.event)
+			if tc.omitsSize {
+				if strings.Contains(obj, `"size"`) {
+					t.Errorf("object %s unexpectedly contains size", obj)
+				}
+				return
+			}
+			if !strings.Contains(obj, tc.wantSize) {
+				t.Errorf("object %s missing %s", obj, tc.wantSize)
+			}
+		})
 	}
 }

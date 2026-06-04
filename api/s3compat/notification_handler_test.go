@@ -273,3 +273,22 @@ func TestHandlerEventNamesMatchNotificationConstants(t *testing.T) {
 		}
 	}
 }
+
+// TestDeleteBucketNotification_MethodNotAllowed verifies that a
+// DELETE /{bucket}?notification returns a 405 with explicit guidance,
+// since S3 has no DeleteBucketNotification operation (a configuration
+// is cleared by PUTting an empty <NotificationConfiguration/>). It must
+// not fall through to the object-delete path and return a misleading
+// "path must be /{bucket}/{key...}" 400.
+func TestDeleteBucketNotification_MethodNotAllowed(t *testing.T) {
+	h, _ := newNotificationTestHandler()
+	req := httptest.NewRequest(http.MethodDelete, "/bucket?notification", nil)
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE ?notification = %d, want 405; body=%s", rec.Code, rec.Body)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "DeleteBucketNotification") {
+		t.Errorf("DELETE ?notification body = %s, want guidance mentioning DeleteBucketNotification", body)
+	}
+}
