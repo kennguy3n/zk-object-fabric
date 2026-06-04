@@ -361,8 +361,9 @@ shared backing store: each gateway holds its own `buckets` map and
 resolves a tenant's steady-state rate/burst through the injected
 `RateLimitLookup` (`TenantBudgetsLookup` over the tenant store).
 The realistic outage is therefore *budget resolution*, not a Redis
-round-trip: when `Lookup` returns `ok=false` or a non-positive
-`rps`, `Allow` takes an early-return path before the bucket logic.
+round-trip: when `Lookup` returns `ok=false` (the tenant cannot be
+resolved — unknown to the directory, or a directory outage), `Allow`
+takes an early-return path before the bucket logic.
 
 That early-return path is now **fail-closed configurable**.
 `RateLimiter.FailClosed` (default `false`) governs it: when
@@ -378,17 +379,37 @@ fail-closed, while other environments opt in via
 `abuse.rate_limit_fail_closed`.
 
 `FailClosed` governs both budget-resolution guards that share the
-tenant directory: the request-rate `Allow` (`Lookup` returns
-`ok=false` or non-positive `rps`) and the monthly-egress
-`AllowEgress` (`EgressLookup` returns `ok=false`). A single
-directory outage therefore closes both rather than leaving egress
+tenant directory, and the two are deliberately **symmetric**: only
+an *unresolved* lookup (`ok=false`) is treated as an outage and
+closed. The request-rate `Allow` and the monthly-egress
+`AllowEgress` both reject on `ok=false` under `FailClosed`, so a
+single directory outage closes both rather than leaving egress
 enforcement silently disabled while rate limiting fails closed.
-Two cases stay fail-open by design even under `FailClosed`: a nil
-`EgressLookup` (egress enforcement not configured) and a budget the
-directory *positively* reports as zero (`budget <= 0` with
-`ok=true`, an intentional "skip enforcement for this tenant"
-signal) — only an unresolved lookup (`ok=false`) is treated as an
-outage.
+
+A tenant the directory *resolves* (`ok=true`) is never closed by
+the flag, including when it reports **no ceiling** for that tenant:
+`rps <= 0` for `Allow` and `budget <= 0` for `AllowEgress` are an
+intentional "this tenant has no limit configured" signal and stay a
+no-op (fail-open) regardless of `FailClosed`. This matters because
+`RequestsPerSec = 0` is a valid tenant budget (`metadata/tenant`
+only rejects negatives) that historically means *unlimited*;
+treating it as an outage would let a fail-closed gateway block
+tenants deliberately provisioned without a ceiling. To keep that
+distinction, `TenantBudgetsLookup` returns `ok=true, rps=0` for a
+known-but-unlimited tenant (rather than collapsing it into
+`ok=false`), mirroring how `TenantEgressBudgetLookup` reports a
+zero egress budget. A nil `EgressLookup` (egress enforcement not
+configured at all) likewise stays fail-open.
+
+Scope caveat for egress: `AllowEgress` only runs where an
+`EgressLookup` is wired into the `RateLimiter`. The current gateway
+(`cmd/gateway/main.go`) wires only the request-rate `Lookup`, so
+the egress guard — and therefore its fail-closed behaviour — is
+inert there today and governs only callers that wire an
+`EgressLookup` (e.g. the abuse test harness, or future gateway
+wiring). The symmetric `ok=false` handling is in place so that
+enabling egress enforcement later inherits the same fail-closed
+posture without a second audit.
 
 Note the scope relative to the `Middleware`, which reaches these
 guards **after** it has resolved a tenant. Requests the `Resolver`
