@@ -8,17 +8,21 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
+	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 // MemoryStore is an in-memory bucket_config.Store for tests and the
 // dev profile. Entries do NOT survive a restart.
 type MemoryStore struct {
 	mu         sync.RWMutex
-	versioning map[string]VersioningState    // key: tenantID + "\x00" + bucket
-	objectLock map[string]object_lock.Config // key: tenantID + "\x00" + bucket
-	cors       map[string]cors.Config        // key: tenantID + "\x00" + bucket
-	lifecycle  map[string]lifecycle.Config   // key: tenantID + "\x00" + bucket
+	versioning map[string]VersioningState     // key: tenantID + "\x00" + bucket
+	objectLock map[string]object_lock.Config  // key: tenantID + "\x00" + bucket
+	cors       map[string]cors.Config         // key: tenantID + "\x00" + bucket
+	lifecycle  map[string]lifecycle.Config    // key: tenantID + "\x00" + bucket
+	notif      map[string]notification.Config // key: tenantID + "\x00" + bucket
+	encryption map[string]sse.Config          // key: tenantID + "\x00" + bucket
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -30,6 +34,8 @@ func NewMemoryStore() *MemoryStore {
 		objectLock: make(map[string]object_lock.Config),
 		cors:       make(map[string]cors.Config),
 		lifecycle:  make(map[string]lifecycle.Config),
+		notif:      make(map[string]notification.Config),
+		encryption: make(map[string]sse.Config),
 	}
 }
 
@@ -179,6 +185,46 @@ func (s *MemoryStore) ListLifecycle(_ context.Context) ([]LifecycleEntry, error)
 	return out, nil
 }
 
+// GetEncryption returns the stored bucket default SSE config, or the
+// zero Config when the bucket has none. sse.Config is a flat value
+// type (no slices/maps/pointers), so it is safe to return by value
+// without a deep copy.
+func (s *MemoryStore) GetEncryption(_ context.Context, tenantID, bucket string) (sse.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return sse.Config{}, errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.encryption[memKey(tenantID, bucket)], nil
+}
+
+// SetEncryption upserts the bucket default SSE config for (tenantID,
+// bucket).
+func (s *MemoryStore) SetEncryption(_ context.Context, tenantID, bucket string, cfg sse.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.encryption[memKey(tenantID, bucket)] = cfg
+	return nil
+}
+
+// DeleteEncryption removes the bucket default SSE config for (tenantID,
+// bucket). Deleting an unconfigured bucket is a no-op.
+func (s *MemoryStore) DeleteEncryption(_ context.Context, tenantID, bucket string) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.encryption, memKey(tenantID, bucket))
+	return nil
+}
+
 // cloneLifecycle deep-copies a lifecycle config so the store never
 // shares slice/map/pointer state with callers.
 func cloneLifecycle(c lifecycle.Config) lifecycle.Config {
@@ -230,6 +276,55 @@ func cloneInt64Ptr(p *int64) *int64 {
 	}
 	v := *p
 	return &v
+}
+
+// GetNotification returns a deep copy of the stored notification
+// config, or the zero Config when the bucket has none.
+func (s *MemoryStore) GetNotification(_ context.Context, tenantID, bucket string) (notification.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return notification.Config{}, errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneNotification(s.notif[memKey(tenantID, bucket)]), nil
+}
+
+// SetNotification upserts the notification config for (tenantID,
+// bucket). An empty cfg clears any existing configuration.
+func (s *MemoryStore) SetNotification(_ context.Context, tenantID, bucket string, cfg notification.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("bucket_config: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cfg.Empty() {
+		delete(s.notif, memKey(tenantID, bucket))
+		return nil
+	}
+	s.notif[memKey(tenantID, bucket)] = cloneNotification(cfg)
+	return nil
+}
+
+// cloneNotification deep-copies a notification config so the store
+// never shares slice backing arrays with callers.
+func cloneNotification(c notification.Config) notification.Config {
+	if len(c.Rules) == 0 {
+		return notification.Config{}
+	}
+	rules := make([]notification.Rule, len(c.Rules))
+	for i, r := range c.Rules {
+		rules[i] = notification.Rule{
+			ID:       r.ID,
+			Events:   append([]notification.EventType(nil), r.Events...),
+			Endpoint: r.Endpoint,
+			Prefix:   r.Prefix,
+			Suffix:   r.Suffix,
+		}
+	}
+	return notification.Config{Rules: rules}
 }
 
 // cloneCORS deep-copies a CORS config so the store never shares slice

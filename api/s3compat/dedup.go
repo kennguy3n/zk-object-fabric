@@ -570,6 +570,7 @@ func (h *Handler) putDeduped(
 		country = prov.PlacementLabels().Country
 	}
 	h.audit(r, "PUT", tenantID, bucket, key, pieceID, pieceBackend, country)
+	h.notify(r, eventObjectCreatedPut, tenantID, bucket, key, pieceETag, manifest.VersionID, manifest.ObjectSize)
 
 	// Return the backend's ETag to the client so dedup-hit and
 	// non-dedup PUTs of the same content remain ETag-stable. The

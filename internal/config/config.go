@@ -87,23 +87,68 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 
 // Config is the top-level runtime configuration.
 type Config struct {
-	Env          string             `json:"env"`
-	Gateway      GatewayConfig      `json:"gateway"`
-	ControlPlane ControlPlaneConfig `json:"control_plane"`
-	Providers    ProvidersConfig    `json:"providers"`
-	Rebalancer   RebalancerConfig   `json:"rebalancer"`
-	Billing      BillingConfig      `json:"billing"`
-	Health       HealthConfig       `json:"health"`
-	Console      ConsoleConfig      `json:"console"`
-	Encryption   EncryptionConfig   `json:"encryption"`
-	Abuse        AbuseConfig        `json:"abuse"`
-	Dedup        DedupConfig        `json:"dedup"`
-	Tracing      TracingConfig      `json:"tracing"`
-	Metrics      MetricsConfig      `json:"metrics"`
-	Compliance   ComplianceConfig   `json:"compliance"`
-	CrossCell    CrossCellConfig    `json:"cross_cell"`
-	Repair       RepairConfig       `json:"repair"`
-	Lifecycle    LifecycleConfig    `json:"lifecycle"`
+	Env           string              `json:"env"`
+	Gateway       GatewayConfig       `json:"gateway"`
+	ControlPlane  ControlPlaneConfig  `json:"control_plane"`
+	Providers     ProvidersConfig     `json:"providers"`
+	Rebalancer    RebalancerConfig    `json:"rebalancer"`
+	Billing       BillingConfig       `json:"billing"`
+	Health        HealthConfig        `json:"health"`
+	Console       ConsoleConfig       `json:"console"`
+	Encryption    EncryptionConfig    `json:"encryption"`
+	Abuse         AbuseConfig         `json:"abuse"`
+	Dedup         DedupConfig         `json:"dedup"`
+	Tracing       TracingConfig       `json:"tracing"`
+	Metrics       MetricsConfig       `json:"metrics"`
+	Compliance    ComplianceConfig    `json:"compliance"`
+	CrossCell     CrossCellConfig     `json:"cross_cell"`
+	Repair        RepairConfig        `json:"repair"`
+	Lifecycle     LifecycleConfig     `json:"lifecycle"`
+	Notifications NotificationsConfig `json:"notifications"`
+}
+
+// NotificationsConfig configures the bucket event-notification
+// dispatcher (WS8.6). When Enabled is false the gateway still stores
+// and serves per-bucket notification configurations
+// (Put/GetBucketNotificationConfiguration) but never delivers events —
+// the s3compat handler is wired with a nil emitter. All tunables have
+// sensible defaults applied by the dispatcher when left at zero.
+type NotificationsConfig struct {
+	// Enabled gates construction of the async webhook dispatcher and
+	// its wiring into the s3compat handler's event-emission path.
+	Enabled bool `json:"enabled"`
+
+	// Workers is the number of concurrent delivery goroutines.
+	// Defaults to 4 when zero.
+	Workers int `json:"workers"`
+
+	// QueueSize bounds the in-flight event buffer. When full, events
+	// are dropped (and dead-lettered) rather than blocking the S3
+	// request path. Defaults to 1024 when zero.
+	QueueSize int `json:"queue_size"`
+
+	// MaxAttempts is the total delivery attempts per destination
+	// (first try plus retries). Defaults to 4 when zero.
+	MaxAttempts int `json:"max_attempts"`
+
+	// BackoffBase is the base delay of the exponential retry backoff.
+	// Defaults to 200ms when zero.
+	BackoffBase Duration `json:"backoff_base"`
+
+	// DeliveryTimeout bounds a single webhook POST. Defaults to 5s
+	// when zero.
+	DeliveryTimeout Duration `json:"delivery_timeout"`
+
+	// ShutdownGrace bounds how long graceful shutdown spends draining
+	// already-queued events before dead-lettering the remainder.
+	// Defaults to 10s (never shorter than DeliveryTimeout).
+	ShutdownGrace Duration `json:"shutdown_grace"`
+
+	// AllowPrivateDestinations disables the SSRF guard that refuses to
+	// deliver webhooks to loopback, link-local, and private addresses.
+	// Leave false in production; set true only for local development
+	// against localhost webhook receivers.
+	AllowPrivateDestinations bool `json:"allow_private_destinations"`
 }
 
 // TracingConfig configures the OpenTelemetry-style request

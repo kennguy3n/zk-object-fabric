@@ -173,6 +173,17 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// Layer the bucket default-encryption configuration (WS8.7) over
+	// the placement policy before the session's encryption state is
+	// fixed, so EncMode and the per-session DEK decision below reflect
+	// the bucket default exactly as the single-piece PUT does.
+	effMode, err := h.effectiveEncryptionMode(r.Context(), tenantID, bucket, policy)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured", err.Error(), r.URL.Path)
+		return
+	}
+	policy.EncryptionMode = effMode
+
 	uploadID, err := newUploadID()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
@@ -774,6 +785,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		country = prov.PlacementLabels().Country
 	}
 	h.audit(r, "PUT", tenantID, bucket, key, auditPieceID, auditBackend, country)
+	h.notify(r, eventObjectCreatedCompleteMPU, tenantID, bucket, key, aggregateETag, manifest.VersionID, manifest.ObjectSize)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-version-id", manifest.VersionID)

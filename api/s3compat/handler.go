@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -190,6 +191,15 @@ type Config struct {
 	// Billing receives usage events. Optional.
 	Billing BillingSink
 
+	// Notifications receives object-level events (PUT / DELETE /
+	// COPY / CompleteMultipartUpload) for asynchronous fan-out to
+	// each bucket's configured webhook destinations (WS8.6). The
+	// handler calls Emit on the success path only; Emit must be
+	// non-blocking so a slow destination never adds latency to the
+	// S3 request. Optional; nil disables event notifications (the
+	// bucket's configuration is still stored, just never delivered).
+	Notifications NotificationEmitter
+
 	// Multipart is the server-side multipart-upload session store.
 	// Required for CreateMultipartUpload / UploadPart /
 	// CompleteMultipartUpload / AbortMultipartUpload. A nil store
@@ -356,6 +366,51 @@ type LegalHoldChecker interface {
 	Active(ctx context.Context, tenantID, bucket, objectKey string) ([]LegalHoldEntry, error)
 }
 
+// NotificationEmitter receives one ObjectEvent per successfully
+// serviced object mutation, for asynchronous fan-out to the bucket's
+// configured webhook destinations (WS8.6). Emit must be non-blocking:
+// the implementation (internal/notifications.Dispatcher) enqueues the
+// event and returns immediately, so a slow or unreachable destination
+// can never add latency to — or fail — the originating S3 request.
+// The handler depends only on this minimal interface so the s3compat
+// package does not import internal/notifications (cmd/gateway adapts
+// the two via a thin shim, mirroring the audit wiring).
+type NotificationEmitter interface {
+	Emit(event ObjectEvent)
+}
+
+// ObjectEvent mirrors the fields of notifications.Event that the
+// handler can populate from the request path. Defined here as a
+// shape-compatible struct so the s3compat package does not import
+// internal/notifications directly. EventName carries the specific
+// leaf S3 event name (e.g. "s3:ObjectCreated:Put"); the dispatcher
+// matches it against each rule's subscribed events, including the
+// wildcard classes.
+type ObjectEvent struct {
+	TenantID  string
+	Bucket    string
+	ObjectKey string
+	EventName string
+	SizeBytes int64
+	ETag      string
+	VersionID string
+	RequestID string
+	SourceIP  string
+}
+
+// Leaf S3 event names the handler emits. They are kept as plain string
+// constants (rather than importing metadata/notification) so the
+// s3compat package stays free of that dependency; cmd/gateway's shim
+// converts them to notification.EventType. They must stay in sync with
+// the leaf constants in metadata/notification.
+const (
+	eventObjectCreatedPut          = "s3:ObjectCreated:Put"
+	eventObjectCreatedCopy         = "s3:ObjectCreated:Copy"
+	eventObjectCreatedCompleteMPU  = "s3:ObjectCreated:CompleteMultipartUpload"
+	eventObjectRemovedDelete       = "s3:ObjectRemoved:Delete"
+	eventObjectRemovedDeleteMarker = "s3:ObjectRemoved:DeleteMarkerCreated"
+)
+
 // LegalHoldEntry mirrors auth.LegalHold so the s3compat package
 // does not import internal/auth directly.
 type LegalHoldEntry struct {
@@ -499,23 +554,21 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // gap rather than as a generic 5xx. Operation names map 1:1 to the
 // AWS API:
 //
-//   acl                ACL operations (GetObjectAcl, PutObjectAcl,
-//                      GetBucketAcl, PutBucketAcl)
-//   lifecycle          Bucket lifecycle configuration
-//   policy             Bucket policy document
-//   encryption         Bucket-level SSE configuration
-//   logging            Bucket logging configuration
-//   notification       Bucket event notification configuration
-//   replication        Cross-region replication configuration
-//   accelerate         Transfer-acceleration toggle
-//   requestPayment     Requester-pays configuration
-//   website            Static-website hosting configuration
-//   inventory          Bucket inventory configuration
-//   metrics            Bucket metrics configuration
-//   analytics          Bucket analytics configuration
-//   intelligent-tiering Auto-tiering configuration
-//   publicAccessBlock  Block-public-access settings
-//   ownershipControls  Object Ownership settings
+//	acl                ACL operations (GetObjectAcl, PutObjectAcl,
+//	                   GetBucketAcl, PutBucketAcl)
+//	lifecycle          Bucket lifecycle configuration
+//	policy             Bucket policy document
+//	logging            Bucket logging configuration
+//	replication        Cross-region replication configuration
+//	accelerate         Transfer-acceleration toggle
+//	requestPayment     Requester-pays configuration
+//	website            Static-website hosting configuration
+//	inventory          Bucket inventory configuration
+//	metrics            Bucket metrics configuration
+//	analytics          Bucket analytics configuration
+//	intelligent-tiering Auto-tiering configuration
+//	publicAccessBlock  Block-public-access settings
+//	ownershipControls  Object Ownership settings
 //
 // The conformance harness in `tests/s3_conformance` asserts every
 // entry here returns 4xx (specifically 501); a future implementation
@@ -525,8 +578,10 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // keys (`tagging`, `versioning`) were removed here and `?tagging` /
 // `?versioning` routing was added to the dispatch switch. Object
 // Lock (WS8.3) followed the same path for `object-lock`, `retention`,
-// and `legal-hold`, bucket CORS (WS8.5) for `cors`, and bucket
-// lifecycle (WS8.2) for `lifecycle`.
+// and `legal-hold`, bucket CORS (WS8.5) for `cors`, bucket
+// lifecycle (WS8.2) for `lifecycle`, bucket event notifications
+// (WS8.6) for `notification`, and bucket default encryption
+// (WS8.7) for `encryption`.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -551,9 +606,7 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
 	"policy":              "NotImplemented",
-	"encryption":          "NotImplemented",
 	"logging":             "NotImplemented",
-	"notification":        "NotImplemented",
 	"replication":         "NotImplemented",
 	"accelerate":          "NotImplemented",
 	"requestPayment":      "NotImplemented",
@@ -677,6 +730,20 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutBucketLifecycleConfiguration(w, r)
 			return
 		}
+		// Bucket event notifications (PUT /{bucket}?notification) —
+		// WS8.6. Bucket-level sub-resource; route before the
+		// implicit-CreateBucket / CopyObject / Put branches.
+		if q.Has("notification") {
+			h.PutBucketNotificationConfiguration(w, r)
+			return
+		}
+		// Bucket default encryption (PUT /{bucket}?encryption) — WS8.7.
+		// Bucket-level sub-resource; route before the
+		// implicit-CreateBucket / CopyObject / Put branches.
+		if q.Has("encryption") {
+			h.PutBucketEncryption(w, r)
+			return
+		}
 		if q.Has("retention") {
 			h.PutObjectRetention(w, r)
 			return
@@ -742,6 +809,20 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.GetBucketLifecycleConfiguration(w, r, bucket)
 			return
 		}
+		// Bucket event notifications (GET /{bucket}?notification) —
+		// WS8.6. Guard on key=="" so GET /{bucket}/{key}?notification
+		// falls through to the object GET.
+		if key == "" && q.Has("notification") {
+			h.GetBucketNotificationConfiguration(w, r, bucket)
+			return
+		}
+		// Bucket default encryption (GET /{bucket}?encryption) — WS8.7.
+		// Guard on key=="" so GET /{bucket}/{key}?encryption falls
+		// through to the object GET.
+		if key == "" && q.Has("encryption") {
+			h.GetBucketEncryption(w, r, bucket)
+			return
+		}
 		if key != "" && q.Has("retention") {
 			h.GetObjectRetention(w, r)
 			return
@@ -800,6 +881,24 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// Bucket lifecycle config (DELETE /{bucket}?lifecycle) — WS8.2.
 		if q.Has("lifecycle") {
 			h.DeleteBucketLifecycleConfiguration(w, r)
+			return
+		}
+		// Bucket default encryption (DELETE /{bucket}?encryption) — WS8.7.
+		if q.Has("encryption") {
+			h.DeleteBucketEncryption(w, r)
+			return
+		}
+		// Bucket event notifications (DELETE /{bucket}?notification) —
+		// WS8.6. S3 has no DeleteBucketNotification operation; a
+		// configuration is cleared by PUTting an empty
+		// <NotificationConfiguration/>. Intercept the bucket-level case
+		// (key=="") so it returns this explicit guidance instead of
+		// falling through to h.Delete, which would reject it with the
+		// generic "path must be /{bucket}/{key...}" 400.
+		if bucket, key := parseBucketKey(r.URL.Path); key == "" && q.Has("notification") {
+			writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
+				"S3 has no DeleteBucketNotification; clear the configuration by PUT /"+bucket+"?notification with an empty <NotificationConfiguration/>",
+				r.URL.Path)
 			return
 		}
 		h.Delete(w, r)
@@ -901,6 +1000,18 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Layer the bucket default-encryption configuration (WS8.7) over
+	// the placement policy: when the policy leaves the mode empty, a
+	// configured bucket default promotes the write to managed. Done
+	// before the EC / dedup branches so every write path sees the same
+	// effective mode.
+	effMode, err := h.effectiveEncryptionMode(r.Context(), tenantID, bucket, policy)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured", err.Error(), r.URL.Path)
+		return
+	}
+	policy.EncryptionMode = effMode
 
 	if policy.ErasureProfile != "" {
 		h.putErasureCoded(w, r, tenantID, bucket, key, backendName, provider, policy)
@@ -1050,6 +1161,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		h.emit(tenantID, bucket, billing.StorageBytesSeconds, uint64(putRes.SizeBytes))
 	}
 	h.audit(r, "PUT", tenantID, bucket, key, pieceID, backendName, provider.PlacementLabels().Country)
+	h.notify(r, eventObjectCreatedPut, tenantID, bucket, key, putRes.ETag, manifest.VersionID, manifest.ObjectSize)
 
 	w.Header().Set("ETag", quote(putRes.ETag))
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
@@ -2354,6 +2466,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-amz-version-id", markerID)
 		h.emit(tenantID, bucket, billing.DeleteRequests, 1)
 		h.audit(r, "DELETE", tenantID, bucket, key, "", "", "")
+		h.notify(r, eventObjectRemovedDeleteMarker, tenantID, bucket, key, "", markerID, 0)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -2474,6 +2587,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 		h.audit(r, "DELETE", tenantID, bucket, key, p.PieceID, p.Backend, country)
 	}
+	h.notify(r, eventObjectRemovedDelete, tenantID, bucket, key, "", manifest.VersionID, 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2712,6 +2826,43 @@ func (h *Handler) emit(tenantID, bucket string, dim billing.Dimension, delta uin
 		ObservedAt:   h.cfg.Now(),
 		SourceNodeID: h.cfg.NodeID,
 	})
+}
+
+// notify hands one object-mutation event to the notification emitter,
+// if any, for asynchronous fan-out to the bucket's configured webhook
+// destinations (WS8.6). Like audit it is best-effort and called only on
+// the success path; Emit is non-blocking, so this never adds latency to
+// the request. eventName is the specific leaf S3 event name (e.g.
+// "s3:ObjectCreated:Put").
+func (h *Handler) notify(r *http.Request, eventName, tenantID, bucket, key, etag, versionID string, size int64) {
+	if h.cfg.Notifications == nil {
+		return
+	}
+	h.cfg.Notifications.Emit(ObjectEvent{
+		TenantID:  tenantID,
+		Bucket:    bucket,
+		ObjectKey: key,
+		EventName: eventName,
+		SizeBytes: size,
+		ETag:      etag,
+		VersionID: versionID,
+		RequestID: requestid.FromContext(r.Context()),
+		SourceIP:  clientIP(r),
+	})
+}
+
+// clientIP extracts the originating client address for an event
+// record's sourceIPAddress field. It strips the port from RemoteAddr
+// and is best-effort: an empty string is fine in the payload.
+func clientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // parseBucketKey splits /{bucket}/{key...}. Leading slashes are

@@ -6,7 +6,9 @@ import (
 
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
+	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 func TestMemoryStore_GetUnsetIsDefault(t *testing.T) {
@@ -339,6 +341,166 @@ func TestMemoryStore_LifecycleValidatesAndRequiresKeys(t *testing.T) {
 	}
 	if err := s.DeleteLifecycle(ctx, "t1", ""); err == nil {
 		t.Fatal("DeleteLifecycle(empty bucket): want error")
+	}
+}
+
+func TestMemoryStore_EncryptionRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	// Unconfigured bucket → empty Config, nil error.
+	got, err := s.GetEncryption(ctx, "t1", "b1")
+	if err != nil {
+		t.Fatalf("GetEncryption: %v", err)
+	}
+	if !got.Empty() {
+		t.Fatalf("unconfigured bucket = %+v, want empty", got)
+	}
+
+	cfg := sse.Config{Algorithm: sse.AWSKMS, KMSMasterKeyID: "arn:key", BucketKeyEnabled: true}
+	if err := s.SetEncryption(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetEncryption: %v", err)
+	}
+	got, _ = s.GetEncryption(ctx, "t1", "b1")
+	if got != cfg {
+		t.Fatalf("round-trip = %+v, want %+v", got, cfg)
+	}
+
+	// Overwrite with AES256.
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{Algorithm: sse.AES256}); err != nil {
+		t.Fatalf("SetEncryption(AES256): %v", err)
+	}
+	if got, _ := s.GetEncryption(ctx, "t1", "b1"); got.Algorithm != sse.AES256 || got.KMSMasterKeyID != "" {
+		t.Fatalf("after overwrite = %+v, want AES256 with no KMS key", got)
+	}
+
+	// Tenant/bucket isolation.
+	if other, _ := s.GetEncryption(ctx, "t1", "b2"); !other.Empty() {
+		t.Fatalf("t1/b2 leaked config: %+v", other)
+	}
+	if other, _ := s.GetEncryption(ctx, "t2", "b1"); !other.Empty() {
+		t.Fatalf("t2/b1 leaked config: %+v", other)
+	}
+
+	// Delete clears it; deleting again is a no-op.
+	if err := s.DeleteEncryption(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteEncryption: %v", err)
+	}
+	if got, _ := s.GetEncryption(ctx, "t1", "b1"); !got.Empty() {
+		t.Fatalf("after delete = %+v, want empty", got)
+	}
+	if err := s.DeleteEncryption(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteEncryption (idempotent): %v", err)
+	}
+}
+
+func TestMemoryStore_EncryptionValidatesAndRequiresKeys(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+	// Invalid config (empty algorithm) is rejected.
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{}); err == nil {
+		t.Fatal("SetEncryption(empty config): want error")
+	}
+	// AES256 with a KMS key id is rejected by Config.Valid.
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{Algorithm: sse.AES256, KMSMasterKeyID: "arn:key"}); err == nil {
+		t.Fatal("SetEncryption(AES256 + KMS key): want error")
+	}
+	if _, err := s.GetEncryption(ctx, "", "b1"); err == nil {
+		t.Fatal("GetEncryption(empty tenant): want error")
+	}
+	if err := s.DeleteEncryption(ctx, "t1", ""); err == nil {
+		t.Fatal("DeleteEncryption(empty bucket): want error")
+	}
+}
+
+func TestMemoryStore_NotificationRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	// Unconfigured bucket → empty Config, nil error.
+	got, err := s.GetNotification(ctx, "t1", "b1")
+	if err != nil {
+		t.Fatalf("GetNotification: %v", err)
+	}
+	if !got.Empty() {
+		t.Fatalf("unconfigured bucket = %+v, want empty", got)
+	}
+
+	cfg := notification.Config{Rules: []notification.Rule{{
+		ID:       "on-upload",
+		Events:   []notification.EventType{notification.ObjectCreatedAll},
+		Endpoint: "https://hooks.example.com/s3",
+		Prefix:   "logs/",
+		Suffix:   ".json",
+	}}}
+	if err := s.SetNotification(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetNotification: %v", err)
+	}
+	got, _ = s.GetNotification(ctx, "t1", "b1")
+	if len(got.Rules) != 1 || got.Rules[0].ID != "on-upload" || got.Rules[0].Prefix != "logs/" {
+		t.Fatalf("round-trip = %+v", got)
+	}
+
+	// Isolation across tenant and bucket.
+	if other, _ := s.GetNotification(ctx, "t1", "b2"); !other.Empty() {
+		t.Fatalf("t1/b2 leaked config: %+v", other)
+	}
+	if other, _ := s.GetNotification(ctx, "t2", "b1"); !other.Empty() {
+		t.Fatalf("t2/b1 leaked config: %+v", other)
+	}
+
+	// Empty config clears the configuration (idempotent).
+	if err := s.SetNotification(ctx, "t1", "b1", notification.Config{}); err != nil {
+		t.Fatalf("SetNotification(empty): %v", err)
+	}
+	if got, _ := s.GetNotification(ctx, "t1", "b1"); !got.Empty() {
+		t.Fatalf("after clear = %+v, want empty", got)
+	}
+}
+
+func TestMemoryStore_NotificationDeepCopy(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+	events := []notification.EventType{notification.ObjectCreatedAll}
+	cfg := notification.Config{Rules: []notification.Rule{{
+		Events:   events,
+		Endpoint: "https://hooks.example.com/s3",
+	}}}
+	if err := s.SetNotification(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetNotification: %v", err)
+	}
+	// Mutating the caller's slice after Set must not corrupt the store.
+	events[0] = notification.ObjectRemovedAll
+	got, _ := s.GetNotification(ctx, "t1", "b1")
+	if got.Rules[0].Events[0] != notification.ObjectCreatedAll {
+		t.Fatalf("stored event mutated by caller: %q", got.Rules[0].Events[0])
+	}
+	// Mutating the returned copy must not corrupt the store either.
+	got.Rules[0].Events[0] = notification.ObjectRemovedAll
+	again, _ := s.GetNotification(ctx, "t1", "b1")
+	if again.Rules[0].Events[0] != notification.ObjectCreatedAll {
+		t.Fatalf("stored event mutated via returned copy: %q", again.Rules[0].Events[0])
+	}
+}
+
+func TestMemoryStore_NotificationValidatesAndRequiresKeys(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+	// Invalid config (rule with no endpoint) is rejected.
+	bad := notification.Config{Rules: []notification.Rule{{Events: []notification.EventType{notification.ObjectCreatedAll}}}}
+	if err := s.SetNotification(ctx, "t1", "b1", bad); err == nil {
+		t.Fatal("SetNotification(invalid): want error")
+	}
+	if _, err := s.GetNotification(ctx, "", "b1"); err == nil {
+		t.Fatal("GetNotification(empty tenant): want error")
+	}
+	if err := s.SetNotification(ctx, "t1", "", notification.Config{}); err == nil {
+		t.Fatal("SetNotification(empty bucket): want error")
 	}
 }
 

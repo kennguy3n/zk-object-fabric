@@ -103,7 +103,11 @@ func TestSQLiteLegalHoldStore_ReleaseMarksReleasedAndIsIdempotentlyGuarded(t *te
 	if err := s.Create(ctx, sampleHold("h1", "t1")); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := s.Release(ctx, "h1"); err != nil {
+	// A release scoped to another tenant must not touch the row.
+	if err := s.Release(ctx, "other", "h1"); !errors.Is(err, ErrLegalHoldNotFound) {
+		t.Fatalf("cross-tenant Release err = %v, want ErrLegalHoldNotFound", err)
+	}
+	if err := s.Release(ctx, "t1", "h1"); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 	got, err := s.Get(ctx, "h1")
@@ -114,11 +118,11 @@ func TestSQLiteLegalHoldStore_ReleaseMarksReleasedAndIsIdempotentlyGuarded(t *te
 		t.Fatalf("after Release: Released=%v ReleasedAt=%v, want released with timestamp", got.Released, got.ReleasedAt)
 	}
 	// A second release affects no rows (already released).
-	if err := s.Release(ctx, "h1"); !errors.Is(err, ErrLegalHoldNotFound) {
+	if err := s.Release(ctx, "t1", "h1"); !errors.Is(err, ErrLegalHoldNotFound) {
 		t.Fatalf("second Release err = %v, want ErrLegalHoldNotFound", err)
 	}
 	// Releasing an unknown id also reports not found.
-	if err := s.Release(ctx, "nope"); !errors.Is(err, ErrLegalHoldNotFound) {
+	if err := s.Release(ctx, "t1", "nope"); !errors.Is(err, ErrLegalHoldNotFound) {
 		t.Fatalf("Release(unknown) err = %v, want ErrLegalHoldNotFound", err)
 	}
 }
@@ -172,7 +176,7 @@ func TestSQLiteLegalHoldStore_ActiveScopingAndExpiryAndRelease(t *testing.T) {
 			t.Fatalf("Create %s: %v", h.ID, err)
 		}
 	}
-	if err := s.Release(ctx, "rel"); err != nil {
+	if err := s.Release(ctx, "t1", "rel"); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 

@@ -365,6 +365,19 @@ func main() {
 	// node carry the same per-node SourceNodeID, instead of the coarse
 	// cfg.Env they used previously.
 	gatewayNodeID := resolveGatewayNodeID(cfg.Gateway.NodeID)
+	// notificationDispatcher fans bucket events out to tenant-configured
+	// webhook destinations (WS8.6). nil when notifications are disabled
+	// or no bucket-config store is available; the handler then runs with
+	// no emitter and only the configuration sub-resource is active.
+	notificationDispatcher, err := buildNotificationDispatcher(cfg.Notifications, bucketConfigStore)
+	if err != nil {
+		log.Fatalf("gateway: build notification dispatcher: %v", err)
+	}
+	var notificationEmit s3compat.NotificationEmitter
+	if notificationDispatcher != nil {
+		defer notificationDispatcher.Close()
+		notificationEmit = notificationEmitter{dispatcher: notificationDispatcher}
+	}
 	s3Handler := s3compat.New(s3compat.Config{
 		Manifests:                store,
 		Providers:                registry,
@@ -372,6 +385,7 @@ func main() {
 		Auth:                     authenticator,
 		VerifiedCheck:            verifiedCheck,
 		Billing:                  billingSink,
+		Notifications:            notificationEmit,
 		Multipart:                multipartStore,
 		BucketConfig:             bucketConfigStore,
 		ErasureCoding:            erasureRegistry,
@@ -1667,17 +1681,17 @@ func buildBucketConfigStore(cfg config.Config, db, embeddedDB *sql.DB) bucket_co
 			if err != nil {
 				log.Fatalf("gateway: build embedded bucket_config store: %v", err)
 			}
-			log.Printf("gateway: embedded SQLite bucket_config store enabled (versioning, object-lock, cors, lifecycle)")
+			log.Printf("gateway: embedded SQLite bucket_config store enabled (versioning, object-lock, cors, lifecycle, encryption)")
 			return store
 		}
-		log.Printf("gateway: no metadata_dsn; using in-memory bucket_config store (dev only — bucket versioning/object-lock/cors/lifecycle configs do NOT survive restart)")
+		log.Printf("gateway: no metadata_dsn; using in-memory bucket_config store (dev only — bucket versioning/object-lock/cors/lifecycle/encryption configs do NOT survive restart)")
 		return bucket_config.NewMemoryStore()
 	}
 	store, err := bcpostgres.New(bcpostgres.Config{DB: db})
 	if err != nil {
 		log.Fatalf("gateway: build postgres bucket_config store: %v", err)
 	}
-	log.Printf("gateway: postgres bucket_config store enabled (versioning, object-lock, cors, lifecycle)")
+	log.Printf("gateway: postgres bucket_config store enabled (versioning, object-lock, cors, lifecycle, encryption)")
 	return store
 }
 

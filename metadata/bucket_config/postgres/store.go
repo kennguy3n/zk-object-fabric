@@ -16,27 +16,34 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
+	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 // Config is the store wiring. Table defaults to "bucket_versioning",
-// LockTable to "bucket_object_lock", CorsTable to "bucket_cors", and
-// LifecycleTable to "bucket_lifecycle".
+// LockTable to "bucket_object_lock", CorsTable to "bucket_cors",
+// LifecycleTable to "bucket_lifecycle", NotificationTable to
+// "bucket_notification", and EncryptionTable to "bucket_encryption".
 type Config struct {
-	DB             *sql.DB
-	Table          string
-	LockTable      string
-	CorsTable      string
-	LifecycleTable string
+	DB                *sql.DB
+	Table             string
+	LockTable         string
+	CorsTable         string
+	LifecycleTable    string
+	NotificationTable string
+	EncryptionTable   string
 }
 
 // Store is a bucket_config.Store backed by Postgres tables.
 type Store struct {
-	db             *sql.DB
-	table          string
-	lockTable      string
-	corsTable      string
-	lifecycleTable string
+	db                *sql.DB
+	table             string
+	lockTable         string
+	corsTable         string
+	lifecycleTable    string
+	notificationTable string
+	encryptionTable   string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
@@ -75,7 +82,86 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(lifecycleTable) {
 		return nil, fmt.Errorf("postgres: invalid lifecycle table name %q", lifecycleTable)
 	}
-	return &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable, lifecycleTable: lifecycleTable}, nil
+	encryptionTable := cfg.EncryptionTable
+	if encryptionTable == "" {
+		encryptionTable = "bucket_encryption"
+	}
+	if !isSafeIdent(encryptionTable) {
+		return nil, fmt.Errorf("postgres: invalid encryption table name %q", encryptionTable)
+	}
+	notificationTable := cfg.NotificationTable
+	if notificationTable == "" {
+		notificationTable = "bucket_notification"
+	}
+	if !isSafeIdent(notificationTable) {
+		return nil, fmt.Errorf("postgres: invalid notification table name %q", notificationTable)
+	}
+	return &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable, lifecycleTable: lifecycleTable, notificationTable: notificationTable, encryptionTable: encryptionTable}, nil
+}
+
+// GetNotification returns the notification config for (tenantID,
+// bucket) or the zero Config when no row exists.
+func (s *Store) GetNotification(ctx context.Context, tenantID, bucket string) (notification.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return notification.Config{}, errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT rules FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.notificationTable)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return notification.Config{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var raw []byte
+	switch err := tx.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return notification.Config{}, nil
+	case err != nil:
+		return notification.Config{}, fmt.Errorf("postgres: bucket_notification get: %w", err)
+	}
+	var cfg notification.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return notification.Config{}, fmt.Errorf("postgres: bucket_notification decode: %w", err)
+	}
+	return cfg, nil
+}
+
+// SetNotification upserts the notification config for (tenantID,
+// bucket). An empty cfg clears any existing configuration (the row is
+// deleted), matching S3's PutBucketNotificationConfiguration with an
+// empty body.
+func (s *Store) SetNotification(ctx context.Context, tenantID, bucket string, cfg notification.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if cfg.Empty() {
+		del := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.notificationTable)
+		if _, err := tx.ExecContext(ctx, del, tenantID, bucket); err != nil {
+			return fmt.Errorf("postgres: bucket_notification clear: %w", err)
+		}
+		return tx.Commit()
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("postgres: bucket_notification encode: %w", err)
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, rules, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET rules = EXCLUDED.rules, updated_at = now()
+	`, s.notificationTable)
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+		return fmt.Errorf("postgres: bucket_notification set: %w", err)
+	}
+	return tx.Commit()
 }
 
 // GetVersioning returns the state for (tenantID, bucket) or
@@ -366,6 +452,81 @@ func (s *Store) ListLifecycle(ctx context.Context) ([]bucket_config.LifecycleEnt
 		return nil, fmt.Errorf("postgres: bucket_lifecycle list rows: %w", err)
 	}
 	return out, nil
+}
+
+// GetEncryption returns the bucket default SSE config for (tenantID,
+// bucket) or the zero Config when no row exists.
+func (s *Store) GetEncryption(ctx context.Context, tenantID, bucket string) (sse.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return sse.Config{}, errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT config FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.encryptionTable)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return sse.Config{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var raw []byte
+	switch err := tx.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return sse.Config{}, nil
+	case err != nil:
+		return sse.Config{}, fmt.Errorf("postgres: bucket_encryption get: %w", err)
+	}
+	var cfg sse.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return sse.Config{}, fmt.Errorf("postgres: bucket_encryption decode: %w", err)
+	}
+	return cfg, nil
+}
+
+// SetEncryption upserts the bucket default SSE config for (tenantID,
+// bucket).
+func (s *Store) SetEncryption(ctx context.Context, tenantID, bucket string, cfg sse.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("postgres: bucket_encryption encode: %w", err)
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, config, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET config = EXCLUDED.config, updated_at = now()
+	`, s.encryptionTable)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+		return fmt.Errorf("postgres: bucket_encryption set: %w", err)
+	}
+	return tx.Commit()
+}
+
+// DeleteEncryption removes the bucket default SSE config for (tenantID,
+// bucket). Deleting an unconfigured bucket is a no-op, matching S3's
+// idempotent DeleteBucketEncryption.
+func (s *Store) DeleteEncryption(ctx context.Context, tenantID, bucket string) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("postgres: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = $1 AND bucket = $2`, s.encryptionTable)
+	tx, err := s.beginTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, q, tenantID, bucket); err != nil {
+		return fmt.Errorf("postgres: bucket_encryption delete: %w", err)
+	}
+	return tx.Commit()
 }
 
 // isSafeIdent guards the table name we interpolate into SQL (the

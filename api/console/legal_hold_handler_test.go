@@ -49,6 +49,44 @@ func TestLegalHoldHandler_IssueListRelease(t *testing.T) {
 	resp3.Body.Close()
 }
 
+func TestLegalHoldHandler_ReleaseAlreadyReleasedReturns404(t *testing.T) {
+	store := auth.NewMemoryLegalHoldStore()
+	h := &LegalHoldHandler{Store: store}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Issue a hold.
+	body, _ := json.Marshal(CreateRequest{Bucket: "b", ObjectKey: "k", Reason: "case-1", IssuedBy: "ops@x"})
+	resp, err := http.Post(srv.URL+"/api/v1/tenants/T/legal-hold", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created auth.LegalHold
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	// First release succeeds.
+	resp2, err := http.Post(srv.URL+"/api/v1/tenants/T/legal-hold/"+created.ID+"/release", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNoContent {
+		t.Fatalf("first release status=%d, want 204", resp2.StatusCode)
+	}
+
+	// Releasing an already-released hold reports 404 (the store returns
+	// ErrLegalHoldNotFound for the 0-rows-affected guard), not a 500.
+	resp3, err := http.Post(srv.URL+"/api/v1/tenants/T/legal-hold/"+created.ID+"/release", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusNotFound {
+		t.Fatalf("second release status=%d, want 404", resp3.StatusCode)
+	}
+}
+
 func TestLegalHoldHandler_ReleaseRejectsCrossTenant(t *testing.T) {
 	store := auth.NewMemoryLegalHoldStore()
 	h := &LegalHoldHandler{Store: store}
