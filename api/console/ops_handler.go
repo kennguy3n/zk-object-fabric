@@ -26,6 +26,7 @@ package console
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/kennguy3n/zk-object-fabric/cache/hot_object_cache"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
@@ -121,8 +122,45 @@ func (h *OpsHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 // the state machine; Node carries the full snapshot for operators who
 // want the detail.
 type OpsHealthResponse struct {
-	Status string          `json:"status"`
-	Node   health.Snapshot `json:"node"`
+	Status string        `json:"status"`
+	Node   OpsHealthNode `json:"node"`
+}
+
+// OpsHealthNode is the ops API's own camelCase projection of
+// internal/health.Snapshot. Re-shaping here (instead of embedding the
+// internal type) keeps every ops endpoint on one JSON convention
+// (camelCase, matching OpsCacheStatsResponse and WasabiBudget) and
+// decouples the public ops contract from internal/health's wire tags,
+// so refactoring the monitor's snake_case JSON cannot silently break
+// the SPA.
+type OpsHealthNode struct {
+	NodeID          string          `json:"nodeId"`
+	CellID          string          `json:"cellId,omitempty"`
+	State           string          `json:"state"`
+	LastPoll        time.Time       `json:"lastPoll,omitempty"`
+	StartedAt       time.Time       `json:"startedAt"`
+	QuorumThreshold int             `json:"quorumThreshold"`
+	HealthyPeers    map[string]bool `json:"healthyPeers,omitempty"`
+	Inflight        int64           `json:"inflight"`
+	DrainStart      time.Time       `json:"drainStart,omitempty"`
+	DrainedAt       time.Time       `json:"drainedAt,omitempty"`
+}
+
+// newOpsHealthNode projects an internal health snapshot onto the ops
+// API's camelCase node shape.
+func newOpsHealthNode(s health.Snapshot) OpsHealthNode {
+	return OpsHealthNode{
+		NodeID:          s.NodeID,
+		CellID:          s.CellID,
+		State:           string(s.State),
+		LastPoll:        s.LastPoll,
+		StartedAt:       s.StartedAt,
+		QuorumThreshold: s.QuorumThreshold,
+		HealthyPeers:    s.HealthyPeers,
+		Inflight:        s.Inflight,
+		DrainStart:      s.DrainStart,
+		DrainedAt:       s.DrainedAt,
+	}
 }
 
 // healthStatus collapses the node state machine into ok / degraded so
@@ -143,7 +181,7 @@ func (h *OpsHandler) getHealth(w http.ResponseWriter, _ *http.Request) {
 	snap := h.cfg.Health()
 	writeJSON(w, http.StatusOK, OpsHealthResponse{
 		Status: healthStatus(snap.State),
-		Node:   snap,
+		Node:   newOpsHealthNode(snap),
 	})
 }
 

@@ -95,7 +95,7 @@ func TestOpsHandler_Health(t *testing.T) {
 		if got.Status != tc.wantStatus {
 			t.Errorf("state %q: status = %q, want %q", tc.state, got.Status, tc.wantStatus)
 		}
-		if got.Node.State != tc.state {
+		if got.Node.State != string(tc.state) {
 			t.Errorf("state %q: node state = %q, want it echoed back", tc.state, got.Node.State)
 		}
 	}

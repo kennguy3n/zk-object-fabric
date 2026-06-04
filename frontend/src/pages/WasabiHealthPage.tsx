@@ -2,6 +2,12 @@ import { useEffect, useState } from "react";
 
 import { api } from "../api/client";
 import type { UsageSnapshot } from "../api/types";
+import {
+  opsGet,
+  type OpsCacheStats,
+  type WasabiBudget,
+  type WasabiBudgetsResponse,
+} from "../api/opsClient";
 import { useAuth } from "../auth/AuthContext";
 import { formatBytes } from "../format";
 import { GaugeChart } from "../components/GaugeChart";
@@ -18,39 +24,6 @@ import { GaugeChart } from "../components/GaugeChart";
 // tenant session can always read it). Cache warm-up and the
 // fleet-wide per-tenant budget table come from the admin-gated
 // /api/v1/ops/* surface and degrade gracefully when not available.
-
-interface OpsCacheStats {
-  bytesUsed: number;
-  bytesLimit: number;
-  utilization: number;
-  hitRatio: number;
-}
-
-interface WasabiBudget {
-  tenantId: string;
-  storedBytes: number;
-  egressBytes: number;
-  egressBudgetBytes: number;
-  egressRatio: number;
-  remainingBytes: number;
-  status: string;
-}
-
-interface WasabiBudgetsResponse {
-  budgets: WasabiBudget[];
-}
-
-async function opsGet<T>(resource: string, token: string | null): Promise<T | null> {
-  try {
-    const res = await fetch(`/api/v1/ops/${resource}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  }
-}
 
 export function WasabiHealthPage() {
   const { tenant, token } = useAuth();

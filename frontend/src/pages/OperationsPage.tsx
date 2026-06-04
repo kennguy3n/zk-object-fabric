@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { api } from "../api/client";
 import type { UsageSnapshot } from "../api/types";
+import { opsGet, type OpsCacheStats, type OpsHealth } from "../api/opsClient";
 import { useAuth } from "../auth/AuthContext";
 import { formatBytes } from "../format";
 import { GaugeChart } from "../components/GaugeChart";
@@ -21,45 +22,6 @@ import { GaugeChart } from "../components/GaugeChart";
 //     gauge. These degrade gracefully: if the operator's session is
 //     not admin-scoped, or the ops surface is not wired, the cards
 //     show an "unavailable" state instead of failing the whole page.
-
-interface OpsHealth {
-  status: string;
-  node: {
-    node_id: string;
-    cell_id?: string;
-    state: string;
-    quorum_threshold: number;
-    healthy_peers?: Record<string, boolean>;
-    inflight: number;
-  };
-}
-
-interface OpsCacheStats {
-  entries: number;
-  bytesUsed: number;
-  bytesLimit: number;
-  hits: number;
-  misses: number;
-  evictions: number;
-  hitRatio: number;
-  utilization: number;
-}
-
-// opsGet fetches an admin-gated /api/v1/ops/* endpoint with the
-// console session's bearer token. It returns null (rather than
-// throwing) on any non-2xx so each ops card can independently render
-// an "unavailable" state without taking down the page.
-async function opsGet<T>(resource: string, token: string | null): Promise<T | null> {
-  try {
-    const res = await fetch(`/api/v1/ops/${resource}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  }
-}
 
 // TB is treated as a binary tebibyte so the budget math lines up with
 // formatBytes (which uses binary prefixes). The tenant budget is
@@ -132,11 +94,11 @@ export function OperationsPage() {
                 </span>
               </div>
               <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-                {health.node.node_id}
-                {health.node.cell_id ? ` · ${health.node.cell_id}` : ""} · state {health.node.state}
+                {health.node.nodeId}
+                {health.node.cellId ? ` · ${health.node.cellId}` : ""} · state {health.node.state}
               </div>
               <div className="muted" style={{ fontSize: 12 }}>
-                {health.node.inflight} in-flight · quorum ≥ {health.node.quorum_threshold}
+                {health.node.inflight} in-flight · quorum ≥ {health.node.quorumThreshold}
               </div>
             </>
           ) : (
