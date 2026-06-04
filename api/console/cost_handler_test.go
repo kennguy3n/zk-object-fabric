@@ -1,0 +1,191 @@
+package console
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/kennguy3n/zk-object-fabric/billing"
+)
+
+type fakeReporter struct {
+	bd    billing.CostBreakdown
+	err   error
+	gotID string
+	gotMo string
+	calls int
+}
+
+func (f *fakeReporter) GetCostBreakdown(_ context.Context, tenantID, month string) (billing.CostBreakdown, error) {
+	f.calls++
+	f.gotID = tenantID
+	f.gotMo = month
+	if f.err != nil {
+		return billing.CostBreakdown{}, f.err
+	}
+	bd := f.bd
+	bd.TenantID = tenantID
+	bd.Month = month
+	return bd, nil
+}
+
+func TestCostHandler_ReturnsBreakdown(t *testing.T) {
+	rep := &fakeReporter{bd: billing.CostBreakdown{WasabiStorageUSD: 6.8, TotalUSD: 5.2, DedupSavingsUSD: 1.6}}
+	h := &CostHandler{Reporter: rep}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-1/cost-breakdown?month=2026-06")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var got billing.CostBreakdown
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.TenantID != "t-1" || got.Month != "2026-06" || got.WasabiStorageUSD != 6.8 {
+		t.Errorf("unexpected breakdown: %+v", got)
+	}
+	if rep.gotID != "t-1" || rep.gotMo != "2026-06" {
+		t.Errorf("reporter called with (%q,%q)", rep.gotID, rep.gotMo)
+	}
+}
+
+func TestCostHandler_DefaultsMonthWhenAbsent(t *testing.T) {
+	rep := &fakeReporter{}
+	h := &CostHandler{Reporter: rep}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-1/cost-breakdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	// Empty month is forwarded to the reporter, which resolves it.
+	if rep.gotMo != "" {
+		t.Errorf("expected empty month forwarded, got %q", rep.gotMo)
+	}
+}
+
+func TestCostHandler_RejectsInvalidMonth(t *testing.T) {
+	h := &CostHandler{Reporter: &fakeReporter{}}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-1/cost-breakdown?month=June-2026")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestCostHandler_AdminAuthGate(t *testing.T) {
+	rep := &fakeReporter{}
+	h := &CostHandler{Reporter: rep, AdminAuth: func(r *http.Request) bool {
+		return r.Header.Get("Authorization") == "Bearer ok"
+	}}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// No token -> 401, reporter never consulted.
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-1/cost-breakdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	if rep.calls != 0 {
+		t.Errorf("reporter consulted despite failed auth (%d calls)", rep.calls)
+	}
+
+	// Correct token -> 200.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/tenants/t-1/cost-breakdown", nil)
+	req.Header.Set("Authorization", "Bearer ok")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestCostHandler_NilReporterIsServiceUnavailable(t *testing.T) {
+	h := &CostHandler{}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-1/cost-breakdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+func TestCostHandler_RejectsNonGet(t *testing.T) {
+	h := &CostHandler{Reporter: &fakeReporter{}}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/tenants/t-1/cost-breakdown", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestCostHandler_NotFoundForBadPath(t *testing.T) {
+	h := &CostHandler{Reporter: &fakeReporter{}}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-1/something-else")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestCostHandler_RegisterRouting exercises the Go 1.22 pattern
+// registration path (PathValue extraction) rather than ServeHTTP's
+// manual parse.
+func TestCostHandler_RegisterRouting(t *testing.T) {
+	rep := &fakeReporter{}
+	mux := http.NewServeMux()
+	(&CostHandler{Reporter: rep}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-42/cost-breakdown?month=2026-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if rep.gotID != "t-42" || rep.gotMo != "2026-01" {
+		t.Errorf("routing extracted (%q,%q), want (t-42,2026-01)", rep.gotID, rep.gotMo)
+	}
+}

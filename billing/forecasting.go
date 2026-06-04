@@ -26,9 +26,9 @@ import (
 // at a given instant. Timestamps are monotonic; the Forecaster
 // resorts on them defensively.
 type UsageSample struct {
-	Timestamp        time.Time
-	StorageBytes     uint64
-	DedupBytesSaved  uint64
+	Timestamp       time.Time
+	StorageBytes    uint64
+	DedupBytesSaved uint64
 }
 
 // EffectiveBytes is the post-dedup ciphertext byte count the
@@ -71,19 +71,35 @@ type Forecaster struct {
 
 	// Clock defaults to time.Now.
 	Clock func() time.Time
+
+	// StorageUSDPerGiBMonth is the storage price used to convert a
+	// cell's projected effective byte count into a monthly cost. It
+	// is the same Wasabi $/GiB-month rate the CostAggregator prices
+	// storage at (see CostModel.WasabiUSDPerGiBMonth). When zero,
+	// cost projection is disabled and
+	// ForecastResult.ProjectedMonthlyCost returns nil — capacity
+	// forecasting still works without it.
+	StorageUSDPerGiBMonth float64
 }
 
 // ForecastResult is the per-cell projection emitted by Forecast.
 type ForecastResult struct {
-	CellID                 string    `json:"cell_id"`
-	CapacityBytes          uint64    `json:"capacity_bytes"`
-	CurrentBytes           uint64    `json:"current_bytes"`
-	UtilizationFraction    float64   `json:"utilization_fraction"`
-	GrowthBytesPerSec      float64   `json:"growth_bytes_per_sec"`
-	ProjectedFillAt        time.Time `json:"projected_fill_at"`
-	ProjectedFillFromNow   string    `json:"projected_fill_from_now"`
-	Alert                  bool      `json:"alert"`
-	SampleCount            int       `json:"sample_count"`
+	CellID               string    `json:"cell_id"`
+	CapacityBytes        uint64    `json:"capacity_bytes"`
+	CurrentBytes         uint64    `json:"current_bytes"`
+	UtilizationFraction  float64   `json:"utilization_fraction"`
+	GrowthBytesPerSec    float64   `json:"growth_bytes_per_sec"`
+	ProjectedFillAt      time.Time `json:"projected_fill_at"`
+	ProjectedFillFromNow string    `json:"projected_fill_from_now"`
+	Alert                bool      `json:"alert"`
+	SampleCount          int       `json:"sample_count"`
+
+	// CostUSDPerGiBMonth is the storage price the forecast was
+	// evaluated with, copied from Forecaster.StorageUSDPerGiBMonth.
+	// It is carried on the result so ProjectedMonthlyCost can run
+	// off a ForecastResult alone. Zero (omitted) means cost
+	// projection was not configured.
+	CostUSDPerGiBMonth float64 `json:"cost_usd_per_gib_month,omitempty"`
 }
 
 // Forecast runs the projection for a single cell.
@@ -97,8 +113,9 @@ func (f *Forecaster) Forecast(ctx context.Context, cellID string, capacityBytes 
 	}
 	if len(samples) == 0 {
 		return ForecastResult{
-			CellID:        cellID,
-			CapacityBytes: capacityBytes,
+			CellID:             cellID,
+			CapacityBytes:      capacityBytes,
+			CostUSDPerGiBMonth: f.StorageUSDPerGiBMonth,
 		}, nil
 	}
 	sort.Slice(samples, func(i, j int) bool { return samples[i].Timestamp.Before(samples[j].Timestamp) })
@@ -110,11 +127,12 @@ func (f *Forecaster) Forecast(ctx context.Context, cellID string, capacityBytes 
 	current := samples[len(samples)-1].EffectiveBytes()
 	_, slope := model(samples, now)
 	res := ForecastResult{
-		CellID:            cellID,
-		CapacityBytes:     capacityBytes,
-		CurrentBytes:      current,
-		GrowthBytesPerSec: slope,
-		SampleCount:       len(samples),
+		CellID:             cellID,
+		CapacityBytes:      capacityBytes,
+		CurrentBytes:       current,
+		GrowthBytesPerSec:  slope,
+		SampleCount:        len(samples),
+		CostUSDPerGiBMonth: f.StorageUSDPerGiBMonth,
 	}
 	if capacityBytes > 0 {
 		res.UtilizationFraction = float64(current) / float64(capacityBytes)
@@ -163,6 +181,58 @@ func (f *Forecaster) now() time.Time {
 		return f.Clock()
 	}
 	return time.Now()
+}
+
+// secondsPerProjectedMonth is the month length ProjectedMonthlyCost
+// steps by. A flat 30-day month keeps the projection deterministic
+// and independent of which calendar month "now" falls in; the
+// forecast is an estimate, not an invoice, so calendar-exact month
+// lengths are not warranted.
+const secondsPerProjectedMonth = float64(30 * 24 * 60 * 60)
+
+// bytesPerGiB is the divisor that turns a ciphertext byte count into
+// GiB so it can be multiplied by a $/GiB-month rate.
+const bytesPerGiB = float64(1 << 30)
+
+// MonthlyCostProjection is one point on the forward storage-cost
+// curve emitted by ProjectedMonthlyCost. MonthsFromNow is 1-based:
+// entry N projects the state N months after the forecast's
+// evaluation instant.
+type MonthlyCostProjection struct {
+	MonthsFromNow           int     `json:"months_from_now"`
+	ProjectedEffectiveBytes uint64  `json:"projected_effective_bytes"`
+	ProjectedCostUSD        float64 `json:"projected_cost_usd"`
+}
+
+// ProjectedMonthlyCost projects the cell's monthly storage cost
+// forward `months` months, extrapolating the post-dedup effective
+// byte count from CurrentBytes along GrowthBytesPerSec and pricing
+// it at CostUSDPerGiBMonth.
+//
+// It complements ProjectedFillAt (which answers "when does the cell
+// run out of space"); this answers "what does the cell cost as it
+// grows". A non-positive `months`, or a zero CostUSDPerGiBMonth
+// (cost projection not configured), returns nil. A shrinking cell
+// (negative slope) is floored at zero bytes rather than projecting
+// a negative cost.
+func (r ForecastResult) ProjectedMonthlyCost(months int) []MonthlyCostProjection {
+	if months <= 0 || r.CostUSDPerGiBMonth <= 0 {
+		return nil
+	}
+	out := make([]MonthlyCostProjection, 0, months)
+	base := float64(r.CurrentBytes)
+	for m := 1; m <= months; m++ {
+		projected := base + r.GrowthBytesPerSec*secondsPerProjectedMonth*float64(m)
+		if projected < 0 || math.IsNaN(projected) || math.IsInf(projected, 0) {
+			projected = 0
+		}
+		out = append(out, MonthlyCostProjection{
+			MonthsFromNow:           m,
+			ProjectedEffectiveBytes: uint64(projected),
+			ProjectedCostUSD:        projected / bytesPerGiB * r.CostUSDPerGiBMonth,
+		})
+	}
+	return out
 }
 
 // LinearGrowth fits a least-squares line through the post-dedup

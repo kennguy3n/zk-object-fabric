@@ -64,6 +64,31 @@ type BillingProvider interface {
 	CancelSubscription(ctx context.Context, subscriptionID string) error
 }
 
+// CostReporter is the parallel companion to BillingProvider for
+// cost *reporting* (the inbound "what is this tenant costing us"
+// view) as opposed to invoicing (the outbound BillingProvider
+// surface).
+//
+// It is deliberately a separate interface rather than an extension
+// of BillingProvider: extending BillingProvider would force every
+// existing implementer (NoopProvider, future Stripe / Chargebee
+// plug-ins) to grow a GetCostBreakdown method even though cost
+// aggregation is computed from the in-product metering pipeline,
+// not from the payment vendor. Only components that actually
+// compute a unified cost view — billing.DefaultCostAggregator —
+// implement CostReporter, and the console cost handler depends on
+// this narrow interface.
+//
+// Implementations must be safe for concurrent use.
+type CostReporter interface {
+	// GetCostBreakdown returns the unified per-provider monthly
+	// cost breakdown for a tenant for the given month. month is an
+	// RFC-3339 year-month ("2006-01"); an empty month is treated by
+	// implementations as the current month. ctx carries the request
+	// deadline / cancellation for the underlying metering reads.
+	GetCostBreakdown(ctx context.Context, tenantID, month string) (CostBreakdown, error)
+}
+
 // CustomerRequest describes the tenant-side customer record the
 // gateway wants reflected on the provider. Fields are
 // vendor-neutral — concrete providers map them onto their own
