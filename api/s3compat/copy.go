@@ -189,6 +189,29 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Destination bucket default encryption (WS8.7). A plaintext
+	// source (no encryption config) copied into a bucket whose
+	// effective encryption mode is gateway-managed must land
+	// encrypted at the destination — matching AWS S3 (CopyObject
+	// honors the destination bucket's default) and the operator's
+	// fail-closed intent when they configured a bucket default.
+	// Sources that already carry a mode (managed/convergent,
+	// client_side, or v1 handled above) keep their own encryption
+	// and are routed through the verbatim/dedup paths below; the
+	// effective-mode resolver leaves a non-empty source mode
+	// untouched, so only truly plaintext sources are promoted here.
+	if srcManifest.Encryption.Mode == "" {
+		dstMode, derr := h.effectiveEncryptionMode(r.Context(), tenantID, dstBucket, srcManifest.PlacementPolicy)
+		if derr != nil {
+			writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured", derr.Error(), r.URL.Path)
+			return
+		}
+		if IsGatewayEncrypted(dstMode) {
+			h.copyEncryptForDefault(w, r, tenantID, dstBucket, dstKey, srcManifest, srcPiece, srcProvider, dstMode)
+			return
+		}
+	}
+
 	// Dedup-aware fast path: source has a ContentHash and the
 	// gateway has the content index wired. Bump the refcount,
 	// reuse the existing piece, write a new manifest pointing at
@@ -397,6 +420,118 @@ func (h *Handler) copyReencrypt(
 		WrapAlgorithm:     wrapped.WrapAlgorithm,
 		ManifestEncrypted: srcManifest.Encryption.ManifestEncrypted,
 		AADVersion:        AADVersionV1,
+	}
+	h.writeCopyManifest(w, r, tenantID, dstBucket, dstKey, srcManifest, newPiece, srcPiece.Backend, dstEnc, false)
+}
+
+// copyEncryptForDefault performs a CopyObject when the destination
+// bucket's default encryption (WS8.7) promotes an otherwise-plaintext
+// copy to a gateway-managed mode. The source object carries no
+// encryption config, so its piece is read in the clear, encrypted
+// under a fresh DEK bound to the destination identity, and stored as
+// an AAD v1 object. It mirrors copyReencrypt's encrypt half without
+// the decrypt step (there is no source ciphertext to unwrap), and
+// records the promoted mode in the destination manifest so the GET
+// path unseals it like any other gateway-encrypted object.
+//
+// Only single-piece, non-EC/non-multipart sources reach here (the
+// same shapes copyReencrypt handles); larger-than-ceiling objects are
+// rejected because the encrypt path buffers the whole object, exactly
+// like copyReencrypt and the buffered PUT/EC paths.
+func (h *Handler) copyEncryptForDefault(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID, dstBucket, dstKey string,
+	srcManifest *metadata.ObjectManifest,
+	srcPiece metadata.Piece,
+	srcProvider providers.StorageProvider,
+	dstMode string,
+) {
+	if h.cfg.Encryption == nil {
+		// Should be unreachable: effectiveEncryptionMode only
+		// returns a gateway-managed mode when a keyring is
+		// configured (it fails closed otherwise). Guard anyway so
+		// a future caller cannot silently store plaintext.
+		writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured",
+			"destination bucket has a default-encryption configuration but no gateway encryption is configured", r.URL.Path)
+		return
+	}
+
+	if srcManifest.ObjectSize > MaxInMemoryObjectBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "CopyEncryptObjectTooLarge",
+			fmt.Sprintf("server-side copy that must apply the destination bucket default encryption requires buffering the %d-byte object, which exceeds the in-memory ceiling of %d bytes; streaming encryption on copy is not yet implemented",
+				srcManifest.ObjectSize, MaxInMemoryObjectBytes),
+			r.URL.Path)
+		return
+	}
+
+	body, err := srcProvider.GetPiece(r.Context(), srcPiece.PieceID, nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+	// The source is stored as plaintext, so the bytes read here are
+	// the plaintext directly. Bound the read one byte over the
+	// ceiling and reject overflow, exactly like copyReencrypt's
+	// defence against a stale ObjectSize.
+	plaintext, rerr := io.ReadAll(io.LimitReader(body, MaxInMemoryObjectBytes+1))
+	_ = body.Close()
+	if rerr != nil {
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
+		return
+	}
+	if int64(len(plaintext)) > MaxInMemoryObjectBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "CopyEncryptObjectTooLarge",
+			fmt.Sprintf("server-side copy source exceeds in-memory encrypt ceiling of %d bytes", MaxInMemoryObjectBytes),
+			r.URL.Path)
+		return
+	}
+
+	dstPieceID := newPieceID(tenantID, dstBucket, dstKey, h.cfg.Now())
+	dstID := aadIdentity{
+		TenantID:      tenantID,
+		Bucket:        dstBucket,
+		ObjectKeyHash: hashObjectKey(dstKey),
+		VersionID:     dstPieceID,
+	}
+	newCiphertext, wrapped, eerr := h.encryptForStorage(plaintext, dstID)
+	// Scrub the plaintext now that the SDK has consumed it.
+	clear(plaintext)
+	if eerr != nil {
+		writeError(w, http.StatusInternalServerError, "EncryptionFailed", eerr.Error(), r.URL.Path)
+		return
+	}
+
+	cipherHash := blake3.Sum256(newCiphertext)
+	putRes, perr := srcProvider.PutPiece(r.Context(), dstPieceID, bytes.NewReader(newCiphertext), providers.PutOptions{
+		ContentLength: int64(len(newCiphertext)),
+		ContentType:   r.Header.Get("Content-Type"),
+	})
+	if perr != nil {
+		writeError(w, http.StatusBadGateway, "BackendPutFailed", perr.Error(), r.URL.Path)
+		return
+	}
+
+	newPiece := metadata.Piece{
+		PieceID:      dstPieceID,
+		Hash:         "blake3:" + hex.EncodeToString(cipherHash[:]),
+		ProviderETag: putRes.ETag,
+		Backend:      srcPiece.Backend,
+		Locator:      putRes.Locator,
+		State:        "active",
+		SizeBytes:    putRes.SizeBytes,
+	}
+	// Fresh v1 EncryptionConfig recording the promoted mode and the
+	// wrapped DEK bound to the destination identity. There is no
+	// source manifest encryption to preserve (plaintext source), so
+	// ManifestEncrypted defaults to false.
+	dstEnc := metadata.EncryptionConfig{
+		Mode:          dstMode,
+		Algorithm:     client_sdk.ContentAlgorithm,
+		KeyID:         wrapped.KeyID,
+		WrappedDEK:    wrapped.WrappedKey,
+		WrapAlgorithm: wrapped.WrapAlgorithm,
+		AADVersion:    AADVersionV1,
 	}
 	h.writeCopyManifest(w, r, tenantID, dstBucket, dstKey, srcManifest, newPiece, srcPiece.Backend, dstEnc, false)
 }

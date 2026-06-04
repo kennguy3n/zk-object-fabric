@@ -53,15 +53,15 @@ const (
 // than one rule.
 type Config struct {
 	// Algorithm is the default SSEAlgorithm ("AES256" or "aws:kms").
-	Algorithm Algorithm
+	Algorithm Algorithm `json:"algorithm,omitempty"`
 	// KMSMasterKeyID is the KMS key id/ARN from
 	// <KMSMasterKeyID>. Only valid with the aws:kms algorithm; optional
 	// even then (AWS falls back to the account default KMS key).
-	KMSMasterKeyID string
+	KMSMasterKeyID string `json:"kms_master_key_id,omitempty"`
 	// BucketKeyEnabled mirrors <BucketKeyEnabled>. It is recorded for
 	// round-trip fidelity with the AWS API; ZKOF derives per-object DEKs
 	// regardless, so the flag has no effect on stored ciphertext.
-	BucketKeyEnabled bool
+	BucketKeyEnabled bool `json:"bucket_key_enabled,omitempty"`
 }
 
 // Empty reports whether the bucket has no default SSE configured.

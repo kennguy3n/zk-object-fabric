@@ -446,3 +446,90 @@ func TestPutObject_BucketDefaultPromotesToManaged(t *testing.T) {
 		t.Errorf("object under default Mode = %q, want managed", man.Encryption.Mode)
 	}
 }
+
+// TestCopyObject_BucketDefaultPromotesToManaged pins the WS8.7
+// behavior that CopyObject honors the *destination* bucket's default
+// encryption: a plaintext source copied into a bucket with an AES256
+// default lands gateway-managed (matching AWS S3), while a copy into a
+// bucket with no default stays plaintext. The promoted destination is
+// also read back to prove the encrypt-on-copy ciphertext round-trips.
+func TestCopyObject_BucketDefaultPromotesToManaged(t *testing.T) {
+	h, _, store := newEncryptionTestHandler(t)
+	ctx := context.Background()
+	body := "copy-me-plaintext"
+
+	// PUT a plaintext source object in a bucket with NO default.
+	pr := httptest.NewRequest(http.MethodPut, "/src/obj", strings.NewReader(body))
+	pr.ContentLength = int64(len(body))
+	pw := httptest.NewRecorder()
+	h.dispatch(pw, pr)
+	if pw.Code != http.StatusOK {
+		t.Fatalf("PUT source = %d, want 200; body=%s", pw.Code, pw.Body)
+	}
+	srcMan, err := store.Get(ctx, manifest_store.ManifestKey{
+		TenantID: AnonymousTenant, Bucket: "src", ObjectKeyHash: hashObjectKey("obj"),
+	})
+	if err != nil {
+		t.Fatalf("manifest get (source): %v", err)
+	}
+	if srcMan.Encryption.Mode != "" {
+		t.Fatalf("source Mode = %q, want empty (plaintext source precondition)", srcMan.Encryption.Mode)
+	}
+
+	// Control: copy into a bucket with no default → stays plaintext.
+	cr := httptest.NewRequest(http.MethodPut, "/plaindst/obj", nil)
+	cr.Header.Set("x-amz-copy-source", "/src/obj")
+	cw := httptest.NewRecorder()
+	h.dispatch(cw, cr)
+	if cw.Code != http.StatusOK {
+		t.Fatalf("copy to no-default bucket = %d, want 200; body=%s", cw.Code, cw.Body)
+	}
+	plainMan, err := store.Get(ctx, manifest_store.ManifestKey{
+		TenantID: AnonymousTenant, Bucket: "plaindst", ObjectKeyHash: hashObjectKey("obj"),
+	})
+	if err != nil {
+		t.Fatalf("manifest get (plain dst): %v", err)
+	}
+	if plainMan.Encryption.Mode != "" {
+		t.Errorf("copy into no-default bucket Mode = %q, want empty", plainMan.Encryption.Mode)
+	}
+
+	// Configure an AES256 default on the destination bucket, then copy.
+	if rec := putEncryption(t, h, "dst", aes256EncryptionBody); rec.Code != http.StatusOK {
+		t.Fatalf("PUT dst ?encryption = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	cr = httptest.NewRequest(http.MethodPut, "/dst/obj", nil)
+	cr.Header.Set("x-amz-copy-source", "/src/obj")
+	cw = httptest.NewRecorder()
+	h.dispatch(cw, cr)
+	if cw.Code != http.StatusOK {
+		t.Fatalf("copy to default bucket = %d, want 200; body=%s", cw.Code, cw.Body)
+	}
+	dstMan, err := store.Get(ctx, manifest_store.ManifestKey{
+		TenantID: AnonymousTenant, Bucket: "dst", ObjectKeyHash: hashObjectKey("obj"),
+	})
+	if err != nil {
+		t.Fatalf("manifest get (dst): %v", err)
+	}
+	if dstMan.Encryption.Mode != string(encryption.ManagedEncrypted) {
+		t.Errorf("copy under default Mode = %q, want managed", dstMan.Encryption.Mode)
+	}
+	if dstMan.Encryption.AADVersion != AADVersionV1 {
+		t.Errorf("copy under default AADVersion = %q, want %q", dstMan.Encryption.AADVersion, AADVersionV1)
+	}
+	if len(dstMan.Encryption.WrappedDEK) == 0 {
+		t.Error("copy under default has empty WrappedDEK, want a fresh wrapped key")
+	}
+
+	// The promoted copy must read back as the original plaintext,
+	// proving the encrypt-on-copy ciphertext unseals correctly.
+	gr := httptest.NewRequest(http.MethodGet, "/dst/obj", nil)
+	gw := httptest.NewRecorder()
+	h.dispatch(gw, gr)
+	if gw.Code != http.StatusOK {
+		t.Fatalf("GET promoted copy = %d, want 200; body=%s", gw.Code, gw.Body)
+	}
+	if gw.Body.String() != body {
+		t.Errorf("GET promoted copy body = %q, want %q", gw.Body.String(), body)
+	}
+}
