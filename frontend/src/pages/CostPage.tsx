@@ -124,11 +124,17 @@ export function CostPage() {
   );
 }
 
-// usd formats a dollar amount with two decimals and thousands
-// separators.
+// usd formats a USD amount. The locale is pinned to en-US so the
+// currency symbol and the grouping/decimal separators always agree
+// (a runtime-default locale could mix a "$" with "1.234,56"). Built
+// once at module scope since Intl.NumberFormat construction isn't free.
+const usdFormat = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+});
 function usd(amount: number): string {
   if (!Number.isFinite(amount)) return "—";
-  return `$${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return usdFormat.format(amount);
 }
 
 function StatCard({ label, value, hint }: { label: string; value: string; hint?: string }) {
