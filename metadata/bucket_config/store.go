@@ -25,6 +25,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 // VersioningState is the S3 bucket-versioning status. The zero value
@@ -132,6 +133,25 @@ type Store interface {
 	// bucket across all tenants once per pass. It is never reachable
 	// from a tenant-facing request path.
 	ListLifecycle(ctx context.Context) ([]LifecycleEntry, error)
+
+	// GetEncryption returns the bucket default SSE configuration for
+	// (tenantID, bucket) — WS8.7. A bucket with no default-encryption
+	// configuration returns the zero sse.Config with a nil error;
+	// callers use Config.Empty to distinguish "not configured" (which
+	// the S3 API surfaces as 404
+	// ServerSideEncryptionConfigurationNotFoundError) from a configured
+	// default.
+	GetEncryption(ctx context.Context, tenantID, bucket string) (sse.Config, error)
+
+	// SetEncryption upserts the bucket default SSE configuration for
+	// (tenantID, bucket). cfg must pass cfg.Valid().
+	SetEncryption(ctx context.Context, tenantID, bucket string, cfg sse.Config) error
+
+	// DeleteEncryption removes any default SSE configuration for
+	// (tenantID, bucket). Deleting a bucket that has none is a no-op and
+	// returns a nil error, matching S3's idempotent
+	// DeleteBucketEncryption.
+	DeleteEncryption(ctx context.Context, tenantID, bucket string) error
 }
 
 // LifecycleEntry is one (tenant, bucket) bucket lifecycle

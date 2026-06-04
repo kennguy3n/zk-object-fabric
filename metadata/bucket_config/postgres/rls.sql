@@ -5,8 +5,9 @@
 -- internal/rlsdb.Statements — the single source of truth shared
 -- with the manifests and content_index tables.
 --
--- bucket_config holds four per-bucket sub-resource tables, each keyed on
--- (tenant_id, bucket): versioning, object lock, CORS, and lifecycle. RLS
+-- bucket_config holds five per-bucket sub-resource tables, each keyed on
+-- (tenant_id, bucket): versioning, object lock, CORS, lifecycle, and
+-- encryption. RLS
 -- here is the defence-in-depth backstop behind the application's explicit
 -- `WHERE tenant_id = $1` predicates. It only takes effect for a
 -- non-superuser role WITHOUT the BYPASSRLS attribute — Postgres skips all
@@ -31,7 +32,7 @@
 --    GRANT CONNECT ON DATABASE <db> TO zkof_app;
 
 -- 2. Arm RLS on each bucket_config table. `zkof_app` is the role from
---    step 1. The four blocks are identical except for the table name —
+--    step 1. The five blocks are identical except for the table name —
 --    every table keys on (tenant_id, bucket), so the tenant_isolation
 --    policy text is uniform.
 
@@ -88,3 +89,16 @@ WITH CHECK (
 tenant_id = current_setting('zkof.tenant_id', true)
 );
 GRANT SELECT, INSERT, UPDATE, DELETE ON bucket_lifecycle TO zkof_app;
+
+ALTER TABLE bucket_encryption ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bucket_encryption FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON bucket_encryption;
+CREATE POLICY tenant_isolation ON bucket_encryption
+USING (
+current_setting('zkof.scan_all', true) = 'on'
+OR tenant_id = current_setting('zkof.tenant_id', true)
+)
+WITH CHECK (
+tenant_id = current_setting('zkof.tenant_id', true)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON bucket_encryption TO zkof_app;
