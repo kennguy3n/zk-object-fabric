@@ -173,6 +173,16 @@ CH_USER="${CLICKHOUSE_USER:-zkof}"
 CH_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
 CH_URL="http://$CH_HOST:$CH_PORT/"
 
+# $CH_DB is interpolated into both a CREATE DATABASE statement and a sed
+# replacement (s/{{database}}/$CH_DB/g) below. A value containing sed
+# metacharacters (/ & \) or SQL would corrupt the rendered schema or worse.
+# Restrict it to a plain ClickHouse identifier and fail loudly rather than
+# silently producing a broken schema.
+if ! printf '%s' "$CH_DB" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+    log "FATAL: CLICKHOUSE_DATABASE='$CH_DB' is not a valid identifier (^[A-Za-z_][A-Za-z0-9_]*\$)"
+    exit 1
+fi
+
 ch_exec() {
     # $1 = SQL text. Authenticates via headers so the password never
     # lands in a URL/argv that shows up in process listings or logs.

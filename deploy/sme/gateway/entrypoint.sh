@@ -12,10 +12,15 @@ set -eu
 TEMPLATE="${ZKOF_CONFIG_TEMPLATE:-/etc/zkof/config.json.tmpl}"
 RENDERED="${ZKOF_CONFIG_RENDERED:-/run/sme/config.json}"
 
-# RFC 3986 percent-encode of $1 (ASCII), leaving unreserved characters
-# intact. Pure POSIX/busybox: walk the string one character at a time and
-# emit %XX for anything that is not unreserved. The leading-quote form of
-# printf ("'$c") yields the numeric byte value of the character.
+# RFC 3986 percent-encode of $1, leaving unreserved characters intact. Pure
+# POSIX/busybox: walk the string one character at a time and emit %XX for
+# anything that is not unreserved. The leading-quote form of printf ("'$c")
+# yields the numeric byte value of the character.
+#
+# ASCII only: for a multi-byte UTF-8 char, printf "'$c" returns the Unicode
+# code point rather than the per-byte values, so this would not produce a
+# correct encoding. That's fine here — the only input is ZKOF_APP_PASSWORD,
+# which .env.example mandates be generated with `openssl rand -hex` (ASCII).
 urlencode() {
     _ue_s="$1"
     while [ -n "$_ue_s" ]; do

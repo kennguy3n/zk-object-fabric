@@ -74,7 +74,13 @@ aws --endpoint-url "$endpoint" s3api list-objects-v2 \
     --query "Contents[?LastModified<='$cutoff'].Key" --output text 2>/dev/null \
     | tr '\t' '\n' \
     | while IFS= read -r old_key; do
-        [ -n "$old_key" ] || continue
+        # An empty prefix (e.g. the very first run) makes the JMESPath query
+        # return null, which --output text renders as the literal "None".
+        # Skip both that sentinel and blank lines so we don't log/attempt a
+        # bogus `s3 rm .../None`.
+        case "$old_key" in
+            ""|None) continue ;;
+        esac
         echo "backup: removing s3://$WASABI_BUCKET/$old_key"
         aws --endpoint-url "$endpoint" s3 rm "s3://$WASABI_BUCKET/$old_key"
       done
