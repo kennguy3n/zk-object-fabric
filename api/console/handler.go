@@ -306,6 +306,14 @@ type Handler struct {
 	// is configured so dispatch can forward matching requests
 	// without registering a second handler on /api/tenants/.
 	sseHandler *UsageStreamHandler
+	// costHandler serves GET /api/v1/tenants/{id}/cost-breakdown.
+	// Set in Register when CostReporter is configured so ServeHTTP
+	// can forward the cost path before it falls through to
+	// dispatchDedup (both live under the /api/v1/tenants/ prefix;
+	// the ServeMux path in Register disambiguates them via the Go
+	// 1.22 method-specific pattern, but the ServeHTTP path has no
+	// ServeMux so it must route the cost path explicitly).
+	costHandler *CostHandler
 }
 
 // New returns a Handler with cfg defaults filled in.
@@ -387,8 +395,19 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	if h.cfg.CostReporter != nil {
 		// Method-specific pattern (Go 1.22+) so it coexists with
 		// the broader "/api/v1/tenants/" subtree handlers without
-		// a routing conflict. Shares the console's AdminAuth gate.
-		(&CostHandler{Reporter: h.cfg.CostReporter, AdminAuth: h.cfg.AdminAuth}).Register(mux)
+		// a routing conflict. Shares the console's AdminAuth gate
+		// and, when a tenant store is configured, its
+		// tenant-existence check so an unknown tenant 404s instead
+		// of returning a zero-valued breakdown.
+		ch := &CostHandler{Reporter: h.cfg.CostReporter, AdminAuth: h.cfg.AdminAuth}
+		if h.cfg.Tenants != nil {
+			ch.TenantExists = func(tenantID string) bool {
+				_, ok := h.cfg.Tenants.LookupTenant(tenantID)
+				return ok
+			}
+		}
+		h.costHandler = ch
+		ch.Register(mux)
 	}
 	if h.cfg.Orchestrator != nil {
 		// MigrationHandler exposes GET /api/v1/migrations and
@@ -423,6 +442,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// matches handler.Register's behavior. Guard on
 	// DedupPolicies != nil so deployments that skip the dedup
 	// API surface do not nil-deref inside dispatchDedup.
+	// The cost-breakdown route shares the /api/v1/tenants/ prefix
+	// with dispatchDedup; route it first (parseCostPath matches
+	// only the exact .../cost-breakdown shape, so dedup paths are
+	// unaffected) so ServeHTTP mirrors Register, where the Go 1.22
+	// method-specific pattern already gives the cost route
+	// precedence.
+	if h.costHandler != nil {
+		if _, ok := parseCostPath(r.URL.Path); ok {
+			h.costHandler.ServeHTTP(w, r)
+			return
+		}
+	}
 	if h.cfg.DedupPolicies != nil && strings.HasPrefix(r.URL.Path, "/api/v1/tenants/") {
 		h.dispatchDedup(w, r)
 		return

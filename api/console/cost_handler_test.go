@@ -233,6 +233,70 @@ func TestConsoleRegister_MountsCostRouteWhenReporterSet(t *testing.T) {
 	}
 }
 
+// TestConsoleServeHTTP_RoutesCostPathWhenDedupEnabled covers the
+// ServeHTTP (non-ServeMux) entry point: when both DedupPolicies and
+// CostReporter are configured, a cost-breakdown request must reach
+// the cost handler rather than falling into dispatchDedup (which
+// would 400 the 2-segment cost path).
+func TestConsoleServeHTTP_RoutesCostPathWhenDedupEnabled(t *testing.T) {
+	rep := &fakeReporter{}
+	h := New(Config{
+		CostReporter:  rep,
+		DedupPolicies: NewMemoryDedupPolicyStore(),
+	})
+	// Register populates h.costHandler; the handler itself (not the
+	// mux) is the surface under test.
+	h.Register(http.NewServeMux())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-7/cost-breakdown?month=2026-06")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (cost path must not fall into dispatchDedup)", resp.StatusCode)
+	}
+	if rep.gotID != "t-7" || rep.gotMo != "2026-06" {
+		t.Errorf("reporter called with (%q,%q), want (t-7,2026-06)", rep.gotID, rep.gotMo)
+	}
+}
+
+// TestConsoleRegister_CostRouteTenantExistence verifies the
+// tenant-existence gate the console wires from Config.Tenants: an
+// unknown tenant 404s without consulting the reporter, a known
+// tenant serves.
+func TestConsoleRegister_CostRouteTenantExistence(t *testing.T) {
+	rep := &fakeReporter{}
+	tenants := newFakeTenantStore(sampleTenant("t-known"))
+	mux := http.NewServeMux()
+	New(Config{CostReporter: rep, Tenants: tenants}).Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/v1/tenants/t-missing/cost-breakdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown tenant status = %d, want 404", resp.StatusCode)
+	}
+	if rep.calls != 0 {
+		t.Fatalf("reporter called %d times for unknown tenant", rep.calls)
+	}
+
+	resp2, err := http.Get(srv.URL + "/api/v1/tenants/t-known/cost-breakdown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("known tenant status = %d, want 200", resp2.StatusCode)
+	}
+}
+
 // TestConsoleRegister_SkipsCostRouteWhenReporterNil verifies the
 // route is absent (404, not 503) when no reporter is configured, so a
 // deployment without a cost model does not advertise the endpoint.

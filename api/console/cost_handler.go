@@ -35,6 +35,15 @@ type CostHandler struct {
 	// AdminAuth gates every request when non-nil. Nil disables the
 	// check (dev only).
 	AdminAuth func(r *http.Request) bool
+
+	// TenantExists, when non-nil, gates the breakdown on the tenant
+	// actually existing so an unknown tenant gets a clean 404
+	// instead of a zero-valued breakdown — consistent with the
+	// other console tenant-subresource handlers (see
+	// Handler.ensureTenantExists). Nil disables the check, which is
+	// the standalone / test mounting that has no tenant store; the
+	// console Handler wires it from Config.Tenants in Register.
+	TenantExists func(tenantID string) bool
 }
 
 // Register mounts the cost-breakdown route on mux. It uses the
@@ -85,6 +94,10 @@ func (h *CostHandler) serve(w http.ResponseWriter, r *http.Request, tenantID str
 	}
 	if tenantID == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if h.TenantExists != nil && !h.TenantExists(tenantID) {
+		writeError(w, http.StatusNotFound, "tenant not found")
 		return
 	}
 	if h.Reporter == nil {
