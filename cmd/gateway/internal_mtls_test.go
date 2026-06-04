@@ -84,10 +84,33 @@ func TestApplyInternalTLSToPostgresDSN_KeywordForm(t *testing.T) {
 		if weak {
 			t.Error("default verify-full should not be weak")
 		}
-		for _, want := range []string{"sslmode=verify-full", "sslcert=" + c.CertFile, "sslkey=" + c.KeyFile, "sslrootcert=" + c.CAFile} {
+		// appended cert paths are single-quoted (libpq keyword form)
+		for _, want := range []string{"sslmode=verify-full", "sslcert='" + c.CertFile + "'", "sslkey='" + c.KeyFile + "'", "sslrootcert='" + c.CAFile + "'"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("result %q missing %q", got, want)
 			}
+		}
+	})
+
+	t.Run("paths with whitespace are quoted so they parse as one value", func(t *testing.T) {
+		spaced := config.InternalTLSConfig{
+			Enabled:  true,
+			CertFile: "/etc/zkof/my certs/client.pem",
+			KeyFile:  "/etc/zkof/my certs/client-key.pem",
+			CAFile:   "/etc/zkof/my certs/ca.pem",
+		}
+		got, _, err := applyInternalTLSToPostgresDSN("host=db user=u", spaced)
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		// The spaced path must be wrapped in quotes, not appended bare
+		// (which would truncate at the first space).
+		if !strings.Contains(got, "sslcert='/etc/zkof/my certs/client.pem'") {
+			t.Errorf("spaced cert path not quoted as a single value: %q", got)
+		}
+		// keywordDSNValue must round-trip the quoted value back intact.
+		if v, ok := keywordDSNValue(got, "sslcert"); !ok || v != spaced.CertFile {
+			t.Errorf("keywordDSNValue(sslcert) = (%q, %v), want (%q, true)", v, ok, spaced.CertFile)
 		}
 	})
 

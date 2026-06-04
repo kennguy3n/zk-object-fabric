@@ -1598,6 +1598,9 @@ func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 		return nil, nil
 	}
 	dsn := cfg.ControlPlane.MetadataDSN
+	if cfg.ControlPlane.MetadataTLS && !cfg.InternalTLS.Enabled {
+		log.Printf("gateway: WARNING control_plane.metadata_tls is set but internal_tls.enabled is false; the metadata Postgres connection will NOT use internal mTLS. Set internal_tls.enabled=true to arm it")
+	}
 	if cfg.InternalTLS.Enabled && cfg.ControlPlane.MetadataTLS {
 		augmented, weakMode, err := applyInternalTLSToPostgresDSN(dsn, cfg.InternalTLS)
 		if err != nil {
@@ -1636,6 +1639,20 @@ func keywordDSNValue(dsn, key string) (string, bool) {
 		return m[1], true
 	}
 	return m[2], true
+}
+
+// quoteKeywordDSNValue renders v as a value in a libpq keyword/value
+// DSN. libpq requires single-quoting any value that contains
+// whitespace, a single quote, or a backslash, escaping embedded
+// backslashes and single quotes with a backslash. We always
+// single-quote: it is unconditionally valid and avoids brittle
+// "does this contain whitespace" heuristics. Without this, a cert
+// path containing a space (e.g. "/etc/zkof/my cert.pem") would be
+// truncated at the space and the remainder mis-parsed as another
+// key, silently breaking the connection.
+func quoteKeywordDSNValue(v string) string {
+	r := strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+	return "'" + r.Replace(v) + "'"
 }
 
 // nonVerifyingPostgresSSLMode reports whether an sslmode value skips
@@ -1707,7 +1724,7 @@ func applyInternalTLSToPostgresDSN(dsn string, c config.InternalTLSConfig) (stri
 	b.WriteString(trimmed)
 	appendIfAbsent := func(key, val string) {
 		if _, ok := keywordDSNValue(b.String(), key); !ok {
-			fmt.Fprintf(&b, " %s=%s", key, val)
+			fmt.Fprintf(&b, " %s=%s", key, quoteKeywordDSNValue(val))
 		}
 	}
 	appendIfAbsent("sslcert", c.CertFile)
@@ -2310,6 +2327,9 @@ func buildBillingSink(cfg config.Config, embeddedDB *sql.DB) interface {
 		FlushInterval: cfg.Billing.FlushInterval.ToDuration(),
 		Logger:        log.New(os.Stdout, "billing ", log.LstdFlags),
 	}
+	if cfg.Billing.ClickHouseTLS && !cfg.InternalTLS.Enabled {
+		log.Printf("gateway: WARNING billing.clickhouse_tls is set but internal_tls.enabled is false; the ClickHouse billing connection will NOT use internal mTLS. Set internal_tls.enabled=true to arm it")
+	}
 	if cfg.InternalTLS.Enabled && cfg.Billing.ClickHouseTLS {
 		chCfg.HTTPClient = buildInternalTLSHTTPClient(cfg.InternalTLS, cfg.Billing.ClickHouseURL)
 		log.Printf("gateway: internal mTLS enabled for clickhouse billing connection (cert=%s ca=%s)", cfg.InternalTLS.CertFile, cfg.InternalTLS.CAFile)
@@ -2346,7 +2366,17 @@ func buildInternalTLSHTTPClient(c config.InternalTLSConfig, endpoint string) *ht
 	if u, perr := url.Parse(strings.TrimSpace(endpoint)); perr == nil && u.Scheme != "https" {
 		log.Printf("gateway: WARNING clickhouse_tls is enabled but clickhouse_url scheme is %q (not https); the client certificate will not be presented until the endpoint uses https", u.Scheme)
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Clone the default transport to inherit its pooling / keep-alive /
+	// proxy defaults. Guard the type assertion: if anything has
+	// replaced http.DefaultTransport with a non-*http.Transport wrapper
+	// (e.g. a future tracing middleware), fall back to a fresh
+	// transport rather than panicking.
+	var transport *http.Transport
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = dt.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
 	transport.TLSClientConfig = tlsCfg
 	return &http.Client{
 		Timeout:   10 * time.Second,
