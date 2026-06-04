@@ -180,17 +180,16 @@ layout above: tagging (`api/s3compat/tagging_handler.go`, WS8.1),
 lifecycle (`lifecycle_handler.go` + `metadata/lifecycle` +
 `lifecycle/evaluator`, WS8.2), Object Lock / WORM
 (`object_lock_handler.go` + `metadata/object_lock`, WS8.3), bucket
-versioning (`versioning_handler.go`, WS8.4), and CORS
-(`cors_handler.go` + `metadata/cors`, WS8.5), all persisted through
-the `metadata/bucket_config` store. The packages below remain
+versioning (`versioning_handler.go`, WS8.4), CORS
+(`cors_handler.go` + `metadata/cors`, WS8.5), and event notifications
+(`notification_handler.go` + `metadata/notification` +
+`internal/notifications` async dispatcher, WS8.6), all persisted
+through the `metadata/bucket_config` store. The packages below remain
 **planned, not yet built**:
 
 ```
 api/s3compat/
-  notification_handler.go # WS8.6 Put/GetBucketNotificationConfiguration
   encryption_handler.go   # WS8.7 Put/Get/DeleteBucketEncryption
-internal/
-  notifications/          # WS8.6 async webhook dispatcher + DLQ
 encryption/
   rust_sdk/               # WS9 byte-compatible Rust client-side SDK
 ```
@@ -205,8 +204,9 @@ lifecycle rules (WS8.2) in `bucket_lifecycle` (rule sets JSON-encoded).
 Object tags (WS8.1) are stored as JSONB on the existing manifest row
 rather than in a new table, and per-object-version retention mode /
 retain-until / legal-hold ride on the object manifest so they version
-with the object. WS8.6 notification and WS8.7 SSE-config tables are
-finalised per slice when those slices land.
+with the object. Notification configs (WS8.6) live in
+`bucket_notification` (rule sets JSON-encoded); the WS8.7 SSE-config
+table is finalised when that slice lands.
 
 ## Component overview
 

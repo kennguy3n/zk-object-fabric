@@ -17,31 +17,34 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
+	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 // Config is the store wiring. Table defaults to "bucket_versioning",
 // LockTable to "bucket_object_lock", CorsTable to "bucket_cors",
-// LifecycleTable to "bucket_lifecycle", and EncryptionTable to
-// "bucket_encryption".
+// LifecycleTable to "bucket_lifecycle", NotificationTable to
+// "bucket_notification", and EncryptionTable to "bucket_encryption".
 type Config struct {
-	DB              *sql.DB
-	Table           string
-	LockTable       string
-	CorsTable       string
-	LifecycleTable  string
-	EncryptionTable string
+	DB                *sql.DB
+	Table             string
+	LockTable         string
+	CorsTable         string
+	LifecycleTable    string
+	NotificationTable string
+	EncryptionTable   string
 }
 
 // Store is a bucket_config.Store backed by SQLite tables.
 type Store struct {
-	db              *sql.DB
-	table           string
-	lockTable       string
-	corsTable       string
-	lifecycleTable  string
-	encryptionTable string
+	db                *sql.DB
+	table             string
+	lockTable         string
+	corsTable         string
+	lifecycleTable    string
+	notificationTable string
+	encryptionTable   string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
@@ -87,7 +90,14 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(encryptionTable) {
 		return nil, fmt.Errorf("sqlite: invalid encryption table name %q", encryptionTable)
 	}
-	s := &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable, lifecycleTable: lifecycleTable, encryptionTable: encryptionTable}
+	notificationTable := cfg.NotificationTable
+	if notificationTable == "" {
+		notificationTable = "bucket_notification"
+	}
+	if !isSafeIdent(notificationTable) {
+		return nil, fmt.Errorf("sqlite: invalid notification table name %q", notificationTable)
+	}
+	s := &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable, lifecycleTable: lifecycleTable, notificationTable: notificationTable, encryptionTable: encryptionTable}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
@@ -147,6 +157,71 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	)`, s.encryptionTable)
 	if _, err := s.db.ExecContext(ctx, eq); err != nil {
 		return fmt.Errorf("sqlite: ensure bucket_encryption schema: %w", err)
+	}
+	nq := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		tenant_id  TEXT NOT NULL,
+		bucket     TEXT NOT NULL,
+		rules      TEXT NOT NULL,
+		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (tenant_id, bucket)
+	)`, s.notificationTable)
+	if _, err := s.db.ExecContext(ctx, nq); err != nil {
+		return fmt.Errorf("sqlite: ensure bucket_notification schema: %w", err)
+	}
+	return nil
+}
+
+// GetNotification returns the notification config for (tenantID,
+// bucket) or the zero Config when no row exists.
+func (s *Store) GetNotification(ctx context.Context, tenantID, bucket string) (notification.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return notification.Config{}, errors.New("sqlite: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT rules FROM %s WHERE tenant_id = ? AND bucket = ?`, s.notificationTable)
+	var raw []byte
+	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return notification.Config{}, nil
+	case err != nil:
+		return notification.Config{}, fmt.Errorf("sqlite: bucket_notification get: %w", err)
+	}
+	var cfg notification.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return notification.Config{}, fmt.Errorf("sqlite: bucket_notification decode: %w", err)
+	}
+	return cfg, nil
+}
+
+// SetNotification upserts the notification config for (tenantID,
+// bucket). An empty cfg clears any existing configuration (the row is
+// deleted), matching S3's PutBucketNotificationConfiguration with an
+// empty body.
+func (s *Store) SetNotification(ctx context.Context, tenantID, bucket string, cfg notification.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("sqlite: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	if cfg.Empty() {
+		del := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = ? AND bucket = ?`, s.notificationTable)
+		if _, err := s.db.ExecContext(ctx, del, tenantID, bucket); err != nil {
+			return fmt.Errorf("sqlite: bucket_notification clear: %w", err)
+		}
+		return nil
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("sqlite: bucket_notification encode: %w", err)
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, rules, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET rules = excluded.rules, updated_at = CURRENT_TIMESTAMP
+	`, s.notificationTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+		return fmt.Errorf("sqlite: bucket_notification set: %w", err)
 	}
 	return nil
 }

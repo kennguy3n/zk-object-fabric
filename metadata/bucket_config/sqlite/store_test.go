@@ -9,6 +9,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/cors"
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
+	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
 	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
@@ -160,6 +161,75 @@ func TestSQLite_CORSRejectsInvalid(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.SetCORS(context.Background(), "t1", "b1", cors.Config{}); err == nil {
 		t.Fatal("SetCORS(empty config): want error")
+	}
+}
+
+func TestSQLite_NotificationRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if got, err := s.GetNotification(ctx, "t1", "b1"); err != nil || !got.Empty() {
+		t.Fatalf("unconfigured get = (%+v, %v), want (empty, nil)", got, err)
+	}
+
+	cfg := notification.Config{Rules: []notification.Rule{
+		{
+			ID:       "on-upload",
+			Events:   []notification.EventType{notification.ObjectCreatedAll, notification.ObjectRemovedDelete},
+			Endpoint: "https://hooks.example.com/s3",
+			Prefix:   "logs/",
+			Suffix:   ".json",
+		},
+		{
+			ID:       "on-delete",
+			Events:   []notification.EventType{notification.ObjectRemovedAll},
+			Endpoint: "https://hooks.example.com/del",
+		},
+	}}
+	if err := s.SetNotification(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetNotification: %v", err)
+	}
+	got, _ := s.GetNotification(ctx, "t1", "b1")
+	if len(got.Rules) != 2 {
+		t.Fatalf("rules = %d, want 2", len(got.Rules))
+	}
+	r0 := got.Rules[0]
+	if r0.ID != "on-upload" || r0.Prefix != "logs/" || r0.Suffix != ".json" ||
+		len(r0.Events) != 2 || r0.Events[0] != notification.ObjectCreatedAll {
+		t.Fatalf("rule 0 round-trip mismatch: %+v", r0)
+	}
+
+	// Upsert replaces the rule set.
+	if err := s.SetNotification(ctx, "t1", "b1", notification.Config{Rules: []notification.Rule{{
+		ID:       "only",
+		Events:   []notification.EventType{notification.ObjectCreatedPut},
+		Endpoint: "https://only.example.com",
+	}}}); err != nil {
+		t.Fatalf("SetNotification(upsert): %v", err)
+	}
+	if got, _ := s.GetNotification(ctx, "t1", "b1"); len(got.Rules) != 1 || got.Rules[0].ID != "only" {
+		t.Fatalf("upsert result = %+v", got)
+	}
+
+	// Empty config clears the row; re-clear is idempotent.
+	if err := s.SetNotification(ctx, "t1", "b1", notification.Config{}); err != nil {
+		t.Fatalf("SetNotification(clear): %v", err)
+	}
+	if got, _ := s.GetNotification(ctx, "t1", "b1"); !got.Empty() {
+		t.Fatalf("after clear = %+v, want empty", got)
+	}
+	if err := s.SetNotification(ctx, "t1", "b1", notification.Config{}); err != nil {
+		t.Fatalf("SetNotification(clear no-op): %v", err)
+	}
+}
+
+func TestSQLite_NotificationRejectsInvalid(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t)
+	bad := notification.Config{Rules: []notification.Rule{{Events: []notification.EventType{notification.ObjectCreatedAll}}}}
+	if err := s.SetNotification(context.Background(), "t1", "b1", bad); err == nil {
+		t.Fatal("SetNotification(invalid): want error")
 	}
 }
 

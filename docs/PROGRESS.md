@@ -642,8 +642,16 @@ independent PR; check the box when the handler is wired and covered by
       headers (`applyCORS`) and the unauthenticated OPTIONS preflight
       (`handleCORSPreflight`). Covered by domain, store, and
       handler/preflight unit tests.
-- [ ] WS8.6 Event notifications (`?notification`) —
-      `internal/notifications/` webhook dispatcher + DLQ.
+- [x] WS8.6 Event notifications (`?notification`) —
+      Put/GetBucketNotificationConfiguration
+      (`api/s3compat/notification_handler.go`), `metadata/notification/`
+      domain types, `bucket_config` store (memory + Postgres + SQLite,
+      `bucket_notification` table), plus the `internal/notifications/`
+      async webhook dispatcher (worker pool, exponential-backoff retry,
+      dead-letter sink) wired into the gateway. The handler emits
+      `ObjectCreated:*`/`ObjectRemoved:*` events on PUT/COPY/
+      CompleteMultipartUpload/DELETE success paths. Covered by domain,
+      dispatcher, and handler/emission unit tests.
 - [ ] WS8.7 Server-side encryption config (`?encryption`) — SSE header
       → ZKOF encryption modes.
 - [x] WS8.8 Docs — PROPOSAL §3.2.2 + §15.1, ARCHITECTURE.md packages,
@@ -656,8 +664,7 @@ ticker so all WS8 sub-resource handlers go live (#101); NodeID
 resolution is unified on `os.Hostname()` so billing/audit
 `SourceNodeID` is per-node (#103); and the embedded single-node
 profile persists the compliance audit trail to local SQLite (#104).
-Remaining future feature slices: WS8.6 (event notifications) and
-WS8.7 (SSE config sub-resource).
+Remaining future feature slice: WS8.7 (SSE config sub-resource).
 
 **WS9 — Rust client-side encryption SDK**
 
