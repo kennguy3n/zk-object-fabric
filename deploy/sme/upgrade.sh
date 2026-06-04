@@ -29,11 +29,19 @@ if [ "$replicas" -lt 1 ]; then
 fi
 echo "upgrade: maintaining $replicas gateway replica(s)"
 
-echo "upgrade: building/pulling the new gateway image ..."
+# Pull XOR build — never both. When ZKOF_IMAGE pins a registry tag the
+# operator wants exactly that image, so we pull it and stop. Running
+# `compose build` afterwards would re-tag a locally built image with the
+# same ZKOF_IMAGE name, silently overwriting the pulled artifact and
+# defeating the version pin. Only when no registry image is pinned do we
+# build from the local checkout (the default :local tag).
 if [ -n "${ZKOF_IMAGE:-}" ]; then
-    compose pull gateway || true
+    echo "upgrade: pulling pinned gateway image $ZKOF_IMAGE ..."
+    compose pull gateway
+else
+    echo "upgrade: building the gateway image from the local checkout ..."
+    compose build gateway
 fi
-compose build gateway
 
 wait_ready() {
     # $1 = container id. Polls /internal/ready on the dedicated health

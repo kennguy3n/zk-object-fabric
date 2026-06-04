@@ -147,7 +147,12 @@ services:
       - .env
     environment:
       # Derived wiring the gateway config template consumes via envsubst.
-      METADATA_DSN: postgres://zkof_app:${ZKOF_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-zkof}?sslmode=disable
+      # The Postgres DSN is assembled by entrypoint.sh (it percent-encodes
+      # ZKOF_APP_PASSWORD so URL-reserved characters survive lib/pq's URL
+      # parser); it reads ZKOF_APP_PASSWORD/POSTGRES_DB from the .env file
+      # loaded above. Set METADATA_DSN here only to target an external
+      # Postgres instead of the in-pool one.
+      ZKOF_DB_NAME: ${POSTGRES_DB:-zkof}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-zkof_billing}
       CONSOLE_HOST: ${DOMAIN_NAME}

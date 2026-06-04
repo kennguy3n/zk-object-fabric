@@ -12,6 +12,38 @@ set -eu
 TEMPLATE="${ZKOF_CONFIG_TEMPLATE:-/etc/zkof/config.json.tmpl}"
 RENDERED="${ZKOF_CONFIG_RENDERED:-/run/sme/config.json}"
 
+# RFC 3986 percent-encode of $1 (ASCII), leaving unreserved characters
+# intact. Pure POSIX/busybox: walk the string one character at a time and
+# emit %XX for anything that is not unreserved. The leading-quote form of
+# printf ("'$c") yields the numeric byte value of the character.
+urlencode() {
+    _ue_s="$1"
+    while [ -n "$_ue_s" ]; do
+        _ue_c="${_ue_s%"${_ue_s#?}"}"
+        case "$_ue_c" in
+            [a-zA-Z0-9.~_-]) printf '%s' "$_ue_c" ;;
+            *) printf '%%%02X' "'$_ue_c" ;;
+        esac
+        _ue_s="${_ue_s#?}"
+    done
+}
+
+# Build the Postgres control-plane DSN from its parts unless the operator
+# pre-set METADATA_DSN (e.g. to point at an external/managed Postgres).
+# The password is percent-encoded so a value containing URL-reserved
+# characters (@ : / ? # %) round-trips through lib/pq's URL parser rather
+# than being misparsed as a user-info/host boundary. URL form (vs lib/pq's
+# keyword=value form) keeps the rendered value free of spaces, quotes and
+# backslashes, so it stays valid inside the JSON config string envsubst
+# produces below. Host/port/db match the single-pool compose topology and
+# are overridable for non-default layouts.
+if [ -z "${METADATA_DSN:-}" ]; then
+    : "${ZKOF_APP_PASSWORD:?ZKOF_APP_PASSWORD is required to build METADATA_DSN}"
+    _enc_pw="$(urlencode "$ZKOF_APP_PASSWORD")"
+    METADATA_DSN="postgres://${ZKOF_DB_USER:-zkof_app}:${_enc_pw}@${ZKOF_DB_HOST:-postgres}:${ZKOF_DB_PORT:-5432}/${ZKOF_DB_NAME:-${POSTGRES_DB:-zkof}}?sslmode=${ZKOF_DB_SSLMODE:-disable}"
+    export METADATA_DSN
+fi
+
 # Only substitute the variables we own. An explicit allow-list keeps
 # envsubst from mangling any future literal "$" in the template and
 # documents exactly which knobs the deployment injects. The single
