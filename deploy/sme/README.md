@@ -92,9 +92,10 @@ openssl rand -hex 24   # CLICKHOUSE_PASSWORD
 ```
 
 Set `DOMAIN_NAME`, `LETSENCRYPT_EMAIL`, and the `WASABI_*` values for your
-bucket. Pick exactly one CMK backend (`KMS_CMK_URI` for AWS KMS, or
-`VAULT_ADDR`+`VAULT_TOKEN` for Vault Transit, or a `cmk://local/...` file
-for a zero-dependency start). See the comments in `.env.example`.
+bucket. Pick exactly one managed CMK backend (`KMS_CMK_URI` for AWS KMS, or
+`VAULT_ADDR`+`VAULT_TOKEN` for Vault Transit). The local-file CMK backend is
+not supported here — the gateway runs in `env=production`, which refuses to
+boot on a local file CMK. See the comments in `.env.example`.
 
 ### 6. Bring up the pool
 

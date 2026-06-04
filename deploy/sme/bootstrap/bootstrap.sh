@@ -166,7 +166,10 @@ done
 CH_HOST="${CLICKHOUSE_HOST:-clickhouse}"
 CH_PORT="${CLICKHOUSE_HTTP_PORT:-8123}"
 CH_DB="${CLICKHOUSE_DATABASE:-zkof_billing}"
-CH_USER="${CLICKHOUSE_USER:-default}"
+# Default to zkof (the compose-provisioned ClickHouse user), matching
+# docker-compose.production.yml so a standalone run doesn't silently fall
+# back to the built-in 'default' account and fail auth.
+CH_USER="${CLICKHOUSE_USER:-zkof}"
 CH_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
 CH_URL="http://$CH_HOST:$CH_PORT/"
 
