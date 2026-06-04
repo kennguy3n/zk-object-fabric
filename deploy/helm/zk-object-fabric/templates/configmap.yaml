@@ -10,6 +10,7 @@ Secret's env vars. This mirrors the repo's own production convention
 The config object is assembled as a dict and serialised with toPrettyJson so
 the output is always valid JSON regardless of which optional blocks are on.
 */}}
+{{- include "zk-object-fabric.validateCredentialsSecret" . -}}
 {{- include "zk-object-fabric.validateManifestBodyKey" . -}}
 {{- $gw := dict
     "listen_addr" (printf ":%d" (int .Values.config.gateway.port))

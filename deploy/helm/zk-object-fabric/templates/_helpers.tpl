@@ -81,15 +81,19 @@ encryption.manifest_body_key_path. Emits "true" or "".
 {{- end }}
 
 {{/*
-Name of the Secret that holds the manifest-body key: an operator-supplied
-existingSecret if set, otherwise the chart-created gateway Secret.
+Name of the dedicated Secret the chart creates to hold an inline
+manifestBodyKey.value. It is kept separate from the gateway credentials Secret
+so the credentials Secret can be consumed with envFrom (the init container
+needs the creds as env vars) without Kubernetes trying — and failing — to
+expose the dotted key name (manifest-body.key) as an env var and logging a
+warning on every pod start. This Secret is only ever volume-mounted.
 */}}
 {{- define "zk-object-fabric.manifestBodyKeySecretName" -}}
 {{- $mbk := .Values.config.encryption.manifestBodyKey -}}
 {{- if $mbk.existingSecret -}}
 {{- $mbk.existingSecret -}}
 {{- else -}}
-{{- include "zk-object-fabric.secretName" . -}}
+{{- printf "%s-manifest-body-key" (include "zk-object-fabric.fullname" .) -}}
 {{- end -}}
 {{- end }}
 
@@ -105,16 +109,19 @@ misconfiguration surfaces at `helm install` instead of as a pod crash-loop.
 {{- if and (eq .Values.config.env "production") $persistent (not (include "zk-object-fabric.manifestBodyKeyConfigured" .)) -}}
 {{- fail "config.env=production with a persistent metadata store (controlPlane.metadataDsnFromSecret or controlPlane.embeddedDbPath) requires config.encryption.manifestBodyKey.value or .existingSecret: the gateway refuses to boot without manifest_body_key_path (manifest JSON would be stored as plaintext). Set the key, or use config.env=development for a no-dependency trial." -}}
 {{- end -}}
-{{- /*
-An inline manifestBodyKey.value is stored in the chart-created Secret (secret.yaml).
-With secret.create=false that Secret is never rendered, so the key has nowhere to
-live: the Deployment would mount manifest-body.key from the external credentials
-Secret (which does not contain it) and the pod would crash-loop on a missing file.
-Fail at install time and steer the operator to manifestBodyKey.existingSecret.
+{{- end }}
+
+{{/*
+Fail fast at template time when the chart is told not to create the credentials
+Secret (secret.create=false) but no existing Secret is named
+(secret.existingSecret is empty). In that case the secretName helper falls back
+to the chart's <fullname>-secrets name, which is never rendered, so the init
+container's envFrom would reference a non-existent Secret and the pod would fail
+with CreateContainerConfigError. Surface it at `helm install` instead.
 */}}
-{{- $mbk := .Values.config.encryption.manifestBodyKey -}}
-{{- if and $mbk.value (not $mbk.existingSecret) (not .Values.secret.create) -}}
-{{- fail "config.encryption.manifestBodyKey.value is set but secret.create=false, so the chart-created Secret that would hold the key is not rendered and the gateway pod would crash-loop on a missing key file. Put the key into the externally-managed Secret and reference it via config.encryption.manifestBodyKey.existingSecret (+ existingSecretKey) instead of inlining .value." -}}
+{{- define "zk-object-fabric.validateCredentialsSecret" -}}
+{{- if and (not .Values.secret.create) (not .Values.secret.existingSecret) -}}
+{{- fail "secret.create=false requires secret.existingSecret to name the Secret that provides the gateway credentials (WASABI_ACCESS_KEY, WASABI_SECRET_KEY, METADATA_DSN, VAULT_TOKEN, CONSOLE_ADMIN_TOKEN). Set secret.existingSecret, or set secret.create=true to let the chart render the Secret from secret.* values." -}}
 {{- end -}}
 {{- end }}
 

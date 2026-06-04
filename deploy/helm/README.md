@@ -80,10 +80,12 @@ flow above; the chart mounts it from a Secret instead.
 Provide a 32-byte XChaCha20-Poly1305 key via `config.encryption.manifestBodyKey`:
 
 - `value` — base64 of the 32 raw bytes (`head -c 32 /dev/urandom | base64`).
-  The chart stores it in the gateway Secret, so this requires
-  `secret.create: true`. Setting `value` together with `secret.create: false`
-  is rejected at install time (the key would have nowhere to live and the pod
-  would crash-loop on a missing file) — use `existingSecret` in that case.
+  The chart stores it in its **own dedicated Secret**
+  (`<release>-manifest-body-key`), separate from the gateway credentials
+  Secret, and only volume-mounts it. Keeping it out of the credentials Secret
+  (which is consumed via `envFrom`) avoids a per-pod Kubernetes warning about
+  the non-identifier key name `manifest-body.key`, and decouples it from
+  `secret.create` — so an inline `value` works even with `secret.create: false`.
 - `existingSecret` / `existingSecretKey` — reference a key in a Secret you
   manage out-of-band (recommended for production).
 
@@ -200,6 +202,11 @@ secret:
   #   --set secret.wasabiAccessKey=… --set secret.wasabiSecretKey=…
   #   --set secret.metadataDsn='postgres://…'
 ```
+
+With `secret.create: false` you **must** set `secret.existingSecret`; the chart
+fails at `helm install`/`helm template` time otherwise (without it the init
+container would reference a Secret that is never created and the pod would fail
+with `CreateContainerConfigError`).
 
 The credentials `existingSecret` must expose these keys: `WASABI_ACCESS_KEY`,
 `WASABI_SECRET_KEY`, `METADATA_DSN`, `VAULT_TOKEN`, `CONSOLE_ADMIN_TOKEN`. The
