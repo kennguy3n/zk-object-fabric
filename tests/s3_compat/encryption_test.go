@@ -37,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -54,6 +55,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/encryption"
 	"github.com/kennguy3n/zk-object-fabric/encryption/client_sdk"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
+	"github.com/kennguy3n/zk-object-fabric/metadata/bucket_config"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
@@ -1599,4 +1601,212 @@ func TestManagedEncryption_StreamingPut_ContentLengthOverflow(t *testing.T) {
 			t.Fatalf("manifest persisted for overflowing upload %s/%s; the early-reject path failed", s.bucket, key)
 		}
 	}
+}
+
+// ---------------------------------------------------------------
+// WS8.7 conformance: the bucket default-encryption sub-resource
+// (?encryption) driven end-to-end through the AWS SDK, mirroring the
+// versioning / lifecycle / CORS / tagging / notification conformance
+// pattern in tests/s3_conformance. The handler-level unit tests in
+// api/s3compat/encryption_handler_test.go pin XML/validation edge
+// cases against an httptest recorder; this test pins the same
+// Put/Get/Delete lifecycle as a real S3 SDK client sees it (typed
+// inputs, AWS error codes, ConfigurationNotFound semantics).
+// ---------------------------------------------------------------
+
+// newSSEConfigServer spins up a gateway wired with a BucketConfig
+// store (so the ?encryption sub-resource is served) and a gateway
+// keyring (so PutBucketEncryption's fail-closed guard is satisfied),
+// returning an SDK client. Unlike newEncryptionServer it does not stamp
+// a placement encryption mode: this test exercises the config
+// sub-resource lifecycle, not the object write path.
+func newSSEConfigServer(t *testing.T) (*s3.Client, string) {
+	t.Helper()
+
+	pieceRoot := t.TempDir()
+	backend, err := local_fs_dev.New(pieceRoot)
+	if err != nil {
+		t.Fatalf("local_fs_dev.New: %v", err)
+	}
+
+	cmkPath := filepath.Join(t.TempDir(), "cmk.key")
+	cmkMaterial := make([]byte, chacha20poly1305.KeySize)
+	if _, err := rand.Read(cmkMaterial); err != nil {
+		t.Fatalf("rand cmk: %v", err)
+	}
+	if err := os.WriteFile(cmkPath, cmkMaterial, 0o600); err != nil {
+		t.Fatalf("write cmk: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	handler := s3compat.New(s3compat.Config{
+		Manifests:    memory.New(),
+		Providers:    map[string]providers.StorageProvider{"local_fs_dev": backend},
+		Placement:    encryptionPlacement{backend: "local_fs_dev"},
+		Multipart:    multipart.NewMemoryStore(),
+		BucketConfig: bucket_config.NewMemoryStore(),
+		Encryption: &s3compat.GatewayEncryption{
+			Wrapper: client_sdk.LocalFileWrapper{Path: cmkPath},
+			CMK: encryption.CustomerMasterKeyRef{
+				URI:         "cmk://test/primary",
+				Version:     1,
+				HolderClass: "gateway_hsm",
+			},
+		},
+		Now: time.Now,
+	})
+	handler.Register(mux)
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+
+	cfg, err := config.LoadDefaultConfig(
+		context.Background(),
+		config.WithRegion("us-east-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+	)
+	if err != nil {
+		t.Fatalf("load sdk config: %v", err)
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(ts.URL)
+		o.UsePathStyle = true
+	})
+	return client, "enc-config-bucket"
+}
+
+func TestBucketEncryptionConfig_Conformance(t *testing.T) {
+	ctx := context.Background()
+	client, bucket := newSSEConfigServer(t)
+
+	// Precondition: an unconfigured bucket reports
+	// ServerSideEncryptionConfigurationNotFoundError (404), matching AWS.
+	_, err := client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+	})
+	if err == nil {
+		t.Fatal("GetBucketEncryption on unconfigured bucket: want error, got nil")
+	}
+	if code := httpStatusOf(err); code != http.StatusNotFound {
+		t.Fatalf("GetBucketEncryption unconfigured status = %d, want 404; err=%v", code, err)
+	}
+	if !errContains(err, "ServerSideEncryptionConfigurationNotFoundError") {
+		t.Errorf("GetBucketEncryption unconfigured err = %v, want ServerSideEncryptionConfigurationNotFoundError", err)
+	}
+
+	// PUT an AES256 (SSE-S3) default.
+	if _, err := client.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+		ServerSideEncryptionConfiguration: &types.ServerSideEncryptionConfiguration{
+			Rules: []types.ServerSideEncryptionRule{{
+				ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{
+					SSEAlgorithm: types.ServerSideEncryptionAes256,
+				},
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("PutBucketEncryption(AES256): %v", err)
+	}
+
+	// GET reads the AES256 default back.
+	got, err := client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		t.Fatalf("GetBucketEncryption after PUT: %v", err)
+	}
+	if got.ServerSideEncryptionConfiguration == nil || len(got.ServerSideEncryptionConfiguration.Rules) != 1 {
+		t.Fatalf("GetBucketEncryption rules = %+v, want exactly one rule", got.ServerSideEncryptionConfiguration)
+	}
+	def := got.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault
+	if def == nil || def.SSEAlgorithm != types.ServerSideEncryptionAes256 {
+		t.Fatalf("default algorithm = %+v, want AES256", def)
+	}
+	if def.KMSMasterKeyID != nil && *def.KMSMasterKeyID != "" {
+		t.Errorf("KMSMasterKeyID = %q, want empty for AES256", *def.KMSMasterKeyID)
+	}
+
+	// Overwrite with an aws:kms (SSE-KMS) default carrying a key id and
+	// BucketKeyEnabled; the whole rule must round-trip.
+	keyID := "arn:aws:kms:us-east-1:111122223333:key/abc"
+	if _, err := client.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+		ServerSideEncryptionConfiguration: &types.ServerSideEncryptionConfiguration{
+			Rules: []types.ServerSideEncryptionRule{{
+				ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{
+					SSEAlgorithm:   types.ServerSideEncryptionAwsKms,
+					KMSMasterKeyID: aws.String(keyID),
+				},
+				BucketKeyEnabled: aws.Bool(true),
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("PutBucketEncryption(aws:kms): %v", err)
+	}
+	got, err = client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		t.Fatalf("GetBucketEncryption after KMS PUT: %v", err)
+	}
+	rule := got.ServerSideEncryptionConfiguration.Rules[0]
+	if rule.ApplyServerSideEncryptionByDefault.SSEAlgorithm != types.ServerSideEncryptionAwsKms {
+		t.Errorf("algorithm = %q, want aws:kms", rule.ApplyServerSideEncryptionByDefault.SSEAlgorithm)
+	}
+	if id := rule.ApplyServerSideEncryptionByDefault.KMSMasterKeyID; id == nil || *id != keyID {
+		t.Errorf("KMSMasterKeyID = %v, want %q round-tripped", id, keyID)
+	}
+	if rule.BucketKeyEnabled == nil || !*rule.BucketKeyEnabled {
+		t.Errorf("BucketKeyEnabled = %v, want true round-tripped", rule.BucketKeyEnabled)
+	}
+
+	// An invalid SSE algorithm is rejected (400), not silently stored.
+	_, err = client.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+		ServerSideEncryptionConfiguration: &types.ServerSideEncryptionConfiguration{
+			Rules: []types.ServerSideEncryptionRule{{
+				ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{
+					SSEAlgorithm: types.ServerSideEncryption("rot13"),
+				},
+			}},
+		},
+	})
+	if err == nil {
+		t.Fatal("PutBucketEncryption(invalid algorithm): want error, got nil")
+	}
+	if code := httpStatusOf(err); code != http.StatusBadRequest {
+		t.Errorf("PutBucketEncryption invalid algorithm status = %d, want 400; err=%v", code, err)
+	}
+	// The rejected PUT must not have clobbered the stored aws:kms default.
+	if got, err := client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+	}); err != nil {
+		t.Fatalf("GetBucketEncryption after rejected PUT: %v", err)
+	} else if got.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != types.ServerSideEncryptionAwsKms {
+		t.Error("rejected invalid PUT mutated the stored default")
+	}
+
+	// DELETE clears the configuration (204), and is idempotent.
+	for i := 0; i < 2; i++ {
+		if _, err := client.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{
+			Bucket: aws.String(bucket),
+		}); err != nil {
+			t.Fatalf("DeleteBucketEncryption call %d: %v", i, err)
+		}
+	}
+
+	// GET after DELETE is ConfigurationNotFound again.
+	if _, err := client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{
+		Bucket: aws.String(bucket),
+	}); err == nil {
+		t.Fatal("GetBucketEncryption after DELETE: want error, got nil")
+	} else if code := httpStatusOf(err); code != http.StatusNotFound {
+		t.Fatalf("GetBucketEncryption after DELETE status = %d, want 404; err=%v", code, err)
+	}
+}
+
+// errContains reports whether err's message contains substr. Used to
+// assert the AWS error code surfaced by the SDK without depending on a
+// typed error the gateway does not model.
+func errContains(err error, substr string) bool {
+	return err != nil && strings.Contains(err.Error(), substr)
 }
