@@ -357,6 +357,13 @@ func (d *Dispatcher) deliver(evt Event, rule notification.Rule) {
 	d.dead.Dead(DeadLetter{Event: evt, Endpoint: rule.Endpoint, Attempts: completed, LastErr: lastErr})
 }
 
+// maxDrainBytes caps how many bytes of a webhook response body we read
+// back before closing the connection. We only drain to enable keep-alive
+// reuse; the body content is never inspected, so 32 KiB is ample for any
+// well-behaved endpoint while denying a hostile one the ability to stream
+// unbounded data into the discard copy.
+const maxDrainBytes = 32 << 10
+
 // attempt performs a single webhook POST. It returns an empty string on
 // success (2xx) or a description of the failure otherwise.
 func (d *Dispatcher) attempt(endpoint string, name notification.EventType, body []byte) string {
@@ -376,8 +383,15 @@ func (d *Dispatcher) attempt(endpoint string, name notification.EventType, body 
 	// Drain the body before closing so the underlying transport can
 	// reuse the keep-alive connection for the next POST to this
 	// destination instead of opening a fresh TCP (and TLS) connection.
+	// The drain is bounded by maxDrainBytes: webhook destinations are
+	// tenant-configured and may be malicious or misconfigured, so we cap
+	// how much of a response body we read back purely to free the
+	// connection (the response content is irrelevant — only the status
+	// code matters). opContext's timeout still bounds total time; this
+	// bounds bytes so a hostile endpoint cannot stream unbounded data
+	// through the discard copy.
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -390,6 +404,12 @@ func (d *Dispatcher) attempt(endpoint string, name notification.EventType, body 
 func (d *Dispatcher) backoff(n int) time.Duration {
 	delay := d.backoffBase << (n - 1)
 	const max = 30 * time.Second
+	// The delay <= 0 arm is load-bearing, not just a floor: with an
+	// operator-configured high MaxAttempts the shift count (n-1) can
+	// reach values where backoffBase << k overflows int64 to a negative
+	// duration (k >= ~36) or shifts every bit out to 0 (k >= 64). Both
+	// collapse to <= 0 and are clamped to the 30s cap here, so a large
+	// MaxAttempts can never produce a negative or zero sleep.
 	if delay > max || delay <= 0 {
 		return max
 	}

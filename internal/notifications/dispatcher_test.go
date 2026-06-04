@@ -477,3 +477,62 @@ func TestProcessConfigLookupFailureDeadLetters(t *testing.T) {
 		t.Errorf("failed = %d, want 1", s.Failed)
 	}
 }
+
+// countingBody is a ReadCloser that yields an effectively unbounded
+// stream of bytes and records how many were read, so a test can prove
+// the dispatcher's keep-alive drain is bounded rather than reading the
+// whole (hostile) body.
+type countingBody struct {
+	read   atomic.Int64
+	closed atomic.Bool
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	b.read.Add(int64(len(p)))
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+func (b *countingBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+// floodDoer replies 200 with a body that never ends, to exercise the
+// bounded drain on the success path.
+type floodDoer struct {
+	body  *countingBody
+	calls atomic.Int64
+}
+
+func (d *floodDoer) Do(_ *http.Request) (*http.Response, error) {
+	d.calls.Add(1)
+	return &http.Response{StatusCode: http.StatusOK, Body: d.body}, nil
+}
+
+func TestAttemptBoundsResponseBodyDrain(t *testing.T) {
+	body := &countingBody{}
+	doer := &floodDoer{body: body}
+	d, err := New(Config{
+		Source:     stubSource{cfg: putRule("https://hook.example/test")},
+		HTTPClient: doer,
+		Workers:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	d.Notify(Event{TenantID: "t1", Bucket: "b1", Name: notification.ObjectCreatedPut, ObjectKey: "k"})
+	waitFor(t, func() bool { return doer.calls.Load() == 1 && body.closed.Load() })
+
+	// io.LimitReader stops the discard copy at maxDrainBytes; the final
+	// Read may overshoot by at most one buffer (io.Copy's 32 KiB default),
+	// so allow a single buffer of slack. The key property: the drain does
+	// NOT read the unbounded body to exhaustion.
+	if got := body.read.Load(); got > maxDrainBytes+32<<10 {
+		t.Errorf("drained %d bytes, want <= %d (bounded drain)", got, maxDrainBytes+32<<10)
+	}
+}
