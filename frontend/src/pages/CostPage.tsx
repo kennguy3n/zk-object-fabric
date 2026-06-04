@@ -59,15 +59,15 @@ export function CostPage() {
       <div className="muted" style={{ fontSize: 13 }}>
         Estimated monthly cost for <strong>{tenant?.name}</strong>, based on live
         usage and the <strong>{tier?.display_name ?? tenant?.licenseTier}</strong> tier
-        price book. The per-TB rate bundles Wasabi storage, Linode compute, and the
+        price book. The per-TiB rate bundles Wasabi storage, Linode compute, and the
         AWS control plane.
       </div>
       {error && <div className="panel danger-text">Failed to load cost inputs: {error}</div>}
 
       <div className="grid cols-3">
-        <StatCard label="Estimated monthly cost" value={loading ? "—" : usd(storageCost)} hint={`${storedTB.toFixed(2)} TB × ${usd(pricePerTB)}/TB`} />
-        <StatCard label="Stored volume" value={usage ? formatBytes(usage.storageBytes) : "—"} hint={`${storedTB.toFixed(3)} TB`} />
-        <StatCard label="Egress this month" value={usage ? formatBytes(usage.egressBytesThisMonth) : "—"} hint={`Budget ${egressBudgetTB} TB`} />
+        <StatCard label="Estimated monthly cost" value={loading ? "—" : usd(storageCost)} hint={`${storedTB.toFixed(2)} TiB × ${usd(pricePerTB)}/TiB`} />
+        <StatCard label="Stored volume" value={usage ? formatBytes(usage.storageBytes) : "—"} hint={`${storedTB.toFixed(3)} TiB`} />
+        <StatCard label="Egress this month" value={usage ? formatBytes(usage.egressBytesThisMonth) : "—"} hint={`Budget ${egressBudgetTB} TiB`} />
       </div>
 
       <div className="panel" style={{ padding: 0 }}>
@@ -86,19 +86,19 @@ export function CostPage() {
               <>
                 <tr>
                   <td>Wasabi storage + Linode compute + AWS control plane</td>
-                  <td className="muted">{storedTB.toFixed(3)} TB × {usd(pricePerTB)}/TB (all-in)</td>
+                  <td className="muted">{storedTB.toFixed(3)} TiB × {usd(pricePerTB)}/TiB (all-in)</td>
                   <td style={{ textAlign: "right" }}>{usd(storageCost)}</td>
                 </tr>
                 <tr>
                   <td>Egress (within fair-use budget)</td>
-                  <td className="muted">{Math.min(egressTB, egressBudgetTB).toFixed(3)} TB of {egressBudgetTB} TB · bundled</td>
+                  <td className="muted">{Math.min(egressTB, egressBudgetTB).toFixed(3)} TiB of {egressBudgetTB} TiB · bundled</td>
                   <td style={{ textAlign: "right" }}>{usd(0)}</td>
                 </tr>
                 <tr>
                   <td>Egress overage</td>
                   <td className="muted">
                     {egressOverage > 0
-                      ? `${egressOverage.toFixed(3)} TB over the 1× fair-use limit`
+                      ? `${egressOverage.toFixed(3)} TiB over the 1× fair-use limit`
                       : "Within fair-use limit"}
                   </td>
                   <td style={{ textAlign: "right" }} className={egressOverage > 0 ? "danger-text" : "muted"}>

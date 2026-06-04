@@ -148,7 +148,7 @@ export function OperationsPage() {
           label="Egress this month"
           value={egressUsed}
           max={Math.max(egressBudgetBytes, egressUsed, 1)}
-          display={`${formatBytes(egressUsed)} / ${tenant?.budgets.egressTbMonth ?? 0} TB budget`}
+          display={`${formatBytes(egressUsed)} / ${tenant?.budgets.egressTbMonth ?? 0} TiB budget`}
           color={egressConsumed >= 0.95 ? "var(--danger)" : "var(--ok)"}
         />
         <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
