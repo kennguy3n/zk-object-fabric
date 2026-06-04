@@ -293,6 +293,25 @@ type AbuseConfig struct {
 	// to alert-only.
 	ThrottleOnAnomaly bool `json:"throttle_on_anomaly"`
 
+	// RateLimitFailClosed makes the per-tenant rate limiter reject
+	// requests whose tenant budget cannot be resolved (the
+	// RateLimiter.Allow path where the budget lookup returns ok=false
+	// or a non-positive rps) instead of letting them through. This
+	// closes the fail-open hole where a budget-directory outage during
+	// a flood silently disables rate limiting for every tenant the
+	// limiter cannot price.
+	//
+	// The effective posture is environment-driven and must be read
+	// through Config.RateLimitFailClosedEnabled rather than this field
+	// directly: production deployments (Env == "production") are
+	// always fail-closed — mirroring the env=production security
+	// guards elsewhere in this file (e.g. the local-CMK guard and
+	// RequireAuth) so the audited posture cannot be silently lost —
+	// while every other environment is fail-open unless an operator
+	// opts in by setting this to true. The default zero value
+	// therefore keeps non-production deployments backwards compatible.
+	RateLimitFailClosed bool `json:"rate_limit_fail_closed"`
+
 	// BaselineAlpha is the EWMA weight applied to each completed
 	// window. Must be in (0, 1]; zero inherits 0.3.
 	BaselineAlpha float64 `json:"baseline_alpha"`
@@ -535,6 +554,19 @@ func rebalancerPresent(data []byte) bool {
 	}
 	_, ok := raw["rebalancer"]
 	return ok
+}
+
+// RateLimitFailClosedEnabled reports the effective fail-closed posture
+// for the per-tenant rate limiter. Production deployments are always
+// fail-closed so the security-audited posture (a budget-resolution
+// outage must not silently disable rate limiting under a flood) cannot
+// be lost by omission; this mirrors the env=production-derived booleans
+// elsewhere in the boot path (e.g. RequireAuth). Every other
+// environment honours the explicit AbuseConfig.RateLimitFailClosed
+// opt-in, which defaults to false to preserve the historical fail-open
+// behaviour for developer ergonomics.
+func (c *Config) RateLimitFailClosedEnabled() bool {
+	return c.Env == "production" || c.Abuse.RateLimitFailClosed
 }
 
 // GatewayConfig configures the S3-compatible gateway fleet on Linode.

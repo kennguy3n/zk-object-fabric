@@ -434,6 +434,10 @@ func main() {
 			auth.TenantResolverFromAuth(authenticator),
 		)
 		rl.AlertSink = alertSink
+		// Production is always fail-closed; other environments opt in
+		// via abuse.rate_limit_fail_closed (see
+		// Config.RateLimitFailClosedEnabled).
+		rl.FailClosed = cfg.RateLimitFailClosedEnabled()
 		applyAbuseConfigToRateLimiter(rl, cfg.Abuse)
 		// The abuse guard layers per-tenant egress bandwidth
 		// budgets, 2x-of-baseline anomaly detection, and the

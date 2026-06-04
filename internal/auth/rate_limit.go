@@ -74,8 +74,8 @@ type AlertSink interface {
 //
 // The zero value is not useful. Construct with NewRateLimiter and
 // optionally set AlertSink, AnomalyMultiplier, AnomalyWindow,
-// AnomalyCooldown, ThrottleOnAnomaly, and EgressLookup before
-// installing the middleware.
+// AnomalyCooldown, ThrottleOnAnomaly, FailClosed, and EgressLookup
+// before installing the middleware.
 type RateLimiter struct {
 	Lookup       RateLimitLookup
 	EgressLookup EgressBudgetLookup
@@ -114,6 +114,18 @@ type RateLimiter struct {
 	// HTTP 429 for requests that land inside an active anomaly
 	// cooldown window. When false the limiter only alerts.
 	ThrottleOnAnomaly bool
+
+	// FailClosed controls Allow's behaviour when a tenant's budget
+	// cannot be resolved (Lookup returns ok=false, or a non-positive
+	// rps). When false (the default) such requests pass through so a
+	// misconfigured or not-yet-provisioned tenant is not locked out
+	// and the Authenticator gets the final say — this is the
+	// fail-open posture. When true the limiter rejects those requests
+	// instead, so that a directory/budget-resolution outage during a
+	// flood cannot silently disable rate limiting for every tenant it
+	// cannot price. The normal token-bucket path (budget resolved) is
+	// unaffected either way.
+	FailClosed bool
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -212,13 +224,18 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 }
 
 // Allow reserves one request for tenantID. It returns false when the
-// bucket is empty.
+// bucket is empty, or when the tenant's budget cannot be resolved and
+// the limiter is configured fail-closed (see FailClosed).
 func (l *RateLimiter) Allow(tenantID string) bool {
 	rps, burst, ok := l.Lookup(tenantID)
 	if !ok || rps <= 0 {
-		// Unknown tenant or no budget configured: allow through so
-		// the Authenticator can reject the request if needed.
-		return true
+		// The tenant's budget could not be resolved (unknown tenant,
+		// no budget configured, or the budget directory is
+		// unreachable). Fail open by default so the Authenticator can
+		// reject the request if needed; fail closed when configured so
+		// a budget-resolution outage cannot silently disable rate
+		// limiting for traffic the limiter cannot price.
+		return !l.FailClosed
 	}
 	if burst <= 0 {
 		burst = rps

@@ -66,6 +66,99 @@ func TestRateLimiter_AllowTokenBucket(t *testing.T) {
 	}
 }
 
+// unresolvableLookup returns a RateLimitLookup that can never resolve
+// a tenant budget. ok controls whether the directory claims to know
+// the tenant at all; rps lets a test exercise the "known but
+// non-positive budget" branch. Both shapes hit Allow's
+// budget-unresolvable early-return path.
+func unresolvableLookup(rps int, ok bool) RateLimitLookup {
+	return func(string) (int, int, bool) { return rps, 0, ok }
+}
+
+// TestRateLimiter_FailClosed pins the fail-closed posture: when the
+// tenant budget cannot be resolved, FailClosed=true rejects the
+// request (the gateway would return 429) instead of letting it
+// through. Both the unknown-tenant (ok=false) and the
+// resolved-but-non-positive-budget (rps<=0) branches are covered.
+func TestRateLimiter_FailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rps  int
+		ok   bool
+	}{
+		{name: "unknown tenant", rps: 100, ok: false},
+		{name: "non-positive budget", rps: 0, ok: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := NewRateLimiter(
+				unresolvableLookup(tc.rps, tc.ok),
+				func(*http.Request) (string, bool) { return "t1", true },
+			)
+			l.FailClosed = true
+			if l.Allow("t1") {
+				t.Fatal("FailClosed=true with an unresolvable budget should reject (Allow=false)")
+			}
+		})
+	}
+}
+
+// TestRateLimiter_FailOpenDefault pins the backwards-compatible
+// default: an unresolvable budget passes through (Allow=true) so a
+// not-yet-provisioned or directory-unknown tenant is not locked out
+// and the Authenticator gets the final say.
+func TestRateLimiter_FailOpenDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rps  int
+		ok   bool
+	}{
+		{name: "unknown tenant", rps: 100, ok: false},
+		{name: "non-positive budget", rps: 0, ok: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := NewRateLimiter(
+				unresolvableLookup(tc.rps, tc.ok),
+				func(*http.Request) (string, bool) { return "t1", true },
+			)
+			// FailClosed defaults to false; assert it explicitly so the
+			// backwards-compatible default is self-documenting.
+			if l.FailClosed {
+				t.Fatal("NewRateLimiter must default to fail-open (FailClosed=false)")
+			}
+			if !l.Allow("t1") {
+				t.Fatal("fail-open default with an unresolvable budget should allow (Allow=true)")
+			}
+		})
+	}
+}
+
+// TestRateLimiter_FailClosedDoesNotAffectResolvedBudget verifies the
+// normal token-bucket path is unchanged when the budget resolves:
+// FailClosed only governs the unresolvable-budget branch, so a tenant
+// with a real budget still gets exactly `burst` tokens before the
+// bucket empties regardless of the flag.
+func TestRateLimiter_FailClosedDoesNotAffectResolvedBudget(t *testing.T) {
+	now := time.Unix(0, 0)
+	clock := func() time.Time { return now }
+	l := NewRateLimiter(fixedLookup(2, 2), func(*http.Request) (string, bool) { return "t1", true })
+	l.Clock = clock
+	l.FailClosed = true
+
+	if !l.Allow("t1") {
+		t.Fatal("first request should consume a token even with FailClosed=true")
+	}
+	if !l.Allow("t1") {
+		t.Fatal("second request should consume the remaining token")
+	}
+	if l.Allow("t1") {
+		t.Fatal("third request should be throttled by the empty bucket, not the fail-closed flag")
+	}
+	now = now.Add(time.Second)
+	if !l.Allow("t1") {
+		t.Fatal("token should be refilled after 1 second regardless of FailClosed")
+	}
+}
+
 func TestRateLimiter_BudgetExhaustionRejects(t *testing.T) {
 	now := time.Unix(0, 0).UTC()
 	clock := func() time.Time { return now }
@@ -314,11 +407,11 @@ func TestTenantEgressBudgetLookup_ConvertsTBToBytes(t *testing.T) {
 		AccessKey: "AK",
 		SecretKey: "SK",
 		Tenant: tenant.Tenant{
-			ID:           "tenant-1",
-			Name:         "t",
-			ContractType: tenant.ContractB2CPooled,
-			LicenseTier:  tenant.LicenseStandard,
-			Keys:         tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
+			ID:               "tenant-1",
+			Name:             "t",
+			ContractType:     tenant.ContractB2CPooled,
+			LicenseTier:      tenant.LicenseStandard,
+			Keys:             tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
 			PlacementDefault: tenant.PlacementDefault{PolicyRef: "p"},
 			Budgets: tenant.Budgets{
 				RequestsPerSec: 50,
@@ -350,14 +443,14 @@ func TestTenantBudgetsLookup_ZeroRPSSkipsLimiter(t *testing.T) {
 		AccessKey: "AK",
 		SecretKey: "SK",
 		Tenant: tenant.Tenant{
-			ID:           "tenant-1",
-			Name:         "t",
-			ContractType: tenant.ContractB2CPooled,
-			LicenseTier:  tenant.LicenseStandard,
-			Keys:         tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
+			ID:               "tenant-1",
+			Name:             "t",
+			ContractType:     tenant.ContractB2CPooled,
+			LicenseTier:      tenant.LicenseStandard,
+			Keys:             tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
 			PlacementDefault: tenant.PlacementDefault{PolicyRef: "p"},
-			Budgets:      tenant.Budgets{RequestsPerSec: 0},
-			Billing:      tenant.Billing{Currency: "USD"},
+			Budgets:          tenant.Budgets{RequestsPerSec: 0},
+			Billing:          tenant.Billing{Currency: "USD"},
 		},
 	})
 	if err != nil {

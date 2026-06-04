@@ -355,12 +355,34 @@ The auditor should:
 
 ### 7.1 Rate limiter (`internal/auth/rate_limit.go`)
 
-The rate limiter is a per-tenant token bucket
-(`RateLimiter.Allow`, line 216-259) with Redis-backed shared
-state. The current implementation is **fail-open** when Redis is
-unreachable — Workstream 2.4 will add a `fail_closed` mode.
+The rate limiter is a purely in-memory, per-process per-tenant
+token bucket (`RateLimiter.Allow`). There is no Redis or other
+shared backing store: each gateway holds its own `buckets` map and
+resolves a tenant's steady-state rate/burst through the injected
+`RateLimitLookup` (`TenantBudgetsLookup` over the tenant store).
+The realistic outage is therefore *budget resolution*, not a Redis
+round-trip: when `Lookup` returns `ok=false` or a non-positive
+`rps`, `Allow` takes an early-return path before the bucket logic.
+
+That early-return path is now **fail-closed configurable**.
+`RateLimiter.FailClosed` (default `false`) governs it: when
+`false` the limiter fails **open** (the request passes through so
+the `Authenticator` can still reject it), preserving the historical
+behaviour; when `true` the limiter fails **closed**, rejecting
+(HTTP 429) any request whose budget it cannot resolve so a
+budget-directory outage during a flood cannot silently disable rate
+limiting for every tenant the limiter cannot price. The gateway
+sets this from `Config.RateLimitFailClosedEnabled()`
+(`internal/config/config.go`): `Env == "production"` is always
+fail-closed, while other environments opt in via
+`abuse.rate_limit_fail_closed`.
 
 The auditor should:
+
+- Confirm production deployments resolve to fail-closed
+  (`RateLimitFailClosedEnabled` returns true for
+  `Env == "production"` regardless of the explicit flag) so the
+  posture cannot be lost by omitting the config key.
 
 - Verify the limiter is invoked **before** the request body is
   read on every PUT/GET path. A naive implementation that

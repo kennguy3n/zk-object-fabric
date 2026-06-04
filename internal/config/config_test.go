@@ -118,6 +118,29 @@ func TestLifecycleConfig_DefaultEnabledDaily(t *testing.T) {
 	}
 }
 
+func TestRateLimitFailClosedEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		env       string
+		failField bool
+		want      bool
+	}{
+		{name: "development default fail-open", env: "development", failField: false, want: false},
+		{name: "development opt-in fail-closed", env: "development", failField: true, want: true},
+		{name: "production default fail-closed", env: "production", failField: false, want: true},
+		{name: "production stays fail-closed when flag set", env: "production", failField: true, want: true},
+		{name: "empty env treated as non-production", env: "", failField: false, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Env: tc.env}
+			cfg.Abuse.RateLimitFailClosed = tc.failField
+			if got := cfg.RateLimitFailClosedEnabled(); got != tc.want {
+				t.Fatalf("RateLimitFailClosedEnabled(env=%q, field=%v) = %v, want %v", tc.env, tc.failField, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLifecycleConfig_OmittedBlockKeepsDefaultEnabled(t *testing.T) {
 	// Load starts from Default(), so a config file with no
 	// "lifecycle" block keeps the daily evaluator enabled.
