@@ -20,12 +20,23 @@ pipeline's `MinStorageTracker` and the placement engine's cost model
 
 ### Estimating the early-delete charge
 
-The residual charge for deleting `sizeBytes` after `age` days is:
+The residual charge for deleting `sizeBytes` of age `age` is computed
+from the **precise** remaining duration of the window (not a rounded
+day count), so partial days are billed proportionally:
 
 ```
-remaining_days   = max(0, 90 - age_days)
-residual_cost_usd = (sizeBytes / 1e12) * 6.99 * (remaining_days / 30)
+billable_remainder = max(0, 90d - age)        # a duration, sub-day precise
+residual_cost_usd  = (sizeBytes / 1e12) * 6.99 * (billable_remainder / 30d)
 ```
+
+This matches `MinStorageWarning.EstimatedEarlyDeleteCostUSD(sizeBytes)`
+exactly. Note that `RemainingDays` (the value shown in the
+`X-Zkof-Wasabi-Min-Storage-Remaining-Days` header, see §4) is the same
+remainder rounded **up** to whole days for display — so for an object
+with, say, 12 hours left, the header reads `1` day while the dollar
+estimate prices only the actual ½ day. Use `BillableRemainder` /
+`EstimatedEarlyDeleteCostUSD` for billing math and `RemainingDays`
+purely as an operator-facing display value.
 
 `providers/wasabi.MinStorageDurationWarning(storedAt, now)` returns
 this window state (`WithinMinStorageWindow`, `RemainingDays`,
@@ -103,6 +114,18 @@ These headers are **advisory only** — the DELETE still succeeds (HTTP
 window, for non-Wasabi backends, or for versioning-enabled deletes that
 merely insert a delete marker (no bytes are removed, so no early-delete
 charge applies).
+
+**Caveat — objects with no creation timestamp:** the warning is
+derived from the object manifest's `CreatedAt`. Manifests written
+before creation-timestamp tracking existed (pre-WS8.2) carry a zero
+`CreatedAt`; for those the gateway cannot determine the object's age,
+so it **fails open** and emits no warning, even if the object is in
+fact within the 90-day window. This is deliberate (better to stay
+silent than assert a charge we can't substantiate), but it means the
+header is not a substitute for the billing pipeline's
+`MinStorageTracker`, which tracks per-piece age authoritatively. For
+older objects, rely on the billing pipeline rather than the DELETE
+header.
 
 Operators and console UIs can use these headers (and the
 `wasabi_min_storage_remaining_days`-style fields surfaced by listing
