@@ -63,7 +63,15 @@ func (h LegalHold) Matches(tenantID, bucket, objectKey string) bool {
 // follow-up.
 type LegalHoldStore interface {
 	Create(ctx context.Context, hold LegalHold) error
-	Release(ctx context.Context, id string) error
+	// Release atomically marks the hold released for (tenantID, id).
+	// The release is tenant-scoped and conditional on the hold still
+	// being active, so it does double duty as the authorization
+	// check: a hold that does not exist, belongs to another tenant,
+	// or is already released all report ErrLegalHoldNotFound in a
+	// single round-trip — there is no separate Get-then-check step
+	// to race against (TOCTOU) and no way to probe another tenant's
+	// hold IDs.
+	Release(ctx context.Context, tenantID, id string) error
 	Get(ctx context.Context, id string) (LegalHold, error)
 	List(ctx context.Context, tenantID string) ([]LegalHold, error)
 	Active(ctx context.Context, tenantID, bucket, objectKey string) ([]LegalHold, error)
@@ -110,12 +118,16 @@ func (s *MemoryLegalHoldStore) Create(_ context.Context, hold LegalHold) error {
 }
 
 // Release marks the hold released; the record stays in the
-// store for audit trail purposes.
-func (s *MemoryLegalHoldStore) Release(_ context.Context, id string) error {
+// store for audit trail purposes. The lookup is tenant-scoped and
+// guards on the hold still being active, mirroring the SQL stores'
+// WHERE id = ? AND tenant_id = ? AND released = 0 clause: a hold
+// that is missing, owned by another tenant, or already released
+// all report ErrLegalHoldNotFound.
+func (s *MemoryLegalHoldStore) Release(_ context.Context, tenantID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h, ok := s.holds[id]
-	if !ok || h.Released {
+	if !ok || h.TenantID != tenantID || h.Released {
 		return ErrLegalHoldNotFound
 	}
 	h.Released = true

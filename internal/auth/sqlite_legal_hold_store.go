@@ -107,10 +107,14 @@ INSERT INTO legal_holds (
 }
 
 // Release marks the hold released; the row stays in place so the
-// compliance audit trail is preserved.
-func (s *SQLiteLegalHoldStore) Release(ctx context.Context, id string) error {
-	const q = `UPDATE legal_holds SET released = 1, released_at = ? WHERE id = ? AND released = 0`
-	res, err := s.db.ExecContext(ctx, q, s.clock().UTC(), id)
+// compliance audit trail is preserved. The UPDATE is tenant-scoped
+// and conditional on released = 0, so the same statement both
+// authorizes the caller (a hold owned by another tenant matches 0
+// rows) and enforces idempotency (an already-released hold matches
+// 0 rows) atomically — no separate Get/authorize round-trip.
+func (s *SQLiteLegalHoldStore) Release(ctx context.Context, tenantID, id string) error {
+	const q = `UPDATE legal_holds SET released = 1, released_at = ? WHERE id = ? AND tenant_id = ? AND released = 0`
+	res, err := s.db.ExecContext(ctx, q, s.clock().UTC(), id, tenantID)
 	if err != nil {
 		return fmt.Errorf("legal_hold: release: %w", err)
 	}
