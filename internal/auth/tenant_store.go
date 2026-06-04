@@ -68,6 +68,16 @@ type TenantStore interface {
 	// whether to enable the rate limiter / abuse guard; zero
 	// bindings means a dev / test deploy with no tenants wired.
 	Size() int
+
+	// CountTenants returns the number of distinct tenants, counting
+	// a tenant once regardless of how many API-key bindings it
+	// holds (and including tenants registered via CreateTenant that
+	// have no binding yet). Unlike Size (a binding count), this is
+	// the correct divisor for amortizing fixed per-tenant
+	// infrastructure spend across the tenant base: a tenant with N
+	// keys must still count once. The billing cost aggregator
+	// (DefaultCostAggregator.ActiveTenants) consumes it.
+	CountTenants() int
 }
 
 // MemoryTenantStore is the Phase 2 in-memory TenantStore.
@@ -188,6 +198,23 @@ func (s *MemoryTenantStore) Size() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.byAccess)
+}
+
+// CountTenants implements TenantStore. It unions the tenant IDs that
+// have bindings (byAccess) with those registered via CreateTenant but
+// not yet bound (tenants), so a tenant with multiple keys counts once
+// and a key-less tenant still counts.
+func (s *MemoryTenantStore) CountTenants() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make(map[string]struct{}, len(s.byAccess)+len(s.tenants))
+	for _, b := range s.byAccess {
+		ids[b.Tenant.ID] = struct{}{}
+	}
+	for id := range s.tenants {
+		ids[id] = struct{}{}
+	}
+	return len(ids)
 }
 
 // ListBindingsByTenantID returns every binding whose Tenant.ID

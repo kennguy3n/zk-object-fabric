@@ -223,3 +223,18 @@ func (s *PostgresTenantStore) Size() int {
 	}
 	return n
 }
+
+// CountTenants implements TenantStore. The tenants table holds one
+// row per distinct tenant (AddBinding's foreign key requires the row
+// to exist first, and DeleteTenant cascades to its bindings), so its
+// row count is the distinct-tenant total regardless of how many
+// API-key bindings each tenant holds. Returns 0 on query error,
+// matching Size's fail-safe behavior.
+func (s *PostgresTenantStore) CountTenants() int {
+	const q = `SELECT COUNT(*) FROM tenants`
+	var n int
+	if err := s.db.QueryRow(q).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
