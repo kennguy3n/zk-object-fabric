@@ -19,12 +19,13 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 // Config is the store wiring. Table defaults to "bucket_versioning",
 // LockTable to "bucket_object_lock", CorsTable to "bucket_cors",
-// LifecycleTable to "bucket_lifecycle", and NotificationTable to
-// "bucket_notification".
+// LifecycleTable to "bucket_lifecycle", NotificationTable to
+// "bucket_notification", and EncryptionTable to "bucket_encryption".
 type Config struct {
 	DB                *sql.DB
 	Table             string
@@ -32,6 +33,7 @@ type Config struct {
 	CorsTable         string
 	LifecycleTable    string
 	NotificationTable string
+	EncryptionTable   string
 }
 
 // Store is a bucket_config.Store backed by SQLite tables.
@@ -42,6 +44,7 @@ type Store struct {
 	corsTable         string
 	lifecycleTable    string
 	notificationTable string
+	encryptionTable   string
 }
 
 var _ bucket_config.Store = (*Store)(nil)
@@ -80,6 +83,13 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(lifecycleTable) {
 		return nil, fmt.Errorf("sqlite: invalid lifecycle table name %q", lifecycleTable)
 	}
+	encryptionTable := cfg.EncryptionTable
+	if encryptionTable == "" {
+		encryptionTable = "bucket_encryption"
+	}
+	if !isSafeIdent(encryptionTable) {
+		return nil, fmt.Errorf("sqlite: invalid encryption table name %q", encryptionTable)
+	}
 	notificationTable := cfg.NotificationTable
 	if notificationTable == "" {
 		notificationTable = "bucket_notification"
@@ -87,7 +97,7 @@ func New(cfg Config) (*Store, error) {
 	if !isSafeIdent(notificationTable) {
 		return nil, fmt.Errorf("sqlite: invalid notification table name %q", notificationTable)
 	}
-	s := &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable, lifecycleTable: lifecycleTable, notificationTable: notificationTable}
+	s := &Store{db: cfg.DB, table: table, lockTable: lockTable, corsTable: corsTable, lifecycleTable: lifecycleTable, notificationTable: notificationTable, encryptionTable: encryptionTable}
 	if err := s.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
@@ -137,6 +147,16 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	)`, s.lifecycleTable)
 	if _, err := s.db.ExecContext(ctx, lcq); err != nil {
 		return fmt.Errorf("sqlite: ensure bucket_lifecycle schema: %w", err)
+	}
+	eq := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		tenant_id  TEXT NOT NULL,
+		bucket     TEXT NOT NULL,
+		config     TEXT NOT NULL,
+		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (tenant_id, bucket)
+	)`, s.encryptionTable)
+	if _, err := s.db.ExecContext(ctx, eq); err != nil {
+		return fmt.Errorf("sqlite: ensure bucket_encryption schema: %w", err)
 	}
 	nq := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		tenant_id  TEXT NOT NULL,
@@ -437,6 +457,66 @@ func (s *Store) ListLifecycle(ctx context.Context) ([]bucket_config.LifecycleEnt
 		return nil, fmt.Errorf("sqlite: bucket_lifecycle list rows: %w", err)
 	}
 	return out, nil
+}
+
+// GetEncryption returns the bucket default SSE config for (tenantID,
+// bucket) or the zero Config when no row exists.
+func (s *Store) GetEncryption(ctx context.Context, tenantID, bucket string) (sse.Config, error) {
+	if tenantID == "" || bucket == "" {
+		return sse.Config{}, errors.New("sqlite: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`SELECT config FROM %s WHERE tenant_id = ? AND bucket = ?`, s.encryptionTable)
+	var raw []byte
+	switch err := s.db.QueryRowContext(ctx, q, tenantID, bucket).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+		return sse.Config{}, nil
+	case err != nil:
+		return sse.Config{}, fmt.Errorf("sqlite: bucket_encryption get: %w", err)
+	}
+	var cfg sse.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return sse.Config{}, fmt.Errorf("sqlite: bucket_encryption decode: %w", err)
+	}
+	return cfg, nil
+}
+
+// SetEncryption upserts the bucket default SSE config for (tenantID,
+// bucket).
+func (s *Store) SetEncryption(ctx context.Context, tenantID, bucket string, cfg sse.Config) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("sqlite: tenant_id and bucket are required")
+	}
+	if err := cfg.Valid(); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("sqlite: bucket_encryption encode: %w", err)
+	}
+	q := fmt.Sprintf(`
+		INSERT INTO %s (tenant_id, bucket, config, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT (tenant_id, bucket)
+		DO UPDATE SET config = excluded.config, updated_at = CURRENT_TIMESTAMP
+	`, s.encryptionTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket, raw); err != nil {
+		return fmt.Errorf("sqlite: bucket_encryption set: %w", err)
+	}
+	return nil
+}
+
+// DeleteEncryption removes the bucket default SSE config for (tenantID,
+// bucket). Deleting an unconfigured bucket is a no-op, matching S3's
+// idempotent DeleteBucketEncryption.
+func (s *Store) DeleteEncryption(ctx context.Context, tenantID, bucket string) error {
+	if tenantID == "" || bucket == "" {
+		return errors.New("sqlite: tenant_id and bucket are required")
+	}
+	q := fmt.Sprintf(`DELETE FROM %s WHERE tenant_id = ? AND bucket = ?`, s.encryptionTable)
+	if _, err := s.db.ExecContext(ctx, q, tenantID, bucket); err != nil {
+		return fmt.Errorf("sqlite: bucket_encryption delete: %w", err)
+	}
+	return nil
 }
 
 // isSafeIdent guards the table name we interpolate into SQL.

@@ -87,3 +87,19 @@ CREATE TABLE IF NOT EXISTS bucket_notification (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, bucket)
 );
+
+-- Per-bucket default server-side encryption configuration (WS8.7). The
+-- never-configured state is the absence of a row, surfaced to callers
+-- as an empty sse.Config and to the S3 API as 404
+-- ServerSideEncryptionConfigurationNotFoundError. The default
+-- (algorithm + optional KMS key + bucket-key flag) is stored as one
+-- JSON document — the stable encoding owned by metadata/sse — for
+-- symmetry with the other JSON-backed sub-resources.
+-- DeleteBucketEncryption removes the row.
+CREATE TABLE IF NOT EXISTS bucket_encryption (
+    tenant_id  TEXT NOT NULL,
+    bucket     TEXT NOT NULL,
+    config     TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, bucket)
+);

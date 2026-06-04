@@ -558,7 +558,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 //	                   GetBucketAcl, PutBucketAcl)
 //	lifecycle          Bucket lifecycle configuration
 //	policy             Bucket policy document
-//	encryption         Bucket-level SSE configuration
 //	logging            Bucket logging configuration
 //	replication        Cross-region replication configuration
 //	accelerate         Transfer-acceleration toggle
@@ -580,8 +579,9 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // `?versioning` routing was added to the dispatch switch. Object
 // Lock (WS8.3) followed the same path for `object-lock`, `retention`,
 // and `legal-hold`, bucket CORS (WS8.5) for `cors`, bucket
-// lifecycle (WS8.2) for `lifecycle`, and bucket event notifications
-// (WS8.6) for `notification`.
+// lifecycle (WS8.2) for `lifecycle`, bucket event notifications
+// (WS8.6) for `notification`, and bucket default encryption
+// (WS8.7) for `encryption`.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -606,7 +606,6 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 var unsupportedSubresources = map[string]string{
 	"acl":                 "NotImplemented",
 	"policy":              "NotImplemented",
-	"encryption":          "NotImplemented",
 	"logging":             "NotImplemented",
 	"replication":         "NotImplemented",
 	"accelerate":          "NotImplemented",
@@ -738,6 +737,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutBucketNotificationConfiguration(w, r)
 			return
 		}
+		// Bucket default encryption (PUT /{bucket}?encryption) — WS8.7.
+		// Bucket-level sub-resource; route before the
+		// implicit-CreateBucket / CopyObject / Put branches.
+		if q.Has("encryption") {
+			h.PutBucketEncryption(w, r)
+			return
+		}
 		if q.Has("retention") {
 			h.PutObjectRetention(w, r)
 			return
@@ -810,6 +816,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.GetBucketNotificationConfiguration(w, r, bucket)
 			return
 		}
+		// Bucket default encryption (GET /{bucket}?encryption) — WS8.7.
+		// Guard on key=="" so GET /{bucket}/{key}?encryption falls
+		// through to the object GET.
+		if key == "" && q.Has("encryption") {
+			h.GetBucketEncryption(w, r, bucket)
+			return
+		}
 		if key != "" && q.Has("retention") {
 			h.GetObjectRetention(w, r)
 			return
@@ -868,6 +881,11 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		// Bucket lifecycle config (DELETE /{bucket}?lifecycle) — WS8.2.
 		if q.Has("lifecycle") {
 			h.DeleteBucketLifecycleConfiguration(w, r)
+			return
+		}
+		// Bucket default encryption (DELETE /{bucket}?encryption) — WS8.7.
+		if q.Has("encryption") {
+			h.DeleteBucketEncryption(w, r)
 			return
 		}
 		// Bucket event notifications (DELETE /{bucket}?notification) —
@@ -982,6 +1000,18 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Layer the bucket default-encryption configuration (WS8.7) over
+	// the placement policy: when the policy leaves the mode empty, a
+	// configured bucket default promotes the write to managed. Done
+	// before the EC / dedup branches so every write path sees the same
+	// effective mode.
+	effMode, err := h.effectiveEncryptionMode(r.Context(), tenantID, bucket, policy)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured", err.Error(), r.URL.Path)
+		return
+	}
+	policy.EncryptionMode = effMode
 
 	if policy.ErasureProfile != "" {
 		h.putErasureCoded(w, r, tenantID, bucket, key, backendName, provider, policy)

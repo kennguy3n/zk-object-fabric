@@ -8,6 +8,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/lifecycle"
 	"github.com/kennguy3n/zk-object-fabric/metadata/notification"
 	"github.com/kennguy3n/zk-object-fabric/metadata/object_lock"
+	"github.com/kennguy3n/zk-object-fabric/metadata/sse"
 )
 
 func TestMemoryStore_GetUnsetIsDefault(t *testing.T) {
@@ -340,6 +341,77 @@ func TestMemoryStore_LifecycleValidatesAndRequiresKeys(t *testing.T) {
 	}
 	if err := s.DeleteLifecycle(ctx, "t1", ""); err == nil {
 		t.Fatal("DeleteLifecycle(empty bucket): want error")
+	}
+}
+
+func TestMemoryStore_EncryptionRoundTrip(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+
+	// Unconfigured bucket → empty Config, nil error.
+	got, err := s.GetEncryption(ctx, "t1", "b1")
+	if err != nil {
+		t.Fatalf("GetEncryption: %v", err)
+	}
+	if !got.Empty() {
+		t.Fatalf("unconfigured bucket = %+v, want empty", got)
+	}
+
+	cfg := sse.Config{Algorithm: sse.AWSKMS, KMSMasterKeyID: "arn:key", BucketKeyEnabled: true}
+	if err := s.SetEncryption(ctx, "t1", "b1", cfg); err != nil {
+		t.Fatalf("SetEncryption: %v", err)
+	}
+	got, _ = s.GetEncryption(ctx, "t1", "b1")
+	if got != cfg {
+		t.Fatalf("round-trip = %+v, want %+v", got, cfg)
+	}
+
+	// Overwrite with AES256.
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{Algorithm: sse.AES256}); err != nil {
+		t.Fatalf("SetEncryption(AES256): %v", err)
+	}
+	if got, _ := s.GetEncryption(ctx, "t1", "b1"); got.Algorithm != sse.AES256 || got.KMSMasterKeyID != "" {
+		t.Fatalf("after overwrite = %+v, want AES256 with no KMS key", got)
+	}
+
+	// Tenant/bucket isolation.
+	if other, _ := s.GetEncryption(ctx, "t1", "b2"); !other.Empty() {
+		t.Fatalf("t1/b2 leaked config: %+v", other)
+	}
+	if other, _ := s.GetEncryption(ctx, "t2", "b1"); !other.Empty() {
+		t.Fatalf("t2/b1 leaked config: %+v", other)
+	}
+
+	// Delete clears it; deleting again is a no-op.
+	if err := s.DeleteEncryption(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteEncryption: %v", err)
+	}
+	if got, _ := s.GetEncryption(ctx, "t1", "b1"); !got.Empty() {
+		t.Fatalf("after delete = %+v, want empty", got)
+	}
+	if err := s.DeleteEncryption(ctx, "t1", "b1"); err != nil {
+		t.Fatalf("DeleteEncryption (idempotent): %v", err)
+	}
+}
+
+func TestMemoryStore_EncryptionValidatesAndRequiresKeys(t *testing.T) {
+	t.Parallel()
+	s := NewMemoryStore()
+	ctx := context.Background()
+	// Invalid config (empty algorithm) is rejected.
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{}); err == nil {
+		t.Fatal("SetEncryption(empty config): want error")
+	}
+	// AES256 with a KMS key id is rejected by Config.Valid.
+	if err := s.SetEncryption(ctx, "t1", "b1", sse.Config{Algorithm: sse.AES256, KMSMasterKeyID: "arn:key"}); err == nil {
+		t.Fatal("SetEncryption(AES256 + KMS key): want error")
+	}
+	if _, err := s.GetEncryption(ctx, "", "b1"); err == nil {
+		t.Fatal("GetEncryption(empty tenant): want error")
+	}
+	if err := s.DeleteEncryption(ctx, "t1", ""); err == nil {
+		t.Fatal("DeleteEncryption(empty bucket): want error")
 	}
 }
 

@@ -1681,17 +1681,17 @@ func buildBucketConfigStore(cfg config.Config, db, embeddedDB *sql.DB) bucket_co
 			if err != nil {
 				log.Fatalf("gateway: build embedded bucket_config store: %v", err)
 			}
-			log.Printf("gateway: embedded SQLite bucket_config store enabled (versioning, object-lock, cors, lifecycle)")
+			log.Printf("gateway: embedded SQLite bucket_config store enabled (versioning, object-lock, cors, lifecycle, encryption)")
 			return store
 		}
-		log.Printf("gateway: no metadata_dsn; using in-memory bucket_config store (dev only — bucket versioning/object-lock/cors/lifecycle configs do NOT survive restart)")
+		log.Printf("gateway: no metadata_dsn; using in-memory bucket_config store (dev only — bucket versioning/object-lock/cors/lifecycle/encryption configs do NOT survive restart)")
 		return bucket_config.NewMemoryStore()
 	}
 	store, err := bcpostgres.New(bcpostgres.Config{DB: db})
 	if err != nil {
 		log.Fatalf("gateway: build postgres bucket_config store: %v", err)
 	}
-	log.Printf("gateway: postgres bucket_config store enabled (versioning, object-lock, cors, lifecycle)")
+	log.Printf("gateway: postgres bucket_config store enabled (versioning, object-lock, cors, lifecycle, encryption)")
 	return store
 }
 
