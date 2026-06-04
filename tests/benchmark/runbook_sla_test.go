@@ -3,6 +3,7 @@ package benchmark
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -169,26 +170,65 @@ func extractBacktickIdent(s string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
+// digitGroupSpaceRe matches a space (regular or non-breaking) sitting
+// between two digits, i.e. a thousands separator like "10 000".
+var digitGroupSpaceRe = regexp.MustCompile(`(\d)[ \x{00a0}]+(\d)`)
+
+// thresholdNumberRe matches the first numeric literal in a cell,
+// including decimals and scientific notation (e.g. "50", "0.95",
+// "1e-3").
+var thresholdNumberRe = regexp.MustCompile(`[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?`)
+
 // parseThreshold turns a documented threshold cell into a float. It
-// strips comparison operators (≤ ≥ <= >=), unit suffixes (ms, req/s),
-// and the thin/space thousands separators used in the table
-// ("10 000" -> 10000). Returns ok=false when no number is present.
+// collapses digit-grouping spaces ("10 000" -> "10000") and then
+// extracts the first numeric literal, so the comparison operators
+// (≤ ≥ <= >=) and unit suffixes (ms, req/s, ratio) are simply ignored
+// rather than stripped by substring matching. Returns ok=false when no
+// number is present.
 func parseThreshold(cell string) (float64, bool) {
 	s := cell
-	for _, tok := range []string{"≤", "≥", "<=", ">=", "req/s", "rq/s", "ms", "ratio"} {
-		s = strings.ReplaceAll(s, tok, "")
+	// Collapse thousands-separator spaces until none remain, so a
+	// number like "1 000 000" becomes a single contiguous token.
+	for digitGroupSpaceRe.MatchString(s) {
+		s = digitGroupSpaceRe.ReplaceAllString(s, "$1$2")
 	}
-	// Remove all spaces, including the digit-grouping space in
-	// "10 000", so strconv sees a contiguous numeric literal.
-	s = strings.ReplaceAll(s, " ", "")
-	s = strings.ReplaceAll(s, "\u00a0", "") // non-breaking space
-	s = strings.TrimSpace(s)
-	if s == "" {
+	tok := thresholdNumberRe.FindString(s)
+	if tok == "" {
 		return 0, false
 	}
-	v, err := strconv.ParseFloat(s, 64)
+	v, err := strconv.ParseFloat(tok, 64)
 	if err != nil {
 		return 0, false
 	}
 	return v, true
+}
+
+// TestParseThreshold guards the threshold parser against the cell
+// formats used in the runbook SLA table (and a couple of edge cases
+// the table does not currently use but could grow into): comparison
+// operators, unit suffixes, decimals, scientific notation, regular and
+// non-breaking thousands-separator spaces, and non-numeric cells.
+func TestParseThreshold(t *testing.T) {
+	cases := []struct {
+		in   string
+		want float64
+		ok   bool
+	}{
+		{"≤ 50 ms", 50, true},
+		{"≤ 200 ms", 200, true},
+		{"≤ 20 ms", 20, true},
+		{"≥ 10 000 req/s", 10000, true},
+		{"≥ 1\u00a0000\u00a0000 req/s", 1000000, true}, // non-breaking grouping
+		{"≤ 1e-3", 1e-3, true},
+		{"≥ 0.95", 0.95, true},
+		{"<= 0.9 ratio", 0.9, true},
+		{"n/a", 0, false},
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := parseThreshold(c.in)
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("parseThreshold(%q) = (%v, %v), want (%v, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
 }

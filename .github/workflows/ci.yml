@@ -283,18 +283,19 @@ jobs:
 
       - name: Wait for RGW + create compliance bucket
         run: |
-          for i in $(seq 1 90); do
-            if curl -sf http://127.0.0.1:8888/ >/dev/null; then
-              echo "RGW up after $((i*2))s"
-              break
+          # Poll until RGW answers, bounded by a real elapsed-time
+          # deadline (bash $SECONDS) so the reported timing is accurate
+          # and the step fails fast if the container never comes up.
+          deadline=$((SECONDS + 180))
+          until curl -sf http://127.0.0.1:8888/ >/dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "RGW did not come up within 180s" >&2
+              docker logs ceph-demo | tail -50 >&2 || true
+              exit 1
             fi
             sleep 2
           done
-          if ! curl -sf http://127.0.0.1:8888/ >/dev/null; then
-            echo "RGW did not come up" >&2
-            docker logs ceph-demo | tail -50 >&2 || true
-            exit 1
-          fi
+          echo "RGW is up after ${SECONDS}s"
           AWS_ACCESS_KEY_ID=zkof-test-ak \
           AWS_SECRET_ACCESS_KEY=zkof-test-sk-0000000000000000000000000 \
           AWS_DEFAULT_REGION=us-east-1 \
@@ -307,6 +308,9 @@ jobs:
           CEPH_RGW_BUCKET: zkof-ceph-compliance
           CEPH_RGW_ACCESS_KEY: zkof-test-ak
           CEPH_RGW_SECRET_KEY: zkof-test-sk-0000000000000000000000000
+          # Match the region the bucket is created with above and the
+          # us-east-1 region the rest of the conformance suite uses.
+          CEPH_RGW_REGION: us-east-1
         run: go test -v -run TestSuite_CephRGW ./tests/s3_compat/ -timeout 15m
 
       - name: Tear down Ceph RGW demo container
