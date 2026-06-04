@@ -198,7 +198,9 @@ func (h *Handler) DeleteBucketEncryption(w http.ResponseWriter, r *http.Request)
 // effectiveEncryptionMode layers the bucket default-encryption
 // configuration (WS8.7) on top of the tenant placement policy to
 // produce the encryption mode applied to an object write. It is called
-// by Put and CreateMultipartUpload after the policy is resolved.
+// by Put, CreateMultipartUpload, and Copy after the (destination)
+// policy is resolved, so a plaintext source copied into a bucket with a
+// default lands encrypted at the destination like a fresh write.
 //
 // The placement policy is authoritative whenever it already names a
 // mode: client_side (Strict ZK) and an explicit managed /
