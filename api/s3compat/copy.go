@@ -599,6 +599,16 @@ func (h *Handler) writeCopyManifest(
 	if dedupCopy {
 		contentHash = srcManifest.ContentHash
 	}
+	// ChunkSize tracks the actual stored destination piece, never the
+	// inherited source value, exactly as the live PUT path
+	// (handler.go records putRes.SizeBytes) and the AAD migrator do.
+	// For the verbatim/dedup/re-encrypt paths the destination piece is
+	// the same length as the source, so this equals srcManifest.ChunkSize;
+	// for the encrypt-on-copy path (copyEncryptForDefault) the stored
+	// piece is ciphertext, larger than the plaintext source, so pinning
+	// to piece.SizeBytes keeps the ChunkSize == Pieces[0].SizeBytes
+	// invariant that cache-warming budgets and the migrator rely on.
+	chunkSize := piece.SizeBytes
 	manifest := &metadata.ObjectManifest{
 		TenantID:        tenantID,
 		Bucket:          dstBucket,
@@ -606,7 +616,7 @@ func (h *Handler) writeCopyManifest(
 		ObjectKeyHash:   dstHash,
 		VersionID:       dstVersion,
 		ObjectSize:      objectSize,
-		ChunkSize:       srcManifest.ChunkSize,
+		ChunkSize:       chunkSize,
 		ContentHash:     contentHash,
 		Encryption:      enc,
 		PlacementPolicy: srcManifest.PlacementPolicy,

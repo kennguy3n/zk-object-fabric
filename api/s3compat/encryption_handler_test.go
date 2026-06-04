@@ -493,6 +493,10 @@ func TestCopyObject_BucketDefaultPromotesToManaged(t *testing.T) {
 	if plainMan.Encryption.Mode != "" {
 		t.Errorf("copy into no-default bucket Mode = %q, want empty", plainMan.Encryption.Mode)
 	}
+	// Verbatim copy: ChunkSize tracks the (unchanged) stored piece.
+	if len(plainMan.Pieces) != 1 || plainMan.ChunkSize != plainMan.Pieces[0].SizeBytes {
+		t.Errorf("verbatim copy ChunkSize = %d, want == Pieces[0].SizeBytes %v", plainMan.ChunkSize, plainMan.Pieces)
+	}
 
 	// Configure an AES256 default on the destination bucket, then copy.
 	if rec := putEncryption(t, h, "dst", aes256EncryptionBody); rec.Code != http.StatusOK {
@@ -519,6 +523,19 @@ func TestCopyObject_BucketDefaultPromotesToManaged(t *testing.T) {
 	}
 	if len(dstMan.Encryption.WrappedDEK) == 0 {
 		t.Error("copy under default has empty WrappedDEK, want a fresh wrapped key")
+	}
+	// Encrypt-on-copy: the stored piece is ciphertext (larger than the
+	// plaintext source), and ChunkSize must track that stored piece, not
+	// the inherited plaintext source value. Guards the cache-warming /
+	// migrator invariant that ChunkSize == Pieces[0].SizeBytes.
+	if len(dstMan.Pieces) != 1 {
+		t.Fatalf("promoted copy Pieces = %v, want exactly one", dstMan.Pieces)
+	}
+	if dstMan.ChunkSize != dstMan.Pieces[0].SizeBytes {
+		t.Errorf("promoted copy ChunkSize = %d, want == stored ciphertext piece SizeBytes %d", dstMan.ChunkSize, dstMan.Pieces[0].SizeBytes)
+	}
+	if dstMan.ChunkSize <= srcMan.ChunkSize {
+		t.Errorf("promoted copy ChunkSize = %d, want > plaintext source ChunkSize %d (ciphertext is larger; must not inherit the source value)", dstMan.ChunkSize, srcMan.ChunkSize)
 	}
 
 	// The promoted copy must read back as the original plaintext,
