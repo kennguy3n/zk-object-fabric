@@ -3,20 +3,28 @@ package chaos
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kennguy3n/zk-object-fabric/api/s3compat"
+	"github.com/kennguy3n/zk-object-fabric/internal/auth"
 	"github.com/kennguy3n/zk-object-fabric/internal/repair"
 	"github.com/kennguy3n/zk-object-fabric/metadata"
 	"github.com/kennguy3n/zk-object-fabric/metadata/erasure_coding"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store/memory"
+	"github.com/kennguy3n/zk-object-fabric/migration/lazy_read_repair"
 	"github.com/kennguy3n/zk-object-fabric/providers"
 	"github.com/kennguy3n/zk-object-fabric/providers/local_fs_dev"
 )
@@ -566,7 +574,461 @@ func TestChaos_FaultManifestStoreEventualHealReleasesBackpressure(t *testing.T) 
 	}
 }
 
+// TestChaos_MetadataDBFailover injects ManifestStore failures
+// mid-PUT and mid-GET via FaultManifestStore and asserts the gateway
+// fails closed with a 5xx (never a 2xx, never corrupted/partial data)
+// and recovers cleanly once the store is restored.
+//
+// Production-readiness note: the ideal mapping for a transient
+// metadata-store outage is a retryable 503 (S3 ServiceUnavailable) so
+// clients back off and retry. The gateway today maps a manifest-store
+// read error to 500 and a write error to 500 (see resolve() →
+// ManifestGetFailed and Put() → ManifestPutFailed in
+// api/s3compat/handler.go). This test asserts the invariants that
+// actually hold on current main — fail-closed 5xx + clean recovery +
+// no orphaned object from a failed PUT — and records the 500→503 gap
+// rather than pinning a status code the gateway does not yet return.
+func TestChaos_MetadataDBFailover(t *testing.T) {
+	inner := memory.New()
+	fms := NewFaultManifestStore(inner)
+	backing := newChaosBacking(t)
+	h := newChaosGateway(t, s3compat.Config{
+		Manifests: fms,
+		Providers: map[string]providers.StorageProvider{"local": backing},
+		Placement: chaosPlacement{backend: "local"},
+	})
+
+	const bucket, key = "b", "k1"
+	body := []byte("metadata-failover-payload")
+
+	// Phase 1: healthy store. PUT then GET must round-trip.
+	if rec := gwPut(t, h, bucket, key, body); rec.Code != http.StatusOK {
+		t.Fatalf("healthy PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+	if rec := gwGet(t, h, bucket, key); rec.Code != http.StatusOK || rec.Body.String() != string(body) {
+		t.Fatalf("healthy GET status=%d body=%q, want 200 %q", rec.Code, rec.Body.String(), body)
+	}
+
+	// Phase 2: the metadata store's read path fails (primary down).
+	// The GET must fail closed with a server error and must NOT leak
+	// the object bytes.
+	fms.GetFault = FaultConfig{Mode: ModeAlwaysFail, Err: errors.New("chaos: postgres primary unreachable")}
+	rec := gwGet(t, h, bucket, key)
+	if rec.Code/100 != 5 {
+		t.Fatalf("GET under metadata-read failure status = %d, want a 5xx server error", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), string(body)) {
+		t.Errorf("GET under metadata failure leaked object bytes in the error body: %q", rec.Body.String())
+	}
+	t.Logf("metadata-read failure → status %d (production-readiness target: 503 ServiceUnavailable, retryable)", rec.Code)
+
+	// Phase 3: the metadata store's write path fails (primary
+	// read-only). The PUT must fail closed AND must not leave an
+	// orphaned object behind: the gateway rolls the piece back, so a
+	// later GET of the never-committed key is a clean 404, not a 500
+	// or a half-written object.
+	fms.GetFault = FaultConfig{}
+	fms.PutFault = FaultConfig{Mode: ModeAlwaysFail, Err: errors.New("chaos: postgres write path read-only")}
+	const failedKey = "k2"
+	if rec := gwPut(t, h, bucket, failedKey, []byte("never-commits")); rec.Code/100 != 5 {
+		t.Fatalf("PUT under metadata-write failure status = %d, want a 5xx server error", rec.Code)
+	}
+
+	// Phase 4: the store heals. The original object is still
+	// readable (no corruption from the outage) and the failed PUT
+	// left nothing behind.
+	fms.PutFault = FaultConfig{}
+	if rec := gwGet(t, h, bucket, key); rec.Code != http.StatusOK || rec.Body.String() != string(body) {
+		t.Fatalf("post-recovery GET of original status=%d body=%q, want 200 %q", rec.Code, rec.Body.String(), body)
+	}
+	if rec := gwGet(t, h, bucket, failedKey); rec.Code != http.StatusNotFound {
+		t.Errorf("GET of the never-committed key status = %d, want 404 (the failed PUT must not orphan an object)", rec.Code)
+	}
+}
+
+// TestChaos_CachePartition wedges the hot-object cache so every Get
+// errors (L0+L1 both gone) via a nil-Inner FaultCache in
+// ModeAlwaysFail, and asserts every request falls through to the
+// origin provider and serves byte-correct data — the cache being
+// useless must degrade latency, never correctness.
+func TestChaos_CachePartition(t *testing.T) {
+	store := memory.New()
+	backing := newChaosBacking(t)
+	cache := &FaultCache{
+		GetFault: FaultConfig{Mode: ModeAlwaysFail, Err: errors.New("chaos: cache partition (L0+L1 down)")},
+		PutFault: FaultConfig{Mode: ModeAlwaysFail, Err: errors.New("chaos: cache partition (L0+L1 down)")},
+	}
+	h := newChaosGateway(t, s3compat.Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"local": backing},
+		Placement: chaosPlacement{backend: "local"},
+		Cache:     cache,
+	})
+
+	const bucket, key = "b", "cached-obj"
+	body := bytes.Repeat([]byte("partition-fallthrough-"), 64)
+	if rec := gwPut(t, h, bucket, key, body); rec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Every read must fall through to origin with correct bytes.
+	const reads = 5
+	for i := 0; i < reads; i++ {
+		rec := gwGet(t, h, bucket, key)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %d under cache partition status = %d, want 200; body=%s", i, rec.Code, rec.Body)
+		}
+		if !bytes.Equal(rec.Body.Bytes(), body) {
+			t.Fatalf("GET %d served wrong bytes under cache partition (len got=%d want=%d)", i, rec.Body.Len(), len(body))
+		}
+	}
+
+	// The cache must actually have been consulted (proving the
+	// fall-through path, not a disabled cache) and never served a
+	// single hit.
+	if cache.Calls.Load() == 0 {
+		t.Error("cache was never consulted; the GET path did not exercise the cache fall-through")
+	}
+	if cache.Hits.Load() != 0 {
+		t.Errorf("cache reported %d hits under a full partition, want 0", cache.Hits.Load())
+	}
+}
+
+// TestChaos_WasabiTimeout injects a 30s delay on the provider GET/PUT
+// path via FaultProvider (ModeSlowResponse) and asserts the gateway
+// respects the caller's context deadline instead of hanging for the
+// full latency, returning promptly with a 5xx.
+//
+// Production-readiness note: a backend that blows the request budget
+// should surface as 504 GatewayTimeout. The gateway currently maps
+// the resulting context error to 502 BackendGetFailed on the read
+// path. This test asserts the property that matters operationally —
+// the gateway does not pin a goroutine for 30s and fails promptly —
+// and records the 502→504 gap.
+func TestChaos_WasabiTimeout(t *testing.T) {
+	store := memory.New()
+	backing := newChaosBacking(t)
+	fp := NewFaultProvider(backing)
+	h := newChaosGateway(t, s3compat.Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"local": fp},
+		Placement: chaosPlacement{backend: "local"},
+	})
+
+	const bucket, key = "b", "slow-obj"
+	body := []byte("timeout-budget-payload")
+	if rec := gwPut(t, h, bucket, key, body); rec.Code != http.StatusOK {
+		t.Fatalf("seed PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Inject a 30s delay on the GET path and give the request a
+	// short deadline. The gateway must abort near the deadline, not
+	// after 30s.
+	fp.GetFault = FaultConfig{Mode: ModeSlowResponse, Latency: 30 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	h.Get(rec, req)
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("GET took %s under a 30s backend delay with a 200ms deadline; the gateway did not honour the caller timeout", elapsed)
+	}
+	if rec.Code/100 != 5 {
+		t.Fatalf("GET under backend timeout status = %d, want a 5xx server error", rec.Code)
+	}
+	t.Logf("backend timeout → status %d after %s (production-readiness target: 504 GatewayTimeout)", rec.Code, elapsed)
+}
+
+// TestChaos_ConcurrentMigration runs a Wasabi→local_fs_dev migration
+// (driven by the real lazy_read_repair.ReadRepair) while concurrent
+// PUTs and GETs are in flight, and asserts zero data loss and no
+// stale/corrupt reads: every migrated object ends up on the new
+// primary with byte-identical content, every concurrent read returns
+// correct bytes regardless of migration progress, and the
+// concurrently-written objects are all durably stored.
+func TestChaos_ConcurrentMigration(t *testing.T) {
+	wasabi := newChaosBacking(t)
+	local := newChaosBacking(t)
+	store := memory.New()
+	registry := map[string]providers.StorageProvider{"wasabi": wasabi, "local": local}
+	rr := lazy_read_repair.New(registry, store)
+
+	// Gateway whose objects live on "wasabi"; ReadRepair wired so a
+	// read during migration can be served from either backend.
+	hWasabi := newChaosGateway(t, s3compat.Config{
+		Manifests:  store,
+		Providers:  registry,
+		Placement:  chaosPlacement{backend: "wasabi"},
+		ReadRepair: rr,
+	})
+	// A second gateway that writes fresh objects to "local"
+	// concurrently, modelling normal write traffic during migration.
+	hLocal := newChaosGateway(t, s3compat.Config{
+		Manifests: store,
+		Providers: registry,
+		Placement: chaosPlacement{backend: "local"},
+	})
+
+	const bucket = "b"
+	const nObjects = 8
+
+	// Seed migratable objects on wasabi, then mark each manifest as
+	// mid-migration to "local" (Generation 2, PrimaryBackend local)
+	// while the piece still physically lives on wasabi.
+	type seeded struct {
+		key  string
+		body []byte
+		mkey manifest_store.ManifestKey
+	}
+	objs := make([]seeded, nObjects)
+	for i := range objs {
+		key := fmt.Sprintf("mig-%d", i)
+		body := []byte(fmt.Sprintf("migratable-object-%d-payload", i))
+		if rec := gwPut(t, hWasabi, bucket, key, body); rec.Code != http.StatusOK {
+			t.Fatalf("seed PUT %s status = %d, want 200; body=%s", key, rec.Code, rec.Body)
+		}
+		m := latestManifest(t, store, bucket, key)
+		mk := manifest_store.ManifestKey{TenantID: m.TenantID, Bucket: m.Bucket, ObjectKeyHash: m.ObjectKeyHash, VersionID: m.VersionID}
+		m.MigrationState = metadata.MigrationState{Generation: 2, PrimaryBackend: "local", CloudCopy: "wasabi"}
+		if err := store.Put(context.Background(), mk, m); err != nil {
+			t.Fatalf("mark migrating %s: %v", key, err)
+		}
+		objs[i] = seeded{key: key, body: body, mkey: mk}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, nObjects*8)
+
+	// Migrators: copy each object's piece wasabi→local and flip the
+	// manifest primary.
+	for i := range objs {
+		wg.Add(1)
+		go func(o seeded) {
+			defer wg.Done()
+			m := latestManifest(t, store, bucket, o.key)
+			if _, err := rr.Repair(ctx, o.mkey, m, 0); err != nil {
+				errCh <- fmt.Errorf("repair %s: %w", o.key, err)
+			}
+		}(objs[i])
+	}
+
+	// Readers: hammer GETs of the migrating objects; every read must
+	// return correct bytes whether it lands before or after the flip.
+	for i := range objs {
+		wg.Add(1)
+		go func(o seeded) {
+			defer wg.Done()
+			for r := 0; r < 6; r++ {
+				rec := gwGet(t, hWasabi, bucket, o.key)
+				if rec.Code != http.StatusOK {
+					errCh <- fmt.Errorf("concurrent GET %s status=%d body=%s", o.key, rec.Code, rec.Body)
+					return
+				}
+				if !bytes.Equal(rec.Body.Bytes(), o.body) {
+					errCh <- fmt.Errorf("concurrent GET %s served stale/corrupt bytes", o.key)
+					return
+				}
+			}
+		}(objs[i])
+	}
+
+	// Writers: create fresh objects on local during the migration.
+	newBodies := make([][]byte, nObjects)
+	for i := range newBodies {
+		newBodies[i] = []byte(fmt.Sprintf("new-write-%d", i))
+	}
+	for i := range newBodies {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if rec := gwPut(t, hLocal, bucket, fmt.Sprintf("new-%d", idx), newBodies[idx]); rec.Code != http.StatusOK {
+				errCh <- fmt.Errorf("concurrent PUT new-%d status=%d body=%s", idx, rec.Code, rec.Body)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	// Post-conditions: every migrated object now lives on local with
+	// byte-identical content, and reads still serve correct bytes.
+	for _, o := range objs {
+		m := latestManifest(t, store, bucket, o.key)
+		if got := m.Pieces[0].Backend; got != "local" {
+			t.Errorf("object %s piece backend = %q after migration, want local", o.key, got)
+		}
+		rc, err := local.GetPiece(context.Background(), m.Pieces[0].PieceID, nil)
+		if err != nil {
+			t.Errorf("migrated object %s missing on new primary: %v", o.key, err)
+			continue
+		}
+		got, _ := io.ReadAll(rc)
+		_ = rc.Close()
+		if !bytes.Equal(got, o.body) {
+			t.Errorf("migrated object %s content differs on new primary (len got=%d want=%d)", o.key, len(got), len(o.body))
+		}
+		if rec := gwGet(t, hWasabi, bucket, o.key); rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), o.body) {
+			t.Errorf("post-migration GET %s status=%d correct=%v", o.key, rec.Code, bytes.Equal(rec.Body.Bytes(), o.body))
+		}
+	}
+	// Concurrently-written objects must all be durably readable.
+	for i, b := range newBodies {
+		if rec := gwGet(t, hLocal, bucket, fmt.Sprintf("new-%d", i)); rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), b) {
+			t.Errorf("concurrently-written object new-%d lost: status=%d correct=%v", i, rec.Code, bytes.Equal(rec.Body.Bytes(), b))
+		}
+	}
+}
+
+// failClosedAvailable reports whether Session 1's fail-closed
+// budget-resolution gate (e.g. a RateLimiter.FailClosed knob that
+// rejects requests whose egress budget cannot be resolved) has merged
+// into the in-memory limiter. It is intentionally a const false on
+// current main: the limiter fails OPEN when EgressLookup returns
+// ok=false (see AllowEgress in internal/auth/rate_limit.go). Flip this
+// to true once Session 1 lands so the unresolved-budget assertion
+// below tightens from "fails open (today)" to "fails closed". The PR
+// notes this cross-session dependency.
+const failClosedAvailable = false
+
+// TestChaos_RateLimiterFailClosed exercises the in-memory rate
+// limiter's egress-budget resolution path. It pins down two
+// behaviours:
+//
+//  1. A RESOLVED, exhausted egress budget fails closed today: once a
+//     tenant has served its monthly quota the limiter denies further
+//     egress. This is the guarantee that holds on current main.
+//  2. A budget that cannot be RESOLVED (lookup ok=false) currently
+//     fails OPEN. This is the path Session 1's FailClosed work
+//     governs; the assertion is guarded by failClosedAvailable so the
+//     test stays green on main and tightens automatically once
+//     Session 1 merges.
+func TestChaos_RateLimiterFailClosed(t *testing.T) {
+	rpsLookup := func(string) (int, int, bool) { return 1000, 1000, true }
+	resolver := func(*http.Request) (string, bool) { return "tenant-A", true }
+
+	// (1) Resolved-but-exhausted budget must fail closed.
+	rl := auth.NewRateLimiter(rpsLookup, resolver)
+	rl.EgressLookup = func(string) (int64, bool) { return 8, true } // 8-byte monthly budget
+	if !rl.AllowEgress("tenant-A") {
+		t.Fatal("fresh tenant under an unspent budget must be allowed")
+	}
+	rl.Observe("tenant-A", 1024) // blow past the budget
+	if rl.AllowEgress("tenant-A") {
+		t.Fatal("exhausted egress budget must fail closed, but the limiter allowed the request")
+	}
+
+	// (2) Unresolvable budget: the FailClosed-governed path.
+	rl2 := auth.NewRateLimiter(rpsLookup, resolver)
+	rl2.EgressLookup = func(string) (int64, bool) { return 0, false } // cannot resolve the budget
+	allowed := rl2.AllowEgress("tenant-A")
+	if failClosedAvailable {
+		if allowed {
+			t.Fatal("with the FailClosed gate merged, an unresolvable egress budget must fail closed")
+		}
+	} else {
+		if !allowed {
+			t.Fatal("on current main an unresolvable egress budget fails OPEN; got a rejection — did Session 1 merge? flip failClosedAvailable")
+		}
+	}
+}
+
 // --- helpers ---
+
+// chaosPlacement is a minimal s3compat.PlacementEngine that resolves
+// every object to a fixed backend, mirroring fixedPlacement in the
+// s3compat package tests. The single-backend AllowedBackends keeps the
+// placement policy self-consistent for the gateway's validation.
+type chaosPlacement struct{ backend string }
+
+func (p chaosPlacement) ResolveBackend(string, string, string) (string, metadata.PlacementPolicy, error) {
+	return p.backend, metadata.PlacementPolicy{AllowedBackends: []string{p.backend}}, nil
+}
+
+// newChaosBacking builds a real local_fs_dev provider rooted in the
+// test's temp dir. Each call gets an isolated root so multiple
+// backends in one test (e.g. a migration source and target) do not
+// collide.
+func newChaosBacking(t *testing.T) providers.StorageProvider {
+	t.Helper()
+	p, err := local_fs_dev.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local_fs_dev.New: %v", err)
+	}
+	return p
+}
+
+// newChaosGateway constructs an s3compat handler with a deterministic
+// clock (advancing one second per call so repeated PUTs of one key
+// get distinct version ids, matching newAdvancingClockTestHandler in
+// the s3compat tests).
+func newChaosGateway(t *testing.T, cfg s3compat.Config) *s3compat.Handler {
+	t.Helper()
+	if cfg.Now == nil {
+		now := time.Unix(1700000000, 0)
+		var mu sync.Mutex
+		cfg.Now = func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			t := now
+			now = now.Add(time.Second)
+			return t
+		}
+	}
+	return s3compat.New(cfg)
+}
+
+func gwPut(t *testing.T, h *s3compat.Handler, bucket, key string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "/"+bucket+"/"+key, bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	return rec
+}
+
+func gwGet(t *testing.T, h *s3compat.Handler, bucket, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	return rec
+}
+
+// latestManifest returns a clone of the current manifest for
+// bucket/key, looked up by the gateway's object-key hash. It fails the
+// test if the object is absent.
+func latestManifest(t *testing.T, store manifest_store.ManifestStore, bucket, key string) *metadata.ObjectManifest {
+	t.Helper()
+	mkey := manifest_store.ManifestKey{
+		TenantID:      s3compat.AnonymousTenant,
+		Bucket:        bucket,
+		ObjectKeyHash: chaosObjectKeyHash(key),
+	}
+	m, err := store.Get(context.Background(), mkey)
+	if err != nil {
+		t.Fatalf("latestManifest %s/%s: %v", bucket, key, err)
+	}
+	return m
+}
+
+// chaosObjectKeyHash mirrors api/s3compat's unexported hashObjectKey
+// (sha256 hex of the raw key) so a test can reconstruct the manifest
+// key the gateway wrote under without reaching into the handler's
+// internals.
+func chaosObjectKeyHash(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
 
 type fakeHealthSource struct {
 	signal repair.HealthSignal
