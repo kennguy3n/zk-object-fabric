@@ -509,7 +509,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, mfaStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, mfaStore, authHooks, billingSink, billingProvider, fleetOrchestrator, healthMon, cache)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -2602,6 +2602,8 @@ func startConsoleAPI(
 	billingSink billing.BillingSink,
 	billingProvider billing.BillingProvider,
 	orchestrator *migration.FleetOrchestrator,
+	healthMon *health.Monitor,
+	cache hot_object_cache.HotObjectCache,
 ) *http.Server {
 	if cfg.Console.ListenAddr == "" {
 		return nil
@@ -2646,6 +2648,30 @@ func startConsoleAPI(
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
+
+	// Operations dashboard surface (api/console/ops_handler.go). The
+	// health monitor and hot-object-cache expose method values that
+	// satisfy the reporter signatures directly, so the /ops/health and
+	// /ops/cache-stats endpoints serve live gateway state. AdminAuth is
+	// the same gate the console handler uses, so the ops surface shares
+	// one auth posture. The Wasabi budget reporter is intentionally left
+	// unset: producing []console.WasabiBudget requires enumerating every
+	// tenant and joining its stored/egress counters (UsageQuery.TenantUsage
+	// is per-tenant only) with the providers/wasabi guardrails, which has
+	// no aggregation API yet. Until that lands, /ops/wasabi-budgets returns
+	// its designed 503 and the SPA renders the "unavailable" card.
+	opsCfg := console.OpsConfig{
+		Cache:     cache.Stats,
+		AdminAuth: buildAdminAuth(cfg),
+	}
+	// healthMon is non-nil on every live path (startHealthMonitor either
+	// returns a monitor or log.Fatalf's), but the shutdown path treats it
+	// as nilable, so guard here too: a nil reporter makes /ops/health
+	// return 503 instead of risking a nil-receiver panic in the handler.
+	if healthMon != nil {
+		opsCfg.Health = healthMon.Snapshot
+	}
+	console.NewOpsHandler(opsCfg).Register(mux)
 
 	// Slowloris hardening: ReadHeaderTimeout / IdleTimeout /
 	// MaxHeaderBytes mirror the gateway's posture so a
