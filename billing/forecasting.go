@@ -217,6 +217,15 @@ type MonthlyCostProjection struct {
 // (cost projection not configured), returns nil. A shrinking cell
 // (negative slope) is floored at zero bytes rather than projecting
 // a negative cost.
+//
+// Each point prices the projected end-of-month byte count (the
+// run-rate at month N), not the month's average volume. For a
+// growing cell that slightly overestimates the cost actually
+// incurred during the month (by up to half a month of growth) — a
+// deliberate, conservative choice consistent with the projection's
+// other simplifications (flat 30-day month, linear growth). It is a
+// planning estimate, not an invoice; compare against bills with that
+// in mind.
 func (r ForecastResult) ProjectedMonthlyCost(months int) []MonthlyCostProjection {
 	if months <= 0 || r.CostUSDPerGiBMonth <= 0 {
 		return nil
