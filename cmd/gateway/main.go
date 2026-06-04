@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -1599,7 +1600,22 @@ func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 	if cfg.ControlPlane.MetadataDSN == "" {
 		return nil, nil
 	}
-	db, err := sql.Open("postgres", cfg.ControlPlane.MetadataDSN)
+	dsn := cfg.ControlPlane.MetadataDSN
+	if cfg.ControlPlane.MetadataTLS && !cfg.InternalTLS.Enabled {
+		log.Printf("gateway: WARNING control_plane.metadata_tls is set but internal_tls.enabled is false; the metadata Postgres connection will NOT use internal mTLS. Set internal_tls.enabled=true to arm it")
+	}
+	if cfg.InternalTLS.Enabled && cfg.ControlPlane.MetadataTLS {
+		augmented, weakMode, err := applyInternalTLSToPostgresDSN(dsn, cfg.InternalTLS)
+		if err != nil {
+			return nil, fmt.Errorf("apply internal mTLS to metadata DSN: %w", err)
+		}
+		dsn = augmented
+		log.Printf("gateway: internal mTLS enabled for metadata Postgres connection (cert=%s ca=%s)", cfg.InternalTLS.CertFile, cfg.InternalTLS.CAFile)
+		if weakMode {
+			log.Printf("gateway: WARNING metadata_dsn sets a non-verifying sslmode; the gateway will present its client certificate but will NOT verify the Postgres server against ca_file. Set sslmode=verify-full (or remove sslmode to let internal mTLS default it) to pin the backend CA")
+		}
+	}
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres metadata DB: %w", err)
 	}
@@ -1609,6 +1625,209 @@ func openMetadataDB(cfg config.Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("ping postgres metadata DB: %w", err)
 	}
 	return db, nil
+}
+
+// keywordDSNValue extracts the value of key from a libpq
+// keyword/value DSN, honouring single-quoting and backslash escapes
+// exactly as libpq's own parser does. Because it understands quoting,
+// it never false-matches a key name that happens to appear inside
+// another key's quoted value (e.g. a cert path "/etc/x sslkey=y"), and
+// it unescapes the value so it round-trips with quoteKeywordDSNValue.
+// The bool reports whether key was present at all (a bare "key=" counts
+// as present with an empty value).
+func keywordDSNValue(dsn, key string) (string, bool) {
+	v, ok := parseKeywordDSN(dsn)[key]
+	return v, ok
+}
+
+// parseKeywordDSN tokenises a libpq keyword/value connection string
+// into its key→value pairs. It mirrors libpq's parser: keys and values
+// are whitespace-separated, '=' may be surrounded by whitespace, a
+// value may be single-quoted to embed whitespace, and a backslash
+// escapes the next character in either a quoted or a bare value. Later
+// duplicates win, matching libpq. Malformed trailing input (a key with
+// no '=') is ignored rather than guessed at.
+func parseKeywordDSN(dsn string) map[string]string {
+	out := map[string]string{}
+	i, n := 0, len(dsn)
+	skipSpace := func() {
+		for i < n && isDSNSpace(dsn[i]) {
+			i++
+		}
+	}
+	for i < n {
+		skipSpace()
+		if i >= n {
+			break
+		}
+		start := i
+		for i < n && dsn[i] != '=' && !isDSNSpace(dsn[i]) {
+			i++
+		}
+		key := dsn[start:i]
+		skipSpace()
+		if i >= n || dsn[i] != '=' {
+			break
+		}
+		i++ // consume '='
+		skipSpace()
+		var b strings.Builder
+		if i < n && dsn[i] == '\'' {
+			i++ // opening quote
+			for i < n {
+				if dsn[i] == '\\' && i+1 < n {
+					b.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				if dsn[i] == '\'' {
+					i++ // closing quote
+					break
+				}
+				b.WriteByte(dsn[i])
+				i++
+			}
+		} else {
+			for i < n && !isDSNSpace(dsn[i]) {
+				if dsn[i] == '\\' && i+1 < n {
+					b.WriteByte(dsn[i+1])
+					i += 2
+					continue
+				}
+				b.WriteByte(dsn[i])
+				i++
+			}
+		}
+		if key != "" {
+			out[key] = b.String()
+		}
+	}
+	return out
+}
+
+// isDSNSpace reports whether c is whitespace for libpq DSN tokenisation.
+func isDSNSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
+}
+
+// quoteKeywordDSNValue renders v as a value in a libpq keyword/value
+// DSN. libpq requires single-quoting any value that contains
+// whitespace, a single quote, or a backslash, escaping embedded
+// backslashes and single quotes with a backslash. We always
+// single-quote: it is unconditionally valid and avoids brittle
+// "does this contain whitespace" heuristics. Without this, a cert
+// path containing a space (e.g. "/etc/zkof/my cert.pem") would be
+// truncated at the space and the remainder mis-parsed as another
+// key, silently breaking the connection.
+func quoteKeywordDSNValue(v string) string {
+	r := strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+	return "'" + r.Replace(v) + "'"
+}
+
+// nonVerifyingPostgresSSLMode reports whether an sslmode value skips
+// server-certificate verification. disable/allow/prefer/require all
+// either disable TLS or encrypt without checking the server's cert
+// chain against the trusted roots; only verify-ca and verify-full
+// actually validate the backend against ca_file. An empty mode is
+// treated as non-verifying because libpq's default ("prefer") does
+// not verify.
+func nonVerifyingPostgresSSLMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "verify-ca", "verify-full":
+		return false
+	default:
+		return true
+	}
+}
+
+// applyInternalTLSToPostgresDSN injects the internal-mTLS material
+// into a lib/pq connection string and reports whether the operator
+// left the connection on a non-verifying sslmode.
+//
+// lib/pq (the registered "postgres" driver) does not accept a
+// *tls.Config programmatically — unlike the ClickHouse HTTP sink, it
+// loads its TLS material from the connection string — so internal
+// mTLS for Postgres is expressed as the standard libpq sslcert /
+// sslkey / sslrootcert parameters. This is the idiomatic way to do
+// client-auth TLS with lib/pq; see docs/runbooks/internal-mtls.md.
+//
+// Both DSN forms lib/pq accepts are supported:
+//   - URL form:     postgres://user@host:5432/db?sslmode=verify-full
+//   - keyword form: host=... user=... dbname=... sslmode=verify-full
+//
+// Precedence rules (operator-provided values always win):
+//   - sslcert / sslkey / sslrootcert already present in the DSN are
+//     left untouched; otherwise they are filled from InternalTLS.
+//   - An sslmode already present is preserved (an operator who chose
+//     verify-ca deliberately is not rewritten). When sslmode is
+//     absent it defaults to verify-full so the pinned CA is actually
+//     checked. The returned bool is true when the *effective* sslmode
+//     does not verify the server, so the caller can warn.
+func applyInternalTLSToPostgresDSN(dsn string, c config.InternalTLSConfig) (string, bool, error) {
+	trimmed := strings.TrimSpace(dsn)
+	if strings.HasPrefix(trimmed, "postgres://") || strings.HasPrefix(trimmed, "postgresql://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return "", false, fmt.Errorf("parse postgres URL DSN: %w", err)
+		}
+		q := u.Query()
+		// Use q.Has, not q.Get()=="": an operator who explicitly pins a
+		// param to an empty value (e.g. "?sslcert=") has made a choice,
+		// and the precedence contract says operator values win. q.Get
+		// can't tell "absent" from "present-but-empty", so it would
+		// clobber that explicit choice.
+		setIfAbsent := func(key, val string) {
+			if !q.Has(key) {
+				q.Set(key, val)
+			}
+		}
+		setIfAbsent("sslcert", c.CertFile)
+		setIfAbsent("sslkey", c.KeyFile)
+		setIfAbsent("sslrootcert", c.CAFile)
+		// sslmode is the one exception to "present-but-empty wins": an
+		// empty sslmode is never a meaningful verifying choice, and once
+		// the operator has armed internal mTLS we default to verify-full
+		// so the pinned CA is actually checked. A non-empty sslmode the
+		// operator set (e.g. verify-ca, or even a non-verifying one) is
+		// preserved and surfaced via the returned weak-mode bool.
+		if q.Get("sslmode") == "" {
+			q.Set("sslmode", "verify-full")
+		}
+		u.RawQuery = q.Encode()
+		return u.String(), nonVerifyingPostgresSSLMode(q.Get("sslmode")), nil
+	}
+
+	// keyword/value form: append only the keys the operator omitted so
+	// existing values keep winning (libpq would otherwise honour the
+	// last duplicate and silently override the operator's choice).
+	var b strings.Builder
+	b.WriteString(trimmed)
+	appendIfAbsent := func(key, val string) {
+		if _, ok := keywordDSNValue(b.String(), key); !ok {
+			fmt.Fprintf(&b, " %s=%s", key, quoteKeywordDSNValue(val))
+		}
+	}
+	appendIfAbsent("sslcert", c.CertFile)
+	appendIfAbsent("sslkey", c.KeyFile)
+	appendIfAbsent("sslrootcert", c.CAFile)
+	// Default sslmode to verify-full when it is absent OR present but
+	// empty, mirroring the URL-form branch: an empty sslmode (sslmode=
+	// or sslmode='') is never a meaningful verifying choice, so once
+	// internal mTLS is armed we upgrade it so the pinned CA is checked.
+	// A non-empty operator sslmode is preserved and surfaced via the
+	// returned weak-mode bool. (libpq honours the last duplicate, so
+	// appending wins over an earlier empty value.)
+	mode, hadSSLMode := keywordDSNValue(trimmed, "sslmode")
+	if !hadSSLMode || mode == "" {
+		b.WriteString(" sslmode=verify-full")
+		mode = "verify-full"
+	}
+	return b.String(), nonVerifyingPostgresSSLMode(mode), nil
 }
 
 // openEmbeddedDB opens the local SQLite database that backs the
@@ -2198,7 +2417,7 @@ func buildBillingSink(cfg config.Config, embeddedDB *sql.DB) interface {
 		}
 		return &billing.LoggerSink{Logger: log.New(os.Stdout, "", log.LstdFlags)}
 	}
-	sink, err := billing.NewClickHouseSink(billing.ClickHouseConfig{
+	chCfg := billing.ClickHouseConfig{
 		Endpoint:      cfg.Billing.ClickHouseURL,
 		Database:      cfg.Billing.ClickHouseDatabase,
 		Table:         cfg.Billing.ClickHouseTable,
@@ -2207,11 +2426,62 @@ func buildBillingSink(cfg config.Config, embeddedDB *sql.DB) interface {
 		BatchSize:     cfg.Billing.BatchSize,
 		FlushInterval: cfg.Billing.FlushInterval.ToDuration(),
 		Logger:        log.New(os.Stdout, "billing ", log.LstdFlags),
-	})
+	}
+	if cfg.Billing.ClickHouseTLS && !cfg.InternalTLS.Enabled {
+		log.Printf("gateway: WARNING billing.clickhouse_tls is set but internal_tls.enabled is false; the ClickHouse billing connection will NOT use internal mTLS. Set internal_tls.enabled=true to arm it")
+	}
+	if cfg.InternalTLS.Enabled && cfg.Billing.ClickHouseTLS {
+		chCfg.HTTPClient = buildInternalTLSHTTPClient(cfg.InternalTLS, cfg.Billing.ClickHouseURL)
+		log.Printf("gateway: internal mTLS enabled for clickhouse billing connection (cert=%s ca=%s)", cfg.InternalTLS.CertFile, cfg.InternalTLS.CAFile)
+	}
+	sink, err := billing.NewClickHouseSink(chCfg)
 	if err != nil {
 		log.Fatalf("gateway: build clickhouse billing sink: %v", err)
 	}
 	return sink
+}
+
+// buildInternalTLSHTTPClient returns an *http.Client whose transport
+// presents the gateway's client certificate and pins the backends'
+// CA, for HTTP-interface backends (the ClickHouse billing sink).
+// Unlike lib/pq, the ClickHouse sink dials over net/http, so it can
+// take a real *tls.Config directly via the transport.
+//
+// The transport is cloned from http.DefaultTransport so connection
+// pooling, keep-alives, and proxy-from-environment behaviour match
+// the sink's default client; only TLSClientConfig is overridden. The
+// 10s client timeout mirrors ClickHouseConfig's default RequestTimeout
+// (which is otherwise bypassed once a custom HTTPClient is supplied).
+//
+// A misconfigured cert/key/CA is fatal here rather than silently
+// degrading to an unauthenticated connection: the operator asked for
+// mTLS, so failing closed is the correct posture. endpoint is used
+// only to warn when mTLS was requested against a non-https endpoint,
+// where the TLS config would never be exercised.
+func buildInternalTLSHTTPClient(c config.InternalTLSConfig, endpoint string) *http.Client {
+	tlsCfg, err := c.BuildClientTLSConfig()
+	if err != nil {
+		log.Fatalf("gateway: build internal mTLS config for clickhouse billing sink: %v", err)
+	}
+	if u, perr := url.Parse(strings.TrimSpace(endpoint)); perr == nil && u.Scheme != "https" {
+		log.Printf("gateway: WARNING clickhouse_tls is enabled but clickhouse_url scheme is %q (not https); the client certificate will not be presented until the endpoint uses https", u.Scheme)
+	}
+	// Clone the default transport to inherit its pooling / keep-alive /
+	// proxy defaults. Guard the type assertion: if anything has
+	// replaced http.DefaultTransport with a non-*http.Transport wrapper
+	// (e.g. a future tracing middleware), fall back to a fresh
+	// transport rather than panicking.
+	var transport *http.Transport
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = dt.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	transport.TLSClientConfig = tlsCfg
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+	}
 }
 
 // buildBillingProvider resolves the configured BillingProvider via

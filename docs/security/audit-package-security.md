@@ -469,11 +469,28 @@ should attempt:
 
 ## 8. Known limitations and explicit out-of-scope items
 
-- **No mTLS between gateway and Postgres / cache / billing.** The
-  TLS we use is server-auth only. mTLS is on the Workstream 3.1
-  roadmap. The audit should flag this in the report but should
-  **not** treat it as a finding against the current code — it is
-  an acknowledged gap.
+- **mTLS between gateway and internal backends — supported.** The
+  gateway can present a client certificate to, and pin the CA of,
+  its internal backend connections: the control-plane **Postgres**
+  (metadata) and the **ClickHouse** billing sink. This is configured
+  under the top-level `internal_tls` section (`enabled`, `cert_file`,
+  `key_file`, `ca_file`) and armed per connection with
+  `control_plane.metadata_tls` and `billing.clickhouse_tls`. It is
+  distinct from the per-listener `tls` blocks, which remain
+  server-auth only for the gateway's *inbound* HTTPS listeners.
+  When `internal_tls.enabled` is false the toggles are ignored and
+  connection behaviour is unchanged, so the feature is fully
+  backwards compatible. Because the registered Postgres driver
+  (`lib/pq`) loads TLS material from the connection string rather
+  than from a `*tls.Config`, internal mTLS for Postgres is applied
+  by injecting the standard libpq `sslcert`/`sslkey`/`sslrootcert`
+  parameters and defaulting `sslmode` to `verify-full` (operator
+  values win); the ClickHouse HTTP sink takes a real `*tls.Config`
+  on its transport. The gateway fails closed if the configured
+  cert/key/CA cannot be loaded. There is **no Redis** in this repo
+  and the hot-object **cache** is in-process (not a network
+  backend), so neither is in scope for internal mTLS. See
+  `docs/runbooks/internal-mtls.md` for cert generation and rollout.
 - **Console API uses a flat bearer token.** RS256/ES256 JWT
   migration is on Workstream 3.2. Same as above: flag but not a
   novel finding.
