@@ -181,16 +181,15 @@ func startsWith(s, prefix string) bool {
 // age: the contract with the caller is that they asked for a delete,
 // not that the piece must be free-and-clear to remove.
 func (p *Provider) DeletePiece(ctx context.Context, pieceID string) error {
-	minDuration := WasabiMinStorageDays * 24 * time.Hour
 	if p.AgeLookup != nil {
-		if age, ok := p.AgeLookup(ctx, pieceID); ok && age < minDuration {
+		if age, ok := p.AgeLookup(ctx, pieceID); ok && age < minStorageDuration {
 			p.logger().Warn(
 				"wasabi: deleting piece before 90-day minimum storage duration; billing continues for the residual window",
 				slog.String("piece_id", pieceID),
 				slog.String("bucket", p.cfg.Bucket),
 				slog.String("region", p.cfg.Region),
 				slog.Duration("age", age),
-				slog.Duration("residual", minDuration-age),
+				slog.Duration("residual", minStorageDuration-age),
 			)
 		}
 	}

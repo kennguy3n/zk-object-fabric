@@ -170,7 +170,7 @@ func DefaultGuardrails(tenantID string) Guardrails {
 			CacheHitRatioAlertMin:     0.85,
 			ThrottlePolicy:            "slowdown_origin_reads",
 		},
-		MinStorage: WasabiMinStorageDays * 24 * time.Hour,
+		MinStorage: minStorageDuration,
 	}
 }
 
