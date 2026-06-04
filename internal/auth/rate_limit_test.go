@@ -66,6 +66,165 @@ func TestRateLimiter_AllowTokenBucket(t *testing.T) {
 	}
 }
 
+// unresolvableLookup returns a RateLimitLookup that reports the tenant
+// as unresolvable (ok=false), the only shape that hits Allow's
+// fail-closed early-return path.
+func unresolvableLookup() RateLimitLookup {
+	return func(string) (int, int, bool) { return 0, 0, false }
+}
+
+// resolvedNoCeilingLookup returns a RateLimitLookup for a tenant that
+// resolves (ok=true) but has no configured rate ceiling (rps=0) — the
+// intentional "unlimited / no-op" signal that must stay fail-open even
+// under FailClosed.
+func resolvedNoCeilingLookup() RateLimitLookup {
+	return func(string) (int, int, bool) { return 0, 0, true }
+}
+
+// TestRateLimiter_FailClosed pins the fail-closed posture: when the
+// tenant budget cannot be *resolved* (ok=false — unknown tenant or
+// directory outage), FailClosed=true rejects (the gateway would return
+// 429) instead of letting it through.
+func TestRateLimiter_FailClosed(t *testing.T) {
+	l := NewRateLimiter(
+		unresolvableLookup(),
+		func(*http.Request) (string, bool) { return "t1", true },
+	)
+	l.FailClosed = true
+	if l.Allow("t1") {
+		t.Fatal("FailClosed=true with an unresolvable (ok=false) budget should reject (Allow=false)")
+	}
+}
+
+// TestRateLimiter_FailOpenDefault pins the backwards-compatible
+// default: an unresolvable budget passes through (Allow=true) so a
+// not-yet-provisioned or directory-unknown tenant is not locked out
+// and the Authenticator gets the final say.
+func TestRateLimiter_FailOpenDefault(t *testing.T) {
+	l := NewRateLimiter(
+		unresolvableLookup(),
+		func(*http.Request) (string, bool) { return "t1", true },
+	)
+	// FailClosed defaults to false; assert it explicitly so the
+	// backwards-compatible default is self-documenting.
+	if l.FailClosed {
+		t.Fatal("NewRateLimiter must default to fail-open (FailClosed=false)")
+	}
+	if !l.Allow("t1") {
+		t.Fatal("fail-open default with an unresolvable budget should allow (Allow=true)")
+	}
+}
+
+// TestRateLimiter_ResolvedNoCeilingIsNoOp pins the asymmetry between an
+// unresolved budget (ok=false) and a resolved-but-unlimited one
+// (rps<=0, ok=true): the latter is an intentional operator choice and
+// stays a no-op (Allow=true) even under FailClosed, so a fail-closed
+// limiter never blocks a tenant deliberately configured without a
+// ceiling.
+func TestRateLimiter_ResolvedNoCeilingIsNoOp(t *testing.T) {
+	for _, failClosed := range []bool{false, true} {
+		l := NewRateLimiter(
+			resolvedNoCeilingLookup(),
+			func(*http.Request) (string, bool) { return "t1", true },
+		)
+		l.FailClosed = failClosed
+		if !l.Allow("t1") {
+			t.Fatalf("resolved tenant with no ceiling must stay a no-op (Allow=true); FailClosed=%v", failClosed)
+		}
+	}
+}
+
+// TestRateLimiter_FailClosedDoesNotAffectResolvedBudget verifies the
+// normal token-bucket path is unchanged when the budget resolves:
+// FailClosed only governs the unresolvable-budget branch, so a tenant
+// with a real budget still gets exactly `burst` tokens before the
+// bucket empties regardless of the flag.
+func TestRateLimiter_FailClosedDoesNotAffectResolvedBudget(t *testing.T) {
+	now := time.Unix(0, 0)
+	clock := func() time.Time { return now }
+	l := NewRateLimiter(fixedLookup(2, 2), func(*http.Request) (string, bool) { return "t1", true })
+	l.Clock = clock
+	l.FailClosed = true
+
+	if !l.Allow("t1") {
+		t.Fatal("first request should consume a token even with FailClosed=true")
+	}
+	if !l.Allow("t1") {
+		t.Fatal("second request should consume the remaining token")
+	}
+	if l.Allow("t1") {
+		t.Fatal("third request should be throttled by the empty bucket, not the fail-closed flag")
+	}
+	now = now.Add(time.Second)
+	if !l.Allow("t1") {
+		t.Fatal("token should be refilled after 1 second regardless of FailClosed")
+	}
+}
+
+// TestRateLimiter_AllowEgressFailClosed pins the egress guard's
+// fail-closed posture: when EgressLookup cannot resolve the tenant
+// (ok=false), FailClosed=true rejects so a directory outage cannot
+// silently disable egress enforcement, while the non-outage cases
+// (feature off, or a positively-reported zero budget) stay fail-open
+// regardless of the flag.
+func TestRateLimiter_AllowEgressFailClosed(t *testing.T) {
+	resolver := func(*http.Request) (string, bool) { return "t1", true }
+
+	t.Run("lookup outage fails closed when FailClosed", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.FailClosed = true
+		l.EgressLookup = func(string) (int64, bool) { return 0, false }
+		if l.AllowEgress("t1") {
+			t.Fatal("FailClosed=true with an unresolvable egress budget should reject")
+		}
+	})
+
+	t.Run("lookup outage fails open by default", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.EgressLookup = func(string) (int64, bool) { return 0, false }
+		if !l.AllowEgress("t1") {
+			t.Fatal("default (fail-open) with an unresolvable egress budget should allow")
+		}
+	})
+
+	t.Run("zero budget stays fail-open under FailClosed", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.FailClosed = true
+		// ok=true with a non-positive budget is an intentional
+		// "no enforcement for this tenant" signal, not an outage.
+		l.EgressLookup = func(string) (int64, bool) { return 0, true }
+		if !l.AllowEgress("t1") {
+			t.Fatal("a positively-reported zero budget must stay fail-open even with FailClosed=true")
+		}
+	})
+
+	t.Run("nil EgressLookup stays fail-open under FailClosed", func(t *testing.T) {
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.FailClosed = true
+		// EgressLookup unset: egress enforcement is not configured.
+		if !l.AllowEgress("t1") {
+			t.Fatal("nil EgressLookup must stay fail-open (feature off) even with FailClosed=true")
+		}
+	})
+
+	t.Run("resolved budget enforcement unaffected by FailClosed", func(t *testing.T) {
+		now := time.Unix(0, 0).UTC()
+		l := NewRateLimiter(fixedLookup(100, 100), resolver)
+		l.Clock = func() time.Time { return now }
+		l.FailClosed = true
+		const budget = int64(1024)
+		l.EgressLookup = func(string) (int64, bool) { return budget, true }
+
+		if !l.AllowEgress("t1") {
+			t.Fatal("fresh tenant within budget should be allowed")
+		}
+		l.Observe("t1", budget)
+		if l.AllowEgress("t1") {
+			t.Fatal("tenant over budget should be rejected via the normal exhaustion path, not the flag")
+		}
+	})
+}
+
 func TestRateLimiter_BudgetExhaustionRejects(t *testing.T) {
 	now := time.Unix(0, 0).UTC()
 	clock := func() time.Time { return now }
@@ -314,11 +473,11 @@ func TestTenantEgressBudgetLookup_ConvertsTBToBytes(t *testing.T) {
 		AccessKey: "AK",
 		SecretKey: "SK",
 		Tenant: tenant.Tenant{
-			ID:           "tenant-1",
-			Name:         "t",
-			ContractType: tenant.ContractB2CPooled,
-			LicenseTier:  tenant.LicenseStandard,
-			Keys:         tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
+			ID:               "tenant-1",
+			Name:             "t",
+			ContractType:     tenant.ContractB2CPooled,
+			LicenseTier:      tenant.LicenseStandard,
+			Keys:             tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
 			PlacementDefault: tenant.PlacementDefault{PolicyRef: "p"},
 			Budgets: tenant.Budgets{
 				RequestsPerSec: 50,
@@ -350,21 +509,33 @@ func TestTenantBudgetsLookup_ZeroRPSSkipsLimiter(t *testing.T) {
 		AccessKey: "AK",
 		SecretKey: "SK",
 		Tenant: tenant.Tenant{
-			ID:           "tenant-1",
-			Name:         "t",
-			ContractType: tenant.ContractB2CPooled,
-			LicenseTier:  tenant.LicenseStandard,
-			Keys:         tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
+			ID:               "tenant-1",
+			Name:             "t",
+			ContractType:     tenant.ContractB2CPooled,
+			LicenseTier:      tenant.LicenseStandard,
+			Keys:             tenant.Keys{RootKeyRef: "cmk://t", DEKPolicy: tenant.DEKPerObject},
 			PlacementDefault: tenant.PlacementDefault{PolicyRef: "p"},
-			Budgets:      tenant.Budgets{RequestsPerSec: 0},
-			Billing:      tenant.Billing{Currency: "USD"},
+			Budgets:          tenant.Budgets{RequestsPerSec: 0},
+			Billing:          tenant.Billing{Currency: "USD"},
 		},
 	})
 	if err != nil {
 		t.Fatalf("AddBinding: %v", err)
 	}
 	lookup := TenantBudgetsLookup(store)
-	if _, _, ok := lookup("tenant-1"); ok {
-		t.Fatal("expected ok=false when RequestsPerSec=0 so the limiter is a no-op")
+	rps, _, ok := lookup("tenant-1")
+	if !ok {
+		t.Fatal("expected ok=true: a known tenant with RequestsPerSec=0 is resolved (unlimited), not unknown")
+	}
+	if rps != 0 {
+		t.Fatalf("expected rps=0 for an unlimited tenant, got %d", rps)
+	}
+	// The limiter must remain a no-op for a resolved zero-RPS tenant
+	// even under FailClosed: a deliberate "no ceiling" config must not
+	// be mistaken for an unresolved budget and blocked.
+	l := NewRateLimiter(lookup, func(*http.Request) (string, bool) { return "tenant-1", true })
+	l.FailClosed = true
+	if !l.Allow("tenant-1") {
+		t.Fatal("RequestsPerSec=0 must remain a no-op (Allow=true) even under FailClosed")
 	}
 }

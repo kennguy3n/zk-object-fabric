@@ -355,12 +355,77 @@ The auditor should:
 
 ### 7.1 Rate limiter (`internal/auth/rate_limit.go`)
 
-The rate limiter is a per-tenant token bucket
-(`RateLimiter.Allow`, line 216-259) with Redis-backed shared
-state. The current implementation is **fail-open** when Redis is
-unreachable — Workstream 2.4 will add a `fail_closed` mode.
+The rate limiter is a purely in-memory, per-process per-tenant
+token bucket (`RateLimiter.Allow`). There is no Redis or other
+shared backing store: each gateway holds its own `buckets` map and
+resolves a tenant's steady-state rate/burst through the injected
+`RateLimitLookup` (`TenantBudgetsLookup` over the tenant store).
+The realistic outage is therefore *budget resolution*, not a Redis
+round-trip: when `Lookup` returns `ok=false` (the tenant cannot be
+resolved — unknown to the directory, or a directory outage), `Allow`
+takes an early-return path before the bucket logic.
+
+That early-return path is now **fail-closed configurable**.
+`RateLimiter.FailClosed` (default `false`) governs it: when
+`false` the limiter fails **open** (the request passes through so
+the `Authenticator` can still reject it), preserving the historical
+behaviour; when `true` the limiter fails **closed**, rejecting
+(HTTP 429) any request whose budget it cannot resolve so a
+budget-directory outage during a flood cannot silently disable rate
+limiting for every tenant the limiter cannot price. The gateway
+sets this from `Config.RateLimitFailClosedEnabled()`
+(`internal/config/config.go`): `Env == "production"` is always
+fail-closed, while other environments opt in via
+`abuse.rate_limit_fail_closed`.
+
+`FailClosed` governs both budget-resolution guards that share the
+tenant directory, and the two are deliberately **symmetric**: only
+an *unresolved* lookup (`ok=false`) is treated as an outage and
+closed. The request-rate `Allow` and the monthly-egress
+`AllowEgress` both reject on `ok=false` under `FailClosed`, so a
+single directory outage closes both rather than leaving egress
+enforcement silently disabled while rate limiting fails closed.
+
+A tenant the directory *resolves* (`ok=true`) is never closed by
+the flag, including when it reports **no ceiling** for that tenant:
+`rps <= 0` for `Allow` and `budget <= 0` for `AllowEgress` are an
+intentional "this tenant has no limit configured" signal and stay a
+no-op (fail-open) regardless of `FailClosed`. This matters because
+`RequestsPerSec = 0` is a valid tenant budget (`metadata/tenant`
+only rejects negatives) that historically means *unlimited*;
+treating it as an outage would let a fail-closed gateway block
+tenants deliberately provisioned without a ceiling. To keep that
+distinction, `TenantBudgetsLookup` returns `ok=true, rps=0` for a
+known-but-unlimited tenant (rather than collapsing it into
+`ok=false`), mirroring how `TenantEgressBudgetLookup` reports a
+zero egress budget. A nil `EgressLookup` (egress enforcement not
+configured at all) likewise stays fail-open.
+
+Scope caveat for egress: `AllowEgress` only runs where an
+`EgressLookup` is wired into the `RateLimiter`. The current gateway
+(`cmd/gateway/main.go`) wires only the request-rate `Lookup`, so
+the egress guard — and therefore its fail-closed behaviour — is
+inert there today and governs only callers that wire an
+`EgressLookup` (e.g. the abuse test harness, or future gateway
+wiring). The symmetric `ok=false` handling is in place so that
+enabling egress enforcement later inherits the same fail-closed
+posture without a second audit.
+
+Note the scope relative to the `Middleware`, which reaches these
+guards **after** it has resolved a tenant. Requests the `Resolver`
+cannot attribute to a tenant (unauthenticated / anonymous callers)
+skip `Allow`/`AllowEgress` entirely and are passed to the handler
+so it can return the appropriate 401/403 — fail-closed does not
+turn the rate limiter into an authenticator. The closed paths apply
+to *identified tenants whose budget cannot be priced*, not to
+unidentified traffic.
 
 The auditor should:
+
+- Confirm production deployments resolve to fail-closed
+  (`RateLimitFailClosedEnabled` returns true for
+  `Env == "production"` regardless of the explicit flag) so the
+  posture cannot be lost by omitting the config key.
 
 - Verify the limiter is invoked **before** the request body is
   read on every PUT/GET path. A naive implementation that

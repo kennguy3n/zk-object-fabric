@@ -434,6 +434,10 @@ func main() {
 			auth.TenantResolverFromAuth(authenticator),
 		)
 		rl.AlertSink = alertSink
+		// Production is always fail-closed; other environments opt in
+		// via abuse.rate_limit_fail_closed (see
+		// Config.RateLimitFailClosedEnabled).
+		rl.FailClosed = cfg.RateLimitFailClosedEnabled()
 		applyAbuseConfigToRateLimiter(rl, cfg.Abuse)
 		// The abuse guard layers per-tenant egress bandwidth
 		// budgets, 2x-of-baseline anomaly detection, and the
@@ -1966,6 +1970,14 @@ func applyAbuseConfigToRateLimiter(l *auth.RateLimiter, cfg config.AbuseConfig) 
 		l.BaselineAlpha = cfg.BaselineAlpha
 	}
 	l.ThrottleOnAnomaly = cfg.ThrottleOnAnomaly
+	// NOTE: l.FailClosed is deliberately NOT set here from
+	// cfg.RateLimitFailClosed. The effective posture is
+	// environment-aware (production is always fail-closed) and is
+	// derived once via Config.RateLimitFailClosedEnabled() at the
+	// callsite. Assigning l.FailClosed = cfg.RateLimitFailClosed here
+	// by analogy with the other fields would let an operator silently
+	// disable the production fail-closed guard by omitting the config
+	// key, so it stays out of this raw-field copy on purpose.
 }
 
 func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]providers.StorageProvider {

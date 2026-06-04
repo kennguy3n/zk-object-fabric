@@ -38,8 +38,11 @@ type RateLimitLookup func(tenantID string) (rps int, burst int, ok bool)
 // EgressBudgetLookup resolves a tenant ID to its monthly egress
 // budget in bytes. A zero return means the tenant has no configured
 // budget and egress enforcement is skipped for them. ok=false means
-// the tenant is unknown to the directory; callers treat that as "no
-// enforcement" as well so misconfiguration cannot lock users out.
+// the tenant could not be resolved (unknown to the directory or a
+// directory outage); by default callers treat that as "no
+// enforcement" so misconfiguration cannot lock users out, but a
+// limiter constructed with FailClosed rejects on ok=false so an
+// outage cannot silently disable egress enforcement.
 type EgressBudgetLookup func(tenantID string) (bytesPerMonth int64, ok bool)
 
 // TenantResolver is the function the middleware uses to identify the
@@ -74,8 +77,8 @@ type AlertSink interface {
 //
 // The zero value is not useful. Construct with NewRateLimiter and
 // optionally set AlertSink, AnomalyMultiplier, AnomalyWindow,
-// AnomalyCooldown, ThrottleOnAnomaly, and EgressLookup before
-// installing the middleware.
+// AnomalyCooldown, ThrottleOnAnomaly, FailClosed, and EgressLookup
+// before installing the middleware.
 type RateLimiter struct {
 	Lookup       RateLimitLookup
 	EgressLookup EgressBudgetLookup
@@ -114,6 +117,24 @@ type RateLimiter struct {
 	// HTTP 429 for requests that land inside an active anomaly
 	// cooldown window. When false the limiter only alerts.
 	ThrottleOnAnomaly bool
+
+	// FailClosed controls behaviour when a tenant's budget cannot be
+	// resolved: the Allow and AllowEgress paths where their lookups
+	// return ok=false (unknown tenant or budget-directory outage).
+	// When false (the default) such requests pass through so a
+	// not-yet-provisioned tenant is not locked out and the
+	// Authenticator gets the final say — this is the fail-open
+	// posture. When true both guards reject those requests instead, so
+	// that a directory/budget-resolution outage during a flood cannot
+	// silently disable rate limiting or egress enforcement for tenants
+	// the limiter cannot price.
+	//
+	// FailClosed does not affect resolved tenants (ok=true). In
+	// particular a tenant resolved with no configured ceiling — rps<=0
+	// for Allow, budget<=0 for AllowEgress — stays a deliberate no-op
+	// (unlimited) regardless of FailClosed; that is an operator choice,
+	// not an unresolved budget.
+	FailClosed bool
 
 	mu      sync.Mutex
 	buckets map[string]*bucket
@@ -212,12 +233,24 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 }
 
 // Allow reserves one request for tenantID. It returns false when the
-// bucket is empty.
+// bucket is empty, or when the tenant's budget cannot be resolved and
+// the limiter is configured fail-closed (see FailClosed).
 func (l *RateLimiter) Allow(tenantID string) bool {
 	rps, burst, ok := l.Lookup(tenantID)
-	if !ok || rps <= 0 {
-		// Unknown tenant or no budget configured: allow through so
-		// the Authenticator can reject the request if needed.
+	if !ok {
+		// The tenant's budget could not be resolved (unknown tenant or
+		// the budget directory is unreachable). Fail open by default so
+		// the Authenticator can reject the request if needed; fail
+		// closed when configured so a budget-resolution outage cannot
+		// silently disable rate limiting for traffic it cannot price.
+		return !l.FailClosed
+	}
+	if rps <= 0 {
+		// Tenant resolved with no rate ceiling configured: the limiter
+		// is intentionally a no-op for them (unlimited), regardless of
+		// FailClosed. This is a deliberate operator choice, not an
+		// unresolved budget, so it mirrors AllowEgress's handling of a
+		// positively-reported zero budget rather than the !ok path.
 		return true
 	}
 	if burst <= 0 {
@@ -255,15 +288,32 @@ func (l *RateLimiter) Allow(tenantID string) bool {
 }
 
 // AllowEgress reports whether tenantID has any monthly egress budget
-// left. It returns true when the tenant has no configured budget (so
-// misconfigured tenants fail open) and emits an AbuseBudgetExhausted
-// alert each time an already-exhausted tenant is rejected.
+// left. It returns true when egress enforcement is not configured
+// (nil EgressLookup) or the tenant has no configured budget, and
+// emits an AbuseBudgetExhausted alert each time an already-exhausted
+// tenant is rejected.
+//
+// When the budget directory cannot resolve the tenant (ok=false) the
+// behaviour mirrors Allow: fail open by default, fail closed when
+// FailClosed is set, so the same directory outage that closes the
+// request-rate guard also closes the egress guard rather than
+// silently disabling it. A tenant the directory positively reports
+// as having no budget (budget <= 0 with ok=true) is an intentional
+// "skip enforcement" signal and stays fail-open regardless.
 func (l *RateLimiter) AllowEgress(tenantID string) bool {
 	if l.EgressLookup == nil {
 		return true
 	}
 	budget, ok := l.EgressLookup(tenantID)
-	if !ok || budget <= 0 {
+	if !ok {
+		// Budget directory could not resolve the tenant (unknown or
+		// outage). Fail closed when configured so a directory outage
+		// cannot silently disable egress enforcement.
+		return !l.FailClosed
+	}
+	if budget <= 0 {
+		// Tenant positively has no configured egress budget:
+		// enforcement is intentionally skipped for them.
 		return true
 	}
 	now := l.now()
@@ -530,6 +580,14 @@ func minFloat(a, b float64) float64 {
 // RateLimitLookup signature. The burst is the same as rps when no
 // explicit burst is configured: the Phase 2 tenant record carries
 // only a single RequestsPerSec knob.
+//
+// ok distinguishes "tenant could not be resolved" from "tenant
+// resolved, no rate ceiling". An unknown tenant returns ok=false so a
+// fail-closed limiter can reject it; a known tenant whose
+// RequestsPerSec is unset (<= 0) returns ok=true with rps=0, which the
+// limiter treats as an intentional no-op (unlimited). Collapsing the
+// latter into ok=false would let a fail-closed limiter block tenants
+// that are deliberately configured without a ceiling.
 func TenantBudgetsLookup(store TenantStore) RateLimitLookup {
 	return func(tenantID string) (int, int, bool) {
 		b, ok := store.LookupByTenantID(tenantID)
@@ -538,7 +596,9 @@ func TenantBudgetsLookup(store TenantStore) RateLimitLookup {
 		}
 		rps := b.Tenant.Budgets.RequestsPerSec
 		if rps <= 0 {
-			return 0, 0, false
+			// Known tenant with no configured ceiling: resolved but
+			// unlimited (rps=0), not unknown.
+			return 0, 0, true
 		}
 		return rps, rps, true
 	}
