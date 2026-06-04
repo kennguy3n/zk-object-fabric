@@ -68,15 +68,19 @@ export function GaugeChart({
           strokeWidth={stroke}
           strokeLinecap="round"
         />
-        {/* Value arc */}
-        <path
-          d={arc}
-          fill="none"
-          stroke={color}
-          strokeWidth={stroke}
-          strokeLinecap="round"
-          strokeDasharray={dash}
-        />
+        {/* Value arc. Omitted entirely at v === 0: a zero-length dash
+            with strokeLinecap="round" would otherwise paint a stray dot
+            (diameter = stroke) at the arc's start instead of nothing. */}
+        {v > 0 && (
+          <path
+            d={arc}
+            fill="none"
+            stroke={color}
+            strokeWidth={stroke}
+            strokeLinecap="round"
+            strokeDasharray={dash}
+          />
+        )}
         <text
           x={cx}
           y={cy - 6}

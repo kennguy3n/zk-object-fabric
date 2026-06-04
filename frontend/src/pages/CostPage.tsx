@@ -14,7 +14,10 @@ import { formatBytes } from "../format";
 // GET /api/v1/tiers — both reachable from the tenant console session,
 // so this view needs no admin scope.
 
-const BYTES_PER_TB = 2 ** 40;
+// Binary tebibyte (2^40), matching the gateway guardrail
+// (internal/auth/abuse.go uses 1<<40) and formatBytes' binary prefixes.
+// Named TIB to make the 2^40 (not 1e12) basis explicit.
+const BYTES_PER_TIB = 2 ** 40;
 
 export function CostPage() {
   const { tenant } = useAuth();
@@ -39,8 +42,8 @@ export function CostPage() {
   }, []);
 
   const tier = tiers.find((t) => t.tier === tenant?.licenseTier);
-  const storedTB = (usage?.storageBytes ?? 0) / BYTES_PER_TB;
-  const egressTB = (usage?.egressBytesThisMonth ?? 0) / BYTES_PER_TB;
+  const storedTB = (usage?.storageBytes ?? 0) / BYTES_PER_TIB;
+  const egressTB = (usage?.egressBytesThisMonth ?? 0) / BYTES_PER_TIB;
   const pricePerTB = tier?.price_per_tb_month ?? 0;
   const storageCost = storedTB * pricePerTB;
 

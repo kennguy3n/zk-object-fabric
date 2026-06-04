@@ -23,10 +23,11 @@ import { GaugeChart } from "../components/GaugeChart";
 //     not admin-scoped, or the ops surface is not wired, the cards
 //     show an "unavailable" state instead of failing the whole page.
 
-// TB is treated as a binary tebibyte so the budget math lines up with
-// formatBytes (which uses binary prefixes). The tenant budget is
-// expressed in "TB/mo" on the tenant record.
-const BYTES_PER_TB = 2 ** 40;
+// The tenant budget field (egressTbMonth) is a binary tebibyte, matching
+// the gateway guardrail (internal/auth/abuse.go uses 1<<40) and
+// formatBytes' binary prefixes. Named TIB to make the 2^40 (not 1e12)
+// basis explicit.
+const BYTES_PER_TIB = 2 ** 40;
 
 export function OperationsPage() {
   const { tenant, token } = useAuth();
@@ -65,7 +66,7 @@ export function OperationsPage() {
     };
   }, [token]);
 
-  const egressBudgetBytes = tenant ? tenant.budgets.egressTbMonth * BYTES_PER_TB : 0;
+  const egressBudgetBytes = tenant ? tenant.budgets.egressTbMonth * BYTES_PER_TIB : 0;
   const egressUsed = usage?.egressBytesThisMonth ?? 0;
   const egressConsumed = egressBudgetBytes > 0 ? egressUsed / egressBudgetBytes : 0;
   const egressRemaining = Math.max(egressBudgetBytes - egressUsed, 0);
