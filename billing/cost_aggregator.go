@@ -142,8 +142,14 @@ type DefaultCostAggregator struct {
 }
 
 // MonthlyCost implements CostAggregator.
+//
+// It delegates to GetCostBreakdown with an empty month so that the
+// current-month resolution AND the nil-receiver / missing-reader
+// guards live in exactly one place. Computing the month here instead
+// would dereference the receiver (via now()) before that guard runs
+// and panic on a nil *DefaultCostAggregator.
 func (a *DefaultCostAggregator) MonthlyCost(ctx context.Context, tenantID string) (CostBreakdown, error) {
-	return a.GetCostBreakdown(ctx, tenantID, a.now().Format(monthLayout))
+	return a.GetCostBreakdown(ctx, tenantID, "")
 }
 
 // GetCostBreakdown implements CostReporter. An empty month resolves

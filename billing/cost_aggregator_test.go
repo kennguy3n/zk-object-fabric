@@ -174,6 +174,11 @@ func TestCostAggregator_Errors(t *testing.T) {
 	if _, err := nilAgg.GetCostBreakdown(context.Background(), "t", "2026-06"); err == nil {
 		t.Error("nil aggregator should error")
 	}
+	// MonthlyCost must inherit the same nil-receiver safety (it must
+	// not dereference the receiver via now() before the guard runs).
+	if _, err := nilAgg.MonthlyCost(context.Background(), "t"); err == nil {
+		t.Error("nil aggregator MonthlyCost should error, not panic")
+	}
 	// missing Usage
 	if _, err := (&DefaultCostAggregator{}).GetCostBreakdown(context.Background(), "t", "2026-06"); err == nil {
 		t.Error("aggregator without StorageUsageReader should error")
