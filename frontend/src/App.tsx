@@ -8,6 +8,9 @@ import { BucketsPage } from "./pages/BucketsPage";
 import { ApiKeysPage } from "./pages/ApiKeysPage";
 import { PlacementPolicyPage } from "./pages/PlacementPolicyPage";
 import { B2BPage } from "./pages/B2BPage";
+import { OperationsPage } from "./pages/OperationsPage";
+import { CostPage } from "./pages/CostPage";
+import { WasabiHealthPage } from "./pages/WasabiHealthPage";
 
 export function App() {
   return (
@@ -64,6 +67,9 @@ function ConsoleShell() {
           <SideLink to="/api-keys">API Keys</SideLink>
           <SideLink to="/placement">Placement Policy</SideLink>
           {isB2B && <SideLink to="/b2b">Dedicated Cells</SideLink>}
+          <SideLink to="/operations">Operations</SideLink>
+          <SideLink to="/cost">Cost</SideLink>
+          <SideLink to="/wasabi-health">Wasabi Health</SideLink>
         </nav>
         <div style={{ marginTop: 32 }}>
           <button className="secondary" onClick={signOut}>
@@ -78,6 +84,9 @@ function ConsoleShell() {
           <Route path="api-keys" element={<ApiKeysPage />} />
           <Route path="placement" element={<PlacementPolicyPage />} />
           {isB2B && <Route path="b2b" element={<B2BPage />} />}
+          <Route path="operations" element={<OperationsPage />} />
+          <Route path="cost" element={<CostPage />} />
+          <Route path="wasabi-health" element={<WasabiHealthPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
