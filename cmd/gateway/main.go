@@ -2629,6 +2629,12 @@ func startConsoleAPI(
 	cellStore := buildDedicatedCellStore(metadataDB)
 	cellProvisioner := buildCellProvisioner(cellStore)
 
+	// One admin-auth gate shared by the console handler and the ops
+	// handler so both surfaces enforce an identical posture from a
+	// single source of truth (changing the gate can't drift one
+	// surface out of sync with the other).
+	adminAuth := buildAdminAuth(cfg)
+
 	h := console.New(console.Config{
 		Tenants:         tenants,
 		Usage:           usage,
@@ -2639,7 +2645,7 @@ func startConsoleAPI(
 		MFA:             mfaStore,
 		MFAIssuer:       cfg.Console.MFAIssuer,
 		AuthHooks:       authHooks,
-		AdminAuth:       buildAdminAuth(cfg),
+		AdminAuth:       adminAuth,
 		BillingSink:     billingSink,
 		BillingProvider: billingProvider,
 		Buckets:         console.NewMemoryBucketStore(),
@@ -2660,11 +2666,17 @@ func startConsoleAPI(
 	// reports 503 and the SPA degrades to an "unavailable" card —
 	// because it requires joining the guardrail config with
 	// per-tenant billing counters, which has no read side here yet.
-	// AdminAuth reuses the same gate as the rest of the console
-	// admin surface so both share one posture.
+	// AdminAuth is the same closure passed to the console handler
+	// above, so both surfaces share one posture. Each data source is
+	// nil-guarded: per the OpsConfig contract a nil reporter makes
+	// its endpoint return 503 rather than panicking, so a future
+	// caller (test harness, refactor, or config path) that passes a
+	// nil cache or monitor degrades gracefully instead of crashing.
 	opsCfg := console.OpsConfig{
-		Cache:     cache.Stats,
-		AdminAuth: buildAdminAuth(cfg),
+		AdminAuth: adminAuth,
+	}
+	if cache != nil {
+		opsCfg.Cache = cache.Stats
 	}
 	if healthMon != nil {
 		opsCfg.Health = healthMon.Snapshot
