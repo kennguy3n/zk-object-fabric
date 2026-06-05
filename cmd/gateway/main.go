@@ -511,7 +511,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, mfaStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, mfaStore, authHooks, billingSink, billingProvider, fleetOrchestrator, cache, healthMon)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -2604,6 +2604,8 @@ func startConsoleAPI(
 	billingSink billing.BillingSink,
 	billingProvider billing.BillingProvider,
 	orchestrator *migration.FleetOrchestrator,
+	cache hot_object_cache.HotObjectCache,
+	healthMon *health.Monitor,
 ) *http.Server {
 	if cfg.Console.ListenAddr == "" {
 		return nil
@@ -2649,6 +2651,25 @@ func startConsoleAPI(
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
+
+	// Operations dashboard (Phase 3 console): read-only /api/v1/ops/*
+	// endpoints the React console renders for SME operators who do
+	// not run Grafana/Prometheus. Health and cache stats are wired
+	// from the live monitor and hot-object cache. The Wasabi
+	// fair-use budget source is left unset for now — its endpoint
+	// reports 503 and the SPA degrades to an "unavailable" card —
+	// because it requires joining the guardrail config with
+	// per-tenant billing counters, which has no read side here yet.
+	// AdminAuth reuses the same gate as the rest of the console
+	// admin surface so both share one posture.
+	opsCfg := console.OpsConfig{
+		Cache:     cache.Stats,
+		AdminAuth: buildAdminAuth(cfg),
+	}
+	if healthMon != nil {
+		opsCfg.Health = healthMon.Snapshot
+	}
+	console.NewOpsHandler(opsCfg).Register(mux)
 
 	// Slowloris hardening: ReadHeaderTimeout / IdleTimeout /
 	// MaxHeaderBytes mirror the gateway's posture so a
