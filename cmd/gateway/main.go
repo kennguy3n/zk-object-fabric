@@ -511,7 +511,7 @@ func main() {
 	// so a saturated S3 data plane cannot starve the management
 	// controls operators use to diagnose it. The default address
 	// is :8081 when the operator has not overridden it in config.
-	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, mfaStore, authHooks, billingSink, billingProvider, fleetOrchestrator)
+	consoleSrv := startConsoleAPI(cfg, metadataDB, tenantStore, authStore, refreshStore, mfaStore, authHooks, billingSink, billingProvider, fleetOrchestrator, cache, healthMon)
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
@@ -2604,6 +2604,8 @@ func startConsoleAPI(
 	billingSink billing.BillingSink,
 	billingProvider billing.BillingProvider,
 	orchestrator *migration.FleetOrchestrator,
+	cache hot_object_cache.HotObjectCache,
+	healthMon *health.Monitor,
 ) *http.Server {
 	if cfg.Console.ListenAddr == "" {
 		return nil
@@ -2627,6 +2629,12 @@ func startConsoleAPI(
 	cellStore := buildDedicatedCellStore(metadataDB)
 	cellProvisioner := buildCellProvisioner(cellStore)
 
+	// One admin-auth gate shared by the console handler and the ops
+	// handler so both surfaces enforce an identical posture from a
+	// single source of truth (changing the gate can't drift one
+	// surface out of sync with the other).
+	adminAuth := buildAdminAuth(cfg)
+
 	h := console.New(console.Config{
 		Tenants:         tenants,
 		Usage:           usage,
@@ -2637,7 +2645,7 @@ func startConsoleAPI(
 		MFA:             mfaStore,
 		MFAIssuer:       cfg.Console.MFAIssuer,
 		AuthHooks:       authHooks,
-		AdminAuth:       buildAdminAuth(cfg),
+		AdminAuth:       adminAuth,
 		BillingSink:     billingSink,
 		BillingProvider: billingProvider,
 		Buckets:         console.NewMemoryBucketStore(),
@@ -2649,6 +2657,31 @@ func startConsoleAPI(
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
+
+	// Operations dashboard (Phase 3 console): read-only /api/v1/ops/*
+	// endpoints the React console renders for SME operators who do
+	// not run Grafana/Prometheus. Health and cache stats are wired
+	// from the live monitor and hot-object cache. The Wasabi
+	// fair-use budget source is left unset for now — its endpoint
+	// reports 503 and the SPA degrades to an "unavailable" card —
+	// because it requires joining the guardrail config with
+	// per-tenant billing counters, which has no read side here yet.
+	// AdminAuth is the same closure passed to the console handler
+	// above, so both surfaces share one posture. Each data source is
+	// nil-guarded: per the OpsConfig contract a nil reporter makes
+	// its endpoint return 503 rather than panicking, so a future
+	// caller (test harness, refactor, or config path) that passes a
+	// nil cache or monitor degrades gracefully instead of crashing.
+	opsCfg := console.OpsConfig{
+		AdminAuth: adminAuth,
+	}
+	if cache != nil {
+		opsCfg.Cache = cache.Stats
+	}
+	if healthMon != nil {
+		opsCfg.Health = healthMon.Snapshot
+	}
+	console.NewOpsHandler(opsCfg).Register(mux)
 
 	// Slowloris hardening: ReadHeaderTimeout / IdleTimeout /
 	// MaxHeaderBytes mirror the gateway's posture so a
