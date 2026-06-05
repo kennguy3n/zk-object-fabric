@@ -638,12 +638,12 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 
 	tenantID, err := h.cfg.NewTenantID()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "mint tenant id: "+err.Error())
+		writeInternalError(w, "mint tenant id failed", err)
 		return
 	}
 	newTenant := defaultB2CTenant(tenantID, req.TenantName)
 	if err := h.cfg.Tenants.CreateTenant(newTenant); err != nil {
-		writeError(w, http.StatusInternalServerError, "create tenant: "+err.Error())
+		writeInternalError(w, "create tenant failed", err)
 		return
 	}
 	// rollbackTenant removes the tenant record the request just
@@ -680,7 +680,7 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 		hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 		if err != nil {
 			rollbackTenant("hash password")
-			writeError(w, http.StatusInternalServerError, "hash password: "+err.Error())
+			writeInternalError(w, "hash password failed", err)
 			return
 		}
 		passwordHash = string(hash)
@@ -719,12 +719,12 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 	accessKey, secretKey, err := h.cfg.GenerateKey()
 	if err != nil {
 		rollbackUserAndTenant("generate key")
-		writeError(w, http.StatusInternalServerError, "generate key: "+err.Error())
+		writeInternalError(w, "generate key failed", err)
 		return
 	}
 	if err := h.cfg.Tenants.AddAPIKey(tenantID, accessKey, secretKey); err != nil {
 		rollbackUserAndTenant("register key")
-		writeError(w, http.StatusInternalServerError, "register key: "+err.Error())
+		writeInternalError(w, "register key failed", err)
 		return
 	}
 
@@ -739,12 +739,12 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 		vtoken, err := newVerificationToken()
 		if err != nil {
 			rollbackUserAndTenant("mint verification token")
-			writeError(w, http.StatusInternalServerError, "mint verification token: "+err.Error())
+			writeInternalError(w, "mint verification token failed", err)
 			return
 		}
 		if err := h.cfg.Auth.SetVerificationToken(tenantID, vtoken); err != nil {
 			rollbackUserAndTenant("store verification token")
-			writeError(w, http.StatusInternalServerError, "store verification token: "+err.Error())
+			writeInternalError(w, "store verification token failed", err)
 			return
 		}
 		if err := h.cfg.Hooks.SendVerificationEmail(req.Email, tenantID, vtoken); err != nil {
@@ -763,7 +763,7 @@ func (h *AuthHandler) signup(w http.ResponseWriter, r *http.Request) {
 	token, err := h.cfg.Tokens.IssueToken(tenantID)
 	if err != nil {
 		rollbackUserAndTenant("issue token")
-		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
+		writeInternalError(w, "issue token failed", err)
 		return
 	}
 	createdAt := h.cfg.Now()
@@ -907,7 +907,7 @@ func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
 	}
 	token, err := h.cfg.Tokens.IssueToken(tenantID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "issue token: "+err.Error())
+		writeInternalError(w, "issue token failed", err)
 		return
 	}
 	refreshToken, refreshExpiresAt := h.issueRefreshToken(tenantID)

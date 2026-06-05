@@ -286,6 +286,14 @@ type Config struct {
 	// PgJobStore so the routes reflect the distributed
 	// coordination view of pending and running migrations.
 	Orchestrator *migration.FleetOrchestrator
+
+	// CostReporter backs GET /api/v1/tenants/{id}/cost-breakdown,
+	// the unified per-tenant cost view. When nil the route is not
+	// mounted at all (the gateway wires it only when a metering
+	// source for the storage component is available, mirroring the
+	// Usage / Orchestrator opt-in surfaces). The route is gated by
+	// the same AdminAuth hook as the other tenant subresources.
+	CostReporter billing.CostReporter
 }
 
 // Handler routes console-API requests. Use New to construct, then
@@ -298,6 +306,14 @@ type Handler struct {
 	// is configured so dispatch can forward matching requests
 	// without registering a second handler on /api/tenants/.
 	sseHandler *UsageStreamHandler
+	// costHandler serves GET /api/v1/tenants/{id}/cost-breakdown.
+	// Set in Register when CostReporter is configured so ServeHTTP
+	// can forward the cost path before it falls through to
+	// dispatchDedup (both live under the /api/v1/tenants/ prefix;
+	// the ServeMux path in Register disambiguates them via the Go
+	// 1.22 method-specific pattern, but the ServeHTTP path has no
+	// ServeMux so it must route the cost path explicitly).
+	costHandler *CostHandler
 }
 
 // New returns a Handler with cfg defaults filled in.
@@ -376,6 +392,23 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		h.sseHandler = sse
 	}
 	h.registerDedupRoutes(mux)
+	if h.cfg.CostReporter != nil {
+		// Method-specific pattern (Go 1.22+) so it coexists with
+		// the broader "/api/v1/tenants/" subtree handlers without
+		// a routing conflict. Shares the console's AdminAuth gate
+		// and, when a tenant store is configured, its
+		// tenant-existence check so an unknown tenant 404s instead
+		// of returning a zero-valued breakdown.
+		ch := &CostHandler{Reporter: h.cfg.CostReporter, AdminAuth: h.cfg.AdminAuth}
+		if h.cfg.Tenants != nil {
+			ch.TenantExists = func(tenantID string) bool {
+				_, ok := h.cfg.Tenants.LookupTenant(tenantID)
+				return ok
+			}
+		}
+		h.costHandler = ch
+		ch.Register(mux)
+	}
 	if h.cfg.Orchestrator != nil {
 		// MigrationHandler exposes GET /api/v1/migrations and
 		// /api/v1/migrations/{job_id} so operators can see the
@@ -409,6 +442,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// matches handler.Register's behavior. Guard on
 	// DedupPolicies != nil so deployments that skip the dedup
 	// API surface do not nil-deref inside dispatchDedup.
+	// The cost-breakdown route shares the /api/v1/tenants/ prefix
+	// with dispatchDedup; route it first (parseCostPath matches
+	// only the exact .../cost-breakdown shape, so dedup paths are
+	// unaffected) so ServeHTTP mirrors Register, where the Go 1.22
+	// method-specific pattern already gives the cost route
+	// precedence.
+	if h.costHandler != nil {
+		if _, ok := parseCostPath(r.URL.Path); ok {
+			h.costHandler.ServeHTTP(w, r)
+			return
+		}
+	}
 	if h.cfg.DedupPolicies != nil && strings.HasPrefix(r.URL.Path, "/api/v1/tenants/") {
 		h.dispatchDedup(w, r)
 		return
@@ -599,7 +644,11 @@ func (h *Handler) getUsage(w http.ResponseWriter, r *http.Request, tenantID stri
 	}
 	counters, err := h.cfg.Usage.TenantUsage(r.Context(), tenantID, start, end)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "usage query failed: "+err.Error())
+		// 502 (not 500): the metering backend is the failing
+		// upstream. Sanitize like the 500 paths — the query error
+		// can carry the backend DSN or SQL text — while keeping the
+		// distinct BadGateway status.
+		writeSanitizedError(w, http.StatusBadGateway, "usage query failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, UsageResponse{
@@ -638,7 +687,7 @@ func (h *Handler) listKeys(w http.ResponseWriter, r *http.Request, tenantID stri
 	}
 	keys, err := lister.ListAPIKeys(tenantID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "list keys: "+err.Error())
+		writeInternalError(w, "list keys failed", err)
 		return
 	}
 	if keys == nil {
@@ -663,7 +712,7 @@ func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request, tenantID, ac
 		return
 	}
 	if err := lister.DeleteAPIKey(tenantID, accessKey); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete key: "+err.Error())
+		writeInternalError(w, "delete key failed", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -680,7 +729,7 @@ func (h *Handler) listBuckets(w http.ResponseWriter, r *http.Request, tenantID s
 	}
 	buckets, err := h.cfg.Buckets.ListBuckets(r.Context(), tenantID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "list buckets: "+err.Error())
+		writeInternalError(w, "list buckets failed", err)
 		return
 	}
 	if buckets == nil {
@@ -735,7 +784,7 @@ func (h *Handler) createBucket(w http.ResponseWriter, r *http.Request, tenantID 
 	}
 	bucket, err := h.cfg.Buckets.CreateBucket(r.Context(), tenantID, req.Name, req.PlacementPolicyRef)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "create bucket: "+err.Error())
+		writeInternalError(w, "create bucket failed", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, bucket)
@@ -751,7 +800,7 @@ func (h *Handler) deleteBucket(w http.ResponseWriter, r *http.Request, tenantID,
 		return
 	}
 	if err := h.cfg.Buckets.DeleteBucket(r.Context(), tenantID, name); err != nil {
-		writeError(w, http.StatusInternalServerError, "delete bucket: "+err.Error())
+		writeInternalError(w, "delete bucket failed", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -815,7 +864,7 @@ func (h *Handler) provisionDedicatedCell(w http.ResponseWriter, r *http.Request,
 	}
 	status, err := h.cfg.CellProvisioner.ProvisionCell(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "provision cell: "+err.Error())
+		writeInternalError(w, "provision cell failed", err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, status)
@@ -832,7 +881,7 @@ func (h *Handler) listDedicatedCells(w http.ResponseWriter, r *http.Request, ten
 	}
 	cells, err := h.cfg.Cells.ListDedicatedCells(r.Context(), tenantID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "list dedicated cells: "+err.Error())
+		writeInternalError(w, "list dedicated cells failed", err)
 		return
 	}
 	if cells == nil {
@@ -853,11 +902,11 @@ func (h *Handler) createKey(w http.ResponseWriter, r *http.Request, tenantID str
 	}
 	accessKey, secretKey, err := h.cfg.GenerateKey()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "generate key: "+err.Error())
+		writeInternalError(w, "generate key failed", err)
 		return
 	}
 	if err := h.cfg.Tenants.AddAPIKey(tenantID, accessKey, secretKey); err != nil {
-		writeError(w, http.StatusInternalServerError, "register key: "+err.Error())
+		writeInternalError(w, "register key failed", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, CreateKeyResponse{
@@ -876,7 +925,7 @@ func (h *Handler) getPlacement(w http.ResponseWriter, r *http.Request, tenantID 
 	}
 	pol, ok, err := h.cfg.Placements.GetPlacement(r.Context(), tenantID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "placement query failed: "+err.Error())
+		writeInternalError(w, "placement query failed", err)
 		return
 	}
 	if !ok {
@@ -921,7 +970,7 @@ func (h *Handler) putPlacement(w http.ResponseWriter, r *http.Request, tenantID 
 		return
 	}
 	if err := h.cfg.Placements.PutPlacement(r.Context(), tenantID, pol); err != nil {
-		writeError(w, http.StatusInternalServerError, "persist policy: "+err.Error())
+		writeInternalError(w, "persist policy failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, pol)
@@ -1002,6 +1051,25 @@ type errorResponse struct {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
+}
+
+// writeSanitizedError logs the underlying error server-side and
+// returns status with only the opaque clientMsg. A backend error
+// string can carry connection strings, query text, or stack traces,
+// so it must never cross the API boundary; operators read the detail
+// from the server log instead. clientMsg is a short, stable,
+// non-sensitive description of the failing operation (e.g. "list keys
+// failed"). Use it for any error-status response whose underlying
+// error originates server-side (500s via writeInternalError, the 502
+// metering-backend path, etc.).
+func writeSanitizedError(w http.ResponseWriter, status int, clientMsg string, err error) {
+	log.Printf("console: %s: %v", clientMsg, err)
+	writeError(w, status, clientMsg)
+}
+
+// writeInternalError is the 500 specialization of writeSanitizedError.
+func writeInternalError(w http.ResponseWriter, clientMsg string, err error) {
+	writeSanitizedError(w, http.StatusInternalServerError, clientMsg, err)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

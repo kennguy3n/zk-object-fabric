@@ -20,12 +20,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -2643,6 +2645,7 @@ func startConsoleAPI(
 		CellProvisioner: cellProvisioner,
 		DedupPolicies:   console.NewMemoryDedupPolicyStore(),
 		Orchestrator:    orchestrator,
+		CostReporter:    buildCostReporter(cfg, billingSink, tenantStore),
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -2676,6 +2679,122 @@ func startConsoleAPI(
 		}
 	}()
 	return srv
+}
+
+// Cost-model keys read out of BillingConfig.ProviderConfig. The
+// cost-model inputs (Wasabi $/GiB-month, amortized Linode / AWS
+// monthly spend) live in the free-form ProviderConfig map rather
+// than as dedicated BillingConfig fields so the cost surface adds
+// no vendor-specific schema; an operator opts in by setting these
+// keys. WasabiUSDPerGiBMonth is required to mount the route — the
+// other two default to zero (no amortized component).
+const (
+	costKeyWasabiUSDPerGiBMonth   = "cost_wasabi_usd_per_gib_month"
+	costKeyLinodeMonthlyUSD       = "cost_linode_monthly_usd"
+	costKeyAWSControlPlaneMonthly = "cost_aws_control_plane_monthly_usd"
+)
+
+// buildCostReporter wires the unified per-tenant cost view. It
+// returns nil — leaving the /cost-breakdown route unmounted — unless
+// both a metering read-side and a cost model are available, mirroring
+// the gateway's other opt-in console surfaces (Usage, Orchestrator).
+// It deliberately does NOT fall back to zero-valued inputs, which
+// would report a confidently-wrong cost.
+func buildCostReporter(cfg config.Config, billingSink billing.BillingSink, tenantStore auth.TenantStore) billing.CostReporter {
+	// The storage component is metered, so the route is only
+	// meaningful when the configured sink can answer windowed
+	// per-tenant reads (the embedded SQLite sink does; a
+	// ClickHouse-only deploy whose sink does not expose reads gets
+	// no route rather than a storage figure of zero).
+	src, ok := windowedReadSide(billingSink)
+	if !ok {
+		return nil
+	}
+	model, ok := parseCostModel(cfg.Billing.ProviderConfig)
+	if !ok {
+		log.Printf("gateway: console cost-breakdown route disabled; set %s in billing.provider_config to enable it", costKeyWasabiUSDPerGiBMonth)
+		return nil
+	}
+	return &billing.DefaultCostAggregator{
+		Usage: billing.NewMeteredStorageUsageReader(src),
+		Model: model,
+		// ActiveTenants is the divisor that amortizes the fixed
+		// Linode / AWS spend across the tenant base. CountTenants()
+		// counts distinct tenants — a tenant is counted once however
+		// many API-key bindings it holds — which is the semantically
+		// correct divisor; Size() (a binding count) would over-divide
+		// and under-report the amortized share for any tenant holding
+		// more than one key. The aggregator floors the value at 1 so a
+		// bootstrap deploy with no tenants does not divide by zero.
+		ActiveTenants: tenantStore.CountTenants,
+	}
+}
+
+// windowedReadSide extracts the metering read-side from sink, seeing
+// through the metrics wrapper. metrics.MetricsBillingSink wraps the
+// real sink to add Emit-side counters but unconditionally exposes its
+// own TenantUsage (forwarding to inner, or an empty-map fallback when
+// inner has none). Asserting the wrapper directly would therefore
+// always satisfy WindowedUsageSource and mount the cost route even on
+// a read-less inner (e.g. a ClickHouse-only sink), reporting a
+// confidently-wrong $0 storage — the very thing buildCostReporter
+// avoids. Unwrapping makes a metrics-enabled deploy detect the same
+// real read capability an unwrapped one would. The cost reader only
+// reads, so bypassing the wrapper's Emit counters is correct.
+func windowedReadSide(sink billing.BillingSink) (billing.WindowedUsageSource, bool) {
+	if mw, ok := sink.(*metrics.MetricsBillingSink); ok {
+		src, ok := mw.Inner.(billing.WindowedUsageSource)
+		return src, ok
+	}
+	src, ok := sink.(billing.WindowedUsageSource)
+	return src, ok
+}
+
+// parseCostModel reads the cost-model inputs out of the billing
+// provider-config map. It returns ok=false when the required Wasabi
+// rate is absent or unparseable so the caller can skip mounting the
+// route entirely.
+func parseCostModel(pc map[string]string) (billing.CostModel, bool) {
+	raw, present := pc[costKeyWasabiUSDPerGiBMonth]
+	if !present {
+		return billing.CostModel{}, false
+	}
+	wasabi, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || !isFiniteNonNegative(wasabi) {
+		log.Printf("gateway: ignoring console cost-breakdown route; %s=%q is not a finite non-negative number", costKeyWasabiUSDPerGiBMonth, raw)
+		return billing.CostModel{}, false
+	}
+	return billing.CostModel{
+		WasabiUSDPerGiBMonth:      wasabi,
+		LinodeMonthlyUSD:          parseOptionalUSD(pc, costKeyLinodeMonthlyUSD),
+		AWSControlPlaneMonthlyUSD: parseOptionalUSD(pc, costKeyAWSControlPlaneMonthly),
+	}, true
+}
+
+// parseOptionalUSD parses a finite non-negative dollar amount from the
+// provider-config map, defaulting to 0 when the key is absent,
+// empty, or malformed (a malformed amortized input should not block
+// the route the way a missing storage rate does).
+func parseOptionalUSD(pc map[string]string, key string) float64 {
+	raw, ok := pc[key]
+	if !ok {
+		return 0
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || !isFiniteNonNegative(v) {
+		log.Printf("gateway: cost-model %s=%q is not a finite non-negative number; treating as 0", key, raw)
+		return 0
+	}
+	return v
+}
+
+// isFiniteNonNegative rejects negative, NaN, and ±Inf rates.
+// strconv.ParseFloat parses "Inf"/"NaN" without error, and a
+// non-finite rate would propagate into the CostBreakdown and make the
+// handler's json.Encode fail mid-response (200 headers already sent,
+// truncated body), so these must be screened out at config parse time.
+func isFiniteNonNegative(v float64) bool {
+	return v >= 0 && !math.IsInf(v, 0) && !math.IsNaN(v)
 }
 
 // buildAuthStore returns the Postgres-backed AuthStore when a

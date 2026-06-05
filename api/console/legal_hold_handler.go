@@ -99,7 +99,7 @@ func (h *LegalHoldHandler) issue(w http.ResponseWriter, r *http.Request, tenantI
 		CreatedAt: now,
 	}
 	if err := h.Store.Create(r.Context(), hold); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeInternalError(w, "create legal hold failed", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -110,7 +110,7 @@ func (h *LegalHoldHandler) issue(w http.ResponseWriter, r *http.Request, tenantI
 func (h *LegalHoldHandler) list(w http.ResponseWriter, r *http.Request, tenantID string) {
 	holds, err := h.Store.List(r.Context(), tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeInternalError(w, "list legal holds failed", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -130,7 +130,7 @@ func (h *LegalHoldHandler) release(w http.ResponseWriter, r *http.Request, tenan
 			http.Error(w, "legal hold not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeInternalError(w, "release legal hold failed", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

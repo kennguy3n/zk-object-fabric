@@ -60,7 +60,7 @@ func (h *ForecastHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 	capacity, ok, err := h.CapacityResolver(r.Context(), cellID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeInternalError(w, "forecast capacity resolve failed", err)
 		return
 	}
 	if !ok {
@@ -70,10 +70,10 @@ func (h *ForecastHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 	res, err := h.Forecaster.Forecast(r.Context(), cellID, capacity)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			http.Error(w, err.Error(), 499)
+			http.Error(w, "client closed request", 499)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeInternalError(w, "forecast failed", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

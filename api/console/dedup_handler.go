@@ -119,7 +119,7 @@ func parseDedupPath(p string) (tenantID, bucket string, ok bool) {
 func (h *Handler) getDedupPolicy(w http.ResponseWriter, r *http.Request, tenantID, bucket string) {
 	policy, err := h.cfg.DedupPolicies.GetDedupPolicy(r.Context(), tenantID, bucket)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "dedup policy lookup failed: "+err.Error())
+		writeInternalError(w, "dedup policy lookup failed", err)
 		return
 	}
 	if policy == nil {
@@ -149,7 +149,7 @@ func (h *Handler) putDedupPolicy(w http.ResponseWriter, r *http.Request, tenantI
 		// Treat POST { enabled: false } as a delete so the SPA
 		// has a single endpoint that toggles on/off.
 		if err := h.cfg.DedupPolicies.DeleteDedupPolicy(r.Context(), tenantID, bucket); err != nil {
-			writeError(w, http.StatusInternalServerError, "dedup policy delete failed: "+err.Error())
+			writeInternalError(w, "dedup policy delete failed", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -188,7 +188,7 @@ func (h *Handler) putDedupPolicy(w http.ResponseWriter, r *http.Request, tenantI
 		Level:   level,
 	}
 	if err := h.cfg.DedupPolicies.PutDedupPolicy(r.Context(), tenantID, bucket, policy); err != nil {
-		writeError(w, http.StatusInternalServerError, "dedup policy write failed: "+err.Error())
+		writeInternalError(w, "dedup policy write failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -202,7 +202,7 @@ func (h *Handler) putDedupPolicy(w http.ResponseWriter, r *http.Request, tenantI
 
 func (h *Handler) deleteDedupPolicy(w http.ResponseWriter, r *http.Request, tenantID, bucket string) {
 	if err := h.cfg.DedupPolicies.DeleteDedupPolicy(r.Context(), tenantID, bucket); err != nil {
-		writeError(w, http.StatusInternalServerError, "dedup policy delete failed: "+err.Error())
+		writeInternalError(w, "dedup policy delete failed", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
