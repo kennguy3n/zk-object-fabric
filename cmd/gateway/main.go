@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -2423,7 +2424,7 @@ func buildCostReporter(cfg config.Config, billingSink billing.BillingSink, tenan
 	// per-tenant reads (the embedded SQLite sink does; a
 	// ClickHouse-only deploy whose sink does not expose reads gets
 	// no route rather than a storage figure of zero).
-	src, ok := billingSink.(billing.WindowedUsageSource)
+	src, ok := windowedReadSide(billingSink)
 	if !ok {
 		return nil
 	}
@@ -2447,6 +2448,26 @@ func buildCostReporter(cfg config.Config, billingSink billing.BillingSink, tenan
 	}
 }
 
+// windowedReadSide extracts the metering read-side from sink, seeing
+// through the metrics wrapper. metrics.MetricsBillingSink wraps the
+// real sink to add Emit-side counters but unconditionally exposes its
+// own TenantUsage (forwarding to inner, or an empty-map fallback when
+// inner has none). Asserting the wrapper directly would therefore
+// always satisfy WindowedUsageSource and mount the cost route even on
+// a read-less inner (e.g. a ClickHouse-only sink), reporting a
+// confidently-wrong $0 storage — the very thing buildCostReporter
+// avoids. Unwrapping makes a metrics-enabled deploy detect the same
+// real read capability an unwrapped one would. The cost reader only
+// reads, so bypassing the wrapper's Emit counters is correct.
+func windowedReadSide(sink billing.BillingSink) (billing.WindowedUsageSource, bool) {
+	if mw, ok := sink.(*metrics.MetricsBillingSink); ok {
+		src, ok := mw.Inner.(billing.WindowedUsageSource)
+		return src, ok
+	}
+	src, ok := sink.(billing.WindowedUsageSource)
+	return src, ok
+}
+
 // parseCostModel reads the cost-model inputs out of the billing
 // provider-config map. It returns ok=false when the required Wasabi
 // rate is absent or unparseable so the caller can skip mounting the
@@ -2457,8 +2478,8 @@ func parseCostModel(pc map[string]string) (billing.CostModel, bool) {
 		return billing.CostModel{}, false
 	}
 	wasabi, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil || wasabi < 0 {
-		log.Printf("gateway: ignoring console cost-breakdown route; %s=%q is not a non-negative number", costKeyWasabiUSDPerGiBMonth, raw)
+	if err != nil || !isFiniteNonNegative(wasabi) {
+		log.Printf("gateway: ignoring console cost-breakdown route; %s=%q is not a finite non-negative number", costKeyWasabiUSDPerGiBMonth, raw)
 		return billing.CostModel{}, false
 	}
 	return billing.CostModel{
@@ -2468,7 +2489,7 @@ func parseCostModel(pc map[string]string) (billing.CostModel, bool) {
 	}, true
 }
 
-// parseOptionalUSD parses a non-negative dollar amount from the
+// parseOptionalUSD parses a finite non-negative dollar amount from the
 // provider-config map, defaulting to 0 when the key is absent,
 // empty, or malformed (a malformed amortized input should not block
 // the route the way a missing storage rate does).
@@ -2478,11 +2499,20 @@ func parseOptionalUSD(pc map[string]string, key string) float64 {
 		return 0
 	}
 	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil || v < 0 {
-		log.Printf("gateway: cost-model %s=%q is not a non-negative number; treating as 0", key, raw)
+	if err != nil || !isFiniteNonNegative(v) {
+		log.Printf("gateway: cost-model %s=%q is not a finite non-negative number; treating as 0", key, raw)
 		return 0
 	}
 	return v
+}
+
+// isFiniteNonNegative rejects negative, NaN, and ±Inf rates.
+// strconv.ParseFloat parses "Inf"/"NaN" without error, and a
+// non-finite rate would propagate into the CostBreakdown and make the
+// handler's json.Encode fail mid-response (200 headers already sent,
+// truncated body), so these must be screened out at config parse time.
+func isFiniteNonNegative(v float64) bool {
+	return v >= 0 && !math.IsInf(v, 0) && !math.IsNaN(v)
 }
 
 // buildAuthStore returns the Postgres-backed AuthStore when a
