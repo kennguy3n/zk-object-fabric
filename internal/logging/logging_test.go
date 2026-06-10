@@ -2,6 +2,7 @@ package logging
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"log/slog"
 	"strings"
@@ -154,5 +155,37 @@ func TestNewStdLoggerRespectsLevel(t *testing.T) {
 	lg.Printf("charged tenant")
 	if !strings.Contains(buf.String(), "\"subsystem\":\"billing\"") {
 		t.Fatalf("NewStdLogger record missing subsystem attribute; got %q", buf.String())
+	}
+}
+
+// TestUnfilteredHandlerStaysUnfilteredAfterDerivation pins that the
+// always-enabled property survives WithAttrs/WithGroup. A plain
+// embedded handler would be promoted and revert to level filtering,
+// silently re-dropping bridged records — the override must re-wrap so
+// the derived handler is still unfiltered and still formats output.
+func TestUnfilteredHandlerStaysUnfilteredAfterDerivation(t *testing.T) {
+	restoreLogGlobals(t)
+	var buf bytes.Buffer
+	// Floor at error so a plain (non-wrapped) handler would drop Info.
+	base := unfilteredHandler{slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})}
+
+	derived := base.WithAttrs([]slog.Attr{slog.String("subsystem", "rebalancer")})
+	if !derived.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("WithAttrs lost the unfiltered property")
+	}
+	if _, ok := derived.(unfilteredHandler); !ok {
+		t.Fatalf("WithAttrs returned %T, want unfilteredHandler", derived)
+	}
+	if grouped := base.WithGroup("g"); !grouped.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("WithGroup lost the unfiltered property")
+	}
+
+	bridge := slog.NewLogLogger(derived, slog.LevelInfo)
+	bridge.Printf("rebalance tick")
+	if !strings.Contains(buf.String(), "rebalance tick") {
+		t.Fatalf("derived unfiltered handler dropped output at LOG_LEVEL=error; got %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\"subsystem\":\"rebalancer\"") {
+		t.Fatalf("derived handler lost the attrs added via WithAttrs; got %q", buf.String())
 	}
 }

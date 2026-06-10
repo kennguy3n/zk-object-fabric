@@ -97,6 +97,21 @@ type unfilteredHandler struct{ slog.Handler }
 
 func (unfilteredHandler) Enabled(context.Context, slog.Level) bool { return true }
 
+// WithAttrs and WithGroup re-wrap the derived handler so the
+// always-enabled property survives derivation. Without these overrides
+// the embedded slog.Handler would be promoted, returning a plain
+// handler that reverts to normal level filtering — silently defeating
+// the bridge if this type is ever used somewhere that derives a child
+// handler. slog.NewLogLogger's writer never derives today, but keeping
+// the wrapper closed under derivation removes the latent trap.
+func (u unfilteredHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return unfilteredHandler{u.Handler.WithAttrs(attrs)}
+}
+
+func (u unfilteredHandler) WithGroup(name string) slog.Handler {
+	return unfilteredHandler{u.Handler.WithGroup(name)}
+}
+
 // NewStdLogger returns a *log.Logger that writes through the
 // process-wide slog handler instead of straight to a stream, so the
 // many subsystems that accept a *log.Logger (read-repair, billing,
