@@ -37,3 +37,42 @@ External audit findings land in this directory under
 the Trail of Bits report templates use: one Markdown file per
 finding, with severity, impact, remediation, and a status field.
 See [`findings/README.md`](findings/README.md) for the layout.
+
+## Automated supply-chain gates
+
+Alongside the periodic external review, the repo runs continuous
+supply-chain checks. `govulncheck` and `staticcheck` run in the core
+`ci` workflow; secret scanning, frontend dependency audit, and SBOM
+generation run in a dedicated `security` workflow
+(`.github/workflows/security.yml`). All are reproducible locally:
+
+```
+# Secret scanning — full git history, uses .gitleaks.toml
+gitleaks detect --no-banner --redact --config .gitleaks.toml
+
+# Go vulnerability scanning — call-graph-aware, only reachable vulns
+govulncheck ./...
+
+# Frontend dependency audit — gate on the shipped (production) tree
+cd frontend && npm audit --omit=dev --audit-level=high
+```
+
+`gitleaks` extends the upstream ruleset and allowlists only specific,
+audited non-secret fixtures **by value** (see `.gitleaks.toml`); it
+does not blanket-skip `_test.go` files. `npm audit` gates on the
+production tree at `high` severity (the console bundle that ships);
+dev/build-tooling advisories are reported informationally.
+
+### SBOM (Software Bill of Materials)
+
+The production Docker image generates an SPDX 2.3 SBOM during the build
+(a dedicated `sbom` stage runs Syft over the gateway binary, the Go
+module graph, and the console's npm lockfile) and ships it at
+`/usr/share/sbom/zk-object-fabric.spdx.json`. The `security` workflow
+also exports it as a build artifact (`zk-object-fabric-sbom-spdx`). To
+produce it locally:
+
+```
+docker build --target sbom -o type=local,dest=./sbom-out .
+jq .spdxVersion ./sbom-out/sbom.spdx.json   # -> "SPDX-2.3"
+```

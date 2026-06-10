@@ -1,0 +1,46 @@
+# gitleaks configuration for zk-object-fabric (Workstream 6.7).
+#
+# We extend gitleaks' built-in ruleset (AWS keys, private keys, GCP
+# service accounts, JWTs, etc.) rather than redefining it, so upstream
+# rule improvements flow through automatically. The allowlist below is
+# deliberately narrow: it names specific, audited test/documentation
+# fixtures that contain non-secret placeholder material. It does NOT
+# blanket-exclude `_test.go` files, so a real provider credential
+# accidentally committed to a test still trips the high-confidence
+# rules.
+#
+# Run locally with: `gitleaks detect --no-banner` (full history) or
+# `gitleaks protect --staged` (pre-commit). CI runs the same binary
+# (see .github/workflows/security.yml).
+
+title = "zk-object-fabric gitleaks config"
+
+[extend]
+# useDefault pulls in gitleaks' maintained rule pack. Keep this true so
+# we inherit new detectors instead of freezing a snapshot.
+useDefault = true
+
+[allowlist]
+description = "Audited non-secret test fixtures and documentation placeholders."
+# Match against the secret value so the exemption is keyed to the
+# fixture content, not just a path — an unrelated real secret in the
+# same file is still flagged because its value won't match.
+regexTarget = "match"
+regexes = [
+  # api/console/totp_test.go — RFC 6238 sample TOTP seed (base32) from
+  # the spec, used to assert the authenticator math; not a credential.
+  '''GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ''',
+  # encryption/client_sdk/sdk_test.go — the generic detector trips on
+  # the `chacha20poly1305.NewX` symbol referenced in a doc comment.
+  # It is a Go identifier, not a secret.
+  '''chacha20poly1305\.NewX''',
+  # docs/runbooks/tenant-setup.md — illustrative access key in a JSON
+  # snippet showing the shape of a tenant credential payload.
+  '''ZKAK6F4U2P9R8G''',
+]
+stopwords = [
+  "example",
+  "changeme",
+  "placeholder",
+  "dummy",
+]
