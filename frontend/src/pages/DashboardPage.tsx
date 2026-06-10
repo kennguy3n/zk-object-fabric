@@ -9,7 +9,7 @@ import { type ChartDatum, CHART_COLORS, DonutChart, TrendAreaChart, type TrendPo
 import { GaugeChart } from "../components/GaugeChart";
 import { PageHeader } from "../components/PageHeader";
 import { StatCard } from "../components/StatCard";
-import { EmptyState } from "../components/states";
+import { EmptyState, InlineError } from "../components/states";
 import { formatBytes, formatNumber, formatPercent, formatUSD } from "../format";
 import { Badge } from "../ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui/card";
@@ -46,6 +46,7 @@ export function DashboardPage() {
   const [streaming, setStreaming] = useState(false);
   const [cache, setCache] = useState<OpsCacheStats | null>(null);
   const [cost, setCost] = useState<CostBreakdown | null>(null);
+  const [costError, setCostError] = useState<string | null>(null);
   const [trend, setTrend] = useState<TrendPoint[]>([]);
   // loading is true only until the first usage snapshot resolves; the
   // SSE stream then keeps the figures live.
@@ -81,12 +82,23 @@ export function DashboardPage() {
     };
   }, []);
 
-  // Cache stats + cost breakdown are admin-gated; opsGet/costBreakdown
-  // degrade to null rather than failing the dashboard.
+  // Cache stats + cost breakdown are admin-gated, so a gated tenant
+  // gets null (client.ts maps 401/403/404/503 -> null) and the rest of
+  // the dashboard still renders. A genuine backend fault (5xx / network)
+  // is rethrown by costBreakdown(); surface it in the breakdown card
+  // rather than swallowing it, mirroring the BillingPage contract so a
+  // broken cost reporter never masquerades as a merely gated feature.
   useEffect(() => {
     let cancelled = false;
     opsGet<OpsCacheStats>("cache-stats", token).then((c) => !cancelled && setCache(c));
-    api.costBreakdown().then((c) => !cancelled && setCost(c)).catch(() => {});
+    api
+      .costBreakdown()
+      .then((c) => {
+        if (cancelled) return;
+        setCost(c);
+        setCostError(null);
+      })
+      .catch((e) => !cancelled && setCostError(e instanceof Error ? e.message : String(e)));
     return () => {
       cancelled = true;
     };
@@ -241,7 +253,9 @@ export function DashboardPage() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {costMix.length === 0 ? (
+            {costError ? (
+              <InlineError message={`Cost breakdown failed: ${costError}`} />
+            ) : costMix.length === 0 ? (
               <EmptyState
                 icon={Database}
                 title="Breakdown unavailable"

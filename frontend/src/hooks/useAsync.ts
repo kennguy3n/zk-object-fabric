@@ -26,6 +26,16 @@ function toMessage(e: unknown): string {
 // On a failed (re)load it sets `error` but intentionally keeps the last
 // successful `data` (see the AsyncState contract above) so callers can
 // keep rendering prior results behind a retry affordance.
+//
+// Dependency contract: `fetcher` is deliberately excluded from the
+// effect deps (callers pass a fresh inline closure every render, which
+// would otherwise re-run the effect on every render). The effect
+// instead re-runs on `deps` + an internal reload nonce, so callers MUST
+// list every changing value their fetcher closes over in `deps` (e.g.
+// `useAsync(() => api.get(id), [id])`). Fetchers that only close over
+// the module-level `api` singleton — the case for all current callers —
+// need no deps. The exhaustive-deps lint is suppressed for exactly this
+// reason; it cannot see through the spread `[...deps, nonce]`.
 export function useAsync<T>(
   fetcher: () => Promise<T>,
   deps: React.DependencyList = [],

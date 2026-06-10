@@ -49,11 +49,19 @@ export function PlacementPolicyPage() {
     setSaving(true);
     setSaveError(null);
     try {
-      await api.savePlacementPolicy({ id: selected.id, name: selected.name, yaml });
+      const saved = await api.savePlacementPolicy({ id: selected.id, name: selected.name, yaml });
       toast({ title: "Policy saved", description: selected.name, variant: "success" });
+      // Adopt the backend's canonical round-trip of the document as the
+      // editor buffer. The user's input may differ only in formatting
+      // (key order, whitespace), so comparing their raw text against the
+      // server form would otherwise leave a misleading "Unsaved changes"
+      // badge. Seeding from `saved.yaml` — the exact shape a subsequent
+      // listPlacementPolicies() returns — makes `dirty` resolve to false
+      // deterministically regardless of how the user typed the JSON.
+      setYaml(saved.yaml);
       // Re-fetch so the list reflects the persisted document as the
-      // single source of truth; the seed effect leaves the current
-      // (saved) buffer untouched, so `dirty` resolves back to false.
+      // single source of truth; the seed effect leaves the buffer (now
+      // the canonical form) untouched.
       reload();
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));

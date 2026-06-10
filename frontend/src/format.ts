@@ -11,21 +11,28 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(precision)} ${units[exponent]}`;
 }
 
+// Intl.NumberFormat instances are comparatively expensive to build, so
+// the shared formatters are constructed once at module scope and reused
+// across every render rather than rebuilt per call (these run on hot
+// paths: chart axes, donut centres, and per-row Billing/Dashboard cells).
+const USD_FORMAT = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 2,
+});
+const COUNT_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+
 // formatUSD renders a dollar amount with cents. Used across the Billing
 // screen so every cost row shares one currency convention.
 export function formatUSD(value: number): string {
   if (!Number.isFinite(value)) return "—";
-  return value.toLocaleString("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 2,
-  });
+  return USD_FORMAT.format(value);
 }
 
 // formatNumber renders an integer-ish count with thousands separators.
 export function formatNumber(value: number): string {
   if (!Number.isFinite(value)) return "—";
-  return Math.round(value).toLocaleString("en-US");
+  return COUNT_FORMAT.format(Math.round(value));
 }
 
 // formatPercent renders a [0,1] ratio as a whole-number percentage.

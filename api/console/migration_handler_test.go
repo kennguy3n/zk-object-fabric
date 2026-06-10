@@ -128,3 +128,44 @@ func TestConsoleHandler_OmitsMigrationRoutesWhenOrchestratorNil(t *testing.T) {
 		t.Fatalf("status=%d, want 404 (handler should be unregistered)", resp.StatusCode)
 	}
 }
+
+// TestConsoleHandler_MigrationRouteServeHTTPMatchesRegister locks in
+// the symmetry between the two mount surfaces: when an Orchestrator is
+// wired, GET /api/v1/migrations[/ {jobId}] must resolve identically
+// whether the console handler is attached via Register (a ServeMux) or
+// used directly as an http.Handler (ServeHTTP, e.g. a reverse proxy or
+// chi router). The ServeHTTP path previously fell through to dispatch()
+// and 400'd the list the MigrationsPage polls.
+func TestConsoleHandler_MigrationRouteServeHTTPMatchesRegister(t *testing.T) {
+	newHandler := func() *Handler {
+		o := migration.NewFleetOrchestrator(nil, nil)
+		_ = o.Enqueue(migration.MigrationJob{JobID: "j-route", TenantID: "T", DestCellID: "c"})
+		return New(Config{Orchestrator: o})
+	}
+
+	muxSrv := func() *httptest.Server {
+		mux := http.NewServeMux()
+		newHandler().Register(mux)
+		return httptest.NewServer(mux)
+	}()
+	defer muxSrv.Close()
+
+	directSrv := httptest.NewServer(newHandler())
+	defer directSrv.Close()
+
+	for _, path := range []string{"/api/v1/migrations", "/api/v1/migrations/j-route"} {
+		viaMux := http.StatusTeapot
+		viaDirect := http.StatusTeapot
+		for srv, code := range map[*httptest.Server]*int{muxSrv: &viaMux, directSrv: &viaDirect} {
+			resp, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			*code = resp.StatusCode
+			resp.Body.Close()
+		}
+		if viaMux != http.StatusOK || viaDirect != http.StatusOK {
+			t.Fatalf("%s: mux=%d direct=%d, want both 200 (ServeHTTP must mirror Register)", path, viaMux, viaDirect)
+		}
+	}
+}
