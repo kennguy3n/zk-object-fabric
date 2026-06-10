@@ -416,8 +416,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		// deployments (single-node, no metadata DB) skip the
 		// routes entirely; the handler also tolerates a nil
 		// pointer internally for tests but checking here keeps
-		// the route table small in the common case.
-		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator}).Register(mux)
+		// the route table small in the common case. It carries the
+		// console's AdminAuth gate because the fleet queue is
+		// cross-tenant operator data (see MigrationHandler doc),
+		// unlike the public TierHandler price book.
+		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator, AdminAuth: h.cfg.AdminAuth}).Register(mux)
 	}
 	// TierHandler serves the read-only product-tier price book at
 	// GET /api/v1/tiers. It is stateless (DefaultTierConfigs is a
@@ -488,7 +491,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Orchestrator is wired.
 	if h.cfg.Orchestrator != nil &&
 		(r.URL.Path == "/api/v1/migrations" || strings.HasPrefix(r.URL.Path, "/api/v1/migrations/")) {
-		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator}).ServeHTTP(w, r)
+		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator, AdminAuth: h.cfg.AdminAuth}).ServeHTTP(w, r)
 		return
 	}
 	h.dispatch(w, r)

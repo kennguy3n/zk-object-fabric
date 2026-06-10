@@ -129,9 +129,52 @@ func TestConsoleHandler_OmitsMigrationRoutesWhenOrchestratorNil(t *testing.T) {
 	}
 }
 
+// TestMigrationHandler_AdminAuthGate verifies the fleet queue is
+// operator-gated like its sibling CostHandler: a non-nil AdminAuth
+// that rejects must 401 both the list and the single-job route (the
+// queue carries cross-tenant tenant/cell IDs, so it must never be
+// readable by a caller that fails the admin check), while an
+// accepting hook passes through to 200.
+func TestMigrationHandler_AdminAuthGate(t *testing.T) {
+	o := migration.NewFleetOrchestrator(nil, nil)
+	_ = o.Enqueue(migration.MigrationJob{JobID: "j1", TenantID: "T", DestCellID: "c"})
+
+	for _, path := range []string{"/api/v1/migrations", "/api/v1/migrations/j1"} {
+		denySrv := httptest.NewServer(&MigrationHandler{
+			Orchestrator: o,
+			AdminAuth:    func(*http.Request) bool { return false },
+		})
+		resp, err := http.Get(denySrv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotDeny := resp.StatusCode
+		resp.Body.Close()
+		denySrv.Close()
+		if gotDeny != http.StatusUnauthorized {
+			t.Fatalf("%s denied: status=%d, want 401", path, gotDeny)
+		}
+
+		allowSrv := httptest.NewServer(&MigrationHandler{
+			Orchestrator: o,
+			AdminAuth:    func(*http.Request) bool { return true },
+		})
+		resp, err = http.Get(allowSrv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotAllow := resp.StatusCode
+		resp.Body.Close()
+		allowSrv.Close()
+		if gotAllow != http.StatusOK {
+			t.Fatalf("%s allowed: status=%d, want 200", path, gotAllow)
+		}
+	}
+}
+
 // TestConsoleHandler_MigrationRouteServeHTTPMatchesRegister locks in
 // the symmetry between the two mount surfaces: when an Orchestrator is
-// wired, GET /api/v1/migrations[/ {jobId}] must resolve identically
+// wired, GET /api/v1/migrations[/{jobId}] must resolve identically
 // whether the console handler is attached via Register (a ServeMux) or
 // used directly as an http.Handler (ServeHTTP, e.g. a reverse proxy or
 // chi router). The ServeHTTP path previously fell through to dispatch()
