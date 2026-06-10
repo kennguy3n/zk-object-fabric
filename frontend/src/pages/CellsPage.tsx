@@ -150,6 +150,16 @@ function ProvisionDialog({ open, onOpenChange, onProvisioned }: { open: boolean;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // The dialog stays mounted, so its state survives close/reopen. Reset
+  // the form and any prior error each time it opens so a failed attempt
+  // never leaves a stale message (or half-entered values) on reopen.
+  useEffect(() => {
+    if (open) {
+      setInput(DEFAULT_INPUT);
+      setErr(null);
+    }
+  }, [open]);
+
   function set<K extends keyof ProvisionCellInput>(key: K, value: ProvisionCellInput[K]) {
     setInput((prev) => ({ ...prev, [key]: value }));
   }

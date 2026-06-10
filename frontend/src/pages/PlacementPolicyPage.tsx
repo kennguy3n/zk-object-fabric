@@ -75,7 +75,10 @@ export function PlacementPolicyPage() {
             <CardTitle>Policies</CardTitle>
           </CardHeader>
           <CardContent className="space-y-1">
-            {loading ? (
+            {/* Skeleton only covers the first load. useAsync keeps the
+                last list across a save-triggered reload, so gating on
+                an empty list avoids a sidebar flicker after every save. */}
+            {loading && policies.length === 0 ? (
               <div className="space-y-2">
                 {[0, 1, 2].map((i) => <Skeleton key={i} className="h-9 w-full" />)}
               </div>

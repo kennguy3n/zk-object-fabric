@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 
 export interface AsyncState<T> {
+  // The last successful result, or null before the first one resolves.
+  // Contract: a failed (re)load sets `error` but does NOT clear `data` —
+  // the previous success is retained so a transient reload failure does
+  // not blank the UI. Consumers must therefore branch in
+  // loading -> error -> data priority order (never read `data` while
+  // `error` is set if stale data would be misleading).
   data: T | null;
   loading: boolean;
   error: string | null;
@@ -17,6 +23,9 @@ function toMessage(e: unknown): string {
 // plus a manual reload. It guards against setting state after unmount
 // (or after deps change mid-flight) so a slow response can never
 // clobber a newer one or warn about updating an unmounted component.
+// On a failed (re)load it sets `error` but intentionally keeps the last
+// successful `data` (see the AsyncState contract above) so callers can
+// keep rendering prior results behind a retry affordance.
 export function useAsync<T>(
   fetcher: () => Promise<T>,
   deps: React.DependencyList = [],

@@ -5,7 +5,7 @@ import { useAuth } from "../auth/AuthContext";
 import { DonutChart, type ChartDatum } from "../components/charts";
 import { PageHeader } from "../components/PageHeader";
 import { StatCard } from "../components/StatCard";
-import { CardError, EmptyState } from "../components/states";
+import { CardError, EmptyState, InlineError } from "../components/states";
 import { TierTable } from "../components/TierTable";
 import { formatBytes, formatUSD } from "../format";
 import { useAsync } from "../hooks/useAsync";
@@ -26,25 +26,32 @@ const BYTES_PER_TIB = 2 ** 40;
 
 export function BillingPage() {
   const { tenant } = useAuth();
-  // currentUsage + the tier price book are required inputs; the
-  // per-backend cost breakdown is admin-gated and optional, so its
-  // failure (incl. a 5xx from a misconfigured reporter) is isolated
-  // to a null breakdown rather than failing the whole page — the
-  // usage×tier estimate is always tenant-accessible.
+  // currentUsage + the tier price book are the required inputs for the
+  // headline usage×tier estimate, which is always tenant-accessible.
   const { data, loading, error, reload } = useAsync(
-    () =>
-      Promise.all([
-        api.currentUsage(),
-        api.listTierConfigs(),
-        api.costBreakdown().catch(() => null),
-      ]),
+    () => Promise.all([api.currentUsage(), api.listTierConfigs()]),
     [],
   );
   const usage = data?.[0] ?? null;
   const tiers = data?.[1] ?? [];
-  const breakdown = data?.[2] ?? null;
+
+  // The per-backend cost breakdown is admin-gated, so it loads on its
+  // own: a gated tenant gets a null breakdown (handled by client.ts as
+  // 401/403/404/503 -> null) and still sees the full estimate, while a
+  // genuine backend fault (5xx / network) surfaces as an error in just
+  // the breakdown card rather than being silently swallowed or taking
+  // down the whole page.
+  const { data: breakdown, loading: breakdownLoading, error: breakdownError } = useAsync(
+    () => api.costBreakdown(),
+    [],
+  );
 
   const tier = tiers.find((t) => t.tier === tenant?.licenseTier);
+  // A tenant whose licenseTier is absent from the price book (e.g. the
+  // beta tier, which DefaultTierConfigs omits) falls through to a $0
+  // estimate. Surface that explicitly so $0 reads as "not priced yet",
+  // not "free".
+  const priceMissing = !loading && !error && tiers.length > 0 && !!tenant?.licenseTier && !tier;
   const storedTB = (usage?.storageBytes ?? 0) / BYTES_PER_TIB;
   const egressTB = (usage?.egressBytesThisMonth ?? 0) / BYTES_PER_TIB;
   const pricePerTB = tier?.price_per_tb_month ?? 0;
@@ -83,6 +90,12 @@ export function BillingPage() {
       />
 
       {error && <CardError message={`Failed to load cost inputs: ${error}`} onRetry={reload} />}
+
+      {priceMissing && (
+        <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
+          No tier price found for license tier “{tenant?.licenseTier}”; storage cost is shown as {formatUSD(0)} until this tier is added to the price book.
+        </div>
+      )}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard label="Estimated this month" value={formatUSD(storageCost)} hint={`${storedTB.toFixed(2)} TiB × ${formatUSD(pricePerTB)}/TiB`} icon={Coins} loading={loading} />
@@ -144,8 +157,10 @@ export function BillingPage() {
             <CardTitle>Cost per backend</CardTitle>
           </CardHeader>
           <CardContent>
-            {loading ? (
+            {breakdownLoading ? (
               <Skeleton className="h-[220px] w-full" />
+            ) : breakdownError ? (
+              <InlineError message={`Cost breakdown failed: ${breakdownError}`} />
             ) : breakdown && breakdownData.length > 0 ? (
               <>
                 <DonutChart data={breakdownData} format={formatUSD} centerValue={formatUSD(breakdown.total_usd)} centerLabel="total" />

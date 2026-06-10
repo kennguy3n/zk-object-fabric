@@ -192,9 +192,9 @@ export function DashboardPage() {
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">
           <CardHeader>
-            <CardTitle>Request throughput</CardTitle>
+            <CardTitle>Requests in rolling window</CardTitle>
             <CardDescription>
-              Requests observed in the rolling usage window, sampled live from the metering stream.
+              Cumulative request count over the rolling usage window, sampled live from the metering stream — a running level, not a per-second rate.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -202,7 +202,7 @@ export function DashboardPage() {
               <EmptyState
                 icon={Activity}
                 title="Waiting for live samples"
-                description="The throughput trend fills in as the metering stream delivers usage frames."
+                description="The trend fills in as the metering stream delivers usage frames."
               />
             ) : (
               <TrendAreaChart data={trend} format={formatNumber} />

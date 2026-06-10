@@ -9,7 +9,16 @@
     @apply border-border;
   }
 
-  html {
+  /* Keep browser-native chrome (scrollbars, date/number controls,
+     autofill backgrounds) in sync with the active token theme rather
+     than hardcoding dark: :root carries the light theme, .dark the
+     operator-console theme. Scoping here means a future light surface
+     (e.g. zk-drive adopting these tokens) gets light chrome for free. */
+  :root {
+    color-scheme: light;
+  }
+
+  .dark {
     color-scheme: dark;
   }
 
