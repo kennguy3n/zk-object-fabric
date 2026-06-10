@@ -207,8 +207,8 @@ export class ApiClient {
   // this session — the console token is not admin-scoped (401/403),
   // the tenant/route is absent (404), or no cost reporter is wired
   // (503). Callers then fall back to the usage×tier estimate, which
-  // is always tenant-accessible. A genuine server fault (5xx) or a
-  // network error is NOT masked as "unavailable": it propagates so
+  // is always tenant-accessible. A genuine server fault (500/502/504)
+  // or a network error is NOT masked as "unavailable": it propagates so
   // the caller can surface that the backend is broken rather than
   // silently hiding it behind the gated-feature notice.
 
@@ -228,9 +228,9 @@ export class ApiClient {
   // --- per-bucket dedup policy (admin-gated; best-effort) ------
   //
   // Same contract as costBreakdown: null means "this session may not
-  // see the policy" (401/403/404/503); 5xx and network failures
-  // propagate so the caller distinguishes a broken backend from a
-  // gated feature.
+  // see the policy" (401/403/404/503); genuine server faults
+  // (500/502/504) and network failures propagate so the caller
+  // distinguishes a broken backend from a gated feature.
 
   async getDedupPolicy(bucket: string): Promise<DedupPolicy | null> {
     try {
@@ -326,16 +326,19 @@ export class ApiError extends Error {
 // admin-gated, best-effort endpoint is legitimately not visible to
 // this session rather than broken: the console token is not
 // admin-scoped (401/403), the tenant or route is absent (404), or the
-// backing reporter/handler is not wired (503). Any other failure —
-// notably 5xx server faults and 4xx contract errors — is a real
-// problem callers should not paper over as "feature unavailable".
+// backing reporter/handler is not wired (503 — the one 5xx the
+// gateway uses to mean "dependency intentionally absent", not
+// "server broke"). Any other failure — the genuine server faults
+// 500/502/504 and 4xx contract errors — is a real problem callers
+// should not paper over as "feature unavailable".
 const FEATURE_UNAVAILABLE_STATUSES = new Set([401, 403, 404, 503]);
 
 // isFeatureUnavailable reports whether an error from a best-effort
 // gated endpoint should degrade to null (feature simply not available
 // to this session) rather than propagate. Network errors (which
-// surface as a non-ApiError TypeError from fetch) and 5xx faults are
-// deliberately excluded so a broken backend is never hidden.
+// surface as a non-ApiError TypeError from fetch) and genuine server
+// faults (500/502/504) are deliberately excluded so a broken backend
+// is never hidden.
 function isFeatureUnavailable(e: unknown): boolean {
   return e instanceof ApiError && FEATURE_UNAVAILABLE_STATUSES.has(e.status);
 }

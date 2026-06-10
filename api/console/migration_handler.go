@@ -25,9 +25,14 @@ func (h *MigrationHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/migrations/", h.dispatch)
 }
 
-// ServeHTTP supports test routing.
+// ServeHTTP routes the same way Register's mux mount does, so the two
+// surfaces resolve identically: the exact "/api/v1/migrations" lists,
+// and the "/api/v1/migrations/" subtree dispatches a single job.
+// dispatch() folds the bare-slash case (empty job id) back to list(),
+// which is exactly what the mux's subtree handler does for that path —
+// matching paths, not just outcomes.
 func (h *MigrationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimRight(r.URL.Path, "/") == "/api/v1/migrations" {
+	if r.URL.Path == "/api/v1/migrations" {
 		h.list(w, r)
 		return
 	}
