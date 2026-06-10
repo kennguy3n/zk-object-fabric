@@ -48,6 +48,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/config"
 	"github.com/kennguy3n/zk-object-fabric/internal/embeddeddb"
 	"github.com/kennguy3n/zk-object-fabric/internal/health"
+	"github.com/kennguy3n/zk-object-fabric/internal/logging"
 	"github.com/kennguy3n/zk-object-fabric/internal/metrics"
 	"github.com/kennguy3n/zk-object-fabric/internal/repair"
 	"github.com/kennguy3n/zk-object-fabric/internal/requestid"
@@ -94,6 +95,13 @@ func main() {
 	// run-time without rewriting their config file.
 	allowLocalCMK := flag.Bool("allow-local-cmk", false, "permit env=production with cmk://local/... — escape hatch for HSM-fuse deployments where the local file path maps to hardware-backed key material; do NOT set this against a plaintext key file (overrides encryption.allow_local_cmk)")
 	flag.Parse()
+
+	// Configure structured logging FIRST, before config load, so the
+	// very first log.Fatalf on a bad config file is already emitted
+	// as a structured record on the same handler as everything else.
+	// All subsequent log.Printf / log.Fatalf calls in this binary are
+	// bridged through slog by this call (see internal/logging).
+	logging.Init("gateway")
 
 	cfg := config.Default()
 	if *cfgPath != "" {
