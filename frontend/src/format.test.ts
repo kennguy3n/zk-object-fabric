@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatBytes } from "./format";
+import { formatBytes, formatRelative } from "./format";
 import { summarizeYaml } from "./pages/PlacementPolicyPage";
 
 describe("formatBytes", () => {
@@ -18,6 +18,25 @@ describe("formatBytes", () => {
 
   it("handles negative", () => {
     expect(formatBytes(-1)).toBe("—");
+  });
+});
+
+describe("formatRelative", () => {
+  it("returns a dash for empty/zero timestamps", () => {
+    expect(formatRelative()).toBe("—");
+    expect(formatRelative("0001-01-01T00:00:00Z")).toBe("—");
+  });
+
+  it("renders recent past as 'just now' and older as 'Nm ago'", () => {
+    expect(formatRelative(new Date(Date.now() - 5_000).toISOString())).toBe("just now");
+    expect(formatRelative(new Date(Date.now() - 5 * 60_000).toISOString())).toBe("5m ago");
+  });
+
+  it("clamps future timestamps (clock skew) to 'just now' regardless of magnitude", () => {
+    // A negative elapsed value would otherwise satisfy every `< N`
+    // branch and mis-render a far-future date as "just now" only by
+    // accident; the clamp makes that explicit and stable.
+    expect(formatRelative(new Date(Date.now() + 3 * 24 * 3600_000).toISOString())).toBe("just now");
   });
 });
 

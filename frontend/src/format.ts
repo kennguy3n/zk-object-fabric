@@ -56,7 +56,13 @@ export function formatRelative(iso?: string): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime()) || d.getUTCFullYear() <= 1) return "—";
-  const seconds = Math.round((Date.now() - d.getTime()) / 1000);
+  // Clamp to the past: these timestamps (key last-used, migration
+  // started/completed) are always historical, but client/server clock
+  // skew can put them slightly ahead of Date.now(). Without the clamp a
+  // negative elapsed value still satisfies every `< N` branch below, so
+  // a date hours or days in the future would also render "just now"
+  // (and a far-future skew could even fall through misleadingly).
+  const seconds = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
   if (seconds < 60) return "just now";
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
