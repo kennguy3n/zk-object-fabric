@@ -314,6 +314,16 @@ type Handler struct {
 	// 1.22 method-specific pattern, but the ServeHTTP path has no
 	// ServeMux so it must route the cost path explicitly).
 	costHandler *CostHandler
+	// tierHandler serves the read-only product-tier price book at
+	// GET /api/v1/tiers, and migrationHandler the fleet-migration queue
+	// at /api/v1/migrations[/{jobId}]. Both are immutable after
+	// construction, so they are built once in New and reused by both
+	// Register (mux mount) and ServeHTTP (direct mount) rather than
+	// allocated per request — mirroring how sseHandler/costHandler are
+	// cached. migrationHandler is nil when no Orchestrator is wired, so
+	// both surfaces 404 the migration subtree identically.
+	tierHandler      *TierHandler
+	migrationHandler *MigrationHandler
 }
 
 // New returns a Handler with cfg defaults filled in.
@@ -327,7 +337,17 @@ func New(cfg Config) *Handler {
 	if cfg.DefaultUsageWindow <= 0 {
 		cfg.DefaultUsageWindow = 30 * 24 * time.Hour
 	}
-	return &Handler{cfg: cfg}
+	h := &Handler{cfg: cfg}
+	// Build the stateless, immutable handlers once so both Register and
+	// the direct ServeHTTP mount reuse a single instance. TierHandler is
+	// always available (public price book); MigrationHandler only when an
+	// Orchestrator is wired, leaving the field nil otherwise so both
+	// mount surfaces 404 the migration subtree the same way.
+	h.tierHandler = &TierHandler{}
+	if cfg.Orchestrator != nil {
+		h.migrationHandler = &MigrationHandler{Orchestrator: cfg.Orchestrator, AdminAuth: cfg.AdminAuth}
+	}
+	return h
 }
 
 // Register attaches the console routes to mux. Route prefixes:
@@ -419,8 +439,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		// the route table small in the common case. It carries the
 		// console's AdminAuth gate because the fleet queue is
 		// cross-tenant operator data (see MigrationHandler doc),
-		// unlike the public TierHandler price book.
-		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator, AdminAuth: h.cfg.AdminAuth}).Register(mux)
+		// unlike the public TierHandler price book. Built once in New.
+		h.migrationHandler.Register(mux)
 	}
 	// TierHandler serves the read-only product-tier price book at
 	// GET /api/v1/tiers. It is stateless (DefaultTierConfigs is a
@@ -429,7 +449,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// the Billing and Tenant screens to compare the active tier
 	// against the others. Registered unconditionally so every
 	// mux-based mount (gateway, tests, custom routers) exposes it.
-	(&TierHandler{}).Register(mux)
+	// Built once in New.
+	h.tierHandler.Register(mux)
 }
 
 // usageStreamWindowEffective returns UsageStreamWindow, falling back
@@ -477,7 +498,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// TrimRight would accept a trailing-slash variant the mux mount
 	// rejects, making the two surfaces disagree.
 	if r.URL.Path == "/api/v1/tiers" {
-		(&TierHandler{}).ServeHTTP(w, r)
+		h.tierHandler.ServeHTTP(w, r)
 		return
 	}
 	// Mirror Register's migration routes: GET /api/v1/migrations (exact)
@@ -491,11 +512,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// subtree without one — return that same 404 rather than letting the
 	// request fall through to dispatch()'s 400.
 	if r.URL.Path == "/api/v1/migrations" || strings.HasPrefix(r.URL.Path, "/api/v1/migrations/") {
-		if h.cfg.Orchestrator == nil {
+		if h.migrationHandler == nil {
 			http.NotFound(w, r)
 			return
 		}
-		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator, AdminAuth: h.cfg.AdminAuth}).ServeHTTP(w, r)
+		h.migrationHandler.ServeHTTP(w, r)
 		return
 	}
 	h.dispatch(w, r)
