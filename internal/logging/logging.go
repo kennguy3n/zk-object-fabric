@@ -120,18 +120,30 @@ func (u unfilteredHandler) WithGroup(name string) slog.Handler {
 // `subsystem` is attached as a structured "subsystem" attribute so a
 // shipper can filter by it, replacing the old text prefix.
 //
-// Unlike the std-`log` bridge installed by Init, records from these
-// loggers ARE subject to the LOG_LEVEL filter: they are ordinary
-// operational logs (not fatal startup diagnostics) emitted at INFO, so
-// LOG_LEVEL=warn|error legitimately quiets them. Must be called after
-// Init so slog.Default() is the configured handler; the returned
-// logger is always usable.
+// Like the std-`log` bridge installed by Init, the handler is wrapped
+// in unfilteredHandler so these records ALWAYS emit regardless of
+// LOG_LEVEL. This is deliberate: a *log.Logger has no level concept,
+// and the subsystems that hold one (rebalancer, lazy read-repair,
+// promotion, lifecycle evaluator, billing sinks, …) overwhelmingly use
+// it to report errors and anomalies — "rebalance %s/%s: %v",
+// "billing: clickhouse flush failed after %d retries", "abort upload
+// %s: %v". Before this package those loggers wrote unconditionally to
+// stdout, so they always reached the operator. If they instead honoured
+// LOG_LEVEL at a fixed INFO, an operator who set LOG_LEVEL=warn|error to
+// cut noise would silently lose every one of those error reports — the
+// opposite of what they asked for, and a NoOps observability hole.
+// Treating any handed-out *log.Logger as must-emit keeps the rule
+// simple: LOG_LEVEL governs leveled native slog calls; level-less
+// std-`log` sinks are never silently dropped. These subsystems are
+// low-frequency (periodic ticks / error paths), not per-request, so
+// must-emit does not flood. Must be called after Init so slog.Default()
+// is the configured handler; the returned logger is always usable.
 func NewStdLogger(subsystem string) *log.Logger {
 	h := slog.Default().Handler()
 	if subsystem != "" {
 		h = h.WithAttrs([]slog.Attr{slog.String("subsystem", subsystem)})
 	}
-	return slog.NewLogLogger(h, slog.LevelInfo)
+	return slog.NewLogLogger(unfilteredHandler{h}, slog.LevelInfo)
 }
 
 // isCompactProfile reports whether the raw ZKOF_PROFILE value selects

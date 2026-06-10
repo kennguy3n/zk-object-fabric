@@ -133,28 +133,34 @@ func TestBridgeEmitsAboveLogLevel(t *testing.T) {
 	}
 }
 
-// TestNewStdLoggerRespectsLevel verifies subsystem loggers created by
-// NewStdLogger DO honour the LOG_LEVEL filter (unlike the must-emit
-// bridge) and carry the subsystem attribute.
-func TestNewStdLoggerRespectsLevel(t *testing.T) {
+// TestNewStdLoggerAlwaysEmits verifies subsystem loggers created by
+// NewStdLogger are must-emit: a *log.Logger has no level, and the
+// subsystems holding one (rebalancer, read-repair, billing, …) use it
+// to report errors, so LOG_LEVEL=warn|error must NOT silently drop
+// their output. The record still carries the subsystem attribute.
+func TestNewStdLoggerAlwaysEmits(t *testing.T) {
 	restoreLogGlobals(t)
 	var buf bytes.Buffer
+	// Floor at error — a native Info record would be dropped here.
 	handler := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})
 	slog.SetDefault(slog.New(handler).With("component", "gateway"))
 
 	lg := NewStdLogger("billing")
-	lg.Printf("charged tenant")
-	if buf.Len() != 0 {
-		t.Fatalf("NewStdLogger emitted an info line at LOG_LEVEL=error; got %q", buf.String())
+	lg.Printf("billing: clickhouse flush failed after 3 retries")
+	if !strings.Contains(buf.String(), "clickhouse flush failed") {
+		t.Fatalf("NewStdLogger dropped a subsystem error at LOG_LEVEL=error; got %q", buf.String())
 	}
-
-	buf.Reset()
-	handler2 := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	slog.SetDefault(slog.New(handler2).With("component", "gateway"))
-	lg = NewStdLogger("billing")
-	lg.Printf("charged tenant")
 	if !strings.Contains(buf.String(), "\"subsystem\":\"billing\"") {
 		t.Fatalf("NewStdLogger record missing subsystem attribute; got %q", buf.String())
+	}
+
+	// A native Info slog call on the same base handler MUST still be
+	// filtered — must-emit applies only to the std-log sink, not to
+	// leveled native slog calls.
+	buf.Reset()
+	slog.Default().Info("native info should be filtered")
+	if buf.Len() != 0 {
+		t.Fatalf("native Info leaked past LOG_LEVEL=error; got %q", buf.String())
 	}
 }
 
