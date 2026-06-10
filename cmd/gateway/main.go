@@ -310,7 +310,7 @@ func main() {
 		Cache:    cache,
 		Policies: hot_object_cache.DefaultPromotionPolicies(),
 		Fetcher:  hot_object_cache.StaticFetcher{Provider: registry[defaultBackend]},
-		Logger:   log.New(os.Stdout, "promotion ", log.LstdFlags),
+		Logger:   logging.NewStdLogger("promotion"),
 	}
 	workerDone := make(chan struct{})
 	go func() {
@@ -319,7 +319,7 @@ func main() {
 	}()
 
 	readRepair := lazy_read_repair.New(registry, store)
-	readRepair.Logger = log.New(os.Stdout, "read_repair ", log.LstdFlags)
+	readRepair.Logger = logging.NewStdLogger("read_repair")
 	// Share the same adapter as the HTTP handler so repair-path
 	// integrity observations land on the same Prometheus series
 	// (zkof_integrity_failure_total / zkof_integrity_claim_unrecognized_total).
@@ -1262,7 +1262,7 @@ func startOrphanGC(
 		Manifests: store,
 		Resolver:  resolver,
 		Interval:  d.OrphanGCInterval.ToDuration(),
-		Logger:    log.New(os.Stdout, "orphan_gc ", log.LstdFlags),
+		Logger:    logging.NewStdLogger("orphan_gc"),
 	})
 	if err != nil {
 		log.Printf("gateway: orphan_gc disabled — config error: %v", err)
@@ -1295,7 +1295,7 @@ func startAADMigrator(
 	mig, err := s3compat.NewAADMigrator(h, s3compat.AADMigratorConfig{
 		Interval:       enc.AADMigrationInterval.ToDuration(),
 		PerObjectDelay: enc.AADMigrationPerObject.ToDuration(),
-		Logger:         log.New(os.Stdout, "aad_migrator ", log.LstdFlags),
+		Logger:         logging.NewStdLogger("aad_migrator"),
 	})
 	if err != nil {
 		log.Printf("gateway: aad_migrator disabled — config error: %v", err)
@@ -1345,7 +1345,7 @@ func startRebalancer(
 		Providers:      registry,
 		Targets:        targets,
 		BytesPerSecond: rb.BytesPerSecond,
-		Logger:         log.New(os.Stdout, "rebalancer ", log.LstdFlags),
+		Logger:         logging.NewStdLogger("rebalancer"),
 	})
 	done := make(chan struct{})
 	go func() {
@@ -1413,7 +1413,7 @@ func startLifecycleEvaluator(
 		NewVersionID: s3compat.NewVersionID,
 		NodeID:       nodeID,
 		Billing:      billingSink,
-		Logger:       log.New(os.Stdout, "lifecycle ", log.LstdFlags),
+		Logger:       logging.NewStdLogger("lifecycle"),
 	}
 	if idx != nil {
 		evCfg.ContentIndex = idx
@@ -1498,7 +1498,7 @@ func buildFleetOrchestrator(cfg config.Config, metadataDB *sql.DB) *migration.Fl
 		NodeID:   nodeID,
 		Limits:   limits,
 		ClaimTTL: ttl,
-		Logger:   log.New(os.Stdout, "orchestrator ", log.LstdFlags),
+		Logger:   logging.NewStdLogger("orchestrator"),
 	})
 	if err != nil {
 		// Construction can only fail when Store or NodeID
@@ -2068,7 +2068,7 @@ func buildMultipartStore(
 	}
 	pgCfg := multipart.PostgresConfig{
 		DB:     db,
-		Logger: log.New(os.Stdout, "multipart_pg ", log.LstdFlags),
+		Logger: logging.NewStdLogger("multipart_pg"),
 		Cleanup: func(ctx context.Context, _ *multipart.Upload, parts []multipart.Part) {
 			for _, p := range parts {
 				provider, ok := registry[p.Backend]
@@ -2157,7 +2157,7 @@ func buildAbuseAlertSink(cfg config.AbuseConfig, billingSink auth.AlertSink) aut
 		return billingSink
 	}
 	webhook := auth.NewWebhookAlertSink(cfg.AlertWebhookURL)
-	webhook.Logger = log.New(os.Stdout, "abuse_webhook ", log.LstdFlags)
+	webhook.Logger = logging.NewStdLogger("abuse_webhook")
 	log.Printf("gateway: abuse alert webhook enabled (%s)", cfg.AlertWebhookURL)
 	return auth.NewMultiAlertSink(billingSink, webhook)
 }
@@ -2417,7 +2417,7 @@ func buildBillingSink(cfg config.Config, embeddedDB *sql.DB) interface {
 				DB:            embeddedDB,
 				BatchSize:     cfg.Billing.BatchSize,
 				FlushInterval: cfg.Billing.FlushInterval.ToDuration(),
-				Logger:        log.New(os.Stdout, "billing ", log.LstdFlags),
+				Logger:        logging.NewStdLogger("billing"),
 			})
 			if err != nil {
 				log.Fatalf("gateway: build embedded billing sink: %v", err)
@@ -2425,7 +2425,7 @@ func buildBillingSink(cfg config.Config, embeddedDB *sql.DB) interface {
 			log.Printf("gateway: embedded SQLite billing sink enabled")
 			return sink
 		}
-		return &billing.LoggerSink{Logger: log.New(os.Stdout, "", log.LstdFlags)}
+		return &billing.LoggerSink{Logger: logging.NewStdLogger("")}
 	}
 	chCfg := billing.ClickHouseConfig{
 		Endpoint:      cfg.Billing.ClickHouseURL,
@@ -2435,7 +2435,7 @@ func buildBillingSink(cfg config.Config, embeddedDB *sql.DB) interface {
 		Password:      cfg.Billing.ClickHousePassword,
 		BatchSize:     cfg.Billing.BatchSize,
 		FlushInterval: cfg.Billing.FlushInterval.ToDuration(),
-		Logger:        log.New(os.Stdout, "billing ", log.LstdFlags),
+		Logger:        logging.NewStdLogger("billing"),
 	}
 	if cfg.Billing.ClickHouseTLS && !cfg.InternalTLS.Enabled {
 		log.Printf("gateway: WARNING billing.clickhouse_tls is set but internal_tls.enabled is false; the ClickHouse billing connection will NOT use internal mTLS. Set internal_tls.enabled=true to arm it")
@@ -2504,7 +2504,7 @@ func buildBillingProvider(cfg config.Config) billing.BillingProvider {
 	provider, err := billing.BuildProvider(billing.ProviderFactoryConfig{
 		Name:     cfg.Billing.Provider,
 		Settings: cfg.Billing.ProviderConfig,
-		Logger:   log.New(os.Stdout, "billing.provider ", log.LstdFlags),
+		Logger:   logging.NewStdLogger("billing.provider"),
 	})
 	if err != nil {
 		log.Fatalf("gateway: build billing provider: %v", err)
@@ -2539,7 +2539,7 @@ func startHealthMonitor(ctx context.Context, hc config.HealthConfig, cache hot_o
 		PollTimeout:     hc.PollTimeout.ToDuration(),
 		DrainTimeout:    hc.DrainTimeout.ToDuration(),
 		Cache:           cache,
-		Logger:          log.New(os.Stdout, "health ", log.LstdFlags),
+		Logger:          logging.NewStdLogger("health"),
 	})
 	if err != nil {
 		log.Fatalf("gateway: build health monitor: %v", err)
@@ -3003,7 +3003,7 @@ func buildCellProvisioner(store console.DedicatedCellStore) cellops.CellProvisio
 		return nil
 	}
 	prov := cellops.NewManualProvisioner(sink)
-	prov.Logger = log.New(os.Stdout, "cellops ", log.LstdFlags)
+	prov.Logger = logging.NewStdLogger("cellops")
 	return prov
 }
 
@@ -3585,7 +3585,7 @@ func startCrossCellReplicator(
 	if d := time.Duration(cfg.ScanInterval); d > 0 {
 		r.Interval = d
 	}
-	r.Logger = log.New(os.Stdout, "cross_cell ", log.LstdFlags)
+	r.Logger = logging.NewStdLogger("cross_cell")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -3625,7 +3625,7 @@ func startRepairQueue(
 	if d := time.Duration(cfg.PollInterval); d > 0 {
 		q.PollInterval = d
 	}
-	q.Logger = log.New(os.Stdout, "repair ", log.LstdFlags)
+	q.Logger = logging.NewStdLogger("repair")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

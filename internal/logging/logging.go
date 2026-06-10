@@ -35,6 +35,7 @@
 package logging
 
 import (
+	"context"
 	"io"
 	"log"
 	"log/slog"
@@ -58,7 +59,8 @@ const CompactProfile = "compact"
 func Init(component string) *slog.Logger {
 	compact := isCompactProfile(os.Getenv("ZKOF_PROFILE"))
 	level := parseLevel(os.Getenv("LOG_LEVEL"))
-	handler := newHandler(os.Stderr, level, compact)
+	format := os.Getenv("LOG_FORMAT")
+	handler := newHandler(os.Stderr, level, compact, format)
 	logger := slog.New(handler).With("component", component)
 	slog.SetDefault(logger)
 
@@ -66,18 +68,55 @@ func Init(component string) *slog.Logger {
 	// log.Printf("gateway: ...") calls emit the same structured
 	// record as a native slog call. LstdFlags is reset to 0 so the
 	// std logger doesn't prepend a timestamp the slog handler would
-	// duplicate. Bridge records are emitted at INFO regardless of
-	// LOG_LEVEL: their producers (this codebase's operational
-	// log.Printf calls and third-party libraries) intend them as
-	// informational, and letting LOG_LEVEL push them to ERROR would
-	// distort error-rate alerting. Using logger.Handler() (not the
-	// raw handler) preserves the "component" attribute on bridged
-	// records too.
-	bridge := slog.NewLogLogger(logger.Handler(), slog.LevelInfo)
+	// duplicate.
+	//
+	// The bridge wraps the handler in unfilteredHandler so bridged
+	// records ALWAYS emit regardless of LOG_LEVEL. This is critical:
+	// the gateway uses log.Fatalf for ~20+ fatal startup failures
+	// (config validation, DB connections, security guards). Without
+	// the wrapper, LOG_LEVEL=warn|error makes the handler's
+	// Enabled(INFO) return false, so slog.NewLogLogger's writer
+	// silently discards every bridged line — the process would exit
+	// 1 on a fatal with no diagnostic at all. The std `log` package
+	// has no level concept, so every call through it is treated as
+	// must-emit. Using logger.Handler() (not the raw handler)
+	// preserves the "component" attribute on bridged records.
+	bridge := slog.NewLogLogger(unfilteredHandler{logger.Handler()}, slog.LevelInfo)
 	log.SetFlags(0)
 	log.SetOutput(bridge.Writer())
 
 	return logger
+}
+
+// unfilteredHandler wraps a slog.Handler so Enabled always reports
+// true, letting records pass the level filter while still being
+// formatted (and carrying the embedded attributes) by the wrapped
+// handler. Used only for the std-`log` bridge, whose records have no
+// level of their own and must never be dropped (see Init).
+type unfilteredHandler struct{ slog.Handler }
+
+func (unfilteredHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+// NewStdLogger returns a *log.Logger that writes through the
+// process-wide slog handler instead of straight to a stream, so the
+// many subsystems that accept a *log.Logger (read-repair, billing,
+// lifecycle, rebalancer, …) emit the same structured records as a
+// native slog call rather than unstructured prefixed text on stdout.
+// `subsystem` is attached as a structured "subsystem" attribute so a
+// shipper can filter by it, replacing the old text prefix.
+//
+// Unlike the std-`log` bridge installed by Init, records from these
+// loggers ARE subject to the LOG_LEVEL filter: they are ordinary
+// operational logs (not fatal startup diagnostics) emitted at INFO, so
+// LOG_LEVEL=warn|error legitimately quiets them. Must be called after
+// Init so slog.Default() is the configured handler; the returned
+// logger is always usable.
+func NewStdLogger(subsystem string) *log.Logger {
+	h := slog.Default().Handler()
+	if subsystem != "" {
+		h = h.WithAttrs([]slog.Attr{slog.String("subsystem", subsystem)})
+	}
+	return slog.NewLogLogger(h, slog.LevelInfo)
 }
 
 // isCompactProfile reports whether the raw ZKOF_PROFILE value selects
@@ -102,13 +141,16 @@ func parseLevel(raw string) slog.Level {
 	}
 }
 
-// newHandler picks JSON vs text based on LOG_FORMAT, falling back to
-// text under the compact profile and json otherwise when LOG_FORMAT
-// is unset. An explicit LOG_FORMAT always wins over the profile
-// default.
-func newHandler(w io.Writer, level slog.Level, compact bool) slog.Handler {
+// newHandler picks JSON vs text based on the resolved LOG_FORMAT
+// value, falling back to text under the compact profile and json
+// otherwise when format is unset. An explicit format always wins over
+// the profile default. format is passed in (read once in Init) rather
+// than read from the environment here so the function is a pure
+// mapping of its inputs — matching how level and compact are resolved
+// in Init and keeping it trivially testable.
+func newHandler(w io.Writer, level slog.Level, compact bool, format string) slog.Handler {
 	opts := &slog.HandlerOptions{Level: level}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("LOG_FORMAT"))) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "text":
 		return slog.NewTextHandler(w, opts)
 	case "json":
