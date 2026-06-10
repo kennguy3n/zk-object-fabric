@@ -1,4 +1,4 @@
-import { ArrowRight, CheckCircle2, CircleAlert, Clock, Loader2, Replace } from "lucide-react";
+import { ArrowRight, CheckCircle2, CircleAlert, Clock, Loader2, Lock, Replace } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api/client";
@@ -27,13 +27,21 @@ const STATE_BADGE: Record<MigrationJobState, { variant: "neutral" | "default" | 
 // counters rather than a fake percentage. Running jobs poll every 5s.
 export function MigrationsPage() {
   const [jobs, setJobs] = useState<MigrationJob[]>([]);
+  // gated is true when the fleet queue is admin-gated for this session
+  // (listMigrations returns null on 401/403/404/503). It is distinct
+  // from an empty job list so an operator with zero jobs sees the
+  // empty state, while a non-admin session sees the operator-only
+  // notice instead of a raw error card.
+  const [gated, setGated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      setJobs(await api.listMigrations());
+      const result = await api.listMigrations();
+      setGated(result === null);
+      setJobs(result ?? []);
       setError(null);
     } catch (err) {
       if (!silent) setError(err instanceof Error ? err.message : String(err));
@@ -47,7 +55,8 @@ export function MigrationsPage() {
   }, [refresh]);
 
   // Poll while any job is in flight so progress stays live without a
-  // websocket. Stops once everything is terminal.
+  // websocket. Stops once everything is terminal. A gated session has
+  // no jobs to poll, so this naturally stays idle.
   const hasActive = jobs.some((j) => j.state === "pending" || j.state === "running");
   useEffect(() => {
     if (!hasActive) return;
@@ -66,6 +75,16 @@ export function MigrationsPage() {
         <div className="space-y-4">{[0, 1].map((i) => <Skeleton key={i} className="h-40 w-full" />)}</div>
       ) : error ? (
         <CardError message={error} onRetry={() => void refresh()} />
+      ) : gated ? (
+        <Card>
+          <CardContent className="p-0">
+            <EmptyState
+              icon={Lock}
+              title="Operator access required"
+              description="The fleet migration queue spans every tenant, so it is restricted to operator (admin-scoped) sessions. Sign in with an operator token to view migration jobs."
+            />
+          </CardContent>
+        </Card>
       ) : jobs.length === 0 ? (
         <Card>
           <CardContent className="p-0">

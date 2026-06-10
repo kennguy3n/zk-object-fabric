@@ -259,10 +259,25 @@ export class ApiClient {
     );
   }
 
-  // --- migrations (fleet-wide, read-only) ----------------------
+  // --- migrations (fleet-wide, read-only; admin-gated) ---------
+  //
+  // The fleet queue carries cross-tenant data (every tenant's job /
+  // cell IDs + backend names), so the backend MigrationHandler gates
+  // it behind the same AdminAuth as cost-breakdown. Same best-effort
+  // contract: null means "this session may not see the fleet queue"
+  // (401/403/404/503) so the page can render an operator-only notice
+  // instead of a raw error, while a genuine server fault (500/502/504)
+  // or network error propagates. null is distinct from [] (visible
+  // but empty), so an operator with zero jobs still sees the empty
+  // state rather than the gated notice.
 
-  async listMigrations(): Promise<MigrationJob[]> {
-    return this.requestAt("GET", `${this.rootBaseUrl}/v1/migrations`);
+  async listMigrations(): Promise<MigrationJob[] | null> {
+    try {
+      return await this.requestAt("GET", `${this.rootBaseUrl}/v1/migrations`);
+    } catch (e) {
+      if (isFeatureUnavailable(e)) return null;
+      throw e;
+    }
   }
 
   // --- product tiers (read-only, not tenant-scoped) ------------

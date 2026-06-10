@@ -39,7 +39,12 @@ type MigrationHandler struct {
 // mirroring CostHandler.serve and Handler.dispatch.
 func (h *MigrationHandler) authorized(w http.ResponseWriter, r *http.Request) bool {
 	if h.AdminAuth != nil && !h.AdminAuth(r) {
-		http.Error(w, "admin authorization required", http.StatusUnauthorized)
+		// writeError (JSON {"error":...}) rather than http.Error
+		// (text/plain) so the 401 matches the console's API error
+		// contract — identical to CostHandler.serve and
+		// Handler.dispatch, which the SPA's ApiError parsing and
+		// isFeatureUnavailable degradation both assume.
+		writeError(w, http.StatusUnauthorized, "admin authorization required")
 		return false
 	}
 	return true
