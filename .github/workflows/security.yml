@@ -1,0 +1,104 @@
+name: security
+
+# Supply-chain and secret-hygiene gates (Workstream 6.7). govulncheck
+# already runs in ci.yml's dedicated job, so this workflow adds the
+# pieces ci.yml does not yet cover: secret scanning, frontend
+# dependency audit, and SPDX SBOM generation. Kept separate so the
+# security surface evolves independently of the build/test pipeline.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `gitleaks detect` scans every commit, not
+          # just the tip — a secret committed then "removed" later is
+          # still a leak in history.
+          fetch-depth: 0
+
+      # Install the pinned gitleaks binary directly rather than via the
+      # marketplace action so the run needs no license env var and the
+      # version can't float. Bumping this is an explicit commit.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.28.0
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Run gitleaks
+        run: gitleaks detect --no-banner --redact --config .gitleaks.toml
+
+  npm-audit:
+    name: frontend-dep-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Gate on the production dependency tree — the code that ships in
+      # the console bundle — at high severity. A high/critical advisory
+      # in a shipped package fails the build and must be resolved (bump
+      # or remove), not suppressed.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      # Dev/build-tooling advisories (e.g. the vite dev-server) don't
+      # reach production, so they're reported for visibility but don't
+      # block. Reviewed manually.
+      - name: Audit all dependencies (informational)
+        run: npm audit || true
+
+  sbom:
+    name: sbom-spdx
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build only the Dockerfile's `sbom` stage and export its
+      # filesystem, then lift the SPDX document out. This exercises the
+      # exact SBOM the release image ships at
+      # /usr/share/sbom/zk-object-fabric.spdx.json (see Dockerfile)
+      # rather than generating a separate, possibly-divergent one.
+      - name: Build SBOM stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: sbom
+          outputs: type=local,dest=./sbom-out
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zk-object-fabric-sbom-spdx
+          path: ./sbom-out/sbom.spdx.json
+          if-no-files-found: error

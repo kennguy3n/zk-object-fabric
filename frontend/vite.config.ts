@@ -1,5 +1,8 @@
-/// <reference types="vitest" />
-import { defineConfig } from "vite";
+// defineConfig is imported from vitest/config (not vite) so the
+// inline `test` block below type-checks: vitest 4 no longer augments
+// vite's UserConfig with the `test` field, exposing its own
+// defineConfig overload that does. The runtime config is identical.
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // Vite config for the tenant console. The console API and its

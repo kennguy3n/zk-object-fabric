@@ -160,12 +160,11 @@ type scanCursor struct {
 // does today, and the keyset would have to be byte-ordered uniformly
 // before that changed.
 func EncodeScanCursor(key ManifestKey) string {
-	b, _ := json.Marshal(scanCursor{
-		TenantID:      key.TenantID,
-		Bucket:        key.Bucket,
-		ObjectKeyHash: key.ObjectKeyHash,
-		VersionID:     key.VersionID,
-	})
+	// scanCursor and ManifestKey have identical field names/types (the
+	// former only adds JSON tags, which Go ignores in a struct
+	// conversion), so convert rather than re-list every field — one
+	// fewer place to update when a key field is added.
+	b, _ := json.Marshal(scanCursor(key))
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
@@ -185,10 +184,5 @@ func DecodeScanCursor(cursor string) (ManifestKey, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return ManifestKey{}, errors.New("manifest_store: malformed scan cursor")
 	}
-	return ManifestKey{
-		TenantID:      c.TenantID,
-		Bucket:        c.Bucket,
-		ObjectKeyHash: c.ObjectKeyHash,
-		VersionID:     c.VersionID,
-	}, nil
+	return ManifestKey(c), nil
 }

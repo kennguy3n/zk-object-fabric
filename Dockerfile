@@ -70,6 +70,33 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---------------------------------------------------------------
+# Stage 2b — SBOM (Workstream 6.7)
+# ---------------------------------------------------------------
+# Generate an SPDX-format Software Bill of Materials for the artifacts
+# that ship in the runtime image — the compiled gateway binary and the
+# console's production node_modules graph — so every release carries an
+# auditable supply-chain manifest a tenant security team can ingest
+# (Grype, Dependency-Track, `cosign attach sbom`, etc.).
+#
+# We scan three inputs because they catalog different things:
+#   - the gateway binary — syft's go-module-binary cataloger reads the
+#     module versions Go embeds, the authoritative list of what is
+#     linked into the shipped executable;
+#   - go.mod/go.sum — the full resolved Go graph, a superset of the
+#     call-graph-reachable subset the binary references;
+#   - frontend/package-lock.json — the locked npm graph behind the
+#     static console bundle copied into the runtime image.
+#
+# The syft image is distroless (no shell), so the scan runs via exec
+# form. The tag is pinned (not :latest) so a syft default-format change
+# can't silently alter the SBOM shape between builds.
+FROM anchore/syft:v1.18.1 AS sbom
+COPY --from=gateway-build /out/gateway /scan/bin/gateway
+COPY --from=gateway-build /src/go.mod /src/go.sum /scan/src/
+COPY frontend/package.json frontend/package-lock.json /scan/frontend/
+RUN ["/syft", "scan", "dir:/scan", "--source-name", "zk-object-fabric", "-o", "spdx-json=/sbom.spdx.json"]
+
+# ---------------------------------------------------------------
 # Stage 3 — Runtime
 # ---------------------------------------------------------------
 # Alpine carries ca-certificates, a minimal tzdata, and wget for
@@ -93,6 +120,10 @@ RUN mkdir -p /data/objects /data/metadata /app/demo /app/frontend /run/zk-fabric
 
 COPY --from=gateway-build /out/gateway /usr/local/bin/gateway
 COPY --from=frontend-build /src/frontend/dist /app/frontend
+# SPDX SBOM (Workstream 6.7) shipped at a stable, documented path so a
+# running container can serve its own bill of materials to a scanner
+# or a compliance export without rebuilding.
+COPY --from=sbom /sbom.spdx.json /usr/share/sbom/zk-object-fabric.spdx.json
 COPY demo /app/demo
 RUN chmod +x /app/demo/entrypoint.sh
 
