@@ -1,0 +1,112 @@
+/*
+ * ZK shared design-token contract.
+ * ---------------------------------
+ * This file is the single source of truth for the ZK Drive / ZK Object
+ * Fabric brand. Both consoles consume these tokens (zk-object-fabric via
+ * Tailwind, see tailwind.config.js; zk-drive can import this file or mirror
+ * the :root / .dark blocks verbatim) so branding stays identical across the
+ * two products.
+ *
+ * Tokens are stored as HSL channel triplets ("H S% L%") rather than finished
+ * colours so Tailwind's `hsl(var(--token) / <alpha-value>)` bridge can apply
+ * opacity modifiers (e.g. bg-primary/40). Consumers that do not use Tailwind
+ * wrap a token in hsl(): `color: hsl(var(--zk-foreground))`.
+ *
+ * The contract is documented in docs/DESIGN_TOKENS.md. Treat token NAMES as a
+ * stable API: add new tokens rather than renaming existing ones.
+ *
+ * :root is the light theme (zk-drive's default surface); .dark is the
+ * operator-console theme that zk-object-fabric defaults to.
+ */
+
+:root {
+  /* Surfaces */
+  --zk-background: 210 40% 98%;
+  --zk-foreground: 222 47% 11%;
+  --zk-card: 0 0% 100%;
+  --zk-card-foreground: 222 47% 11%;
+  --zk-popover: 0 0% 100%;
+  --zk-popover-foreground: 222 47% 11%;
+
+  /* Brand + interactive */
+  --zk-primary: 221 83% 53%;
+  --zk-primary-foreground: 0 0% 100%;
+  --zk-secondary: 214 32% 91%;
+  --zk-secondary-foreground: 222 47% 16%;
+  --zk-accent: 199 89% 48%;
+  --zk-accent-foreground: 0 0% 100%;
+
+  /* Muted text / fills */
+  --zk-muted: 214 32% 94%;
+  --zk-muted-foreground: 215 16% 42%;
+
+  /* Semantic status */
+  --zk-success: 142 71% 38%;
+  --zk-success-foreground: 0 0% 100%;
+  --zk-warning: 32 95% 44%;
+  --zk-warning-foreground: 0 0% 100%;
+  --zk-destructive: 0 72% 51%;
+  --zk-destructive-foreground: 0 0% 100%;
+
+  /* Lines + focus */
+  --zk-border: 214 20% 88%;
+  --zk-input: 214 20% 84%;
+  --zk-ring: 221 83% 53%;
+
+  /* Categorical chart palette (provider/cost/usage series) */
+  --zk-chart-1: 221 83% 53%;
+  --zk-chart-2: 199 89% 48%;
+  --zk-chart-3: 142 71% 38%;
+  --zk-chart-4: 32 95% 44%;
+  --zk-chart-5: 270 67% 58%;
+  --zk-chart-6: 340 75% 55%;
+
+  /* Shape, type, elevation */
+  --zk-radius: 0.65rem;
+  --zk-font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --zk-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --zk-shadow-card: 0 1px 2px 0 hsl(222 47% 11% / 0.06), 0 1px 3px 0 hsl(222 47% 11% / 0.05);
+  --zk-shadow-overlay: 0 10px 38px -10px hsl(222 47% 11% / 0.35), 0 10px 20px -15px hsl(222 47% 11% / 0.2);
+}
+
+.dark {
+  /* Surfaces — derived from the legacy console palette (#0b0e13 / #141923). */
+  --zk-background: 218 30% 6%;
+  --zk-foreground: 213 30% 92%;
+  --zk-card: 219 26% 11%;
+  --zk-card-foreground: 213 30% 92%;
+  --zk-popover: 219 26% 11%;
+  --zk-popover-foreground: 213 30% 92%;
+
+  /* Brand + interactive — cyan accent continues the legacy console look. */
+  --zk-primary: 201 100% 68%;
+  --zk-primary-foreground: 205 95% 8%;
+  --zk-secondary: 219 22% 18%;
+  --zk-secondary-foreground: 213 30% 92%;
+  --zk-accent: 199 89% 60%;
+  --zk-accent-foreground: 205 95% 8%;
+
+  --zk-muted: 219 22% 16%;
+  --zk-muted-foreground: 214 16% 62%;
+
+  --zk-success: 137 49% 67%;
+  --zk-success-foreground: 150 60% 8%;
+  --zk-warning: 38 92% 60%;
+  --zk-warning-foreground: 36 90% 8%;
+  --zk-destructive: 0 100% 71%;
+  --zk-destructive-foreground: 0 60% 10%;
+
+  --zk-border: 220 24% 18%;
+  --zk-input: 220 22% 22%;
+  --zk-ring: 201 100% 68%;
+
+  --zk-chart-1: 201 100% 68%;
+  --zk-chart-2: 162 73% 55%;
+  --zk-chart-3: 137 49% 67%;
+  --zk-chart-4: 38 92% 60%;
+  --zk-chart-5: 268 86% 74%;
+  --zk-chart-6: 340 82% 70%;
+
+  --zk-shadow-card: 0 1px 2px 0 hsl(218 60% 2% / 0.5), 0 1px 3px 0 hsl(218 60% 2% / 0.4);
+  --zk-shadow-overlay: 0 10px 38px -10px hsl(218 60% 2% / 0.7), 0 10px 20px -15px hsl(218 60% 2% / 0.5);
+}

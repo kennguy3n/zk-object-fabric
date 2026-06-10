@@ -1,0 +1,187 @@
+import { CalendarClock, Coins, Database, TrendingUp } from "lucide-react";
+import { useEffect, useState } from "react";
+
+import { api } from "../api/client";
+import type { CostBreakdown, TierConfig, UsageSnapshot } from "../api/types";
+import { useAuth } from "../auth/AuthContext";
+import { DonutChart, type ChartDatum } from "../components/charts";
+import { PageHeader } from "../components/PageHeader";
+import { StatCard } from "../components/StatCard";
+import { CardError, EmptyState } from "../components/states";
+import { TierTable } from "../components/TierTable";
+import { formatBytes, formatUSD } from "../format";
+import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
+import { Skeleton } from "../ui/skeleton";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../ui/table";
+
+// BillingPage estimates the tenant's monthly bill from live usage and
+// the tier price book (both reachable from the tenant session), and
+// overlays the operator-gated per-backend cost breakdown when available.
+//
+// The product bundles Wasabi storage + Linode compute + AWS control
+// plane into one per-TiB tier price, so the headline estimate is
+// stored volume × that all-in rate. In-budget egress is $0 incremental
+// (Wasabi fair-use bundles egress up to 1× stored volume).
+
+const BYTES_PER_TIB = 2 ** 40;
+
+export function BillingPage() {
+  const { tenant } = useAuth();
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [tiers, setTiers] = useState<TierConfig[]>([]);
+  const [breakdown, setBreakdown] = useState<CostBreakdown | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  function load() {
+    setLoading(true);
+    setError(null);
+    let cancelled = false;
+    Promise.all([api.currentUsage(), api.listTierConfigs(), api.costBreakdown().catch(() => null)])
+      .then(([u, t, b]) => {
+        if (cancelled) return;
+        setUsage(u);
+        setTiers(t);
+        setBreakdown(b);
+      })
+      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }
+
+  useEffect(load, []);
+
+  const tier = tiers.find((t) => t.tier === tenant?.licenseTier);
+  const storedTB = (usage?.storageBytes ?? 0) / BYTES_PER_TIB;
+  const egressTB = (usage?.egressBytesThisMonth ?? 0) / BYTES_PER_TIB;
+  const pricePerTB = tier?.price_per_tb_month ?? 0;
+  const storageCost = storedTB * pricePerTB;
+  const egressBudgetTB = tenant?.budgets.egressTbMonth ?? 0;
+  const egressOverage = Math.max(egressTB - egressBudgetTB, 0);
+
+  // Month-end forecast linearly prorates the live estimate over the
+  // calendar month. With cost concentrated in stored volume (which is
+  // a level, not a flow) this is a conservative straight-line view.
+  const now = new Date();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const dayOfMonth = now.getDate();
+  const forecast = dayOfMonth > 0 ? (storageCost / dayOfMonth) * daysInMonth : storageCost;
+
+  const breakdownData: ChartDatum[] = breakdown
+    ? [
+        { label: "Wasabi storage", value: breakdown.wasabi_storage_usd },
+        { label: "Linode compute", value: breakdown.linode_compute_usd },
+        { label: "AWS control plane", value: breakdown.aws_control_plane_usd },
+      ].filter((d) => d.value > 0)
+    : [];
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title="Billing"
+        description={
+          <>
+            Estimated monthly cost for <span className="font-medium text-foreground">{tenant?.name}</span> on the{" "}
+            <span className="font-medium text-foreground">{tier?.display_name ?? tenant?.licenseTier}</span> tier. The per-TiB rate
+            bundles Wasabi storage, Linode compute, and the AWS control plane.
+          </>
+        }
+      />
+
+      {error && <CardError message={`Failed to load cost inputs: ${error}`} onRetry={load} />}
+
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard label="Estimated this month" value={formatUSD(storageCost)} hint={`${storedTB.toFixed(2)} TiB × ${formatUSD(pricePerTB)}/TiB`} icon={Coins} loading={loading} />
+        <StatCard label="Month-end forecast" value={formatUSD(forecast)} hint={`Prorated over ${daysInMonth} days`} icon={CalendarClock} loading={loading} tone={egressOverage > 0 ? "warning" : "default"} />
+        <StatCard label="Stored volume" value={usage ? formatBytes(usage.storageBytes) : "—"} hint={`${storedTB.toFixed(3)} TiB`} icon={Database} loading={loading} />
+        <StatCard label="Egress this month" value={usage ? formatBytes(usage.egressBytesThisMonth) : "—"} hint={`Budget ${egressBudgetTB} TiB`} icon={TrendingUp} loading={loading} tone={egressOverage > 0 ? "destructive" : "default"} />
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-[1fr_minmax(280px,360px)]">
+        <Card>
+          <CardHeader>
+            <CardTitle>Cost components</CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            {loading ? (
+              <div className="space-y-2 p-4">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-10 w-full" />)}</div>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Component</TableHead>
+                    <TableHead>Basis</TableHead>
+                    <TableHead className="text-right">Monthly estimate</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <TableRow>
+                    <TableCell className="font-medium text-foreground">Storage + compute + control plane</TableCell>
+                    <TableCell className="text-muted-foreground">{storedTB.toFixed(3)} TiB × {formatUSD(pricePerTB)}/TiB (all-in)</TableCell>
+                    <TableCell className="text-right tabular-nums">{formatUSD(storageCost)}</TableCell>
+                  </TableRow>
+                  <TableRow>
+                    <TableCell className="font-medium text-foreground">Egress (within fair-use)</TableCell>
+                    <TableCell className="text-muted-foreground">{Math.min(egressTB, egressBudgetTB).toFixed(3)} of {egressBudgetTB} TiB · bundled</TableCell>
+                    <TableCell className="text-right tabular-nums">{formatUSD(0)}</TableCell>
+                  </TableRow>
+                  <TableRow>
+                    <TableCell className="font-medium text-foreground">Egress overage</TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {egressOverage > 0 ? `${egressOverage.toFixed(3)} TiB over the 1× fair-use limit` : "Within fair-use limit"}
+                    </TableCell>
+                    <TableCell className={`text-right tabular-nums ${egressOverage > 0 ? "text-destructive" : "text-muted-foreground"}`}>
+                      {egressOverage > 0 ? "review" : formatUSD(0)}
+                    </TableCell>
+                  </TableRow>
+                  <TableRow>
+                    <TableCell className="font-semibold text-foreground">Total</TableCell>
+                    <TableCell />
+                    <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatUSD(storageCost)}</TableCell>
+                  </TableRow>
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Cost per backend</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {loading ? (
+              <Skeleton className="h-[220px] w-full" />
+            ) : breakdown && breakdownData.length > 0 ? (
+              <>
+                <DonutChart data={breakdownData} format={formatUSD} centerValue={formatUSD(breakdown.total_usd)} centerLabel="total" />
+                {breakdown.dedup_savings_usd > 0 && (
+                  <p className="mt-3 text-center text-xs text-success">Dedup saved {formatUSD(breakdown.dedup_savings_usd)} this month</p>
+                )}
+              </>
+            ) : (
+              <EmptyState icon={Coins} title="Backend breakdown unavailable" description="Per-backend cost attribution requires operator access. Your all-in estimate is shown on the left." />
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Tier comparison</CardTitle>
+        </CardHeader>
+        <CardContent className="p-0">
+          {loading ? (
+            <div className="space-y-2 p-4">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-9 w-full" />)}</div>
+          ) : tiers.length === 0 ? (
+            <EmptyState title="No tiers configured" />
+          ) : (
+            <TierTable tiers={tiers} activeTier={tenant?.licenseTier} />
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

@@ -26,6 +26,22 @@ const API_PROXY_PREFIX = "/api/";
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Split heavy, rarely-changing vendor code into long-lived chunks
+    // so the app shell stays small and returning tenants re-download
+    // only the application bundle on each deploy. Recharts pulls in
+    // d3 and is by far the largest dependency, so it gets its own
+    // chunk that only loads on chart-bearing routes (Dashboard,
+    // Billing, Wasabi Health) which are themselves lazy-loaded.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-react": ["react", "react-dom", "react-router-dom"],
+          "vendor-charts": ["recharts"],
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     proxy: {

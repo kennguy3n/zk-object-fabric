@@ -1,15 +1,40 @@
+import { Copy, KeyRound, Plus } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api/client";
 import type { ApiKey } from "../api/types";
+import { PageHeader } from "../components/PageHeader";
+import { CardError, EmptyState } from "../components/states";
+import { formatDateTime, formatRelative } from "../format";
+import { Badge } from "../ui/badge";
+import { Button } from "../ui/button";
+import { Card, CardContent } from "../ui/card";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../ui/dialog";
+import { Skeleton } from "../ui/skeleton";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../ui/table";
+import { useToast } from "../ui/toast";
 
 export function ApiKeysPage() {
+  const { toast } = useToast();
   const [keys, setKeys] = useState<ApiKey[]>([]);
-  const [freshSecret, setFreshSecret] = useState<ApiKey | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [freshSecret, setFreshSecret] = useState<ApiKey | null>(null);
+  const [revoking, setRevoking] = useState<ApiKey | null>(null);
+  const [revokeBusy, setRevokeBusy] = useState(false);
 
   const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
       setKeys(await api.listApiKeys());
     } catch (err) {
@@ -23,136 +48,149 @@ export function ApiKeysPage() {
     void refresh();
   }, [refresh]);
 
+  async function onCreate() {
+    setCreating(true);
+    try {
+      const k = await api.createApiKey();
+      setFreshSecret(k);
+      await refresh();
+    } catch (err) {
+      toast({ title: "Could not create key", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function onRevoke() {
+    if (!revoking) return;
+    setRevokeBusy(true);
+    try {
+      await api.revokeApiKey(revoking.accessKey);
+      toast({ title: "Key revoked", description: revoking.accessKey, variant: "success" });
+      setRevoking(null);
+      await refresh();
+    } catch (err) {
+      toast({ title: "Revoke failed", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    } finally {
+      setRevokeBusy(false);
+    }
+  }
+
   return (
-    <div className="stack">
-      <h1 style={{ margin: 0 }}>API keys</h1>
-      <div className="panel row" style={{ justifyContent: "space-between" }}>
-        <div className="muted" style={{ fontSize: 13 }}>
-          API keys are S3-compatible credentials. Secret keys are shown once, at
-          creation — store them in your secret manager.
-        </div>
-        <button
-          onClick={async () => {
-            setError(null);
-            try {
-              const k = await api.createApiKey();
-              setFreshSecret(k);
-              await refresh();
-            } catch (err) {
-              setError(err instanceof Error ? err.message : String(err));
-            }
-          }}
-        >
-          Create key
-        </button>
-      </div>
-      {freshSecret?.secretKey && (
-        <div className="panel" style={{ borderColor: "var(--accent)" }}>
-          <div style={{ fontWeight: 600 }}>New key — copy this now</div>
-          <div className="muted" style={{ fontSize: 13, marginBottom: 8 }}>
-            The secret will not be shown again.
+    <div className="space-y-6">
+      <PageHeader
+        title="API keys"
+        description="S3-compatible credentials. Secret keys are shown once, at creation — store them in your secret manager."
+        actions={
+          <Button onClick={onCreate} disabled={creating}>
+            <Plus className="size-4" /> {creating ? "Creating…" : "Create key"}
+          </Button>
+        }
+      />
+
+      <Card>
+        <CardContent className="p-0">
+          {loading ? (
+            <div className="space-y-2 p-4">
+              {[0, 1, 2].map((i) => (
+                <Skeleton key={i} className="h-10 w-full" />
+              ))}
+            </div>
+          ) : error ? (
+            <CardError message={error} onRetry={() => void refresh()} />
+          ) : keys.length === 0 ? (
+            <EmptyState
+              icon={KeyRound}
+              title="No API keys"
+              description="Create a key to access your buckets over the S3 API."
+              action={<Button onClick={onCreate} disabled={creating}><Plus className="size-4" /> Create key</Button>}
+            />
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Access key</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead>Last used</TableHead>
+                  <TableHead className="w-[1%]" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {keys.map((k) => (
+                  <TableRow key={k.accessKey}>
+                    <TableCell className="font-mono text-xs">{k.accessKey}</TableCell>
+                    <TableCell className="text-muted-foreground">{formatDateTime(k.createdAt)}</TableCell>
+                    <TableCell className="text-muted-foreground">{k.lastUsedAt ? formatRelative(k.lastUsedAt) : <Badge variant="neutral">never</Badge>}</TableCell>
+                    <TableCell className="text-right">
+                      <Button variant="outline" size="sm" onClick={() => setRevoking(k)}>Revoke</Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* New secret reveal */}
+      <Dialog open={!!freshSecret} onOpenChange={(o) => !o && setFreshSecret(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>New API key</DialogTitle>
+            <DialogDescription>Copy the secret key now — it will not be shown again.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-4">
+            <SecretField label="Access key" value={freshSecret?.accessKey ?? ""} />
+            <SecretField label="Secret key" value={freshSecret?.secretKey ?? ""} />
           </div>
-          <Code label="Access key" value={freshSecret.accessKey} />
-          <Code label="Secret key" value={freshSecret.secretKey} />
-          <button className="secondary" onClick={() => setFreshSecret(null)}>
-            Dismiss
-          </button>
-        </div>
-      )}
-      {error && <div className="panel danger-text">{error}</div>}
-      <div className="panel" style={{ padding: 0 }}>
-        <table>
-          <thead>
-            <tr>
-              <th>Access key</th>
-              <th>Created</th>
-              <th>Last used</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading && (
-              <tr>
-                <td colSpan={4} className="muted">
-                  Loading…
-                </td>
-              </tr>
-            )}
-            {!loading && keys.length === 0 && (
-              <tr>
-                <td colSpan={4} className="muted">
-                  No keys yet.
-                </td>
-              </tr>
-            )}
-            {keys.map((k) => (
-              <tr key={k.accessKey}>
-                <td style={{ fontFamily: "monospace" }}>{k.accessKey}</td>
-                <td>{formatTimestamp(k.createdAt)}</td>
-                <td>{k.lastUsedAt ? formatTimestamp(k.lastUsedAt) : "never"}</td>
-                <td style={{ textAlign: "right" }}>
-                  <button
-                    className="danger"
-                    onClick={async () => {
-                      if (!confirm("Revoke this key? Clients using it will start getting 403s.")) {
-                        return;
-                      }
-                      try {
-                        await api.revokeApiKey(k.accessKey);
-                        await refresh();
-                      } catch (err) {
-                        setError(err instanceof Error ? err.message : String(err));
-                      }
-                    }}
-                  >
-                    Revoke
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button type="button">Done</Button>
+            </DialogClose>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Revoke confirm */}
+      <Dialog open={!!revoking} onOpenChange={(o) => !o && setRevoking(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Revoke key</DialogTitle>
+            <DialogDescription>
+              Revoke <span className="font-mono text-xs">{revoking?.accessKey}</span>? Clients using it will immediately start getting 403s.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button type="button" variant="outline">Cancel</Button>
+            </DialogClose>
+            <Button variant="destructive" onClick={onRevoke} disabled={revokeBusy}>{revokeBusy ? "Revoking…" : "Revoke"}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-// formatTimestamp renders an ISO timestamp as a locale string, but
-// collapses Go's zero time (0001-01-01T00:00:00Z) and any other
-// unparseable / pre-epoch value to "unknown". The list endpoint
-// returns zero timestamps when the binding schema predates the
-// createdAt column; rendering those as "1/1/1" in the UI was
-// confusing operators into thinking keys were decades old.
-function formatTimestamp(value: string | undefined): string {
-  if (!value) {
-    return "unknown";
+function SecretField({ label, value }: { label: string; value: string }) {
+  const { toast } = useToast();
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast({ title: "Copied", description: label, variant: "success" });
+    } catch {
+      toast({ title: "Copy failed", description: "Select the value and copy manually.", variant: "destructive" });
+    }
   }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() <= 1) {
-    return "unknown";
-  }
-  return d.toLocaleString();
-}
-
-function Code({ label, value }: { label: string; value: string }) {
   return (
-    <div style={{ marginBottom: 8 }}>
-      <div className="muted" style={{ fontSize: 12 }}>
-        {label}
+    <div className="space-y-1">
+      <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 overflow-x-auto rounded-md border border-border bg-muted px-3 py-2 font-mono text-xs text-foreground">{value}</code>
+        <Button variant="outline" size="icon" aria-label={`Copy ${label}`} onClick={copy}>
+          <Copy className="size-4" />
+        </Button>
       </div>
-      <code
-        style={{
-          display: "block",
-          fontFamily: "monospace",
-          padding: "6px 8px",
-          borderRadius: 4,
-          background: "rgba(92, 200, 255, 0.08)",
-          border: "1px solid var(--border)",
-          wordBreak: "break-all",
-        }}
-      >
-        {value}
-      </code>
     </div>
   );
 }

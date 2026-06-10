@@ -419,6 +419,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		// the route table small in the common case.
 		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator}).Register(mux)
 	}
+	// TierHandler serves the read-only product-tier price book at
+	// GET /api/v1/tiers. It is stateless (DefaultTierConfigs is a
+	// compile-time constant) and intentionally ungated: the tier
+	// catalogue is public product information the console renders on
+	// the Billing and Tenant screens to compare the active tier
+	// against the others. Registered unconditionally so every
+	// mux-based mount (gateway, tests, custom routers) exposes it.
+	(&TierHandler{}).Register(mux)
 }
 
 // usageStreamWindowEffective returns UsageStreamWindow, falling back
@@ -456,6 +464,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.cfg.DedupPolicies != nil && strings.HasPrefix(r.URL.Path, "/api/v1/tenants/") {
 		h.dispatchDedup(w, r)
+		return
+	}
+	// Mirror Register's read-only tier catalogue route so ServeHTTP
+	// callers resolve GET /api/v1/tiers identically to the mux mount.
+	if strings.TrimRight(r.URL.Path, "/") == "/api/v1/tiers" {
+		(&TierHandler{}).ServeHTTP(w, r)
 		return
 	}
 	h.dispatch(w, r)

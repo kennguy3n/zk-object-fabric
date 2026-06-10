@@ -16,7 +16,7 @@ interface GaugeChartProps {
   // valueLabel overrides the centred readout. Defaults to the value
   // formatted as a whole-number percentage (e.g. "90%").
   valueLabel?: string;
-  // color is the arc fill. Defaults to the accent colour.
+  // color is the arc fill. Defaults to the primary brand colour.
   color?: string;
   // size is the gauge width in pixels. Height is ~60% of width.
   size?: number;
@@ -35,7 +35,7 @@ export function GaugeChart({
   value,
   label,
   valueLabel,
-  color = "var(--accent)",
+  color = "hsl(var(--zk-primary))",
   size = 160,
 }: GaugeChartProps) {
   const v = clamp01(value);
@@ -64,7 +64,7 @@ export function GaugeChart({
         <path
           d={arc}
           fill="none"
-          stroke="var(--border)"
+          stroke="hsl(var(--zk-border))"
           strokeWidth={stroke}
           strokeLinecap="round"
         />
@@ -87,13 +87,13 @@ export function GaugeChart({
           textAnchor="middle"
           fontSize={28}
           fontWeight={700}
-          fill="var(--text)"
+          fill="hsl(var(--zk-foreground))"
         >
           {readout}
         </text>
       </svg>
       {label && (
-        <div className="muted" style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+        <div className="text-xs uppercase tracking-wide text-muted-foreground">
           {label}
         </div>
       )}

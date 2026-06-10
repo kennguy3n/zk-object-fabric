@@ -1,8 +1,13 @@
 import type {
   ApiKey,
   Bucket,
+  CellStatus,
+  CostBreakdown,
   DedicatedCell,
+  DedupPolicy,
+  MigrationJob,
   PlacementPolicy,
+  ProvisionCellInput,
   Tenant,
   TierConfig,
   UsageSnapshot,
@@ -34,6 +39,12 @@ export interface AuthWire {
 // the auth endpoints are callable.
 export class ApiClient {
   private tenantBaseUrl: string | undefined;
+  // tenantId is retained alongside tenantBaseUrl because a handful of
+  // routes live under the versioned /api/v1/tenants/{id}/ prefix
+  // (cost-breakdown, dedup-policy) rather than the legacy
+  // /api/tenants/{id}/ subtree the CRUD calls use, so they need the raw
+  // ID to build their own URL.
+  private tenantId: string | undefined;
 
   constructor(
     private readonly rootBaseUrl: string,
@@ -53,9 +64,20 @@ export class ApiClient {
   setTenantScope(tenantId: string | undefined) {
     if (!tenantId) {
       this.tenantBaseUrl = undefined;
+      this.tenantId = undefined;
       return;
     }
+    this.tenantId = tenantId;
     this.tenantBaseUrl = `${this.rootBaseUrl}/tenants/${encodeURIComponent(tenantId)}`;
+  }
+
+  // versionedTenantUrl builds a URL under the /api/v1/tenants/{id}
+  // subtree used by the cost-breakdown and dedup-policy routes.
+  private versionedTenantUrl(suffix: string): string {
+    if (!this.tenantId) {
+      throw new ApiError(0, "tenant scope is not set; call setTenantScope() after login/signup");
+    }
+    return `${this.rootBaseUrl}/v1/tenants/${encodeURIComponent(this.tenantId)}${suffix}`;
   }
 
   // --- auth -----------------------------------------------------
@@ -152,14 +174,86 @@ export class ApiClient {
 
   async savePlacementPolicy(policy: Omit<PlacementPolicy, "updatedAt">): Promise<PlacementPolicy> {
     const body = frontendToBackendPolicy(policy);
-    const raw = await this.put<BackendPlacementPolicy>("/placement", body);
-    return backendToFrontendPolicy(raw);
+    const raw = await this.put<BackendPlacementPolicy | undefined>("/placement", body);
+    // The gateway replies 200 with the persisted Policy, but tolerate a
+    // 204/empty response by echoing the submitted document so a save
+    // never surfaces a spurious parse error to the user.
+    return backendToFrontendPolicy(raw ?? body);
   }
 
   // --- dedicated cells (b2b_dedicated / sovereign only) --------
 
   async listDedicatedCells(): Promise<DedicatedCell[]> {
     return this.get("/dedicated-cells");
+  }
+
+  // provisionDedicatedCell submits a dedicated-cell provisioning
+  // request. The gateway replies 202 with the initial CellStatus
+  // (status "provisioning"); the list view reflects the transition to
+  // "active" once the provisioner completes.
+  async provisionDedicatedCell(input: ProvisionCellInput): Promise<CellStatus> {
+    return this.post("/dedicated-cells", {
+      region: input.region,
+      country: input.country,
+      capacity_petabytes: input.capacityPetabytes,
+      erasure_profile: input.erasureProfile ?? "",
+      node_count: input.nodeCount,
+    });
+  }
+
+  // --- cost breakdown (admin-gated; best-effort) ---------------
+  //
+  // Returns null when the route is not reachable for this session
+  // (401/403 because the console token is not admin-scoped, or 503
+  // when no cost reporter is wired). Callers fall back to the
+  // usage×tier estimate, which is always tenant-accessible.
+
+  async costBreakdown(month?: string): Promise<CostBreakdown | null> {
+    const qs = month ? `?month=${encodeURIComponent(month)}` : "";
+    try {
+      return await this.requestAt<CostBreakdown>(
+        "GET",
+        this.versionedTenantUrl(`/cost-breakdown${qs}`),
+      );
+    } catch (e) {
+      if (e instanceof ApiError && e.status > 0) return null;
+      throw e;
+    }
+  }
+
+  // --- per-bucket dedup policy (admin-gated; best-effort) ------
+
+  async getDedupPolicy(bucket: string): Promise<DedupPolicy | null> {
+    try {
+      return await this.requestAt<DedupPolicy>(
+        "GET",
+        this.versionedTenantUrl(`/buckets/${encodeURIComponent(bucket)}/dedup-policy`),
+      );
+    } catch (e) {
+      if (e instanceof ApiError && e.status > 0) return null;
+      throw e;
+    }
+  }
+
+  // setDedupPolicy enables (level given) or disables (enabled:false)
+  // intra-tenant dedup for a bucket. Surfaces the gateway's error
+  // verbatim so the UI can show the precise rejection reason (e.g.
+  // object+block requiring a Ceph RGW backend).
+  async setDedupPolicy(
+    bucket: string,
+    input: { enabled: boolean; level?: "object" | "object+block" },
+  ): Promise<DedupPolicy> {
+    return this.requestAt(
+      "POST",
+      this.versionedTenantUrl(`/buckets/${encodeURIComponent(bucket)}/dedup-policy`),
+      { enabled: input.enabled, scope: "intra_tenant", level: input.level ?? "object" },
+    );
+  }
+
+  // --- migrations (fleet-wide, read-only) ----------------------
+
+  async listMigrations(): Promise<MigrationJob[]> {
+    return this.requestAt("GET", `${this.rootBaseUrl}/v1/migrations`);
   }
 
   // --- product tiers (read-only, not tenant-scoped) ------------
@@ -266,6 +360,7 @@ function backendToUsageSnapshot(raw: BackendUsageResponse): UsageSnapshot {
       (c["delete_requests"] ?? 0),
     egressBytesThisMonth: c["egress_bytes"] ?? 0,
     monthStart: raw.start,
+    counters: c,
   };
 }
 

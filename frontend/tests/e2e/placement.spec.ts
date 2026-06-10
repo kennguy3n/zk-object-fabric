@@ -80,7 +80,7 @@ test.describe("placement policies", () => {
       (r) => /\/api\/tenants\/[^/]+\/placement$/.test(r.url()) && r.method() === "PUT",
       { timeout: 10_000 },
     );
-    await page.getByRole("button", { name: /^save$/i }).click();
+    await page.getByRole("button", { name: /save policy|^save$/i }).click();
     await req;
   });
 
@@ -124,7 +124,7 @@ test.describe("placement policies", () => {
       (r) => /\/api\/tenants\/[^/]+\/placement$/.test(r.url()) && r.method() === "PUT",
       { timeout: 10_000 },
     );
-    await page.getByRole("button", { name: /^save$/i }).click();
+    await page.getByRole("button", { name: /save policy|^save$/i }).click();
     await putReq;
     expect(saved).not.toBeNull();
 

@@ -3,7 +3,9 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 
 import { App } from "./App";
-import "./styles.css";
+import { ToastProvider } from "./ui/toast";
+import { TooltipProvider } from "./ui/tooltip";
+import "./index.css";
 
 const container = document.getElementById("root");
 if (!container) {
@@ -13,7 +15,11 @@ if (!container) {
 createRoot(container).render(
   <StrictMode>
     <BrowserRouter>
-      <App />
+      <TooltipProvider delayDuration={200}>
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      </TooltipProvider>
     </BrowserRouter>
   </StrictMode>,
 );
