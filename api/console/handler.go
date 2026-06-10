@@ -480,17 +480,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		(&TierHandler{}).ServeHTTP(w, r)
 		return
 	}
-	// Mirror Register's migration routes, which are mounted only when an
-	// Orchestrator is configured: GET /api/v1/migrations (exact) and
-	// /api/v1/migrations/{jobId} (subtree). Without this a direct
+	// Mirror Register's migration routes: GET /api/v1/migrations (exact)
+	// and /api/v1/migrations/{jobId} (subtree). Without this a direct
 	// ServeHTTP mount (reverse proxy / chi router) would fall through to
 	// dispatch(), which only understands the /api/tenants/{id}/… surface
 	// and would 400 the migration list the console's MigrationsPage
-	// polls. Guarding on Orchestrator != nil keeps the two surfaces in
-	// lockstep with Register, which omits the routes entirely when no
-	// Orchestrator is wired.
-	if h.cfg.Orchestrator != nil &&
-		(r.URL.Path == "/api/v1/migrations" || strings.HasPrefix(r.URL.Path, "/api/v1/migrations/")) {
+	// polls. Claim the whole subtree here, then branch on Orchestrator so
+	// the two surfaces agree on the nil case too: Register mounts these
+	// routes only when an Orchestrator is wired, so the mux 404s the
+	// subtree without one — return that same 404 rather than letting the
+	// request fall through to dispatch()'s 400.
+	if r.URL.Path == "/api/v1/migrations" || strings.HasPrefix(r.URL.Path, "/api/v1/migrations/") {
+		if h.cfg.Orchestrator == nil {
+			http.NotFound(w, r)
+			return
+		}
 		(&MigrationHandler{Orchestrator: h.cfg.Orchestrator, AdminAuth: h.cfg.AdminAuth}).ServeHTTP(w, r)
 		return
 	}

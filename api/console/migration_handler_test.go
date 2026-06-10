@@ -140,6 +140,23 @@ func TestConsoleHandler_OmitsMigrationRoutesWhenOrchestratorNil(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 (handler should be unregistered)", resp.StatusCode)
 	}
+
+	// The direct ServeHTTP mount (reverse proxy / chi router) must agree
+	// with the mux on the nil-Orchestrator case: claim the migrations
+	// subtree and 404 it rather than falling through to dispatch()'s 400.
+	directSrv := httptest.NewServer(h)
+	defer directSrv.Close()
+	for _, path := range []string{"/api/v1/migrations", "/api/v1/migrations/j1"} {
+		dResp, err := http.Get(directSrv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := dResp.StatusCode
+		dResp.Body.Close()
+		if got != http.StatusNotFound {
+			t.Fatalf("ServeHTTP %s: status=%d, want 404 (must match the mux, not dispatch()'s 400)", path, got)
+		}
+	}
 }
 
 // TestMigrationHandler_AdminAuthGate verifies the fleet queue is
