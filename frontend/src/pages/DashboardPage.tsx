@@ -1,7 +1,7 @@
 import { Activity, Database, Gauge as GaugeIcon, Send } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { api } from "../api/client";
+import { api, usageSnapshotFromCounters } from "../api/client";
 import { opsGet, type OpsCacheStats } from "../api/opsClient";
 import type { CostBreakdown, UsageSnapshot } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
@@ -16,32 +16,16 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui
 
 // Server-Sent Events frame emitted by api/console/sse_handler.go.
 // Counter names mirror billing.Dimension constants on the backend.
+// It is a UsageCountersPayload plus an observed_at timestamp, so it
+// projects onto a UsageSnapshot through the same
+// usageSnapshotFromCounters() the REST bootstrap uses — no duplicate
+// projection to keep in sync.
 interface UsageStreamEvent {
   tenant_id: string;
   observed_at: string;
   start: string;
   end: string;
   counters: Record<string, number>;
-}
-
-// usageFromStreamEvent projects the counter map onto the
-// UsageSnapshot shape the dashboard already renders so the live SSE
-// frame can drop into the same StatCard without duplicating format
-// logic. Keep this aligned with backendToUsageSnapshot in client.ts.
-function usageFromStreamEvent(ev: UsageStreamEvent): UsageSnapshot {
-  const c = ev.counters ?? {};
-  return {
-    tenantId: ev.tenant_id,
-    storageBytes: c["storage_bytes_seconds"] ?? 0,
-    requestsLast30Days:
-      (c["put_requests"] ?? 0) +
-      (c["get_requests"] ?? 0) +
-      (c["list_requests"] ?? 0) +
-      (c["delete_requests"] ?? 0),
-    egressBytesThisMonth: c["egress_bytes"] ?? 0,
-    monthStart: ev.start,
-    counters: c,
-  };
 }
 
 // REQUEST_VERBS maps the per-verb counter dimensions onto a stable
@@ -123,7 +107,7 @@ export function DashboardPage() {
     const onUsage = (ev: MessageEvent) => {
       try {
         const frame = JSON.parse(ev.data) as UsageStreamEvent;
-        const snapshot = usageFromStreamEvent(frame);
+        const snapshot = usageSnapshotFromCounters(frame);
         setUsage(snapshot);
         pushTrendPoint(snapshot);
         setError(null);

@@ -225,25 +225,36 @@ function BucketConfigDialog({ bucket, onClose }: { bucket: Bucket | null; onClos
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [gated, setGated] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!bucket) {
       setPolicy(null);
       setGated(false);
+      setLoadError(null);
       return;
     }
     let cancelled = false;
     setLoading(true);
+    setLoadError(null);
     api
       .getDedupPolicy(bucket.name)
       .then((p) => {
         if (cancelled) return;
         if (p === null) {
+          // null means the policy is gated for this session
+          // (operator-managed); a genuine fault is thrown, not null.
           setGated(true);
         } else {
           setPolicy(p);
           setGated(false);
         }
+      })
+      .catch((e) => {
+        // Network error or 5xx: surface it honestly instead of
+        // leaving an unhandled rejection and a misleading interactive
+        // toggle that does not reflect the real backend state.
+        if (!cancelled) setLoadError(e instanceof Error ? e.message : String(e));
       })
       .finally(() => !cancelled && setLoading(false));
     return () => {
@@ -273,20 +284,25 @@ function BucketConfigDialog({ bucket, onClose }: { bucket: Bucket | null; onClos
           <DialogDescription>Storage behaviour for this bucket.</DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-4">
-          <div className="flex items-center justify-between gap-4 rounded-lg border border-border p-4">
-            <div className="space-y-0.5">
-              <div className="text-sm font-medium text-foreground">Intra-tenant dedup</div>
-              <p className="text-xs text-muted-foreground">
-                Object-level deduplication within your tenant. Block-level dedup requires a Ceph RGW backend on a dedicated cell.
-              </p>
+          <div className="space-y-3 rounded-lg border border-border p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="space-y-0.5">
+                <div className="text-sm font-medium text-foreground">Intra-tenant dedup</div>
+                <p className="text-xs text-muted-foreground">
+                  Object-level deduplication within your tenant. Block-level dedup requires a Ceph RGW backend on a dedicated cell.
+                </p>
+              </div>
+              {loading ? (
+                <Skeleton className="h-6 w-11" />
+              ) : loadError ? (
+                <Badge variant="destructive">Unavailable</Badge>
+              ) : gated ? (
+                <Badge variant="neutral">Operator-managed</Badge>
+              ) : (
+                <Switch checked={!!policy?.enabled} disabled={saving} onCheckedChange={toggleDedup} aria-label="Toggle dedup" />
+              )}
             </div>
-            {loading ? (
-              <Skeleton className="h-6 w-11" />
-            ) : gated ? (
-              <Badge variant="neutral">Operator-managed</Badge>
-            ) : (
-              <Switch checked={!!policy?.enabled} disabled={saving} onCheckedChange={toggleDedup} aria-label="Toggle dedup" />
-            )}
+            {loadError && <InlineError message={`Couldn't load dedup policy: ${loadError}`} />}
           </div>
           <div className="rounded-lg border border-border p-4">
             <div className="text-sm font-medium text-foreground">Versioning · Lifecycle · CORS · Object Lock</div>

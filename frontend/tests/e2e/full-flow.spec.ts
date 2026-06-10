@@ -41,6 +41,17 @@ test.describe("end-to-end onboarding journey", () => {
       test.skip(true, "signup rejected by upstream; skipping post-signup steps");
     }
 
+    // Wait for the authenticated dashboard to render before the hard
+    // navigation below. SignupPage does a client-side redirect to "/"
+    // and AuthContext persists the session to sessionStorage in a
+    // post-commit effect; the dashboard heading only mounts inside
+    // <RequireAuth> once that commit lands, so observing it guarantees
+    // the session is both in memory and persisted. Issuing the hard
+    // page.goto("/buckets") any earlier races the persist effect and
+    // the reload reads an empty sessionStorage, bouncing to /login.
+    await expect(page).toHaveURL(/\/(dashboard)?$/);
+    await expect(page.getByRole("heading", { name: /dashboard/i })).toBeVisible();
+
     // --- create bucket -----------------------------------------
     await page.goto("/buckets");
     await expect(page.getByRole("heading", { name: /buckets/i })).toBeVisible();

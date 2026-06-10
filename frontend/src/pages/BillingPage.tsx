@@ -1,8 +1,6 @@
 import { CalendarClock, Coins, Database, TrendingUp } from "lucide-react";
-import { useEffect, useState } from "react";
 
 import { api } from "../api/client";
-import type { CostBreakdown, TierConfig, UsageSnapshot } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { DonutChart, type ChartDatum } from "../components/charts";
 import { PageHeader } from "../components/PageHeader";
@@ -10,6 +8,7 @@ import { StatCard } from "../components/StatCard";
 import { CardError, EmptyState } from "../components/states";
 import { TierTable } from "../components/TierTable";
 import { formatBytes, formatUSD } from "../format";
+import { useAsync } from "../hooks/useAsync";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
 import { Skeleton } from "../ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../ui/table";
@@ -27,31 +26,23 @@ const BYTES_PER_TIB = 2 ** 40;
 
 export function BillingPage() {
   const { tenant } = useAuth();
-  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
-  const [tiers, setTiers] = useState<TierConfig[]>([]);
-  const [breakdown, setBreakdown] = useState<CostBreakdown | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  function load() {
-    setLoading(true);
-    setError(null);
-    let cancelled = false;
-    Promise.all([api.currentUsage(), api.listTierConfigs(), api.costBreakdown().catch(() => null)])
-      .then(([u, t, b]) => {
-        if (cancelled) return;
-        setUsage(u);
-        setTiers(t);
-        setBreakdown(b);
-      })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => !cancelled && setLoading(false));
-    return () => {
-      cancelled = true;
-    };
-  }
-
-  useEffect(load, []);
+  // currentUsage + the tier price book are required inputs; the
+  // per-backend cost breakdown is admin-gated and optional, so its
+  // failure (incl. a 5xx from a misconfigured reporter) is isolated
+  // to a null breakdown rather than failing the whole page — the
+  // usage×tier estimate is always tenant-accessible.
+  const { data, loading, error, reload } = useAsync(
+    () =>
+      Promise.all([
+        api.currentUsage(),
+        api.listTierConfigs(),
+        api.costBreakdown().catch(() => null),
+      ]),
+    [],
+  );
+  const usage = data?.[0] ?? null;
+  const tiers = data?.[1] ?? [];
+  const breakdown = data?.[2] ?? null;
 
   const tier = tiers.find((t) => t.tier === tenant?.licenseTier);
   const storedTB = (usage?.storageBytes ?? 0) / BYTES_PER_TIB;
@@ -61,13 +52,14 @@ export function BillingPage() {
   const egressBudgetTB = tenant?.budgets.egressTbMonth ?? 0;
   const egressOverage = Math.max(egressTB - egressBudgetTB, 0);
 
-  // Month-end forecast linearly prorates the live estimate over the
-  // calendar month. With cost concentrated in stored volume (which is
-  // a level, not a flow) this is a conservative straight-line view.
-  const now = new Date();
-  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  const dayOfMonth = now.getDate();
-  const forecast = dayOfMonth > 0 ? (storageCost / dayOfMonth) * daysInMonth : storageCost;
+  // Storage cost is a level, not a flow: the monthly bill is
+  // stored volume × per-TiB rate regardless of the day of the month
+  // (stored bytes do not accumulate over the month the way egress
+  // does). storageBytes is already the average volume held over the
+  // usage window (see usageSnapshotFromCounters in client.ts), so
+  // storageCost is the current monthly run-rate and the 12-month
+  // projection simply assumes that volume holds flat — no proration.
+  const annualForecast = storageCost * 12;
 
   const breakdownData: ChartDatum[] = breakdown
     ? [
@@ -90,11 +82,11 @@ export function BillingPage() {
         }
       />
 
-      {error && <CardError message={`Failed to load cost inputs: ${error}`} onRetry={load} />}
+      {error && <CardError message={`Failed to load cost inputs: ${error}`} onRetry={reload} />}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard label="Estimated this month" value={formatUSD(storageCost)} hint={`${storedTB.toFixed(2)} TiB × ${formatUSD(pricePerTB)}/TiB`} icon={Coins} loading={loading} />
-        <StatCard label="Month-end forecast" value={formatUSD(forecast)} hint={`Prorated over ${daysInMonth} days`} icon={CalendarClock} loading={loading} tone={egressOverage > 0 ? "warning" : "default"} />
+        <StatCard label="Projected annual" value={formatUSD(annualForecast)} hint="At current run-rate (flat volume)" icon={CalendarClock} loading={loading} />
         <StatCard label="Stored volume" value={usage ? formatBytes(usage.storageBytes) : "—"} hint={`${storedTB.toFixed(3)} TiB`} icon={Database} loading={loading} />
         <StatCard label="Egress this month" value={usage ? formatBytes(usage.egressBytesThisMonth) : "—"} hint={`Budget ${egressBudgetTB} TiB`} icon={TrendingUp} loading={loading} tone={egressOverage > 0 ? "destructive" : "default"} />
       </div>

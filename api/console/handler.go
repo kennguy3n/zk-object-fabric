@@ -468,7 +468,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Mirror Register's read-only tier catalogue route so ServeHTTP
 	// callers resolve GET /api/v1/tiers identically to the mux mount.
-	if strings.TrimRight(r.URL.Path, "/") == "/api/v1/tiers" {
+	// Register mounts the exact pattern "/api/v1/tiers" (Go's mux
+	// treats a trailing-slash-free pattern as an exact match and does
+	// NOT match "/api/v1/tiers/"), so match exactly here too — a
+	// TrimRight would accept a trailing-slash variant the mux mount
+	// rejects, making the two surfaces disagree.
+	if r.URL.Path == "/api/v1/tiers" {
 		(&TierHandler{}).ServeHTTP(w, r)
 		return
 	}

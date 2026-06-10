@@ -2,9 +2,9 @@ import { Globe, Layers, MapPin } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { api } from "../api/client";
-import type { PlacementPolicy } from "../api/types";
 import { PageHeader } from "../components/PageHeader";
 import { CardError, EmptyState, InlineError } from "../components/states";
+import { useAsync } from "../hooks/useAsync";
 import { cn } from "../lib/cn";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -20,36 +20,22 @@ import { useToast } from "../ui/toast";
 // derived from the canonical buffer, which stays the source of truth.
 export function PlacementPolicyPage() {
   const { toast } = useToast();
-  const [policies, setPolicies] = useState<PlacementPolicy[]>([]);
+  const { data, loading, error, reload } = useAsync(() => api.listPlacementPolicies(), []);
+  const policies = useMemo(() => data ?? [], [data]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [yaml, setYaml] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [loading, setLoading] = useState(true);
 
-  function load() {
-    setLoading(true);
-    setError(null);
-    let cancelled = false;
-    api
-      .listPlacementPolicies()
-      .then((p) => {
-        if (cancelled) return;
-        setPolicies(p);
-        if (p.length > 0) {
-          setSelectedId((cur) => cur ?? p[0].id);
-          setYaml((cur) => (cur === "" ? p[0].yaml : cur));
-        }
-      })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => !cancelled && setLoading(false));
-    return () => {
-      cancelled = true;
-    };
-  }
-
-  useEffect(load, []);
+  // Seed the selection and editor buffer from the first successful
+  // load (and re-seed after a save-triggered reload). The functional
+  // updaters keep any in-progress edit: yaml is only replaced while it
+  // is still empty, so a reload never clobbers unsaved keystrokes.
+  useEffect(() => {
+    if (policies.length === 0) return;
+    setSelectedId((cur) => cur ?? policies[0].id);
+    setYaml((cur) => (cur === "" ? policies[0].yaml : cur));
+  }, [policies]);
 
   const selected = useMemo(
     () => policies.find((p) => p.id === selectedId) ?? null,
@@ -63,9 +49,12 @@ export function PlacementPolicyPage() {
     setSaving(true);
     setSaveError(null);
     try {
-      const updated = await api.savePlacementPolicy({ id: selected.id, name: selected.name, yaml });
-      setPolicies((ps) => ps.map((p) => (p.id === updated.id ? updated : p)));
+      await api.savePlacementPolicy({ id: selected.id, name: selected.name, yaml });
       toast({ title: "Policy saved", description: selected.name, variant: "success" });
+      // Re-fetch so the list reflects the persisted document as the
+      // single source of truth; the seed effect leaves the current
+      // (saved) buffer untouched, so `dirty` resolves back to false.
+      reload();
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -91,7 +80,7 @@ export function PlacementPolicyPage() {
                 {[0, 1, 2].map((i) => <Skeleton key={i} className="h-9 w-full" />)}
               </div>
             ) : error ? (
-              <CardError message={error} onRetry={load} />
+              <CardError message={error} onRetry={reload} />
             ) : policies.length === 0 ? (
               <EmptyState icon={Layers} title="No policies" description="Placement policies are provisioned with your tenant." />
             ) : (

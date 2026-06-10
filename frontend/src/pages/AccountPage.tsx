@@ -1,13 +1,12 @@
 import { Building2, LogOut } from "lucide-react";
-import { useEffect, useState } from "react";
 
 import { api } from "../api/client";
-import type { TierConfig } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
 import { CardError, EmptyState } from "../components/states";
 import { TierTable } from "../components/TierTable";
 import { formatDateTime, formatNumber } from "../format";
+import { useAsync } from "../hooks/useAsync";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
@@ -27,25 +26,8 @@ const CONTRACT_LABEL: Record<string, string> = {
 // table is read-only by design.
 export function AccountPage() {
   const { tenant, signOut } = useAuth();
-  const [tiers, setTiers] = useState<TierConfig[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  function load() {
-    setLoading(true);
-    setError(null);
-    let cancelled = false;
-    api
-      .listTierConfigs()
-      .then((t) => !cancelled && setTiers(t))
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => !cancelled && setLoading(false));
-    return () => {
-      cancelled = true;
-    };
-  }
-
-  useEffect(load, []);
+  const { data, loading, error, reload } = useAsync(() => api.listTierConfigs(), []);
+  const tiers = data ?? [];
 
   return (
     <div className="space-y-6">
@@ -103,7 +85,7 @@ export function AccountPage() {
           {loading ? (
             <div className="space-y-2 p-4">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-9 w-full" />)}</div>
           ) : error ? (
-            <CardError message={error} onRetry={load} />
+            <CardError message={error} onRetry={reload} />
           ) : tiers.length === 0 ? (
             <EmptyState title="No tiers configured" />
           ) : (
