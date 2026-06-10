@@ -273,8 +273,22 @@ export class ApiClient {
 
   async listMigrations(): Promise<MigrationJob[] | null> {
     try {
-      return await this.requestAt("GET", `${this.rootBaseUrl}/v1/migrations`);
+      const jobs = await this.requestAt<MigrationJob[] | null>(
+        "GET",
+        `${this.rootBaseUrl}/v1/migrations`,
+      );
+      // Gating is an HTTP-status concern, not a body concern: a 200
+      // means "you are authorized". A null/absent body therefore means
+      // "authorized, zero jobs", which must coalesce to [] — never the
+      // gated sentinel. A Postgres-backed gateway returns `null` for an
+      // empty migration_jobs table (nil slice), so without this the
+      // MigrationsPage would mis-render an empty fleet as the
+      // operator-only notice. (The backend now also emits [] at the
+      // boundary; this keeps the contract honest for any deployment.)
+      return jobs ?? [];
     } catch (e) {
+      // Only a feature-unavailable status (401/403/404/503) yields the
+      // null gated sentinel; real 5xx / network faults propagate.
       if (isFeatureUnavailable(e)) return null;
       throw e;
     }

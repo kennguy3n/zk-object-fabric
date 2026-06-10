@@ -1,13 +1,26 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kennguy3n/zk-object-fabric/migration"
 )
+
+// nilJobsStore is a JobStore whose Jobs() returns a nil slice, exactly
+// like PgJobStore when the migration_jobs table is empty. Embedding the
+// interface leaves every other method nil — list() only ever calls
+// Jobs(), so that is all this fake needs to override.
+type nilJobsStore struct{ migration.JobStore }
+
+func (nilJobsStore) Jobs(context.Context) ([]migration.MigrationJob, error) {
+	return nil, nil
+}
 
 func TestMigrationHandler_ListsJobs(t *testing.T) {
 	o := migration.NewFleetOrchestrator(nil, nil)
@@ -168,6 +181,48 @@ func TestMigrationHandler_AdminAuthGate(t *testing.T) {
 		allowSrv.Close()
 		if gotAllow != http.StatusOK {
 			t.Fatalf("%s allowed: status=%d, want 200", path, gotAllow)
+		}
+	}
+}
+
+// TestMigrationHandler_EmptyListIsArrayNotNull guards the list
+// endpoint's JSON contract: an empty fleet must serialize to `[]`,
+// never `null`. PgJobStore.Jobs() returns a nil slice when the
+// migration_jobs table is empty (its steady state), and the SPA infers
+// AdminAuth gating purely from the HTTP status — a 200 with a `null`
+// body would be mis-read as "Operator access required" instead of "no
+// migrations". The in-memory store returns a non-nil empty slice, so a
+// store that returns nil (like Postgres) is used here to exercise the
+// exact production path; the nil Orchestrator case is checked too.
+func TestMigrationHandler_EmptyListIsArrayNotNull(t *testing.T) {
+	nilStoreOrch, err := migration.NewFleetOrchestratorWithStore(migration.FleetOrchestratorConfig{
+		Store:  nilJobsStore{},
+		NodeID: "test-node",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]*MigrationHandler{
+		"nil-slice store (Postgres empty table)": {Orchestrator: nilStoreOrch},
+		"nil orchestrator":                       {Orchestrator: nil},
+	}
+	for name, h := range cases {
+		srv := httptest.NewServer(h)
+		resp, err := http.Get(srv.URL + "/api/v1/migrations")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			srv.Close()
+			t.Fatalf("%s: status=%d, want 200", name, resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		srv.Close()
+		if got := strings.TrimSpace(string(body)); got != "[]" {
+			t.Errorf("%s: body=%q, want \"[]\" (must never be null)", name, got)
 		}
 	}
 }

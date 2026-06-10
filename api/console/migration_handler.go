@@ -72,24 +72,33 @@ func (h *MigrationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *MigrationHandler) list(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if !h.authorized(w, r) {
 		return
 	}
-	if h.Orchestrator == nil {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte("[]"))
-		return
+	// A list endpoint must always serialize to a JSON array, never
+	// null. PgJobStore.Jobs() returns a nil slice when the
+	// migration_jobs table is empty (the common steady state), and
+	// json.Encode(nil-slice) writes `null`. The SPA treats any 200 as
+	// "authorized" and infers gating purely from the HTTP status, so a
+	// null body must not be confused with the AdminAuth 401 — coalesce
+	// to [] here so every store (PG nil slice, in-memory empty slice,
+	// nil Orchestrator) presents the same honest empty-list contract.
+	jobs := []migration.MigrationJob{}
+	if h.Orchestrator != nil {
+		if existing := h.Orchestrator.Jobs(); existing != nil {
+			jobs = existing
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(h.Orchestrator.Jobs())
+	_ = json.NewEncoder(w).Encode(jobs)
 }
 
 func (h *MigrationHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/v1/migrations/")
@@ -104,12 +113,12 @@ func (h *MigrationHandler) dispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.Orchestrator == nil {
-		http.NotFound(w, r)
+		writeError(w, http.StatusNotFound, "migration job not found")
 		return
 	}
 	j, ok := h.Orchestrator.Job(id)
 	if !ok {
-		http.NotFound(w, r)
+		writeError(w, http.StatusNotFound, "migration job not found")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
