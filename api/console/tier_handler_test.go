@@ -37,9 +37,24 @@ func TestTierHandler_RejectsNonGet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status=%d, want 405", resp.StatusCode)
+	}
+	// The 405 must use the console's JSON error envelope (writeError),
+	// not http.Error's text/plain, so it matches Migration/Cost/dedup/
+	// ops and the SPA's ApiError parsing.
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type=%q, want application/json", ct)
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body.Error == "" {
+		t.Errorf("error body = %+v, want non-empty {\"error\":...}", body)
 	}
 }
 
