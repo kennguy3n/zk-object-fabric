@@ -41,19 +41,34 @@ test.describe("end-to-end onboarding journey", () => {
       test.skip(true, "signup rejected by upstream; skipping post-signup steps");
     }
 
+    // Wait for the authenticated dashboard to render before the hard
+    // navigation below. SignupPage does a client-side redirect to "/"
+    // and AuthContext persists the session to sessionStorage in a
+    // post-commit effect; the dashboard heading only mounts inside
+    // <RequireAuth> once that commit lands, so observing it guarantees
+    // the session is both in memory and persisted. Issuing the hard
+    // page.goto("/buckets") any earlier races the persist effect and
+    // the reload reads an empty sessionStorage, bouncing to /login.
+    await expect(page).toHaveURL(/\/(dashboard)?$/);
+    await expect(page.getByRole("heading", { name: /dashboard/i })).toBeVisible();
+
     // --- create bucket -----------------------------------------
     await page.goto("/buckets");
     await expect(page.getByRole("heading", { name: /buckets/i })).toBeVisible();
 
     const bucketName = `e2e-bucket-${Date.now()}`;
+    // Open the create dialog; the form fields live inside it.
+    await page.getByRole("button", { name: /new bucket/i }).first().click();
+    const createDialog = page.getByRole("dialog");
+    await expect(createDialog).toBeVisible();
     const createBucket = page.waitForResponse(
       (r) =>
         /\/api\/tenants\/[^/]+\/buckets$/.test(r.url()) && r.request().method() === "POST",
       { timeout: 10_000 },
     );
-    await page.getByLabel(/bucket name/i).fill(bucketName);
-    await page.getByLabel(/placement policy/i).fill("b2c_pooled_default");
-    await page.getByRole("button", { name: /create bucket/i }).click();
+    await createDialog.getByLabel(/bucket name/i).fill(bucketName);
+    await createDialog.getByLabel(/placement policy/i).fill("b2c_pooled_default");
+    await createDialog.getByRole("button", { name: /create bucket/i }).click();
     const createResp = await createBucket;
     expect([200, 201]).toContain(createResp.status());
 
@@ -63,19 +78,22 @@ test.describe("end-to-end onboarding journey", () => {
     await expect(page.getByRole("cell", { name: bucketName })).toBeVisible({ timeout: 5_000 });
 
     // --- delete -------------------------------------------------
-    // The Delete button fires window.confirm; auto-accept it so the
-    // DELETE actually runs without a user click.
-    page.once("dialog", (dialog) => dialog.accept());
+    // The row Delete control opens a confirmation dialog (see
+    // BucketsPage.tsx); click the row icon, then confirm inside the
+    // dialog to fire the DELETE.
+    await page
+      .getByRole("row", { name: new RegExp(bucketName) })
+      .getByRole("button", { name: /delete/i })
+      .click();
+    const confirmDialog = page.getByRole("dialog");
+    await expect(confirmDialog).toBeVisible();
     const deleteBucket = page.waitForResponse(
       (r) =>
         /\/api\/tenants\/[^/]+\/buckets\/[^/]+$/.test(r.url()) &&
         r.request().method() === "DELETE",
       { timeout: 10_000 },
     );
-    await page
-      .getByRole("row", { name: new RegExp(bucketName) })
-      .getByRole("button", { name: /delete/i })
-      .click();
+    await confirmDialog.getByRole("button", { name: /^delete$/i }).click();
     const deleteResp = await deleteBucket;
     expect([200, 204]).toContain(deleteResp.status());
 

@@ -73,16 +73,16 @@ test.describe("api keys (stubbed)", () => {
     await page.goto("/api-keys");
     await page.getByRole("button", { name: /create key|create|new/i }).first().click();
 
-    // The "New key" reveal panel must show both the access and
-    // the secret exactly once.
-    await expect(page.getByText(/new key/i)).toBeVisible({ timeout: 5_000 });
+    // The "New API key" reveal dialog must show both the access
+    // and the secret exactly once.
+    await expect(page.getByText(/new api key/i)).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText("AKIAE2EDEMO").first()).toBeVisible();
     await expect(page.getByText("secretE2EONETIMEONLY1234567890")).toBeVisible();
 
-    // Dismissing the reveal panel must hide the secret. The
+    // Dismissing the reveal dialog must hide the secret. The
     // listing row underneath continues to show the access key
     // because listKeys returns the descriptor without the secret.
-    await page.getByRole("button", { name: /dismiss/i }).click();
+    await page.getByRole("button", { name: /done|dismiss/i }).click();
     await expect(page.getByText("secretE2EONETIMEONLY1234567890")).toHaveCount(0);
     await expect(page.getByText("AKIAE2EDEMO").first()).toBeVisible();
   });

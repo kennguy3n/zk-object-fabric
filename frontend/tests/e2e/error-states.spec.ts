@@ -49,7 +49,10 @@ test.describe("error states (stubbed)", () => {
       });
     });
     await page.goto("/buckets");
-    await expect(page.getByText(/rate limit|429|too many requests|retry/i)).toBeVisible({
+    // Match the surfaced error message specifically. "retry" is omitted
+    // from the pattern because the error state also renders a "Retry"
+    // button, which would otherwise make this a strict-mode collision.
+    await expect(page.getByText(/rate limit|429|too many requests/i)).toBeVisible({
       timeout: 5_000,
     });
     expect(serverHits).toBeGreaterThan(0);

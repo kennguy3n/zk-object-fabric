@@ -10,3 +10,65 @@ export function formatBytes(bytes: number): string {
   const precision = value >= 100 ? 0 : value >= 10 ? 1 : 2;
   return `${value.toFixed(precision)} ${units[exponent]}`;
 }
+
+// Intl.NumberFormat instances are comparatively expensive to build, so
+// the shared formatters are constructed once at module scope and reused
+// across every render rather than rebuilt per call (these run on hot
+// paths: chart axes, donut centres, and per-row Billing/Dashboard cells).
+const USD_FORMAT = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 2,
+});
+const COUNT_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+
+// formatUSD renders a dollar amount with cents. Used across the Billing
+// screen so every cost row shares one currency convention.
+export function formatUSD(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  return USD_FORMAT.format(value);
+}
+
+// formatNumber renders an integer-ish count with thousands separators.
+export function formatNumber(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  return COUNT_FORMAT.format(Math.round(value));
+}
+
+// formatPercent renders a [0,1] ratio as a whole-number percentage.
+export function formatPercent(ratio: number, digits = 0): string {
+  if (!Number.isFinite(ratio)) return "—";
+  return `${(ratio * 100).toFixed(digits)}%`;
+}
+
+// formatDateTime renders an ISO timestamp in the operator's locale,
+// returning a dash for the empty/zero values the backend omits.
+export function formatDateTime(iso?: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() <= 1) return "—";
+  return d.toLocaleString();
+}
+
+// formatRelative renders a compact "time ago" string for recent
+// activity (e.g. key last-used). Falls back to absolute for old dates.
+export function formatRelative(iso?: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() <= 1) return "—";
+  // Clamp to the past: these timestamps (key last-used, migration
+  // started/completed) are always historical, but client/server clock
+  // skew can put them slightly ahead of Date.now(). Without the clamp a
+  // negative elapsed value still satisfies every `< N` branch below, so
+  // a date hours or days in the future would also render "just now"
+  // (and a far-future skew could even fall through misleadingly).
+  const seconds = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return d.toLocaleDateString();
+}

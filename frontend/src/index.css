@@ -1,0 +1,56 @@
+@import "./styles/tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  /* Keep browser-native chrome (scrollbars, date/number controls,
+     autofill backgrounds) in sync with the active token theme rather
+     than hardcoding dark: :root carries the light theme, .dark the
+     operator-console theme. Scoping here means a future light surface
+     (e.g. zk-drive adopting these tokens) gets light chrome for free. */
+  :root {
+    color-scheme: light;
+  }
+
+  .dark {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    margin: 0;
+    min-height: 100vh;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Consistent, brand-coloured focus ring for keyboard users across
+     every interactive element, including the Radix primitives. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Tabular figures keep metric columns aligned as values change. */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  /* Skeleton shimmer used by the loading states. */
+  .skeleton-shimmer::after {
+    content: "";
+    @apply absolute inset-0 -translate-x-full animate-shimmer;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      hsl(var(--zk-foreground) / 0.06),
+      transparent
+    );
+  }
+}

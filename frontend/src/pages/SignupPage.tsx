@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
 import { useAuth } from "../auth/AuthContext";
+import { InlineError } from "../components/states";
+import { Button } from "../ui/button";
+import { Input } from "../ui/input";
+import { Label } from "../ui/label";
 import { AuthShell } from "./LoginPage";
 
 // The hCaptcha site key is injected at build time via Vite's env
@@ -71,9 +75,9 @@ export function SignupPage() {
   const captchaRequired = Boolean(HCAPTCHA_SITEKEY);
 
   return (
-    <AuthShell title="Create a tenant">
+    <AuthShell title="Create a tenant" subtitle="Spin up a zero-knowledge object store in seconds.">
       <form
-        className="stack"
+        className="space-y-4"
         onSubmit={async (e) => {
           e.preventDefault();
           setError(null);
@@ -101,48 +105,50 @@ export function SignupPage() {
           }
         }}
       >
-        <div>
-          <label htmlFor="tenantName">Organization</label>
-          <input
+        <div className="space-y-1.5">
+          <Label htmlFor="tenantName">Organization</Label>
+          <Input
             id="tenantName"
             value={tenantName}
             onChange={(e) => setTenantName(e.target.value)}
             required
           />
         </div>
-        <div>
-          <label htmlFor="email">Work email</label>
-          <input
+        <div className="space-y-1.5">
+          <Label htmlFor="email">Work email</Label>
+          <Input
             id="email"
             type="email"
+            autoComplete="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             required
           />
         </div>
-        <div>
-          <label htmlFor="password">Password</label>
-          <input
+        <div className="space-y-1.5">
+          <Label htmlFor="password">Password</Label>
+          <Input
             id="password"
             type="password"
+            autoComplete="new-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             required
             minLength={12}
           />
+          <p className="text-xs text-muted-foreground">Minimum 12 characters.</p>
         </div>
-        {captchaRequired && (
-          <div>
-            <div ref={captchaRef} data-testid="hcaptcha-widget" />
-          </div>
-        )}
-        {error && <div className="danger-text">{error}</div>}
-        <button type="submit" disabled={submitting}>
+        {captchaRequired && <div ref={captchaRef} data-testid="hcaptcha-widget" />}
+        {error && <InlineError message={error} />}
+        <Button type="submit" disabled={submitting} className="w-full">
           {submitting ? "Creating tenant…" : "Create tenant"}
-        </button>
-        <div className="muted" style={{ fontSize: 13 }}>
-          Already have an account? <Link to="/login">Sign in</Link>
-        </div>
+        </Button>
+        <p className="text-center text-sm text-muted-foreground">
+          Already have an account?{" "}
+          <Link to="/login" className="font-medium text-primary hover:underline">
+            Sign in
+          </Link>
+        </p>
       </form>
     </AuthShell>
   );

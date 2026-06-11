@@ -23,7 +23,11 @@ func (h *TierHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.serv
 
 func (h *TierHandler) serveList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		// writeError (JSON {"error":...}) rather than http.Error
+		// (text/plain) so every console handler — Tier, Migration,
+		// Cost, dedup, ops — returns the same error envelope the SPA's
+		// ApiError parsing expects.
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

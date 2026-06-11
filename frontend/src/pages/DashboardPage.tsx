@@ -1,12 +1,25 @@
-import { useEffect, useState } from "react";
+import { Activity, Database, Gauge as GaugeIcon, Send } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import { api } from "../api/client";
-import type { UsageSnapshot } from "../api/types";
+import { api, usageSnapshotFromCounters } from "../api/client";
+import { opsGet, type OpsCacheStats } from "../api/opsClient";
+import type { CostBreakdown, UsageSnapshot } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
-import { formatBytes } from "../format";
+import { type ChartDatum, CHART_COLORS, DonutChart, TrendAreaChart, type TrendPoint } from "../components/charts";
+import { GaugeChart } from "../components/GaugeChart";
+import { PageHeader } from "../components/PageHeader";
+import { StatCard } from "../components/StatCard";
+import { EmptyState, InlineError } from "../components/states";
+import { formatBytes, formatNumber, formatPercent, formatUSD } from "../format";
+import { Badge } from "../ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui/card";
 
 // Server-Sent Events frame emitted by api/console/sse_handler.go.
 // Counter names mirror billing.Dimension constants on the backend.
+// It is a UsageCountersPayload plus an observed_at timestamp, so it
+// projects onto a UsageSnapshot through the same
+// usageSnapshotFromCounters() the REST bootstrap uses — no duplicate
+// projection to keep in sync.
 interface UsageStreamEvent {
   tenant_id: string;
   observed_at: string;
@@ -15,46 +28,83 @@ interface UsageStreamEvent {
   counters: Record<string, number>;
 }
 
-// usageFromStreamEvent projects the counter map onto the
-// UsageSnapshot shape the dashboard already renders so the live SSE
-// frame can drop into the same StatCard without duplicating format
-// logic.
-function usageFromStreamEvent(ev: UsageStreamEvent): UsageSnapshot {
-  const c = ev.counters ?? {};
-  return {
-    tenantId: ev.tenant_id,
-    storageBytes: c["storage_bytes_seconds"] ?? 0,
-    requestsLast30Days:
-      (c["put_requests"] ?? 0) +
-      (c["get_requests"] ?? 0) +
-      (c["list_requests"] ?? 0) +
-      (c["delete_requests"] ?? 0),
-    egressBytesThisMonth: c["egress_bytes"] ?? 0,
-    monthStart: ev.start,
-  };
-}
+// REQUEST_VERBS maps the per-verb counter dimensions onto a stable
+// label + palette slot for the request-mix donut.
+const REQUEST_VERBS: { key: string; label: string; color: string }[] = [
+  { key: "get_requests", label: "GET", color: CHART_COLORS[0] },
+  { key: "put_requests", label: "PUT", color: CHART_COLORS[1] },
+  { key: "list_requests", label: "LIST", color: CHART_COLORS[2] },
+  { key: "delete_requests", label: "DELETE", color: CHART_COLORS[3] },
+];
+
+const MAX_TREND_POINTS = 30;
 
 export function DashboardPage() {
   const { tenant, token } = useAuth();
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
+  const [cache, setCache] = useState<OpsCacheStats | null>(null);
+  const [cost, setCost] = useState<CostBreakdown | null>(null);
+  const [costError, setCostError] = useState<string | null>(null);
+  const [trend, setTrend] = useState<TrendPoint[]>([]);
+  // loading is true only until the first usage snapshot resolves; the
+  // SSE stream then keeps the figures live.
+  const [loading, setLoading] = useState(true);
+  const seededTrend = useRef(false);
+
+  function pushTrendPoint(snapshot: UsageSnapshot) {
+    setTrend((prev) => {
+      const next = [
+        ...prev,
+        { t: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), value: snapshot.requestsLast30Days },
+      ];
+      return next.slice(-MAX_TREND_POINTS);
+    });
+  }
 
   useEffect(() => {
     let cancelled = false;
     api
       .currentUsage()
-      .then((u) => !cancelled && setUsage(u))
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
+      .then((u) => {
+        if (cancelled) return;
+        setUsage(u);
+        if (!seededTrend.current) {
+          seededTrend.current = true;
+          pushTrendPoint(u);
+        }
+      })
+      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
   }, []);
 
+  // Cache stats + cost breakdown are admin-gated, so a gated tenant
+  // gets null (client.ts maps 401/403/404/503 -> null) and the rest of
+  // the dashboard still renders. A genuine backend fault (5xx / network)
+  // is rethrown by costBreakdown(); surface it in the breakdown card
+  // rather than swallowing it, mirroring the BillingPage contract so a
+  // broken cost reporter never masquerades as a merely gated feature.
+  useEffect(() => {
+    let cancelled = false;
+    opsGet<OpsCacheStats>("cache-stats", token).then((c) => !cancelled && setCache(c));
+    api
+      .costBreakdown()
+      .then((c) => {
+        if (cancelled) return;
+        setCost(c);
+        setCostError(null);
+      })
+      .catch((e) => !cancelled && setCostError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
   // Subscribe to the SSE usage stream once we know the tenant ID.
-  // EventSource is a native browser API; we keep the connection open
-  // for the lifetime of the dashboard and close it on unmount to
-  // avoid leaking tabs in the React dev overlay.
   useEffect(() => {
     if (!tenant?.id) return;
     if (typeof EventSource === "undefined") return;
@@ -69,21 +119,16 @@ export function DashboardPage() {
     const onUsage = (ev: MessageEvent) => {
       try {
         const frame = JSON.parse(ev.data) as UsageStreamEvent;
-        setUsage(usageFromStreamEvent(frame));
+        const snapshot = usageSnapshotFromCounters(frame);
+        setUsage(snapshot);
+        pushTrendPoint(snapshot);
         setError(null);
-        // EventSource transparently reconnects after transport
-        // errors; the first usage frame delivered after a
-        // reconnect is the signal that the stream is healthy
-        // again, so re-raise the live badge here.
         setStreaming(true);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
     };
     const onError = () => {
-      // Browser auto-reconnects on transport errors; surface the
-      // most recent one to the operator so a stuck stream is
-      // visible without flipping the entire dashboard red.
       setError("usage stream connection lost; reconnecting…");
       setStreaming(false);
     };
@@ -97,58 +142,149 @@ export function DashboardPage() {
     };
   }, [tenant?.id, token]);
 
+  const requestMix = useMemo<ChartDatum[]>(() => {
+    const c = usage?.counters ?? {};
+    return REQUEST_VERBS.map((v) => ({ label: v.label, value: c[v.key] ?? 0, color: v.color })).filter(
+      (d) => d.value > 0,
+    );
+  }, [usage]);
+
+  const costMix = useMemo<ChartDatum[]>(() => {
+    if (!cost) return [];
+    return [
+      { label: "Wasabi storage", value: cost.wasabi_storage_usd, color: CHART_COLORS[0] },
+      { label: "Linode compute", value: cost.linode_compute_usd, color: CHART_COLORS[1] },
+      { label: "AWS control plane", value: cost.aws_control_plane_usd, color: CHART_COLORS[2] },
+    ].filter((d) => d.value > 0);
+  }, [cost]);
+
   return (
-    <div className="stack">
-      <h1 style={{ margin: 0 }}>
-        Dashboard{" "}
-        {streaming && (
-          <span className="badge accent" style={{ fontSize: 12, verticalAlign: "middle" }}>
-            live
-          </span>
-        )}
-      </h1>
-      {error && <div className="panel danger-text">Failed to load usage: {error}</div>}
-      <div className="grid cols-3">
+    <div className="space-y-6">
+      <PageHeader
+        title="Dashboard"
+        description={`Live storage, request, and cost signals for ${tenant?.name ?? "your tenant"}.`}
+        actions={
+          <Badge variant={streaming ? "success" : "neutral"}>
+            <span className={streaming ? "size-1.5 rounded-full bg-success" : "size-1.5 rounded-full bg-muted-foreground"} />
+            {streaming ? "Live" : "Paused"}
+          </Badge>
+        }
+      />
+
+      {error && (
+        <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
+          {error}
+        </div>
+      )}
+
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="Storage" value={usage ? formatBytes(usage.storageBytes) : "—"} icon={Database} loading={loading} />
         <StatCard
-          label="Storage"
-          value={usage ? formatBytes(usage.storageBytes) : "—"}
-        />
-        <StatCard
-          label="Requests (last 30d)"
-          value={usage ? usage.requestsLast30Days.toLocaleString() : "—"}
+          label="Requests (window)"
+          value={usage ? formatNumber(usage.requestsLast30Days) : "—"}
+          icon={Activity}
+          loading={loading}
         />
         <StatCard
           label="Egress this month"
           value={usage ? formatBytes(usage.egressBytesThisMonth) : "—"}
-          hint={tenant ? `Budget: ${tenant.budgets.egressTbMonth} TB/mo` : undefined}
+          hint={tenant ? `Budget: ${tenant.budgets.egressTbMonth} TiB/mo` : undefined}
+          icon={Send}
+          loading={loading}
+        />
+        <StatCard
+          label="Cache hit ratio"
+          value={cache ? formatPercent(cache.hitRatio) : "—"}
+          hint={cache ? `${formatNumber(cache.hits)} hits · ${formatNumber(cache.misses)} misses` : "Operator access required"}
+          icon={GaugeIcon}
+          tone={cache && cache.hitRatio < 0.7 ? "warning" : "default"}
         />
       </div>
-      <div className="panel">
-        <div className="muted" style={{ fontSize: 13, marginBottom: 8 }}>
-          Tenant
-        </div>
-        <div style={{ fontWeight: 600 }}>{tenant?.name}</div>
-        <div className="muted" style={{ fontSize: 13 }}>
-          Contract: {tenant?.contractType} · License: {tenant?.licenseTier} · Default
-          placement: {tenant?.placementDefaultPolicyRef}
-        </div>
-      </div>
-    </div>
-  );
-}
 
-function StatCard({ label, value, hint }: { label: string; value: string; hint?: string }) {
-  return (
-    <div className="panel">
-      <div className="muted" style={{ fontSize: 12, textTransform: "uppercase" }}>
-        {label}
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Requests in rolling window</CardTitle>
+            <CardDescription>
+              Cumulative request count over the rolling usage window, sampled live from the metering stream — a running level, not a per-second rate.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {trend.length <= 1 ? (
+              <EmptyState
+                icon={Activity}
+                title="Waiting for live samples"
+                description="The trend fills in as the metering stream delivers usage frames."
+              />
+            ) : (
+              <TrendAreaChart data={trend} format={formatNumber} />
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Request mix</CardTitle>
+            <CardDescription>Share by S3 verb over the usage window.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {requestMix.length === 0 ? (
+              <EmptyState icon={Activity} title="No requests yet" description="Verb breakdown appears once traffic is recorded." />
+            ) : (
+              <DonutChart
+                data={requestMix}
+                format={formatNumber}
+                centerValue={formatNumber(usage?.requestsLast30Days ?? 0)}
+                centerLabel="requests"
+              />
+            )}
+          </CardContent>
+        </Card>
       </div>
-      <div style={{ fontSize: 28, fontWeight: 700, marginTop: 4 }}>{value}</div>
-      {hint && (
-        <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-          {hint}
-        </div>
-      )}
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Cost breakdown per backend</CardTitle>
+            <CardDescription>
+              {cost
+                ? `Provider split for ${cost.month}. Dedup saved ${formatUSD(cost.dedup_savings_usd)} this month.`
+                : "Per-provider costs require operator access; see Billing for your tier estimate."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {costError ? (
+              <InlineError message={`Cost breakdown failed: ${costError}`} />
+            ) : costMix.length === 0 ? (
+              <EmptyState
+                icon={Database}
+                title="Breakdown unavailable"
+                description="The per-provider cost feed is operator-gated. The Billing screen always shows your usage-based estimate."
+              />
+            ) : (
+              <DonutChart data={costMix} format={formatUSD} centerValue={formatUSD(cost?.total_usd ?? 0)} centerLabel="total" />
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="flex flex-col">
+          <CardHeader>
+            <CardTitle>Cache efficiency</CardTitle>
+            <CardDescription>Hot-object cache hit ratio.</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-1 items-center justify-center">
+            {cache ? (
+              <GaugeChart
+                value={cache.hitRatio}
+                label="Cache hit ratio"
+                color={cache.hitRatio >= 0.9 ? "hsl(var(--zk-success))" : cache.hitRatio >= 0.7 ? "hsl(var(--zk-warning))" : "hsl(var(--zk-destructive))"}
+              />
+            ) : (
+              <EmptyState icon={GaugeIcon} title="Cache stats unavailable" description="Operator access required." />
+            )}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
