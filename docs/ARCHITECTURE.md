@@ -353,6 +353,18 @@ adapter status matrix.
   control plane, abuse, dedup, compliance, console).
 - `health/` — `/internal/health`, `/internal/ready`,
   `/internal/drain`.
+- `logging/` — process-wide structured logger (slog) plus a bridge
+  that points the legacy std `log` package at the same handler, so
+  every existing `log.Printf` emits a structured record. Tuned by
+  `LOG_LEVEL` (`debug|info|warn|error`, default `info`) and
+  `LOG_FORMAT` (`json|text`, default `json`); `ZKOF_PROFILE=compact`
+  flips the unset-`LOG_FORMAT` default to `text` for the single-node
+  SME posture (an explicit `LOG_FORMAT` always wins). All log output —
+  including subsystem loggers built via `logging.NewStdLogger`, which
+  previously wrote prefixed text to **stdout** — now goes to a single
+  stream, **stderr**, matching the std `log` package default and the
+  gateway's own `log.Fatalf` startup diagnostics. A deployment that
+  routes stdout and stderr separately should collect logs from stderr.
 - `metrics/` — self-contained Prometheus text-format exporter
   (`zkof_request_duration_seconds`, `zkof_cache_hit_total`,
   `zkof_dedup_*`, `zkof_provider_errors_total`,
