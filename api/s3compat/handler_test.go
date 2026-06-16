@@ -293,6 +293,36 @@ func TestGet_OpenEndedRange(t *testing.T) {
 	}
 }
 
+// TestGet_SuffixRange pins the suffix Range form ("bytes=-N"): the
+// final N bytes of the object, served as 206 with a Content-Range
+// resolved against the object size. AWS S3, MinIO and Ceph RGW all
+// honour this shape; CDNs and the AWS SDK emit it to fetch object
+// trailers (e.g. ZIP central directories) without a prior HEAD.
+func TestGet_SuffixRange(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/obj", bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	h.Put(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+	req.Header.Set("Range", "bytes=-3")
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("GET suffix range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 7-9/10" {
+		t.Errorf("suffix range Content-Range = %q, want %q", got, "bytes 7-9/10")
+	}
+	if got := rec.Header().Get("Content-Length"); got != "3" {
+		t.Errorf("suffix range Content-Length = %q, want %q", got, "3")
+	}
+	if rec.Body.String() != "789" {
+		t.Errorf("suffix range body = %q, want %q", rec.Body.String(), "789")
+	}
+}
+
 // TestHead_RangeRequest_Returns206WithSliceContentLength pins
 // RFC 9110 §13.1 conformance: a HEAD on a target that the client
 // would GET with Range must report the same metadata a GET would
@@ -826,8 +856,34 @@ func TestParseHTTPRange(t *testing.T) {
 	if r.Start != 500 || r.End != -1 {
 		t.Errorf("parseHTTPRange open-ended = %+v, want [500,-1]", r)
 	}
-	if _, err := parseHTTPRange("bytes=-100", 1000); err == nil {
-		t.Error("parseHTTPRange(suffix) should error")
+	// Suffix range: the final N bytes resolve to an absolute
+	// [size-N, size-1] range.
+	r, err = parseHTTPRange("bytes=-100", 1000)
+	if err != nil {
+		t.Fatalf("parseHTTPRange(suffix): %v", err)
+	}
+	if r.Start != 900 || r.End != 999 {
+		t.Errorf("parseHTTPRange suffix = %+v, want [900,999]", r)
+	}
+	// A suffix at or beyond the object size returns the whole object.
+	r, err = parseHTTPRange("bytes=-5000", 1000)
+	if err != nil {
+		t.Fatalf("parseHTTPRange(suffix>size): %v", err)
+	}
+	if r.Start != 0 || r.End != 999 {
+		t.Errorf("parseHTTPRange suffix>size = %+v, want [0,999]", r)
+	}
+	// A zero-length suffix is unsatisfiable.
+	if _, err := parseHTTPRange("bytes=-0", 1000); err == nil {
+		t.Error("parseHTTPRange(bytes=-0) should error")
+	}
+	// A suffix against a zero-byte object is unsatisfiable.
+	if _, err := parseHTTPRange("bytes=-100", 0); err == nil {
+		t.Error("parseHTTPRange(suffix on empty object) should error")
+	}
+	// A negative suffix length is malformed.
+	if _, err := parseHTTPRange("bytes=--5", 1000); err == nil {
+		t.Error("parseHTTPRange(bytes=--5) should error")
 	}
 	if _, err := parseHTTPRange("bytes=10-5", 1000); err == nil {
 		t.Error("parseHTTPRange(inverted) should error")
