@@ -2961,9 +2961,16 @@ func newPieceID(tenantID, bucket, key string, now time.Time) string {
 }
 
 // parseHTTPRange parses a single-range HTTP Range header
-// ("bytes=start-end" or "bytes=start-") into a providers.ByteRange.
-// Suffix ranges ("bytes=-N") and multi-range requests are not yet
-// supported.
+// ("bytes=start-end", "bytes=start-", or the suffix form "bytes=-N")
+// into a providers.ByteRange. Multi-range requests are not supported.
+//
+// Suffix ranges request the final N bytes of the object and are
+// resolved here against the known object size into an absolute
+// [size-N, size-1] range, so every downstream consumer (Content-Range
+// / Content-Length formatting, the backend ByteRange fetch) sees
+// concrete endpoints and needs no suffix-awareness. Per RFC 7233
+// §2.1 a suffix length at or beyond the object size returns the whole
+// object, and a zero suffix length is unsatisfiable.
 func parseHTTPRange(h string, size int64) (*providers.ByteRange, error) {
 	if !strings.HasPrefix(h, "bytes=") {
 		return nil, fmt.Errorf("invalid range header %q", h)
@@ -2978,7 +2985,27 @@ func parseHTTPRange(h string, size int64) (*providers.ByteRange, error) {
 	}
 	startStr, endStr := spec[:dash], spec[dash+1:]
 	if startStr == "" {
-		return nil, fmt.Errorf("suffix ranges are not supported")
+		// Suffix range ("bytes=-N"): the final N bytes of the object.
+		if endStr == "" {
+			return nil, fmt.Errorf("invalid range header %q", h)
+		}
+		suffix, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid suffix length: %w", err)
+		}
+		if suffix < 0 {
+			return nil, fmt.Errorf("invalid range header %q", h)
+		}
+		// A suffix at or beyond the object size yields the whole
+		// object; clamp before the zero check so a >size suffix on a
+		// non-empty object stays satisfiable.
+		if suffix > size {
+			suffix = size
+		}
+		if suffix == 0 {
+			return nil, fmt.Errorf("unsatisfiable suffix range %q for size %d", h, size)
+		}
+		return &providers.ByteRange{Start: size - suffix, End: size - 1}, nil
 	}
 	start, err := strconv.ParseInt(startStr, 10, 64)
 	if err != nil {
