@@ -2184,17 +2184,17 @@ func (h *Handler) notifyCacheWarmingExhausted(backend string, pieceSize int64) {
 // processing Range; HEAD mirrors that dispatch so the headers
 // HEAD emits exactly match what the matching Get would emit:
 //
-//   - Erasure-coded manifests: getErasureCoded rejects Range with
-//     501 NotImplemented (chunk-level range seek lands in a future
-//     phase). HEAD must do the same — returning 206 with a
-//     slice-sized Content-Length would advertise capability the
-//     follow-up GET doesn't have, breaking AWS SDK / CDN
-//     pre-flight probes. EC GET also does NOT set ETag (the
-//     manifest's piece hashes are per-shard, not per-object), so
-//     HEAD must skip ETag too.
+//   - Erasure-coded manifests: getErasureCoded serves Range as a
+//     206 + Content-Range slice of the reconstructed object (416
+//     on an invalid range). HEAD mirrors that — same status and
+//     Content-Range with the body omitted. EC GET does NOT set
+//     ETag (the manifest's piece hashes are per-shard, not
+//     per-object), so HEAD must skip ETag too.
 //
-//   - Multipart manifests: getMultipart likewise rejects Range
-//     with 501 and does not set ETag. HEAD mirrors both.
+//   - Multipart manifests: getMultipart likewise serves Range as a
+//     206 + Content-Range slice and does not set ETag. HEAD
+//     mirrors both. Objects above maxMultipartInMemoryBytes still
+//     return 507 on HEAD to match the GET ceiling.
 //
 //   - Gateway-encrypted manifests with a Range header:
 //     bufferedGatewayDecryptedGet rejects pieces above
@@ -2282,7 +2282,8 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 }
 
 // headErasureCoded mirrors getErasureCoded's response metadata:
-// 501 for Range, 200 + full ObjectSize + no ETag otherwise. EC
+// 206 + Content-Range for a satisfiable Range, 416 for an invalid
+// one, 200 + full ObjectSize otherwise, and no ETag in any case. EC
 // pieces are per-shard, not per-object, so the gateway has no
 // authoritative per-object hash to advertise as ETag (the
 // Reed-Solomon decoder reconstructs the object on the fly; the
@@ -2332,23 +2333,39 @@ func (h *Handler) headErasureCoded(
 		writeError(w, http.StatusInternalServerError, "ErasureProfileNotRegistered", err.Error(), r.URL.Path)
 		return
 	}
-	if r.Header.Get("Range") != "" {
-		writeError(w, http.StatusNotImplemented, "NotImplemented",
-			"range reads on erasure-coded objects are not yet supported", r.URL.Path)
-		return
+	var byteRange *providers.ByteRange
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
+		if perr != nil {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+			return
+		}
+		byteRange = rng
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
-	w.WriteHeader(http.StatusOK)
+	status := http.StatusOK
+	if byteRange != nil {
+		end := byteRange.End
+		if end < 0 {
+			end = manifest.ObjectSize - 1
+		}
+		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
+		status = http.StatusPartialContent
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	}
+	w.WriteHeader(status)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	auditBackend, auditPieceID, auditCountry := h.ecAuditAttribution(manifest)
 	h.audit(r, "HEAD", tenantID, bucket, manifest.ObjectKey, auditPieceID, auditBackend, auditCountry)
 }
 
-// headMultipart mirrors getMultipart's response metadata: 501 for
-// Range, 507 above maxMultipartInMemoryBytes, otherwise 200 + full
-// ObjectSize with no ETag. Multipart objects don't expose a
+// headMultipart mirrors getMultipart's response metadata: 206 +
+// Content-Range for a satisfiable Range, 507 above
+// maxMultipartInMemoryBytes, otherwise 200 + full ObjectSize, with
+// no ETag in any case. Multipart objects don't expose a
 // per-object ETag on read (the multipart ETag returned at upload
 // completion is a non-cryptographic concatenation hash that isn't
 // recoverable from the manifest; matching GET we omit it rather
@@ -2370,10 +2387,14 @@ func (h *Handler) headMultipart(
 	_ providers.StorageProvider,
 	tenantID, bucket string,
 ) {
-	if r.Header.Get("Range") != "" {
-		writeError(w, http.StatusNotImplemented, "NotImplemented",
-			"range reads on multipart objects are not yet supported", r.URL.Path)
-		return
+	var byteRange *providers.ByteRange
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
+		if perr != nil {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+			return
+		}
+		byteRange = rng
 	}
 	if manifest.ObjectSize > maxMultipartInMemoryBytes {
 		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
@@ -2403,8 +2424,19 @@ func (h *Handler) headMultipart(
 		}
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
-	w.WriteHeader(http.StatusOK)
+	status := http.StatusOK
+	if byteRange != nil {
+		end := byteRange.End
+		if end < 0 {
+			end = manifest.ObjectSize - 1
+		}
+		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
+		status = http.StatusPartialContent
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+	}
+	w.WriteHeader(status)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	auditBackend, auditPieceID, auditCountry := h.multipartAuditAttribution(manifest)
