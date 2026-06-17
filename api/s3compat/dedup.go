@@ -518,6 +518,7 @@ func (h *Handler) putDeduped(
 			SizeBytes:    sizeOnWire,
 			State:        "active",
 		}},
+		Tags: requestObjectTags(r.Header.Get("x-amz-tagging")),
 		MigrationState: metadata.MigrationState{
 			Generation:     1,
 			PrimaryBackend: pieceBackend,

@@ -970,6 +970,15 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Inline object tagging (x-amz-tagging): validate the header up front
+	// so a malformed tag set fails with 400 before any backend write. The
+	// single-piece / erasure-coded / dedup manifest paths below re-read the
+	// validated value via requestObjectTags.
+	if _, verr := parseObjectTaggingHeader(r.Header.Get("x-amz-tagging")); verr != nil {
+		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
+		return
+	}
+
 	// Object Lock overwrite enforcement (WS8.3): when versioning is
 	// NOT Enabled, a PUT replaces the current version in place, which
 	// would destroy a locked version. Refuse the overwrite up-front
@@ -1132,6 +1141,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 			SizeBytes:    putRes.SizeBytes,
 			State:        "active",
 		}},
+		Tags: requestObjectTags(r.Header.Get("x-amz-tagging")),
 		MigrationState: metadata.MigrationState{
 			Generation:     1,
 			PrimaryBackend: backendName,
