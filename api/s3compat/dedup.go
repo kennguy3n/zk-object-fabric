@@ -525,6 +525,7 @@ func (h *Handler) putDeduped(
 		},
 		CreatedAt: h.cfg.Now(),
 	}
+	applyRequestObjectMetadata(manifest, r.Header)
 	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
 		if _, derr := h.cfg.ContentIndex.DecrementRef(r.Context(), tenantID, res.ContentHash); derr != nil {
 			_ = derr

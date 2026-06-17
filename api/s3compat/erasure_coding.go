@@ -247,6 +247,7 @@ func (h *Handler) putErasureCoded(
 		},
 		CreatedAt: h.cfg.Now(),
 	}
+	applyRequestObjectMetadata(manifest, r.Header)
 	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
 		rollbackEC(r, h.cfg.Providers, provider, backendName, written)
 		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
