@@ -452,14 +452,10 @@ func (h *Handler) getErasureCoded(
 	manifest *metadata.ObjectManifest,
 	tenantID, bucket string,
 ) {
-	var byteRange *providers.ByteRange
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
-		if perr != nil {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
-			return
-		}
-		byteRange = rng
+	single, multi, perr := parseObjectRanges(r, manifest.ObjectSize)
+	if perr != nil {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+		return
 	}
 
 	plaintext, rerr := h.reconstructErasureCoded(r.Context(), manifest)
@@ -468,26 +464,32 @@ func (h *Handler) getErasureCoded(
 		return
 	}
 
-	out := plaintext
-	status := http.StatusOK
-	if byteRange != nil {
-		end := byteRange.End
-		if end < 0 || end >= int64(len(plaintext)) {
-			end = int64(len(plaintext)) - 1
-		}
-		if byteRange.Start < 0 || byteRange.Start > end+1 {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
-			return
-		}
-		out = plaintext[byteRange.Start : end+1]
-		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
-		status = http.StatusPartialContent
-	}
-
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(out)))
-	w.WriteHeader(status)
-	n, _ := w.Write(out)
+
+	var n int64
+	if multi != nil {
+		n = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), plaintext)
+	} else {
+		out := plaintext
+		status := http.StatusOK
+		if single != nil {
+			end := single.End
+			if end < 0 || end >= int64(len(plaintext)) {
+				end = int64(len(plaintext)) - 1
+			}
+			if single.Start < 0 || single.Start > end+1 {
+				writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
+				return
+			}
+			out = plaintext[single.Start : end+1]
+			w.Header().Set("Content-Range", formatContentRange(single, manifest.ObjectSize))
+			status = http.StatusPartialContent
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(out)))
+		w.WriteHeader(status)
+		written, _ := w.Write(out)
+		n = int64(written)
+	}
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	if n > 0 {
@@ -690,14 +692,10 @@ func (h *Handler) getMultipart(
 	manifest *metadata.ObjectManifest,
 	tenantID, bucket string,
 ) {
-	var byteRange *providers.ByteRange
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
-		if perr != nil {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
-			return
-		}
-		byteRange = rng
+	single, multi, perr := parseObjectRanges(r, manifest.ObjectSize)
+	if perr != nil {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+		return
 	}
 
 	bodies, total, rerr := h.reconstructMultipart(r.Context(), manifest)
@@ -709,26 +707,33 @@ func (h *Handler) getMultipart(
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
 
 	var written int64
-	if byteRange != nil {
+	switch {
+	case multi != nil:
 		assembled := make([]byte, 0, total)
 		for _, b := range bodies {
 			assembled = append(assembled, b...)
 		}
-		end := byteRange.End
+		written = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), assembled)
+	case single != nil:
+		assembled := make([]byte, 0, total)
+		for _, b := range bodies {
+			assembled = append(assembled, b...)
+		}
+		end := single.End
 		if end < 0 || end >= total {
 			end = total - 1
 		}
-		if byteRange.Start < 0 || byteRange.Start > end+1 {
+		if single.Start < 0 || single.Start > end+1 {
 			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
 			return
 		}
-		slice := assembled[byteRange.Start : end+1]
-		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+		slice := assembled[single.Start : end+1]
+		w.Header().Set("Content-Range", formatContentRange(single, manifest.ObjectSize))
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(slice)))
 		w.WriteHeader(http.StatusPartialContent)
 		n, _ := w.Write(slice)
 		written += int64(n)
-	} else {
+	default:
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", total))
 		w.WriteHeader(http.StatusOK)
 		for _, b := range bodies {
