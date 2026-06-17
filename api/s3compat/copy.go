@@ -213,21 +213,13 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Erasure-coded and multipart manifests are not supported by
-	// CopyObject in this gateway. The source manifest's pieces
-	// list cannot be safely refcounted as a single piece.
-	if isErasureCodedManifest(srcManifest) || isMultipartManifest(srcManifest) {
-		writeError(w, http.StatusNotImplemented, "NotImplemented", "CopyObject does not support multipart or erasure-coded sources", r.URL.Path)
-		return
-	}
-
 	srcPiece := srcManifest.Pieces[0]
 
 	// CopyObject source preconditions (x-amz-copy-source-if-*). Evaluated
 	// against the resolved source object's ETag / CreatedAt; an
 	// unsatisfied precondition aborts the copy with 412 PreconditionFailed
-	// (a write has no 304 fallback). Runs after the EC/multipart guard so
-	// an unsupported source still surfaces as 501.
+	// (a write has no 304 fallback). For erasure-coded / multipart sources
+	// condETagForRead returns "" so only the "*"/date validators apply.
 	if evaluateCopySourceConditionals(r.Header, condETagForRead(srcManifest, srcPiece), srcManifest.CreatedAt) {
 		writeError(w, http.StatusPreconditionFailed, "PreconditionFailed",
 			"the copy source conditional request precondition failed", r.URL.Path)
@@ -249,6 +241,16 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 	// from this request's headers).
 	if verr := validateCopyMetadataDirective(r.Header); verr != nil {
 		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
+		return
+	}
+
+	// Erasure-coded and multipart sources span many pieces and cannot be
+	// refcounted or server-side-copied as a single piece. Reconstruct the
+	// object's logical bytes and re-store them as a fresh single-piece
+	// destination. The conditional, tagging, and metadata-directive
+	// validations above have already run, so they apply to these sources too.
+	if isErasureCodedManifest(srcManifest) || isMultipartManifest(srcManifest) {
+		h.copyReconstructedSource(w, r, tenantID, dstBucket, dstKey, srcManifest)
 		return
 	}
 
@@ -452,65 +454,11 @@ func (h *Handler) copyReencrypt(
 		return
 	}
 
-	dstPieceID := newPieceID(tenantID, dstBucket, dstKey, h.cfg.Now())
-	dstID := aadIdentity{
-		TenantID:      tenantID,
-		Bucket:        dstBucket,
-		ObjectKeyHash: hashObjectKey(dstKey),
-		VersionID:     dstPieceID,
-	}
-	newCiphertext, wrapped, eerr := h.encryptForStorage(plaintext, dstID)
-	// Scrub the recovered plaintext now that the SDK has consumed
-	// it; defence-in-depth against heap-dump exposure of cleartext
-	// copied through the gateway.
-	clear(plaintext)
-	if eerr != nil {
-		writeError(w, http.StatusInternalServerError, "EncryptionFailed", eerr.Error(), r.URL.Path)
-		return
-	}
-
-	cipherHash := blake3.Sum256(newCiphertext)
-	putRes, perr := srcProvider.PutPiece(r.Context(), dstPieceID, bytes.NewReader(newCiphertext), providers.PutOptions{
-		ContentLength: int64(len(newCiphertext)),
-		ContentType:   r.Header.Get("Content-Type"),
-	})
-	if perr != nil {
-		writeError(w, http.StatusBadGateway, "BackendPutFailed", perr.Error(), r.URL.Path)
-		return
-	}
-
-	newPiece := metadata.Piece{
-		// Record the deterministic dstPieceID we minted, not
-		// putRes.PieceID: writeCopyManifest derives the
-		// manifest VersionID from Piece.PieceID, and the AAD
-		// above was bound to dstPieceID. Binding to dstPieceID
-		// (rather than whatever the backend echoes) keeps the
-		// recorded VersionID identical to the bound identity on
-		// every provider, mirroring the single-piece PUT path
-		// (handler.go: VersionID = requested pieceID) and the
-		// non-dedup copy path (which also records dstPieceID).
-		PieceID:      dstPieceID,
-		Hash:         "blake3:" + hex.EncodeToString(cipherHash[:]),
-		ProviderETag: putRes.ETag,
-		Backend:      srcPiece.Backend,
-		Locator:      putRes.Locator,
-		State:        "active",
-		SizeBytes:    putRes.SizeBytes,
-	}
-	// Fresh v1 EncryptionConfig: new wrapped DEK, bound to the
-	// destination identity. Preserve the source's Mode and
-	// ManifestEncrypted; the DEK/algorithm fields all come from the
-	// re-encrypt above.
-	dstEnc := metadata.EncryptionConfig{
-		Mode:              srcManifest.Encryption.Mode,
-		Algorithm:         client_sdk.ContentAlgorithm,
-		KeyID:             wrapped.KeyID,
-		WrappedDEK:        wrapped.WrappedKey,
-		WrapAlgorithm:     wrapped.WrapAlgorithm,
-		ManifestEncrypted: srcManifest.Encryption.ManifestEncrypted,
-		AADVersion:        AADVersionV1,
-	}
-	h.writeCopyManifest(w, r, tenantID, dstBucket, dstKey, srcManifest, newPiece, srcPiece.Backend, dstEnc, false)
+	// Re-encrypt the recovered plaintext under the destination identity and
+	// store it, preserving the source's mode and ManifestEncrypted flag.
+	h.storeReencryptedCopy(w, r, tenantID, dstBucket, dstKey, srcManifest,
+		srcProvider, srcPiece.Backend, plaintext,
+		srcManifest.Encryption.Mode, srcManifest.Encryption.ManifestEncrypted)
 }
 
 // copyEncryptForDefault performs a CopyObject when the destination
@@ -576,6 +524,114 @@ func (h *Handler) copyEncryptForDefault(
 		return
 	}
 
+	// Encrypt the plaintext source under the destination identity, recording
+	// the promoted mode. There is no source manifest encryption to preserve
+	// (plaintext source), so ManifestEncrypted is false.
+	h.storeReencryptedCopy(w, r, tenantID, dstBucket, dstKey, srcManifest,
+		srcProvider, srcPiece.Backend, plaintext, dstMode, false)
+}
+
+// copyReconstructedSource performs a CopyObject whose source is an
+// erasure-coded or multipart object. Such a source spans many pieces and
+// cannot be refcounted or server-side-copied as a single piece, so the
+// gateway reconstructs the object's logical bytes (EC decode / multipart
+// concat, transparently decrypting gateway-encrypted sources under the
+// source identity) and re-stores them as a fresh single-piece destination.
+// The destination's encryption mirrors the single-piece copy paths:
+//
+//   - gateway-encrypted source (managed / public_distribution): the
+//     reconstructed bytes are true plaintext, so re-encrypt under the
+//     destination identity, preserving the source mode and ManifestEncrypted.
+//   - plaintext source (no encryption config): honour the destination
+//     bucket's effective encryption — re-encrypt when it resolves to a
+//     gateway-managed mode (WS8.7), else store verbatim.
+//   - client_side source: the reconstructed bytes are the opaque ZK payload;
+//     store them verbatim and preserve the source envelope. The gateway
+//     never re-encrypts client-side ciphertext.
+//
+// Reconstruction is bounded by the same in-memory ceilings the GET path
+// enforces (reconstructErasureCoded / reconstructMultipart return 507/413
+// for oversized objects), so a large source cannot OOM the gateway.
+func (h *Handler) copyReconstructedSource(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID, dstBucket, dstKey string,
+	srcManifest *metadata.ObjectManifest,
+) {
+	// Reconstruct the source's logical bytes into one contiguous buffer.
+	var content []byte
+	if isErasureCodedManifest(srcManifest) {
+		decoded, rerr := h.reconstructErasureCoded(r.Context(), srcManifest)
+		if rerr != nil {
+			writeError(w, rerr.status, rerr.s3code, rerr.msg, r.URL.Path)
+			return
+		}
+		content = decoded
+	} else {
+		bodies, total, rerr := h.reconstructMultipart(r.Context(), srcManifest)
+		if rerr != nil {
+			writeError(w, rerr.status, rerr.s3code, rerr.msg, r.URL.Path)
+			return
+		}
+		assembled := make([]byte, 0, total)
+		for _, b := range bodies {
+			assembled = append(assembled, b...)
+		}
+		content = assembled
+	}
+
+	dstProvider, dstBackend, ok := h.copyDestinationBackend(srcManifest)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "BackendNotRegistered",
+			"no registered backend available for the copy destination", r.URL.Path)
+		return
+	}
+
+	switch {
+	case IsGatewayEncrypted(srcManifest.Encryption.Mode):
+		h.storeReencryptedCopy(w, r, tenantID, dstBucket, dstKey, srcManifest,
+			dstProvider, dstBackend, content,
+			srcManifest.Encryption.Mode, srcManifest.Encryption.ManifestEncrypted)
+	case srcManifest.Encryption.Mode == "":
+		dstMode, derr := h.effectiveEncryptionMode(r.Context(), tenantID, dstBucket, srcManifest.PlacementPolicy)
+		if derr != nil {
+			writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured", derr.Error(), r.URL.Path)
+			return
+		}
+		if IsGatewayEncrypted(dstMode) {
+			h.storeReencryptedCopy(w, r, tenantID, dstBucket, dstKey, srcManifest,
+				dstProvider, dstBackend, content, dstMode, false)
+			return
+		}
+		h.storeVerbatimCopy(w, r, tenantID, dstBucket, dstKey, srcManifest,
+			dstProvider, dstBackend, content, metadata.EncryptionConfig{})
+	default:
+		h.storeVerbatimCopy(w, r, tenantID, dstBucket, dstKey, srcManifest,
+			dstProvider, dstBackend, content, srcManifest.Encryption)
+	}
+}
+
+// storeReencryptedCopy encrypts plaintext under a fresh DEK bound to the
+// destination identity, stores it as a single piece on dstProvider, and
+// writes the destination manifest. It is the shared encrypt-and-store half
+// of every gateway-encrypted copy path: copyReencrypt (v1 source decrypted
+// first), copyEncryptForDefault (plaintext source promoted by the bucket
+// default), and copyReconstructedSource (EC/multipart source reconstructed to
+// plaintext). The caller supplies the EncryptionConfig.Mode to record and the
+// source's ManifestEncrypted flag; the wrapped DEK, algorithm, and AAD
+// version come from the encrypt step here. The plaintext is scrubbed once the
+// SDK has consumed it (defence-in-depth against heap-dump exposure).
+func (h *Handler) storeReencryptedCopy(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID, dstBucket, dstKey string,
+	srcManifest *metadata.ObjectManifest,
+	dstProvider providers.StorageProvider,
+	dstBackend string,
+	plaintext []byte,
+	mode string,
+	manifestEncrypted bool,
+) {
 	dstPieceID := newPieceID(tenantID, dstBucket, dstKey, h.cfg.Now())
 	dstID := aadIdentity{
 		TenantID:      tenantID,
@@ -584,7 +640,6 @@ func (h *Handler) copyEncryptForDefault(
 		VersionID:     dstPieceID,
 	}
 	newCiphertext, wrapped, eerr := h.encryptForStorage(plaintext, dstID)
-	// Scrub the plaintext now that the SDK has consumed it.
 	clear(plaintext)
 	if eerr != nil {
 		writeError(w, http.StatusInternalServerError, "EncryptionFailed", eerr.Error(), r.URL.Path)
@@ -592,7 +647,7 @@ func (h *Handler) copyEncryptForDefault(
 	}
 
 	cipherHash := blake3.Sum256(newCiphertext)
-	putRes, perr := srcProvider.PutPiece(r.Context(), dstPieceID, bytes.NewReader(newCiphertext), providers.PutOptions{
+	putRes, perr := dstProvider.PutPiece(r.Context(), dstPieceID, bytes.NewReader(newCiphertext), providers.PutOptions{
 		ContentLength: int64(len(newCiphertext)),
 		ContentType:   r.Header.Get("Content-Type"),
 	})
@@ -601,28 +656,92 @@ func (h *Handler) copyEncryptForDefault(
 		return
 	}
 
+	// Record the deterministic dstPieceID we minted, not putRes.PieceID:
+	// writeCopyManifest derives the manifest VersionID from Piece.PieceID and
+	// the AAD above was bound to dstPieceID, so binding the recorded VersionID
+	// to it keeps identity consistent on every provider.
 	newPiece := metadata.Piece{
 		PieceID:      dstPieceID,
 		Hash:         "blake3:" + hex.EncodeToString(cipherHash[:]),
 		ProviderETag: putRes.ETag,
-		Backend:      srcPiece.Backend,
+		Backend:      dstBackend,
 		Locator:      putRes.Locator,
 		State:        "active",
 		SizeBytes:    putRes.SizeBytes,
 	}
-	// Fresh v1 EncryptionConfig recording the promoted mode and the
-	// wrapped DEK bound to the destination identity. There is no
-	// source manifest encryption to preserve (plaintext source), so
-	// ManifestEncrypted defaults to false.
 	dstEnc := metadata.EncryptionConfig{
-		Mode:          dstMode,
-		Algorithm:     client_sdk.ContentAlgorithm,
-		KeyID:         wrapped.KeyID,
-		WrappedDEK:    wrapped.WrappedKey,
-		WrapAlgorithm: wrapped.WrapAlgorithm,
-		AADVersion:    AADVersionV1,
+		Mode:              mode,
+		Algorithm:         client_sdk.ContentAlgorithm,
+		KeyID:             wrapped.KeyID,
+		WrappedDEK:        wrapped.WrappedKey,
+		WrapAlgorithm:     wrapped.WrapAlgorithm,
+		ManifestEncrypted: manifestEncrypted,
+		AADVersion:        AADVersionV1,
 	}
-	h.writeCopyManifest(w, r, tenantID, dstBucket, dstKey, srcManifest, newPiece, srcPiece.Backend, dstEnc, false)
+	h.writeCopyManifest(w, r, tenantID, dstBucket, dstKey, srcManifest, newPiece, dstBackend, dstEnc, false)
+}
+
+// storeVerbatimCopy stores content as a single destination piece with no
+// gateway encryption transform and writes the destination manifest with the
+// supplied EncryptionConfig. It backs the reconstructed-copy paths where the
+// bytes are stored as-is: a plaintext source landing in a plaintext bucket
+// (enc = zero EncryptionConfig) and a client_side source whose opaque ZK
+// payload is preserved together with its source envelope
+// (enc = srcManifest.Encryption).
+func (h *Handler) storeVerbatimCopy(
+	w http.ResponseWriter,
+	r *http.Request,
+	tenantID, dstBucket, dstKey string,
+	srcManifest *metadata.ObjectManifest,
+	dstProvider providers.StorageProvider,
+	dstBackend string,
+	content []byte,
+	enc metadata.EncryptionConfig,
+) {
+	dstPieceID := newPieceID(tenantID, dstBucket, dstKey, h.cfg.Now())
+	contentHash := blake3.Sum256(content)
+	putRes, perr := dstProvider.PutPiece(r.Context(), dstPieceID, bytes.NewReader(content), providers.PutOptions{
+		ContentLength: int64(len(content)),
+		ContentType:   r.Header.Get("Content-Type"),
+	})
+	if perr != nil {
+		writeError(w, http.StatusBadGateway, "BackendPutFailed", perr.Error(), r.URL.Path)
+		return
+	}
+	newPiece := metadata.Piece{
+		PieceID:      dstPieceID,
+		Hash:         "blake3:" + hex.EncodeToString(contentHash[:]),
+		ProviderETag: putRes.ETag,
+		Backend:      dstBackend,
+		Locator:      putRes.Locator,
+		State:        "active",
+		SizeBytes:    putRes.SizeBytes,
+	}
+	h.writeCopyManifest(w, r, tenantID, dstBucket, dstKey, srcManifest, newPiece, dstBackend, enc, false)
+}
+
+// copyDestinationBackend picks a registered storage provider for the
+// reconstructed copy destination. It prefers the source's anchor backend (the
+// EC primary backend, else the first piece's backend for multipart) so the
+// copy lands on the same provider as the source when possible, and falls back
+// to the first piece backend that is actually registered. Returns ok=false
+// when none of the candidate backends are registered.
+func (h *Handler) copyDestinationBackend(m *metadata.ObjectManifest) (providers.StorageProvider, string, bool) {
+	anchor := m.MigrationState.PrimaryBackend
+	if anchor == "" && len(m.Pieces) > 0 {
+		anchor = m.Pieces[0].Backend
+	}
+	if anchor != "" {
+		if prov, ok := h.cfg.Providers[anchor]; ok {
+			return prov, anchor, true
+		}
+	}
+	for _, p := range m.Pieces {
+		if prov, ok := h.cfg.Providers[p.Backend]; ok {
+			return prov, p.Backend, true
+		}
+	}
+	return nil, "", false
 }
 
 // copyViaGetPut streams the source piece through GetPiece and
