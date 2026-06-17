@@ -17,6 +17,7 @@ package s3compat
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -280,47 +281,40 @@ func (h *Handler) putErasureCoded(
 	w.WriteHeader(http.StatusOK)
 }
 
-// getErasureCoded reconstructs the plaintext from the shards named in
-// manifest.Pieces and serves it whole (200) or, when the request
-// carries a Range header, as a byte-range slice (206 + Content-Range).
-// The full object is reconstructed in memory regardless, so slicing
-// the already-materialised plaintext costs nothing extra. Streaming
-// range reads that fetch only the stripes overlapping the range remain
-// a Phase 4 optimisation (docs/PROPOSAL.md §6); this buffered path
-// gives correct S3-compatible Range semantics in the meantime.
-func (h *Handler) getErasureCoded(
-	w http.ResponseWriter,
-	r *http.Request,
-	manifest *metadata.ObjectManifest,
-	tenantID, bucket string,
-) {
+// reconstructError carries a structured failure from the EC / multipart
+// reconstruction helpers so both the GET path (which writes an HTTP error)
+// and the CopyObject path (which writes the same HTTP error) translate it
+// identically without duplicating the per-failure status/code/message.
+type reconstructError struct {
+	status int
+	s3code string
+	msg    string
+}
+
+func (e *reconstructError) Error() string { return e.msg }
+
+// reconstructErasureCoded fetches every shard named in manifest.Pieces,
+// verifies each shard's BLAKE3 hash, Reed-Solomon-decodes the stripes, and
+// — for gateway-encrypted objects — unseals the decoded ciphertext under
+// the manifest identity. It returns the object's logical bytes: true
+// plaintext for managed / public_distribution objects, the opaque
+// client_side payload otherwise. It is shared by getErasureCoded (GET/HEAD
+// range reads) and copyReconstructedSource (server-side copy of an EC
+// source). The whole object is materialised in memory, bounded by the EC
+// PUT ceiling (maxECObjectSize) that produced it.
+func (h *Handler) reconstructErasureCoded(ctx context.Context, manifest *metadata.ObjectManifest) ([]byte, *reconstructError) {
 	if h.cfg.ErasureCoding == nil {
-		writeError(w, http.StatusInternalServerError, "ErasureCodingNotConfigured",
-			"object is erasure-coded but no registry is configured", r.URL.Path)
-		return
+		return nil, &reconstructError{http.StatusInternalServerError, "ErasureCodingNotConfigured",
+			"object is erasure-coded but no registry is configured"}
 	}
 	profile := manifest.PlacementPolicy.ErasureProfile
 	if profile == "" {
-		// The manifest was produced by EC (shard metadata populated)
-		// but dropped the profile name. Attempt inference by looking
-		// up any profile whose (k, m) matches the piece layout.
-		writeError(w, http.StatusInternalServerError, "ErasureProfileMissing",
-			"erasure-coded manifest is missing ErasureProfile", r.URL.Path)
-		return
+		return nil, &reconstructError{http.StatusInternalServerError, "ErasureProfileMissing",
+			"erasure-coded manifest is missing ErasureProfile"}
 	}
 	encoder, err := h.cfg.ErasureCoding.Lookup(profile)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "ErasureProfileNotRegistered", err.Error(), r.URL.Path)
-		return
-	}
-	var byteRange *providers.ByteRange
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
-		if perr != nil {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
-			return
-		}
-		byteRange = rng
+		return nil, &reconstructError{http.StatusInternalServerError, "ErasureProfileNotRegistered", err.Error()}
 	}
 
 	total := encoder.Profile().TotalShards()
@@ -331,9 +325,8 @@ func (h *Handler) getErasureCoded(
 		}
 	}
 	if numStripes == 0 {
-		writeError(w, http.StatusInternalServerError, "EmptyManifest",
-			"erasure-coded manifest has no stripes", r.URL.Path)
-		return
+		return nil, &reconstructError{http.StatusInternalServerError, "EmptyManifest",
+			"erasure-coded manifest has no stripes"}
 	}
 
 	// Stable ordering helps the fetcher report meaningful errors.
@@ -359,14 +352,12 @@ func (h *Handler) getErasureCoded(
 				Kind:        shardKindFromManifest(p.ShardKind),
 			})
 			if losses[p.StripeIndex] > tolerance {
-				writeError(w, http.StatusBadGateway, "DataLoss",
-					fmt.Sprintf("stripe %d exceeded parity tolerance: backend %q not registered", p.StripeIndex, p.Backend),
-					r.URL.Path)
-				return
+				return nil, &reconstructError{http.StatusBadGateway, "DataLoss",
+					fmt.Sprintf("stripe %d exceeded parity tolerance: backend %q not registered", p.StripeIndex, p.Backend)}
 			}
 			continue
 		}
-		body, getErr := prov.GetPiece(r.Context(), p.PieceID, nil)
+		body, getErr := prov.GetPiece(ctx, p.PieceID, nil)
 		if getErr != nil {
 			losses[p.StripeIndex]++
 			shards = append(shards, erasure_coding.Shard{
@@ -375,18 +366,15 @@ func (h *Handler) getErasureCoded(
 				Kind:        shardKindFromManifest(p.ShardKind),
 			})
 			if losses[p.StripeIndex] > tolerance {
-				writeError(w, http.StatusBadGateway, "DataLoss",
-					fmt.Sprintf("stripe %d exceeded parity tolerance: %v", p.StripeIndex, getErr),
-					r.URL.Path)
-				return
+				return nil, &reconstructError{http.StatusBadGateway, "DataLoss",
+					fmt.Sprintf("stripe %d exceeded parity tolerance: %v", p.StripeIndex, getErr)}
 			}
 			continue
 		}
 		buf, rerr := io.ReadAll(body)
 		_ = body.Close()
 		if rerr != nil {
-			writeError(w, http.StatusBadGateway, "BackendGetFailed", rerr.Error(), r.URL.Path)
-			return
+			return nil, &reconstructError{http.StatusBadGateway, "BackendGetFailed", rerr.Error()}
 		}
 
 		// Verify the shard bytes match the manifest's per-shard
@@ -416,10 +404,8 @@ func (h *Handler) getErasureCoded(
 					Kind:        shardKindFromManifest(p.ShardKind),
 				})
 				if losses[p.StripeIndex] > tolerance {
-					writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
-						fmt.Sprintf("stripe %d exceeded parity tolerance after shard integrity failure: %v", p.StripeIndex, verr),
-						r.URL.Path)
-					return
+					return nil, &reconstructError{http.StatusBadGateway, "IntegrityCheckFailed",
+						fmt.Sprintf("stripe %d exceeded parity tolerance after shard integrity failure: %v", p.StripeIndex, verr)}
 				}
 				continue
 			}
@@ -435,22 +421,51 @@ func (h *Handler) getErasureCoded(
 
 	decoded, err := encoder.Decode(shards)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "ErasureDecodeFailed", err.Error(), r.URL.Path)
-		return
+		return nil, &reconstructError{http.StatusBadGateway, "ErasureDecodeFailed", err.Error()}
 	}
 
 	// For managed / public_distribution objects the encoder's
 	// output is the ciphertext the gateway produced in
 	// prepareErasureCodedEncryption; we unseal it before handing
 	// it back. client_side objects stay opaque.
-	plaintext := decoded
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
 		decrypted, derr := h.decryptFromStorage(decoded, manifest.Encryption, aadIdentityOf(manifest))
 		if derr != nil {
-			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
+			return nil, &reconstructError{http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error()}
+		}
+		return decrypted, nil
+	}
+	return decoded, nil
+}
+
+// getErasureCoded reconstructs the plaintext from the shards named in
+// manifest.Pieces and serves it whole (200) or, when the request
+// carries a Range header, as a byte-range slice (206 + Content-Range).
+// The full object is reconstructed in memory regardless, so slicing
+// the already-materialised plaintext costs nothing extra. Streaming
+// range reads that fetch only the stripes overlapping the range remain
+// a Phase 4 optimisation (docs/PROPOSAL.md §6); this buffered path
+// gives correct S3-compatible Range semantics in the meantime.
+func (h *Handler) getErasureCoded(
+	w http.ResponseWriter,
+	r *http.Request,
+	manifest *metadata.ObjectManifest,
+	tenantID, bucket string,
+) {
+	var byteRange *providers.ByteRange
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
+		if perr != nil {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
 			return
 		}
-		plaintext = decrypted
+		byteRange = rng
+	}
+
+	plaintext, rerr := h.reconstructErasureCoded(r.Context(), manifest)
+	if rerr != nil {
+		writeError(w, rerr.status, rerr.s3code, rerr.msg, r.URL.Path)
+		return
 	}
 
 	out := plaintext
@@ -521,6 +536,140 @@ func shardKindFromManifest(s string) erasure_coding.ShardKind {
 	return erasure_coding.ShardKindData
 }
 
+// reconstructMultipart fetches every part named in manifest.Pieces in
+// ascending PartNumber order, verifies each part's BLAKE3 hash, and — for
+// gateway-encrypted uploads — decrypts each part under the session DEK. It
+// returns the per-part logical bodies (true plaintext for managed /
+// public_distribution, opaque client_side payloads otherwise) and their
+// aggregate length, keeping the parts un-concatenated so getMultipart can
+// stream them part-by-part for a whole-object GET without an extra copy. It
+// is shared by getMultipart (GET/HEAD range reads) and copyReconstructedSource
+// (server-side copy of a multipart source). Bounded by maxMultipartInMemoryBytes.
+func (h *Handler) reconstructMultipart(ctx context.Context, manifest *metadata.ObjectManifest) ([][]byte, int64, *reconstructError) {
+	if manifest.ObjectSize > maxMultipartInMemoryBytes {
+		return nil, 0, &reconstructError{http.StatusInsufficientStorage, "MultipartTooLarge",
+			fmt.Sprintf("multipart object of %d bytes exceeds in-memory pre-fetch ceiling of %d bytes",
+				manifest.ObjectSize, maxMultipartInMemoryBytes)}
+	}
+
+	pieces := make([]metadata.Piece, len(manifest.Pieces))
+	copy(pieces, manifest.Pieces)
+	sort.Slice(pieces, func(i, j int) bool {
+		return pieces[i].PartNumber < pieces[j].PartNumber
+	})
+
+	provs := make([]providers.StorageProvider, len(pieces))
+	for i, p := range pieces {
+		prov, ok := h.cfg.Providers[p.Backend]
+		if !ok {
+			return nil, 0, &reconstructError{http.StatusBadGateway, "BackendNotRegistered",
+				fmt.Sprintf("part %d references unregistered backend %q", p.PartNumber, p.Backend)}
+		}
+		provs[i] = prov
+	}
+
+	// Pre-fetch every piece body into memory so a backend failure
+	// mid-assembly fails cleanly as a 502. Writing the status line
+	// before we hold the full object would force us to truncate on
+	// a late error; the EC path has the same constraint and
+	// resolves it the same way (see reconstructErasureCoded).
+	bodies := make([][]byte, len(pieces))
+	for i, p := range pieces {
+		body, err := provs[i].GetPiece(ctx, p.PieceID, nil)
+		if err != nil {
+			return nil, 0, &reconstructError{http.StatusBadGateway, "BackendGetFailed",
+				fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, err)}
+		}
+		buf, rerr := io.ReadAll(body)
+		_ = body.Close()
+		if rerr != nil {
+			return nil, 0, &reconstructError{http.StatusBadGateway, "BackendGetFailed",
+				fmt.Sprintf("part %d piece %q: read: %v", p.PartNumber, p.PieceID, rerr)}
+		}
+
+		// Verify the per-part BLAKE3 hash before decryption /
+		// concatenation. UploadPart hashes the ciphertext as it
+		// streams to the backend (PR-2), so a mismatch here
+		// means the backend either lost or tampered with the
+		// part. Fail closed on a content mismatch: we have
+		// already read the part into memory but have not
+		// committed the response status line, so a 502 cleanly
+		// aborts the GET before any bytes reach the client. A
+		// legacy manifest with an unrecognised hash format gets
+		// the observability counter but still serves — there is
+		// no proof the bytes are wrong.
+		if verr := pieceintegrity.Verify(buf, p); verr != nil {
+			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
+				h.recordIntegrityUnrecognized(p, verr)
+			} else {
+				h.recordIntegrityFailure(p, verr)
+				return nil, 0, &reconstructError{http.StatusBadGateway, "IntegrityCheckFailed",
+					fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, verr)}
+			}
+		}
+		bodies[i] = buf
+	}
+
+	var total int64
+	for _, b := range bodies {
+		total += int64(len(b))
+	}
+
+	// For managed / public_distribution multipart uploads each
+	// piece is an independently-sealed ciphertext stream under the
+	// session-level DEK. The SDK's framing treats any shorter-
+	// than-chunk-size frame as terminal, so we cannot just
+	// concatenate the ciphertexts and decrypt once — we decrypt
+	// each part in isolation and concatenate the resulting
+	// plaintexts. All parts of a single upload share one wrapped
+	// DEK, so we unwrap once up front and reuse the plaintext key
+	// across every part via decryptWithDEK; this mirrors the
+	// write path, where UploadPart calls encryptWithDEK with the
+	// session DEK generated at CreateMultipartUpload time.
+	// manifest.ObjectSize records the plaintext aggregate so the
+	// integrity check below still fires.
+	if IsGatewayEncrypted(manifest.Encryption.Mode) {
+		if h.cfg.Encryption == nil {
+			return nil, 0, &reconstructError{http.StatusInternalServerError, "EncryptionNotConfigured",
+				"object is encrypted but no gateway encryption is configured"}
+		}
+		dek, uerr := h.cfg.Encryption.Wrapper.UnwrapDEK(encryption.DataEncryptionKey{
+			KeyID:         manifest.Encryption.KeyID,
+			Algorithm:     manifest.Encryption.Algorithm,
+			WrappedKey:    manifest.Encryption.WrappedDEK,
+			WrapAlgorithm: manifest.Encryption.WrapAlgorithm,
+		}, h.cfg.Encryption.CMK)
+		if uerr != nil {
+			return nil, 0, &reconstructError{http.StatusInternalServerError, "DEKUnwrapFailed", uerr.Error()}
+		}
+		plaintexts := make([][]byte, len(bodies))
+		var newTotal int64
+		for i, b := range bodies {
+			pt, derr := h.decryptWithDEK(b, dek, manifest.Encryption, aadIdentityOf(manifest))
+			if derr != nil {
+				return nil, 0, &reconstructError{http.StatusInternalServerError, "DecryptionFailed", derr.Error()}
+			}
+			plaintexts[i] = pt
+			newTotal += int64(len(pt))
+		}
+		bodies = plaintexts
+		total = newTotal
+	}
+
+	// Integrity guard: the aggregate of the piece bodies we just
+	// pulled from the backends must match the manifest's recorded
+	// object size. A mismatch points at either manifest corruption
+	// or a backend that served truncated / padded pieces — either
+	// way, the client should see a 502 instead of a correct-looking
+	// 200 with the wrong Content-Length.
+	if manifest.ObjectSize != 0 && total != manifest.ObjectSize {
+		return nil, 0, &reconstructError{http.StatusBadGateway, "ManifestIntegrityMismatch",
+			fmt.Sprintf("assembled %d bytes but manifest records %d", total, manifest.ObjectSize)}
+	}
+
+	return bodies, total, nil
+}
+
 // getMultipart serves a multipart-assembled object by concatenating
 // each piece in ascending PartNumber order. It serves the whole
 // object (200) or, when the request carries a Range header, a
@@ -551,139 +700,9 @@ func (h *Handler) getMultipart(
 		byteRange = rng
 	}
 
-	if manifest.ObjectSize > maxMultipartInMemoryBytes {
-		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
-			fmt.Sprintf("multipart object of %d bytes exceeds in-memory pre-fetch ceiling of %d bytes",
-				manifest.ObjectSize, maxMultipartInMemoryBytes),
-			r.URL.Path)
-		return
-	}
-
-	pieces := make([]metadata.Piece, len(manifest.Pieces))
-	copy(pieces, manifest.Pieces)
-	sort.Slice(pieces, func(i, j int) bool {
-		return pieces[i].PartNumber < pieces[j].PartNumber
-	})
-
-	provs := make([]providers.StorageProvider, len(pieces))
-	for i, p := range pieces {
-		prov, ok := h.cfg.Providers[p.Backend]
-		if !ok {
-			writeError(w, http.StatusBadGateway, "BackendNotRegistered",
-				fmt.Sprintf("part %d references unregistered backend %q", p.PartNumber, p.Backend),
-				r.URL.Path)
-			return
-		}
-		provs[i] = prov
-	}
-
-	// Pre-fetch every piece body into memory so a backend failure
-	// mid-assembly fails cleanly as a 502. Writing the status line
-	// before we hold the full object would force us to truncate on
-	// a late error; the EC path has the same constraint and
-	// resolves it the same way (see getErasureCoded).
-	bodies := make([][]byte, len(pieces))
-	for i, p := range pieces {
-		body, err := provs[i].GetPiece(r.Context(), p.PieceID, nil)
-		if err != nil {
-			writeError(w, http.StatusBadGateway, "BackendGetFailed",
-				fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, err),
-				r.URL.Path)
-			return
-		}
-		buf, rerr := io.ReadAll(body)
-		_ = body.Close()
-		if rerr != nil {
-			writeError(w, http.StatusBadGateway, "BackendGetFailed",
-				fmt.Sprintf("part %d piece %q: read: %v", p.PartNumber, p.PieceID, rerr),
-				r.URL.Path)
-			return
-		}
-
-		// Verify the per-part BLAKE3 hash before decryption /
-		// concatenation. UploadPart hashes the ciphertext as it
-		// streams to the backend (PR-2), so a mismatch here
-		// means the backend either lost or tampered with the
-		// part. Fail closed on a content mismatch: we have
-		// already read the part into memory but have not
-		// committed the response status line, so a 502 cleanly
-		// aborts the GET before any bytes reach the client. A
-		// legacy manifest with an unrecognised hash format gets
-		// the observability counter but still serves — there is
-		// no proof the bytes are wrong.
-		if verr := pieceintegrity.Verify(buf, p); verr != nil {
-			if errors.Is(verr, pieceintegrity.ErrIntegrityClaimUnrecognized) {
-				h.recordIntegrityUnrecognized(p, verr)
-			} else {
-				h.recordIntegrityFailure(p, verr)
-				writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
-					fmt.Sprintf("part %d piece %q: %v", p.PartNumber, p.PieceID, verr),
-					r.URL.Path)
-				return
-			}
-		}
-		bodies[i] = buf
-	}
-
-	var total int64
-	for _, b := range bodies {
-		total += int64(len(b))
-	}
-
-	// For managed / public_distribution multipart uploads each
-	// piece is an independently-sealed ciphertext stream under the
-	// session-level DEK. The SDK's framing treats any shorter-
-	// than-chunk-size frame as terminal, so we cannot just
-	// concatenate the ciphertexts and decrypt once — we decrypt
-	// each part in isolation and concatenate the resulting
-	// plaintexts. All parts of a single upload share one wrapped
-	// DEK, so we unwrap once up front and reuse the plaintext key
-	// across every part via decryptWithDEK; this mirrors the
-	// write path, where UploadPart calls encryptWithDEK with the
-	// session DEK generated at CreateMultipartUpload time.
-	// manifest.ObjectSize records the plaintext aggregate so the
-	// integrity check below still fires.
-	if IsGatewayEncrypted(manifest.Encryption.Mode) {
-		if h.cfg.Encryption == nil {
-			writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured",
-				"object is encrypted but no gateway encryption is configured", r.URL.Path)
-			return
-		}
-		dek, uerr := h.cfg.Encryption.Wrapper.UnwrapDEK(encryption.DataEncryptionKey{
-			KeyID:         manifest.Encryption.KeyID,
-			Algorithm:     manifest.Encryption.Algorithm,
-			WrappedKey:    manifest.Encryption.WrappedDEK,
-			WrapAlgorithm: manifest.Encryption.WrapAlgorithm,
-		}, h.cfg.Encryption.CMK)
-		if uerr != nil {
-			writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", uerr.Error(), r.URL.Path)
-			return
-		}
-		plaintexts := make([][]byte, len(bodies))
-		var newTotal int64
-		for i, b := range bodies {
-			pt, derr := h.decryptWithDEK(b, dek, manifest.Encryption, aadIdentityOf(manifest))
-			if derr != nil {
-				writeError(w, http.StatusInternalServerError, "DecryptionFailed", derr.Error(), r.URL.Path)
-				return
-			}
-			plaintexts[i] = pt
-			newTotal += int64(len(pt))
-		}
-		bodies = plaintexts
-		total = newTotal
-	}
-
-	// Integrity guard: the aggregate of the piece bodies we just
-	// pulled from the backends must match the manifest's recorded
-	// object size. A mismatch points at either manifest corruption
-	// or a backend that served truncated / padded pieces — either
-	// way, the client should see a 502 instead of a correct-looking
-	// 200 with the wrong Content-Length.
-	if manifest.ObjectSize != 0 && total != manifest.ObjectSize {
-		writeError(w, http.StatusBadGateway, "ManifestIntegrityMismatch",
-			fmt.Sprintf("assembled %d bytes but manifest records %d", total, manifest.ObjectSize),
-			r.URL.Path)
+	bodies, total, rerr := h.reconstructMultipart(r.Context(), manifest)
+	if rerr != nil {
+		writeError(w, rerr.status, rerr.s3code, rerr.msg, r.URL.Path)
 		return
 	}
 
