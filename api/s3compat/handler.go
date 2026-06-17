@@ -1296,6 +1296,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	// gateway-encrypted GETs all return the same metadata.
 	setObjectMetadataHeaders(w, manifest)
 
+	// S3 response-* query parameters let a signed GET override individual
+	// response headers (Content-Type, Content-Disposition, …) without
+	// changing the stored object. Apply after the stored metadata so an
+	// override wins, and before any dispatch path writes the status.
+	applyResponseOverrideHeaders(w, r.URL.Query())
+
 	if isErasureCodedManifest(manifest) {
 		h.getErasureCoded(w, r, manifest, tenantID, bucket)
 		return
@@ -2317,6 +2323,10 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	// Mirror Get's metadata chokepoint so HEAD returns the same
 	// Content-Type / system / x-amz-meta-* headers as GET would.
 	setObjectMetadataHeaders(w, manifest)
+
+	// Mirror Get: response-* query parameters override the same headers on
+	// HeadObject too, matching AWS.
+	applyResponseOverrideHeaders(w, r.URL.Query())
 
 	if isErasureCodedManifest(manifest) {
 		h.headErasureCoded(w, r, manifest, piece, pieceProvider, tenantID, bucket)
