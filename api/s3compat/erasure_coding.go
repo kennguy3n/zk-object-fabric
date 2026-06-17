@@ -240,6 +240,7 @@ func (h *Handler) putErasureCoded(
 		Encryption:      encCfg,
 		PlacementPolicy: policy,
 		Pieces:          pieces,
+		Tags:            requestObjectTags(r.Header.Get("x-amz-tagging")),
 		MigrationState: metadata.MigrationState{
 			Generation:     1,
 			PrimaryBackend: backendName,

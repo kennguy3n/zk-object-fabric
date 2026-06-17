@@ -234,6 +234,14 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Destination tagging (x-amz-tagging-directive): validate up front so a
+	// bad directive or REPLACE x-amz-tagging header fails with 400 before
+	// any bytes move. writeCopyManifest re-resolves the validated value.
+	if _, verr := resolveCopyTags(r.Header, srcManifest.Tags); verr != nil {
+		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
+		return
+	}
+
 	srcProvider, ok := h.cfg.Providers[srcPiece.Backend]
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "BackendNotRegistered",
@@ -701,6 +709,7 @@ func (h *Handler) writeCopyManifest(
 		Encryption:      enc,
 		PlacementPolicy: srcManifest.PlacementPolicy,
 		Pieces:          []metadata.Piece{piece},
+		Tags:            copyDestinationTags(r.Header, srcManifest.Tags),
 		MigrationState: metadata.MigrationState{
 			Generation:     1,
 			PrimaryBackend: backend,

@@ -17,7 +17,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 
 	"github.com/kennguy3n/zk-object-fabric/billing"
 	"github.com/kennguy3n/zk-object-fabric/metadata/manifest_store"
@@ -301,4 +303,84 @@ func validateTagSet(entries []tagEntry) (map[string]string, *tagValidationError)
 		tags[e.Key] = e.Value
 	}
 	return tags, nil
+}
+
+// parseObjectTaggingHeader parses the x-amz-tagging request header used
+// to set an object's tag set at creation time (PutObject) or on a copy
+// with x-amz-tagging-directive: REPLACE. Its value is a URL query
+// string (key1=Value1&key2=Value2) per the S3 REST API, with percent
+// encoding decoded. It enforces the same limits as PutObjectTagging and
+// rejects repeated keys. An empty header yields (nil, nil) — the object
+// is created untagged.
+func parseObjectTaggingHeader(header string) (map[string]string, *tagValidationError) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return nil, nil
+	}
+	values, err := url.ParseQuery(header)
+	if err != nil {
+		return nil, &tagValidationError{http.StatusBadRequest, "InvalidArgument",
+			"The x-amz-tagging header you provided is invalid"}
+	}
+	entries := make([]tagEntry, 0, len(values))
+	for key, vals := range values {
+		// url.ParseQuery groups repeated keys; more than one value for a
+		// single key is a duplicate tag, which validateTagSet also rejects.
+		if len(vals) != 1 {
+			return nil, &tagValidationError{http.StatusBadRequest, "InvalidTag",
+				"Cannot provide multiple Tags with the same key"}
+		}
+		entries = append(entries, tagEntry{Key: key, Value: vals[0]})
+	}
+	return validateTagSet(entries)
+}
+
+// requestObjectTags returns the validated tag set carried by the
+// x-amz-tagging header, or nil when absent. Callers MUST have already
+// validated the header (e.g. the guard at the top of Put); a header
+// that somehow fails re-validation yields nil rather than a partial
+// set, so the object is created untagged rather than half-tagged.
+func requestObjectTags(header string) map[string]string {
+	tags, err := parseObjectTaggingHeader(header)
+	if err != nil {
+		return nil
+	}
+	return tags
+}
+
+// resolveCopyTags determines a CopyObject destination's tag set from the
+// x-amz-tagging-directive header. The default (absent or COPY) carries
+// the source object's tags to the destination — matching AWS S3, which
+// preserves the source tag set unless told otherwise. REPLACE takes the
+// tags from the x-amz-tagging header instead. Any other value is a 400
+// InvalidArgument. The returned map is a fresh copy so the destination
+// manifest never aliases the source's Tags map.
+func resolveCopyTags(hdr http.Header, srcTags map[string]string) (map[string]string, *tagValidationError) {
+	switch hdr.Get("x-amz-tagging-directive") {
+	case "", "COPY":
+		if len(srcTags) == 0 {
+			return nil, nil
+		}
+		out := make(map[string]string, len(srcTags))
+		for k, v := range srcTags {
+			out[k] = v
+		}
+		return out, nil
+	case "REPLACE":
+		return parseObjectTaggingHeader(hdr.Get("x-amz-tagging"))
+	default:
+		return nil, &tagValidationError{http.StatusBadRequest, "InvalidArgument",
+			"The x-amz-tagging-directive you provided is invalid"}
+	}
+}
+
+// copyDestinationTags is resolveCopyTags for an already-validated
+// request (Copy guards the directive / x-amz-tagging header up front).
+// A residual error yields nil rather than a partial set.
+func copyDestinationTags(hdr http.Header, srcTags map[string]string) map[string]string {
+	tags, err := resolveCopyTags(hdr, srcTags)
+	if err != nil {
+		return nil
+	}
+	return tags
 }
