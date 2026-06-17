@@ -242,6 +242,16 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Destination object metadata (x-amz-metadata-directive): validate up
+	// front so a bad directive or oversized REPLACE x-amz-meta-* set fails
+	// with 400 before any bytes move. writeCopyManifest re-applies the
+	// validated value (COPY preserves the source metadata, REPLACE takes it
+	// from this request's headers).
+	if verr := validateCopyMetadataDirective(r.Header); verr != nil {
+		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
+		return
+	}
+
 	srcProvider, ok := h.cfg.Providers[srcPiece.Backend]
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "BackendNotRegistered",
@@ -716,6 +726,12 @@ func (h *Handler) writeCopyManifest(
 		},
 		CreatedAt: h.cfg.Now(),
 	}
+	// Object metadata (Content-Type, system headers, x-amz-meta-*) per
+	// x-amz-metadata-directive — COPY preserves the source's, REPLACE takes
+	// this request's. Validated up front in Copy; applied here so every copy
+	// path (verbatim, dedup, re-encrypt) funnels through one site, exactly
+	// like Tags above.
+	applyCopyObjectMetadata(manifest, r.Header, srcManifest)
 	rollbackCopyPiece := func() {
 		// Best-effort rollback for non-dedup copy: drop the
 		// freshly-uploaded destination piece. For dedup copy
