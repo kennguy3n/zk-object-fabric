@@ -979,6 +979,13 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Object metadata (x-amz-meta-*): reject an oversized user-metadata
+	// set up front, before any backend write, matching AWS's 2 KB limit.
+	if verr := validateRequestObjectMetadata(r.Header); verr != nil {
+		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
+		return
+	}
+
 	// Object Lock overwrite enforcement (WS8.3): when versioning is
 	// NOT Enabled, a PUT replaces the current version in place, which
 	// would destroy a locked version. Refuse the overwrite up-front
@@ -1148,6 +1155,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		},
 		CreatedAt: h.cfg.Now(),
 	}
+	applyRequestObjectMetadata(manifest, r.Header)
 	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, bucket, manifest); err != nil {
 		_ = provider.DeletePiece(r.Context(), pieceID)
 		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)
@@ -1281,6 +1289,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	if h.applyReadConditionals(w, r, manifest, piece) {
 		return
 	}
+
+	// Single chokepoint for object metadata: emit Content-Type and the
+	// stored system / x-amz-meta-* headers before dispatching to any
+	// read path, so single-piece, erasure-coded, multipart, and
+	// gateway-encrypted GETs all return the same metadata.
+	setObjectMetadataHeaders(w, manifest)
 
 	if isErasureCodedManifest(manifest) {
 		h.getErasureCoded(w, r, manifest, tenantID, bucket)
@@ -2299,6 +2313,10 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	if h.applyReadConditionals(w, r, manifest, piece) {
 		return
 	}
+
+	// Mirror Get's metadata chokepoint so HEAD returns the same
+	// Content-Type / system / x-amz-meta-* headers as GET would.
+	setObjectMetadataHeaders(w, manifest)
 
 	if isErasureCodedManifest(manifest) {
 		h.headErasureCoded(w, r, manifest, piece, pieceProvider, tenantID, bucket)
@@ -3369,6 +3387,13 @@ type s3ErrorResponse struct {
 }
 
 func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource string) {
+	// A read sub-handler can fail after the GET/HEAD metadata chokepoint
+	// has already written the object's stored Content-Encoding /
+	// Content-Disposition / x-amz-meta-* headers. Strip them so they
+	// don't ride this XML error body (a stale Content-Encoding: gzip
+	// would corrupt how the client decodes it). No-op for write/non-read
+	// paths that never set these headers.
+	clearObjectMetadataHeaders(w)
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(httpCode)
 	_ = xml.NewEncoder(w).Encode(s3ErrorResponse{Code: s3Code, Message: message, Resource: resource})

@@ -63,6 +63,30 @@ type ObjectManifest struct {
 	// boundary in api/s3compat, not here. See docs/PROPOSAL.md §15.1.1.
 	Tags map[string]string `json:"tags,omitempty"`
 
+	// ContentType, ContentEncoding, ContentDisposition, ContentLanguage,
+	// CacheControl, and Expires hold the S3 system-defined HTTP metadata
+	// supplied at PUT/Copy/CompleteMultipartUpload time. They ride the
+	// opaque manifest JSONB body (like Tags, never used for placement)
+	// and are replayed verbatim on every GET/HEAD so clients, browsers,
+	// and CDNs see the headers AWS would return. Empty fields are omitted
+	// from both the body and the response; the API boundary defaults a
+	// missing ContentType to "binary/octet-stream" on read, matching AWS.
+	// See docs/PROPOSAL.md §15.1.2.
+	ContentType        string `json:"content_type,omitempty"`
+	ContentEncoding    string `json:"content_encoding,omitempty"`
+	ContentDisposition string `json:"content_disposition,omitempty"`
+	ContentLanguage    string `json:"content_language,omitempty"`
+	CacheControl       string `json:"cache_control,omitempty"`
+	Expires            string `json:"expires,omitempty"`
+
+	// UserMetadata is the S3 user-defined metadata set (x-amz-meta-*).
+	// Keys are stored lower-cased without the "x-amz-meta-" prefix (HTTP
+	// header names are case-insensitive) and re-emitted as
+	// "x-amz-meta-<key>" on GET/HEAD; values are opaque. Persisted on the
+	// manifest JSONB body, never used for placement. Empty/absent when
+	// the object carries no user metadata.
+	UserMetadata map[string]string `json:"user_metadata,omitempty"`
+
 	// RetentionMode and RetainUntil hold the S3 Object Lock retention
 	// for this object version (WS8.3), set by PutObjectRetention or
 	// inherited from the bucket default rule at PUT time. RetentionMode
