@@ -1199,11 +1199,60 @@ func (h *Handler) audit(r *http.Request, op, tenantID, bucket, key, pieceID, bac
 	})
 }
 
+// applyReadConditionals emits the object's Last-Modified header and
+// evaluates the RFC 7232 conditional-request headers shared by GET and
+// HEAD. It returns true when it has fully written the response (a 304
+// Not Modified or 412 Precondition Failed short-circuit), so the caller
+// must return without touching the backend; false means the read should
+// proceed normally.
+//
+// It runs at the post-resolve / pre-dispatch chokepoint so a satisfied
+// precondition short-circuits before any backend fetch, EC decode, or
+// multipart assembly — the whole point of conditional reads. The
+// advertised object ETag drives entity-tag comparison: the single-piece
+// read paths set ETag = pieceETag(piece), while erasure-coded and
+// multipart objects expose no per-object ETag, so for them only the "*"
+// wildcard and the date-based conditionals apply.
+//
+// A 304/412 short-circuit is not separately metered, mirroring the
+// other pre-body early returns (e.g. an invalid Range 416).
+func (h *Handler) applyReadConditionals(w http.ResponseWriter, r *http.Request, manifest *metadata.ObjectManifest, piece metadata.Piece) bool {
+	var condETag string
+	if !isErasureCodedManifest(manifest) && !isMultipartManifest(manifest) {
+		if e := pieceETag(piece); e != "" {
+			condETag = quote(e)
+		}
+	}
+	w.Header().Set("Last-Modified", manifest.CreatedAt.UTC().Format(http.TimeFormat))
+
+	status, diverted := evaluateConditionalRead(r.Header, condETag, manifest.CreatedAt)
+	if !diverted {
+		return false
+	}
+	if status == http.StatusNotModified {
+		// RFC 7232 §4.1: a 304 carries the validators it would have
+		// sent with the 200 so the client can refresh cached metadata.
+		if condETag != "" {
+			w.Header().Set("ETag", condETag)
+		}
+		w.Header().Set("x-amz-version-id", manifest.VersionID)
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	writeError(w, http.StatusPreconditionFailed, "PreconditionFailed",
+		"the conditional request precondition failed", r.URL.Path)
+	return true
+}
+
 // Get handles S3 GET object.
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	manifest, pieceProvider, piece, tenantID, bucket, err := h.resolve(r)
 	if err != nil {
 		writeResolveError(w, r, err)
+		return
+	}
+
+	if h.applyReadConditionals(w, r, manifest, piece) {
 		return
 	}
 
@@ -2221,6 +2270,10 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.applyReadConditionals(w, r, manifest, piece) {
+		return
+	}
+
 	if isErasureCodedManifest(manifest) {
 		h.headErasureCoded(w, r, manifest, piece, pieceProvider, tenantID, bucket)
 		return
@@ -3065,6 +3118,80 @@ func formatContentRange(r *providers.ByteRange, total int64) string {
 		end = total - 1
 	}
 	return fmt.Sprintf("bytes %d-%d/%d", r.Start, end, total)
+}
+
+// etagInList reports whether etag (the gateway's advertised ETag in its
+// quoted wire form, e.g. `"abc123"`) appears in an If-Match /
+// If-None-Match header value. The value is a comma-separated list of
+// entity-tags; a leading weak indicator ("W/") is stripped so a weak
+// validator still matches our strong tag (RFC 7232 §2.3.2). Weak
+// comparison is adequate here because the gateway only ever mints
+// strong ETags. The "*" wildcard is handled by the caller.
+func etagInList(headerValue, etag string) bool {
+	if etag == "" {
+		return false
+	}
+	for _, tok := range strings.Split(headerValue, ",") {
+		tok = strings.TrimSpace(tok)
+		tok = strings.TrimPrefix(tok, "W/")
+		if tok == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// evaluateConditionalRead applies the RFC 7232 / S3 GetObject
+// conditional-request headers to a GET or HEAD whose target object has
+// already been resolved. etag is the object ETag the gateway advertises
+// in its quoted wire form ("" when the object exposes none, e.g.
+// erasure-coded / multipart objects); lastModified is the stored
+// CreatedAt.
+//
+// It returns (304, true) or (412, true) when a precondition diverts the
+// response, and (0, false) when the read proceeds normally.
+//
+// Precedence follows RFC 7232 §6 (and matches AWS S3): the 412 group
+// (If-Match, then If-Unmodified-Since) is evaluated before the 304
+// group (If-None-Match, then If-Modified-Since); within each group the
+// entity-tag header takes precedence and the date header is ignored
+// when both are present. Last-modified comparisons are truncated to
+// whole seconds so they agree with the second-resolution Last-Modified
+// header the gateway emits.
+func evaluateConditionalRead(hdr http.Header, etag string, lastModified time.Time) (int, bool) {
+	modifiedAfter := func(raw string) (modified bool, ok bool) {
+		t, err := http.ParseTime(raw)
+		if err != nil {
+			// An unparseable date makes the conditional inoperative
+			// (RFC 7232 §3.3/§3.4): ignore the header.
+			return false, false
+		}
+		return lastModified.Truncate(time.Second).After(t), true
+	}
+
+	// 412 group: If-Match wins over If-Unmodified-Since.
+	if im := hdr.Get("If-Match"); im != "" {
+		if strings.TrimSpace(im) != "*" && !etagInList(im, etag) {
+			return http.StatusPreconditionFailed, true
+		}
+	} else if ius := hdr.Get("If-Unmodified-Since"); ius != "" {
+		if modified, ok := modifiedAfter(ius); ok && modified {
+			return http.StatusPreconditionFailed, true
+		}
+	}
+
+	// 304 group: If-None-Match wins over If-Modified-Since.
+	if inm := hdr.Get("If-None-Match"); inm != "" {
+		if strings.TrimSpace(inm) == "*" || etagInList(inm, etag) {
+			return http.StatusNotModified, true
+		}
+	} else if ims := hdr.Get("If-Modified-Since"); ims != "" {
+		if modified, ok := modifiedAfter(ims); ok && !modified {
+			return http.StatusNotModified, true
+		}
+	}
+
+	return 0, false
 }
 
 // writeErrCapturingWriter wraps an io.Writer and remembers the first

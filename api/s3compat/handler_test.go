@@ -2802,3 +2802,392 @@ func TestNewVersionID_MatchesInteractiveMinter(t *testing.T) {
 		t.Fatal("NewVersionID collided for distinct timestamps")
 	}
 }
+
+// fixedTestNow is the clock value newTestHandler pins, so it is also the
+// CreatedAt (and therefore Last-Modified) of every object it stores.
+var fixedTestNow = time.Unix(1700000000, 0)
+
+// putSimpleObject PUTs body at path through h and returns the quoted
+// ETag the gateway advertised (its wire form, e.g. `"abc123"`).
+func putSimpleObject(t *testing.T, h *Handler, path string, body []byte) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT %s status = %d, want 200; body=%s", path, rec.Code, rec.Body)
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("PUT %s returned empty ETag", path)
+	}
+	return etag
+}
+
+func TestConditionalGet_LastModifiedAlwaysEmitted(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+	wantLM := fixedTestNow.UTC().Format(http.TimeFormat)
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "/bucket/obj", nil)
+		rec := httptest.NewRecorder()
+		if method == http.MethodGet {
+			h.Get(rec, req)
+		} else {
+			h.Head(rec, req)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200; body=%s", method, rec.Code, rec.Body)
+		}
+		if got := rec.Header().Get("Last-Modified"); got != wantLM {
+			t.Errorf("%s Last-Modified = %q, want %q", method, got, wantLM)
+		}
+	}
+}
+
+func TestConditionalGet_IfNoneMatch(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	etag := putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+
+	cases := []struct {
+		name       string
+		header     string
+		wantStatus int
+		wantBody   bool
+	}{
+		{"matching tag -> 304", etag, http.StatusNotModified, false},
+		{"wildcard -> 304", "*", http.StatusNotModified, false},
+		{"weak matching tag -> 304", "W/" + etag, http.StatusNotModified, false},
+		{"non-matching tag -> 200", `"deadbeef"`, http.StatusOK, true},
+		{"list incl. match -> 304", `"deadbeef", ` + etag, http.StatusNotModified, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+			req.Header.Set("If-None-Match", tc.header)
+			rec := httptest.NewRecorder()
+			h.Get(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body)
+			}
+			if tc.wantStatus == http.StatusNotModified {
+				if rec.Body.Len() != 0 {
+					t.Errorf("304 carried a body of %d bytes, want empty", rec.Body.Len())
+				}
+				if got := rec.Header().Get("ETag"); got != etag {
+					t.Errorf("304 ETag = %q, want %q", got, etag)
+				}
+				if rec.Header().Get("Last-Modified") == "" {
+					t.Error("304 missing Last-Modified header")
+				}
+			}
+			if tc.wantBody && rec.Body.Len() == 0 {
+				t.Error("200 returned an empty body")
+			}
+		})
+	}
+}
+
+func TestConditionalGet_IfMatch(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	etag := putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+
+	cases := []struct {
+		name       string
+		header     string
+		wantStatus int
+	}{
+		{"matching tag -> 200", etag, http.StatusOK},
+		{"wildcard -> 200", "*", http.StatusOK},
+		{"non-matching tag -> 412", `"deadbeef"`, http.StatusPreconditionFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+			req.Header.Set("If-Match", tc.header)
+			rec := httptest.NewRecorder()
+			h.Get(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body)
+			}
+		})
+	}
+}
+
+func TestConditionalGet_IfModifiedSince(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+
+	cases := []struct {
+		name       string
+		when       time.Time
+		wantStatus int
+	}{
+		{"date after CreatedAt -> 304", fixedTestNow.Add(time.Hour), http.StatusNotModified},
+		{"date == CreatedAt -> 304", fixedTestNow, http.StatusNotModified},
+		{"date before CreatedAt -> 200", fixedTestNow.Add(-time.Hour), http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+			req.Header.Set("If-Modified-Since", tc.when.UTC().Format(http.TimeFormat))
+			rec := httptest.NewRecorder()
+			h.Get(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body)
+			}
+		})
+	}
+}
+
+func TestConditionalGet_IfUnmodifiedSince(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+
+	cases := []struct {
+		name       string
+		when       time.Time
+		wantStatus int
+	}{
+		{"date after CreatedAt -> 200", fixedTestNow.Add(time.Hour), http.StatusOK},
+		{"date == CreatedAt -> 200", fixedTestNow, http.StatusOK},
+		{"date before CreatedAt -> 412", fixedTestNow.Add(-time.Hour), http.StatusPreconditionFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+			req.Header.Set("If-Unmodified-Since", tc.when.UTC().Format(http.TimeFormat))
+			rec := httptest.NewRecorder()
+			h.Get(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body)
+			}
+		})
+	}
+}
+
+// TestConditionalGet_Precedence verifies the RFC 7232 §6 evaluation
+// order: an entity-tag conditional takes precedence over the
+// like-grouped date conditional, and the 412 group is evaluated before
+// the 304 group.
+func TestConditionalGet_Precedence(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	etag := putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+	dateBefore := fixedTestNow.Add(-time.Hour).UTC().Format(http.TimeFormat)
+	dateAfter := fixedTestNow.Add(time.Hour).UTC().Format(http.TimeFormat)
+
+	// If-Match satisfied; the stale If-Unmodified-Since that would
+	// otherwise 412 is ignored.
+	t.Run("If-Match beats If-Unmodified-Since", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+		req.Header.Set("If-Match", etag)
+		req.Header.Set("If-Unmodified-Since", dateBefore)
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body)
+		}
+	})
+
+	// If-None-Match misses (proceed); the If-Modified-Since that would
+	// otherwise 304 is ignored.
+	t.Run("If-None-Match beats If-Modified-Since", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+		req.Header.Set("If-None-Match", `"deadbeef"`)
+		req.Header.Set("If-Modified-Since", dateAfter)
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body)
+		}
+	})
+
+	// 412 group wins over the 304 group: If-Match fails -> 412 even
+	// though If-None-Match would have produced a 304.
+	t.Run("412 group precedes 304 group", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+		req.Header.Set("If-Match", `"deadbeef"`)
+		req.Header.Set("If-None-Match", "*")
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusPreconditionFailed {
+			t.Fatalf("status = %d, want 412; body=%s", rec.Code, rec.Body)
+		}
+	})
+}
+
+func TestConditionalHead_Parity(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	etag := putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+
+	t.Run("If-None-Match match -> 304", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+		req.Header.Set("If-None-Match", etag)
+		rec := httptest.NewRecorder()
+		h.Head(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Fatalf("HEAD status = %d, want 304; body=%s", rec.Code, rec.Body)
+		}
+		if got := rec.Header().Get("ETag"); got != etag {
+			t.Errorf("HEAD 304 ETag = %q, want %q", got, etag)
+		}
+	})
+
+	t.Run("If-Match miss -> 412", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+		req.Header.Set("If-Match", `"deadbeef"`)
+		rec := httptest.NewRecorder()
+		h.Head(rec, req)
+		if rec.Code != http.StatusPreconditionFailed {
+			t.Fatalf("HEAD status = %d, want 412; body=%s", rec.Code, rec.Body)
+		}
+	})
+}
+
+// TestConditionalGet_ErasureCoded checks that erasure-coded objects —
+// which advertise no per-object ETag — still honour the wildcard and
+// date conditionals, and that an entity-tag If-Match can never match
+// (so it 412s) since there is no tag to compare against.
+func TestConditionalGet_ErasureCoded(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return fixedTestNow },
+	})
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	put := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	put.ContentLength = int64(len(body))
+	putRec := httptest.NewRecorder()
+	h.Put(putRec, put)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("EC PUT status = %d, want 200; body=%s", putRec.Code, putRec.Body)
+	}
+
+	t.Run("wildcard If-None-Match -> 304", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+		req.Header.Set("If-None-Match", "*")
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Fatalf("status = %d, want 304; body=%s", rec.Code, rec.Body)
+		}
+		if rec.Header().Get("Last-Modified") == "" {
+			t.Error("missing Last-Modified header")
+		}
+	})
+
+	t.Run("If-Modified-Since after -> 304", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+		req.Header.Set("If-Modified-Since", fixedTestNow.Add(time.Hour).UTC().Format(http.TimeFormat))
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Fatalf("status = %d, want 304; body=%s", rec.Code, rec.Body)
+		}
+	})
+
+	t.Run("entity-tag If-Match -> 412 (no ETag to match)", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+		req.Header.Set("If-Match", `"anything"`)
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusPreconditionFailed {
+			t.Fatalf("status = %d, want 412; body=%s", rec.Code, rec.Body)
+		}
+	})
+
+	t.Run("wildcard If-Match -> 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+		req.Header.Set("If-Match", "*")
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body)
+		}
+	})
+}
+
+// TestConditionalGet_Multipart confirms the conditional chokepoint also
+// covers multipart objects (which, like EC objects, advertise no
+// per-object ETag): the wildcard and date conditionals apply and
+// short-circuit before any part assembly.
+func TestConditionalGet_Multipart(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return fixedTestNow },
+	})
+
+	createRec := httptest.NewRecorder()
+	h.CreateMultipartUpload(createRec, httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", createRec.Code, createRec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(createRec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("part-1-"), 1024),
+		bytes.Repeat([]byte("part-2-"), 1024),
+	}
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, partBody := range parts {
+		partNum := i + 1
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
+		uploadReq := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		uploadReq.ContentLength = int64(len(partBody))
+		uploadRec := httptest.NewRecorder()
+		h.UploadPart(uploadRec, uploadReq)
+		if uploadRec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, want 200; body=%s", partNum, uploadRec.Code, uploadRec.Body)
+		}
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: strings.Trim(uploadRec.Header().Get("ETag"), `"`)})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	completeReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID), bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	t.Run("wildcard If-None-Match -> 304", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/mp-obj", nil)
+		req.Header.Set("If-None-Match", "*")
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Fatalf("status = %d, want 304; body=%s", rec.Code, rec.Body)
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("304 carried a body of %d bytes, want empty", rec.Body.Len())
+		}
+		if rec.Header().Get("Last-Modified") == "" {
+			t.Error("missing Last-Modified header")
+		}
+	})
+
+	t.Run("If-Unmodified-Since before -> 412", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/mp-obj", nil)
+		req.Header.Set("If-Unmodified-Since", fixedTestNow.Add(-time.Hour).UTC().Format(http.TimeFormat))
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != http.StatusPreconditionFailed {
+			t.Fatalf("status = %d, want 412; body=%s", rec.Code, rec.Body)
+		}
+	})
+}
