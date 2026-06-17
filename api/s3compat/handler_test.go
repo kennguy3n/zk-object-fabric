@@ -3191,3 +3191,133 @@ func TestConditionalGet_Multipart(t *testing.T) {
 		}
 	})
 }
+
+// TestConditionalGet_IfMatchStrong verifies If-Match uses RFC 7232 §3.1
+// strong comparison: a weak validator never satisfies it, even when its
+// opaque-tag equals the gateway's strong ETag. (If-None-Match keeps weak
+// comparison — covered by TestConditionalGet_IfNoneMatch.)
+func TestConditionalGet_IfMatchStrong(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	etag := putSimpleObject(t, h, "/bucket/obj", []byte("conditional payload"))
+
+	cases := []struct {
+		name       string
+		header     string
+		wantStatus int
+	}{
+		{"strong match -> 200", etag, http.StatusOK},
+		{"weak validator -> 412", "W/" + etag, http.StatusPreconditionFailed},
+		{"list of weak only -> 412", "W/" + etag + `, W/"deadbeef"`, http.StatusPreconditionFailed},
+		{"list incl. strong match -> 200", `"deadbeef", ` + etag, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+			req.Header.Set("If-Match", tc.header)
+			rec := httptest.NewRecorder()
+			h.Get(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body)
+			}
+		})
+	}
+}
+
+// TestConditionalGet_IfRange exercises RFC 7233 §3.2: a Range paired with
+// an If-Range validator that still matches the representation is served
+// as a 206 slice; a stale, weak, or date-mismatched validator falls back
+// to the full 200. A Range without If-Range is unaffected.
+func TestConditionalGet_IfRange(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	body := []byte("0123456789ABCDEF")
+	etag := putSimpleObject(t, h, "/bucket/obj", body)
+	wantSlice := body[2:8]
+
+	// CreatedAt == fixedTestNow. A date equal to (or after) CreatedAt
+	// means "not modified after", so the range is honored; a date before
+	// CreatedAt means the object changed since, so serve the full object.
+	dateNotModifiedAfter := fixedTestNow.UTC().Format(http.TimeFormat)
+	dateModifiedAfter := fixedTestNow.Add(-time.Hour).UTC().Format(http.TimeFormat)
+
+	cases := []struct {
+		name      string
+		ifRange   string
+		wantRange bool
+	}{
+		{"no If-Range -> 206", "", true},
+		{"matching ETag -> 206", etag, true},
+		{"stale ETag -> 200", `"deadbeef"`, false},
+		{"weak validator -> 200", "W/" + etag, false},
+		{"date not modified after -> 206", dateNotModifiedAfter, true},
+		{"date modified after -> 200", dateModifiedAfter, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/obj", nil)
+			req.Header.Set("Range", "bytes=2-7")
+			if tc.ifRange != "" {
+				req.Header.Set("If-Range", tc.ifRange)
+			}
+			rec := httptest.NewRecorder()
+			h.Get(rec, req)
+
+			if tc.wantRange {
+				if rec.Code != http.StatusPartialContent {
+					t.Fatalf("status = %d, want 206; body=%s", rec.Code, rec.Body)
+				}
+				if rec.Header().Get("Content-Range") == "" {
+					t.Error("206 missing Content-Range header")
+				}
+				if got := rec.Body.Bytes(); !bytes.Equal(got, wantSlice) {
+					t.Errorf("206 body = %q, want %q", got, wantSlice)
+				}
+				return
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body)
+			}
+			if cr := rec.Header().Get("Content-Range"); cr != "" {
+				t.Errorf("full 200 set Content-Range = %q, want none", cr)
+			}
+			if got := rec.Body.Bytes(); !bytes.Equal(got, body) {
+				t.Errorf("200 body = %q, want full %q", got, body)
+			}
+		})
+	}
+}
+
+// TestConditionalHead_IfRange verifies HEAD honors If-Range the same way
+// GET does: a matching validator yields a 206 (body omitted), a stale one
+// the full 200.
+func TestConditionalHead_IfRange(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	etag := putSimpleObject(t, h, "/bucket/obj", []byte("0123456789ABCDEF"))
+
+	t.Run("matching ETag -> 206", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+		req.Header.Set("Range", "bytes=2-7")
+		req.Header.Set("If-Range", etag)
+		rec := httptest.NewRecorder()
+		h.Head(rec, req)
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("HEAD status = %d, want 206; body=%s", rec.Code, rec.Body)
+		}
+		if rec.Header().Get("Content-Range") == "" {
+			t.Error("HEAD 206 missing Content-Range header")
+		}
+	})
+
+	t.Run("stale ETag -> 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodHead, "/bucket/obj", nil)
+		req.Header.Set("Range", "bytes=2-7")
+		req.Header.Set("If-Range", `"deadbeef"`)
+		rec := httptest.NewRecorder()
+		h.Head(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("HEAD status = %d, want 200; body=%s", rec.Code, rec.Body)
+		}
+		if cr := rec.Header().Get("Content-Range"); cr != "" {
+			t.Errorf("HEAD full 200 set Content-Range = %q, want none", cr)
+		}
+	})
+}

@@ -1199,6 +1199,22 @@ func (h *Handler) audit(r *http.Request, op, tenantID, bucket, key, pieceID, bac
 	})
 }
 
+// condETagForRead returns the quoted ETag the gateway advertises for a
+// resolved object's conditional-request comparison, or "" when the
+// object exposes none. Erasure-coded and multipart objects have only
+// per-shard / per-part piece hashes, not a per-object ETag, so they
+// participate in conditional reads only through the "*" wildcard and
+// the date-based validators.
+func condETagForRead(manifest *metadata.ObjectManifest, piece metadata.Piece) string {
+	if isErasureCodedManifest(manifest) || isMultipartManifest(manifest) {
+		return ""
+	}
+	if e := pieceETag(piece); e != "" {
+		return quote(e)
+	}
+	return ""
+}
+
 // applyReadConditionals emits the object's Last-Modified header and
 // evaluates the RFC 7232 conditional-request headers shared by GET and
 // HEAD. It returns true when it has fully written the response (a 304
@@ -1217,16 +1233,16 @@ func (h *Handler) audit(r *http.Request, op, tenantID, bucket, key, pieceID, bac
 // A 304/412 short-circuit is not separately metered, mirroring the
 // other pre-body early returns (e.g. an invalid Range 416).
 func (h *Handler) applyReadConditionals(w http.ResponseWriter, r *http.Request, manifest *metadata.ObjectManifest, piece metadata.Piece) bool {
-	var condETag string
-	if !isErasureCodedManifest(manifest) && !isMultipartManifest(manifest) {
-		if e := pieceETag(piece); e != "" {
-			condETag = quote(e)
-		}
-	}
+	condETag := condETagForRead(manifest, piece)
 	w.Header().Set("Last-Modified", manifest.CreatedAt.UTC().Format(http.TimeFormat))
 
 	status, diverted := evaluateConditionalRead(r.Header, condETag, manifest.CreatedAt)
 	if !diverted {
+		// RFC 7233 §3.2: a Range paired with a now-stale If-Range
+		// validator must fall back to a full 200, so normalise the
+		// Range header here — before any single-piece / EC / multipart
+		// dispatch path parses it.
+		applyIfRange(r, condETag, manifest.CreatedAt)
 		return false
 	}
 	if status == http.StatusNotModified {
@@ -3120,25 +3136,78 @@ func formatContentRange(r *providers.ByteRange, total int64) string {
 	return fmt.Sprintf("bytes %d-%d/%d", r.Start, end, total)
 }
 
-// etagInList reports whether etag (the gateway's advertised ETag in its
-// quoted wire form, e.g. `"abc123"`) appears in an If-Match /
-// If-None-Match header value. The value is a comma-separated list of
-// entity-tags; a leading weak indicator ("W/") is stripped so a weak
-// validator still matches our strong tag (RFC 7232 §2.3.2). Weak
-// comparison is adequate here because the gateway only ever mints
-// strong ETags. The "*" wildcard is handled by the caller.
-func etagInList(headerValue, etag string) bool {
+// etagListMatch reports whether etag (the gateway's advertised ETag in
+// its quoted wire form, e.g. `"abc123"`) satisfies a comma-separated
+// If-Match / If-None-Match list of entity-tags. The "*" wildcard is
+// handled by the caller.
+//
+// When strong is true the comparison follows RFC 7232 §2.3.2 strong
+// comparison: a weak validator ("W/"-prefixed) on either side never
+// matches. If-Match (and copy-source-if-match) require strong
+// comparison. When strong is false the weak indicator is ignored on
+// both sides — the weak comparison RFC 7232 §3.2 prescribes for
+// If-None-Match. In practice the gateway only ever mints strong tags,
+// so the distinction only affects clients that send a weak validator.
+func etagListMatch(headerValue, etag string, strong bool) bool {
 	if etag == "" {
 		return false
 	}
+	etagWeak := strings.HasPrefix(etag, "W/")
+	want := strings.TrimPrefix(etag, "W/")
 	for _, tok := range strings.Split(headerValue, ",") {
 		tok = strings.TrimSpace(tok)
-		tok = strings.TrimPrefix(tok, "W/")
-		if tok == etag {
+		tokWeak := strings.HasPrefix(tok, "W/")
+		if strong && (tokWeak || etagWeak) {
+			continue
+		}
+		if strings.TrimPrefix(tok, "W/") == want {
 			return true
 		}
 	}
 	return false
+}
+
+// honorIfRange implements the RFC 7233 §3.2 If-Range validator test: it
+// reports whether the client's If-Range value still matches the
+// selected representation, in which case the paired Range request is
+// served as a 206. An entity-tag uses strong comparison (§3.2 forbids a
+// weak validator in If-Range, so one never honors the range); a date
+// matches when the representation has not been modified after it. etag
+// is the object's advertised ETag in quoted wire form ("" when the
+// object exposes none, e.g. erasure-coded / multipart objects).
+func honorIfRange(ifRange, etag string, lastModified time.Time) bool {
+	ir := strings.TrimSpace(ifRange)
+	if ir == "" {
+		return false
+	}
+	// A weak validator is invalid in If-Range; an entity-tag is
+	// recognised by its leading DQUOTE, anything else is an HTTP-date.
+	if strings.HasPrefix(ir, "W/") {
+		return false
+	}
+	if strings.HasPrefix(ir, `"`) {
+		return etag != "" && ir == etag
+	}
+	t, err := http.ParseTime(ir)
+	if err != nil {
+		return false
+	}
+	return !lastModified.Truncate(time.Second).After(t)
+}
+
+// applyIfRange implements RFC 7233 §3.2: when a request carries both
+// Range and If-Range, the Range is honored only if the If-Range
+// validator still matches the selected representation. When it does
+// not, the Range header is dropped so the caller serves the full 200
+// response instead of a 206. A request missing either header is left
+// untouched.
+func applyIfRange(r *http.Request, etag string, lastModified time.Time) {
+	if r.Header.Get("Range") == "" || r.Header.Get("If-Range") == "" {
+		return
+	}
+	if !honorIfRange(r.Header.Get("If-Range"), etag, lastModified) {
+		r.Header.Del("Range")
+	}
 }
 
 // evaluateConditionalRead applies the RFC 7232 / S3 GetObject
@@ -3169,9 +3238,10 @@ func evaluateConditionalRead(hdr http.Header, etag string, lastModified time.Tim
 		return lastModified.Truncate(time.Second).After(t), true
 	}
 
-	// 412 group: If-Match wins over If-Unmodified-Since.
+	// 412 group: If-Match wins over If-Unmodified-Since. If-Match uses
+	// strong comparison (RFC 7232 §3.1).
 	if im := hdr.Get("If-Match"); im != "" {
-		if strings.TrimSpace(im) != "*" && !etagInList(im, etag) {
+		if strings.TrimSpace(im) != "*" && !etagListMatch(im, etag, true) {
 			return http.StatusPreconditionFailed, true
 		}
 	} else if ius := hdr.Get("If-Unmodified-Since"); ius != "" {
@@ -3180,9 +3250,10 @@ func evaluateConditionalRead(hdr http.Header, etag string, lastModified time.Tim
 		}
 	}
 
-	// 304 group: If-None-Match wins over If-Modified-Since.
+	// 304 group: If-None-Match wins over If-Modified-Since. If-None-Match
+	// uses weak comparison (RFC 7232 §3.2).
 	if inm := hdr.Get("If-None-Match"); inm != "" {
-		if strings.TrimSpace(inm) == "*" || etagInList(inm, etag) {
+		if strings.TrimSpace(inm) == "*" || etagListMatch(inm, etag, false) {
 			return http.StatusNotModified, true
 		}
 	} else if ims := hdr.Get("If-Modified-Since"); ims != "" {
