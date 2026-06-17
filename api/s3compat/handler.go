@@ -1325,13 +1325,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		VersionID:     manifest.VersionID,
 	}
 
-	// Branch on (encrypted, range) before we touch the backend.
-	// Four paths:
+	// Branch on (encrypted, range shape) before we touch the backend.
+	// parseObjectRanges has already classified the Range header into
+	// single (one range), multi (several ranges -> multipart/byteranges)
+	// or neither (whole object). The dispositions:
 	//
-	//   1. Not gateway-encrypted, any range:
-	//      fetchPiece handles ciphertext-vs-clear-bytes
-	//      transparently; the body it returns is what we serve.
-	//   2. Gateway-encrypted, no range:
+	//   1. Gateway-encrypted, no range:
 	//      Streaming decryption path — pull ciphertext as an
 	//      io.Reader, TeeReader through a BLAKE3 hasher for
 	//      post-EOF integrity verification, then chain through
@@ -1339,12 +1338,19 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	//      to the client. No MaxInMemoryObjectBytes ceiling: a
 	//      multi-GiB object uses a few hundred KiB of buffers
 	//      (one DecryptObject chunk frame + os pipes).
-	//   3. Gateway-encrypted, range request:
+	//   2. Gateway-encrypted, single or multi range:
 	//      Buffered decrypt path. We need the full plaintext in
-	//      memory to slice an arbitrary byte range; chunk-level
+	//      memory to slice arbitrary byte ranges; chunk-level
 	//      range seek lands in v0.2.0. Until then the
 	//      MaxInMemoryObjectBytes ceiling still applies to
 	//      protect the gateway from OOM on a 4 GiB Range GET.
+	//   3. Not gateway-encrypted, multi range:
+	//      serveMultipartSinglePiece fetches each range through
+	//      fetchPiece (cache-aware) and frames the parts as a
+	//      streaming multipart/byteranges body.
+	//   4. Not gateway-encrypted, single range or whole object:
+	//      fetchPiece handles ciphertext-vs-clear-bytes
+	//      transparently; the body it returns is what we serve.
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
 		if single == nil && multi == nil {
 			h.streamGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, tenantID, bucket)
