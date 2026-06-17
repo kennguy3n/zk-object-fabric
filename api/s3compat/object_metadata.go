@@ -151,3 +151,31 @@ func setObjectMetadataHeaders(w http.ResponseWriter, m *metadata.ObjectManifest)
 		w.Header().Set(userMetadataHeaderPrefix+k, v)
 	}
 }
+
+// clearObjectMetadataHeaders strips the object-metadata response headers
+// that setObjectMetadataHeaders writes at the GET/HEAD chokepoint, so
+// they never linger on an error response emitted by a read sub-handler
+// (e.g. a 416 InvalidRange or a 502 BackendGetFailed raised after the
+// chokepoint). writeError calls this before rendering the XML error
+// body: a stored Content-Encoding (gzip) would make a client try to
+// gunzip the plaintext error XML, and a Content-Disposition: attachment
+// would make a browser download the error as a file — both hide the
+// real error. Content-Type is excluded here because writeError resets
+// it to application/xml itself. The header names come from the same
+// systemMetadataHeaders table that drives capture/emission (a throwaway
+// manifest is used purely to read the names, never field values) so the
+// cleared set can never drift from the emitted set.
+func clearObjectMetadataHeaders(w http.ResponseWriter) {
+	hdr := w.Header()
+	for _, hf := range systemMetadataHeaders(&metadata.ObjectManifest{}) {
+		if hf.header == "Content-Type" {
+			continue
+		}
+		hdr.Del(hf.header)
+	}
+	for name := range hdr {
+		if strings.HasPrefix(strings.ToLower(name), userMetadataHeaderPrefix) {
+			hdr.Del(name)
+		}
+	}
+}

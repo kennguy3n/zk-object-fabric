@@ -3387,6 +3387,13 @@ type s3ErrorResponse struct {
 }
 
 func writeError(w http.ResponseWriter, httpCode int, s3Code, message, resource string) {
+	// A read sub-handler can fail after the GET/HEAD metadata chokepoint
+	// has already written the object's stored Content-Encoding /
+	// Content-Disposition / x-amz-meta-* headers. Strip them so they
+	// don't ride this XML error body (a stale Content-Encoding: gzip
+	// would corrupt how the client decodes it). No-op for write/non-read
+	// paths that never set these headers.
+	clearObjectMetadataHeaders(w)
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(httpCode)
 	_ = xml.NewEncoder(w).Encode(s3ErrorResponse{Code: s3Code, Message: message, Resource: resource})

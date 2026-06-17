@@ -174,6 +174,48 @@ func TestObjectMetadata_TooLarge(t *testing.T) {
 	}
 }
 
+// TestObjectMetadata_NotLeakedOnError proves the object's stored
+// metadata headers (set at the GET chokepoint before dispatch) do not
+// ride an error response emitted by a read sub-handler. A 416
+// InvalidRange is raised after the chokepoint, so without the
+// writeError strip the response would carry the object's
+// Content-Encoding/Content-Disposition/x-amz-meta-* — a stale
+// Content-Encoding: gzip in particular would corrupt how a client
+// decodes the XML error body.
+func TestObjectMetadata_NotLeakedOnError(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+
+	headers := map[string]string{
+		"Content-Type":        "image/png",
+		"Content-Encoding":    "gzip",
+		"Content-Disposition": `attachment; filename="report.pdf"`,
+		"Cache-Control":       "max-age=3600",
+		"x-amz-meta-team":     "storage",
+	}
+	if rec := putWithHeaders(t, h, "/bucket/err-obj", []byte("payload"), headers); rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200; body=%s", rec.Code, rec.Body)
+	}
+
+	// Out-of-range Range → 416 InvalidRange, raised after the metadata
+	// chokepoint in Get().
+	req := httptest.NewRequest(http.MethodGet, "/bucket/err-obj", nil)
+	req.Header.Set("Range", "bytes=9999-10000")
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("GET out-of-range = %d, want 416; body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/xml" {
+		t.Errorf("error Content-Type = %q, want application/xml", got)
+	}
+	for _, name := range []string{"Content-Encoding", "Content-Disposition", "Cache-Control", "x-amz-meta-team"} {
+		if got := rec.Header().Get(name); got != "" {
+			t.Errorf("error response leaked %s = %q, want empty", name, got)
+		}
+	}
+}
+
 // TestCollectUserMetadata unit-tests the header→map extraction in
 // isolation: prefix stripping, lower-casing, and nil-when-absent.
 func TestCollectUserMetadata(t *testing.T) {
