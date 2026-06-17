@@ -14,6 +14,7 @@ package s3compat
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/kennguy3n/zk-object-fabric/metadata"
@@ -176,6 +177,30 @@ func clearObjectMetadataHeaders(w http.ResponseWriter) {
 	for name := range hdr {
 		if strings.HasPrefix(strings.ToLower(name), userMetadataHeaderPrefix) {
 			hdr.Del(name)
+		}
+	}
+}
+
+// responseOverrideQueryPrefix is the S3 query-parameter prefix that lets a
+// signed GET/HEAD override individual response headers without changing the
+// stored object: response-content-type, response-content-disposition,
+// response-content-encoding, response-content-language, response-cache-control,
+// and response-expires. Each maps 1:1 onto a system metadata header, so the
+// override set can never drift from what setObjectMetadataHeaders emits.
+const responseOverrideQueryPrefix = "response-"
+
+// applyResponseOverrideHeaders overrides the object-metadata response headers
+// from the S3 response-* query parameters, matching AWS GetObject/HeadObject.
+// It MUST run after setObjectMetadataHeaders (so an override wins over the
+// stored value) and before WriteHeader. A parameter that is present overrides
+// the corresponding header even when empty, so a client can blank a stored
+// header (e.g. response-content-disposition=) exactly as AWS allows. Object
+// GET/HEAD is reached only after SigV4 authentication, so these are always
+// signed-request overrides — never an anonymous reflected-download vector.
+func applyResponseOverrideHeaders(w http.ResponseWriter, q url.Values) {
+	for _, hf := range systemMetadataHeaders(&metadata.ObjectManifest{}) {
+		if vals, ok := q[responseOverrideQueryPrefix+strings.ToLower(hf.header)]; ok && len(vals) > 0 {
+			w.Header().Set(hf.header, vals[0])
 		}
 	}
 }
