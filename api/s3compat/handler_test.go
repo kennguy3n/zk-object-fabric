@@ -997,6 +997,89 @@ func TestCopyObject_DeleteMarkerSource(t *testing.T) {
 	}
 }
 
+// TestCopyObject_SourceConditionals exercises the CopyObject source
+// preconditions (x-amz-copy-source-if-*). A satisfied precondition
+// copies (200); an unsatisfied one aborts with 412 PreconditionFailed,
+// with no 304 fallback (a copy is a write). The source CreatedAt is
+// fixedTestNow.
+func TestCopyObject_SourceConditionals(t *testing.T) {
+	h, _, _, _ := newTestHandler()
+	srcETag := putSimpleObject(t, h, "/bucket/src.txt", []byte("conditional copy payload"))
+
+	dateBefore := fixedTestNow.Add(-time.Hour).UTC().Format(http.TimeFormat)
+	dateAfter := fixedTestNow.Add(time.Hour).UTC().Format(http.TimeFormat)
+	dateEqual := fixedTestNow.UTC().Format(http.TimeFormat)
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    int
+	}{
+		{"no conditionals -> 200", nil, http.StatusOK},
+
+		{"if-match matches -> 200",
+			map[string]string{"x-amz-copy-source-if-match": srcETag}, http.StatusOK},
+		{"if-match mismatch -> 412",
+			map[string]string{"x-amz-copy-source-if-match": `"deadbeef"`}, http.StatusPreconditionFailed},
+		{"if-match wildcard -> 200",
+			map[string]string{"x-amz-copy-source-if-match": "*"}, http.StatusOK},
+		{"if-match weak validator never matches -> 412",
+			map[string]string{"x-amz-copy-source-if-match": "W/" + srcETag}, http.StatusPreconditionFailed},
+
+		{"if-none-match matches -> 412",
+			map[string]string{"x-amz-copy-source-if-none-match": srcETag}, http.StatusPreconditionFailed},
+		{"if-none-match mismatch -> 200",
+			map[string]string{"x-amz-copy-source-if-none-match": `"deadbeef"`}, http.StatusOK},
+		{"if-none-match wildcard -> 412",
+			map[string]string{"x-amz-copy-source-if-none-match": "*"}, http.StatusPreconditionFailed},
+
+		{"if-unmodified-since after CreatedAt -> 200",
+			map[string]string{"x-amz-copy-source-if-unmodified-since": dateAfter}, http.StatusOK},
+		{"if-unmodified-since == CreatedAt -> 200",
+			map[string]string{"x-amz-copy-source-if-unmodified-since": dateEqual}, http.StatusOK},
+		{"if-unmodified-since before CreatedAt -> 412",
+			map[string]string{"x-amz-copy-source-if-unmodified-since": dateBefore}, http.StatusPreconditionFailed},
+
+		{"if-modified-since before CreatedAt -> 200",
+			map[string]string{"x-amz-copy-source-if-modified-since": dateBefore}, http.StatusOK},
+		{"if-modified-since == CreatedAt -> 412",
+			map[string]string{"x-amz-copy-source-if-modified-since": dateEqual}, http.StatusPreconditionFailed},
+		{"if-modified-since after CreatedAt -> 412",
+			map[string]string{"x-amz-copy-source-if-modified-since": dateAfter}, http.StatusPreconditionFailed},
+
+		// Precedence: a satisfied if-match wins over a stale
+		// if-unmodified-since (positive group) -> still copies.
+		{"if-match beats stale if-unmodified-since -> 200",
+			map[string]string{
+				"x-amz-copy-source-if-match":            srcETag,
+				"x-amz-copy-source-if-unmodified-since": dateBefore,
+			}, http.StatusOK},
+		// Precedence: a matching if-none-match wins over a satisfied
+		// if-modified-since (negative group) -> fails the copy.
+		{"if-none-match match beats satisfied if-modified-since -> 412",
+			map[string]string{
+				"x-amz-copy-source-if-none-match":     srcETag,
+				"x-amz-copy-source-if-modified-since": dateBefore,
+			}, http.StatusPreconditionFailed},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := fmt.Sprintf("/bucket/dst-%d.txt", i)
+			cr := httptest.NewRequest(http.MethodPut, dst, nil)
+			cr.Header.Set("x-amz-copy-source", "/bucket/src.txt")
+			for k, v := range tc.headers {
+				cr.Header.Set(k, v)
+			}
+			cw := httptest.NewRecorder()
+			h.Copy(cw, cr)
+			if cw.Code != tc.want {
+				t.Fatalf("Copy %s = %d, want %d; body=%s", tc.name, cw.Code, tc.want, cw.Body)
+			}
+		})
+	}
+}
+
 func TestParseCopySource(t *testing.T) {
 	cases := []struct {
 		in              string

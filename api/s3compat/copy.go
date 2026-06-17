@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/zeebo/blake3"
 
@@ -77,6 +78,64 @@ type ListDeleteMarkerEntry struct {
 	VersionID    string `xml:"VersionId"`
 	IsLatest     bool   `xml:"IsLatest"`
 	LastModified string `xml:"LastModified"`
+}
+
+// evaluateCopySourceConditionals applies the CopyObject source
+// preconditions against the resolved source object: the
+// x-amz-copy-source-if-match / -if-none-match / -if-modified-since /
+// -if-unmodified-since headers. It reports true when a precondition is
+// NOT satisfied, in which case the caller must abort the copy with
+// 412 PreconditionFailed. Unlike a conditional read there is no 304 —
+// a copy is a write that either proceeds or fails — so an unsatisfied
+// negative-group condition also yields 412.
+//
+// Precedence matches AWS S3 (CopyObject API reference) and the read
+// path's evaluateConditionalRead: within the positive group
+// copy-source-if-match wins over -if-unmodified-since; within the
+// negative group copy-source-if-none-match wins over -if-modified-since;
+// when an entity-tag header is present its sibling date header is
+// ignored. copy-source-if-match uses RFC 7232 §3.1 strong comparison;
+// copy-source-if-none-match uses §3.2 weak comparison. etag is the
+// source object's advertised ETag in quoted wire form ("" when it
+// exposes none, e.g. erasure-coded / multipart sources — which Copy
+// rejects with 501 before reaching here); lastModified is the source
+// CreatedAt, truncated to whole seconds to agree with the second
+// resolution of the HTTP-date validators.
+func evaluateCopySourceConditionals(hdr http.Header, etag string, lastModified time.Time) bool {
+	modifiedAfter := func(raw string) (modified bool, ok bool) {
+		t, err := http.ParseTime(raw)
+		if err != nil {
+			// An unparseable date makes the conditional inoperative
+			// (RFC 7232 §3.3/§3.4): ignore the header.
+			return false, false
+		}
+		return lastModified.Truncate(time.Second).After(t), true
+	}
+
+	// Positive group: if-match wins over if-unmodified-since.
+	if im := hdr.Get("x-amz-copy-source-if-match"); im != "" {
+		if strings.TrimSpace(im) != "*" && !etagListMatch(im, etag, true) {
+			return true
+		}
+	} else if ius := hdr.Get("x-amz-copy-source-if-unmodified-since"); ius != "" {
+		if modified, ok := modifiedAfter(ius); ok && modified {
+			return true
+		}
+	}
+
+	// Negative group: if-none-match wins over if-modified-since. A
+	// satisfied negative condition fails the copy (412), not a 304.
+	if inm := hdr.Get("x-amz-copy-source-if-none-match"); inm != "" {
+		if strings.TrimSpace(inm) == "*" || etagListMatch(inm, etag, false) {
+			return true
+		}
+	} else if ims := hdr.Get("x-amz-copy-source-if-modified-since"); ims != "" {
+		if modified, ok := modifiedAfter(ims); ok && !modified {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Copy handles S3 CopyObject (PUT with x-amz-copy-source).
@@ -163,6 +222,18 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srcPiece := srcManifest.Pieces[0]
+
+	// CopyObject source preconditions (x-amz-copy-source-if-*). Evaluated
+	// against the resolved source object's ETag / CreatedAt; an
+	// unsatisfied precondition aborts the copy with 412 PreconditionFailed
+	// (a write has no 304 fallback). Runs after the EC/multipart guard so
+	// an unsupported source still surfaces as 501.
+	if evaluateCopySourceConditionals(r.Header, condETagForRead(srcManifest, srcPiece), srcManifest.CreatedAt) {
+		writeError(w, http.StatusPreconditionFailed, "PreconditionFailed",
+			"the copy source conditional request precondition failed", r.URL.Path)
+		return
+	}
+
 	srcProvider, ok := h.cfg.Providers[srcPiece.Backend]
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "BackendNotRegistered",
