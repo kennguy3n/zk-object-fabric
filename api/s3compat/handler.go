@@ -1312,14 +1312,10 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var byteRange *providers.ByteRange
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
-		if perr != nil {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
-			return
-		}
-		byteRange = rng
+	single, multi, perr := parseObjectRanges(r, manifest.ObjectSize)
+	if perr != nil {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+		return
 	}
 
 	mkey := manifest_store.ManifestKey{
@@ -1329,13 +1325,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		VersionID:     manifest.VersionID,
 	}
 
-	// Branch on (encrypted, range) before we touch the backend.
-	// Four paths:
+	// Branch on (encrypted, range shape) before we touch the backend.
+	// parseObjectRanges has already classified the Range header into
+	// single (one range), multi (several ranges -> multipart/byteranges)
+	// or neither (whole object). The dispositions:
 	//
-	//   1. Not gateway-encrypted, any range:
-	//      fetchPiece handles ciphertext-vs-clear-bytes
-	//      transparently; the body it returns is what we serve.
-	//   2. Gateway-encrypted, no range:
+	//   1. Gateway-encrypted, no range:
 	//      Streaming decryption path — pull ciphertext as an
 	//      io.Reader, TeeReader through a BLAKE3 hasher for
 	//      post-EOF integrity verification, then chain through
@@ -1343,21 +1338,34 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	//      to the client. No MaxInMemoryObjectBytes ceiling: a
 	//      multi-GiB object uses a few hundred KiB of buffers
 	//      (one DecryptObject chunk frame + os pipes).
-	//   3. Gateway-encrypted, range request:
+	//   2. Gateway-encrypted, single or multi range:
 	//      Buffered decrypt path. We need the full plaintext in
-	//      memory to slice an arbitrary byte range; chunk-level
+	//      memory to slice arbitrary byte ranges; chunk-level
 	//      range seek lands in v0.2.0. Until then the
 	//      MaxInMemoryObjectBytes ceiling still applies to
 	//      protect the gateway from OOM on a 4 GiB Range GET.
+	//   3. Not gateway-encrypted, multi range:
+	//      serveMultipartSinglePiece fetches each range through
+	//      fetchPiece (cache-aware) and frames the parts as a
+	//      streaming multipart/byteranges body.
+	//   4. Not gateway-encrypted, single range or whole object:
+	//      fetchPiece handles ciphertext-vs-clear-bytes
+	//      transparently; the body it returns is what we serve.
 	if IsGatewayEncrypted(manifest.Encryption.Mode) {
-		if byteRange == nil {
+		if single == nil && multi == nil {
 			h.streamGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, tenantID, bucket)
 			return
 		}
-		h.bufferedGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
+		h.bufferedGatewayDecryptedGet(w, r, mkey, manifest, piece, pieceProvider, single, multi, tenantID, bucket)
 		return
 	}
 
+	if multi != nil {
+		h.serveMultipartSinglePiece(w, r, mkey, manifest, piece, pieceProvider, multi, tenantID, bucket)
+		return
+	}
+
+	byteRange := single
 	body, served, err := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, byteRange, tenantID, bucket)
 	if err != nil {
 		if errors.Is(err, pieceintegrity.ErrIntegrityCheckFailed) {
@@ -1403,11 +1411,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
 }
 
-// bufferedGatewayDecryptedGet serves a gateway-encrypted object
-// with a Range header. We must materialise the full plaintext to
-// slice an arbitrary range (chunk-level range seek is a v0.2.0
-// follow-up), so the MaxInMemoryObjectBytes ceiling still applies
-// here as a hard OOM guard.
+// bufferedGatewayDecryptedGet serves a gateway-encrypted object with a
+// Range header — either a single range (single != nil) or several
+// (multi != nil, served as multipart/byteranges). We must materialise
+// the full plaintext to slice an arbitrary range (chunk-level range
+// seek is a v0.2.0 follow-up), so the MaxInMemoryObjectBytes ceiling
+// still applies here as a hard OOM guard.
 func (h *Handler) bufferedGatewayDecryptedGet(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -1415,7 +1424,8 @@ func (h *Handler) bufferedGatewayDecryptedGet(
 	manifest *metadata.ObjectManifest,
 	piece metadata.Piece,
 	pieceProvider providers.StorageProvider,
-	byteRange *providers.ByteRange,
+	single *providers.ByteRange,
+	multi []providers.ByteRange,
 	tenantID, bucket string,
 ) {
 	if manifest.ObjectSize > MaxInMemoryObjectBytes {
@@ -1462,30 +1472,101 @@ func (h *Handler) bufferedGatewayDecryptedGet(
 		writeError(w, http.StatusInternalServerError, "DEKUnwrapFailed", derr.Error(), r.URL.Path)
 		return
 	}
-	end := byteRange.End
-	if end < 0 || end >= int64(len(plaintext)) {
-		end = int64(len(plaintext)) - 1
-	}
-	if byteRange.Start < 0 || byteRange.Start > end+1 {
-		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
-		return
-	}
-	sliced := plaintext[byteRange.Start : end+1]
 
 	if etag := pieceETag(piece); etag != "" {
 		w.Header().Set("ETag", quote(etag))
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
-	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(sliced)), 10))
-	w.WriteHeader(http.StatusPartialContent)
-	n, _ := w.Write(sliced)
+
+	var n int64
+	if multi != nil {
+		var werr error
+		n, werr = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), plaintext)
+		if werr != nil {
+			writeError(w, http.StatusBadGateway, "BackendGetFailed", werr.Error(), r.URL.Path)
+			return
+		}
+	} else {
+		end := single.End
+		if end < 0 || end >= int64(len(plaintext)) {
+			end = int64(len(plaintext)) - 1
+		}
+		if single.Start < 0 || single.Start > end+1 {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
+			return
+		}
+		sliced := plaintext[single.Start : end+1]
+		w.Header().Set("Content-Range", formatContentRange(single, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(int64(len(sliced)), 10))
+		w.WriteHeader(http.StatusPartialContent)
+		written, _ := w.Write(sliced)
+		n = int64(written)
+	}
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	if n > 0 {
 		h.emit(tenantID, bucket, billing.EgressBytes, uint64(n))
 		if !served {
 			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(n))
+		}
+	}
+	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
+}
+
+// serveMultipartSinglePiece serves several byte ranges of a
+// non-gateway-encrypted single-piece object as a
+// multipart/byteranges response. Each part streams independently:
+// fetchPiece is invoked once per range so a hot-cache hit or a
+// backend range read serves only that range's bytes, never the
+// whole object. The first range is prefetched before the 206 status
+// is committed so an unreachable backend produces a clean error
+// status rather than a half-written multipart body.
+func (h *Handler) serveMultipartSinglePiece(
+	w http.ResponseWriter,
+	r *http.Request,
+	mkey manifest_store.ManifestKey,
+	manifest *metadata.ObjectManifest,
+	piece metadata.Piece,
+	pieceProvider providers.StorageProvider,
+	multi []providers.ByteRange,
+	tenantID, bucket string,
+) {
+	if etag := pieceETag(piece); etag != "" {
+		w.Header().Set("ETag", quote(etag))
+	}
+	w.Header().Set("x-amz-version-id", manifest.VersionID)
+
+	var anyServedFromOrigin bool
+	payload, committed, err := writeMultipartByteRanges(
+		w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"),
+		func(rng providers.ByteRange) (io.ReadCloser, error) {
+			pr := rng
+			body, served, ferr := h.fetchPiece(r, mkey, manifest, piece, pieceProvider, &pr, tenantID, bucket)
+			if ferr != nil {
+				return nil, ferr
+			}
+			if !served {
+				anyServedFromOrigin = true
+			}
+			return body, nil
+		},
+	)
+	if err != nil && !committed {
+		if errors.Is(err, pieceintegrity.ErrIntegrityCheckFailed) {
+			writeError(w, http.StatusBadGateway, "IntegrityCheckFailed",
+				"backend returned a piece whose content hash did not match the manifest; refusing to serve",
+				r.URL.Path)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "BackendGetFailed", err.Error(), r.URL.Path)
+		return
+	}
+
+	h.emit(tenantID, bucket, billing.GetRequests, 1)
+	if payload > 0 {
+		h.emit(tenantID, bucket, billing.EgressBytes, uint64(payload))
+		if anyServedFromOrigin {
+			h.emit(tenantID, bucket, billing.OriginEgressBytes, uint64(payload))
 		}
 	}
 	h.audit(r, "GET", tenantID, bucket, manifest.ObjectKey, piece.PieceID, piece.Backend, pieceProvider.PlacementLabels().Country)
@@ -2337,14 +2418,10 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var byteRange *providers.ByteRange
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
-		if perr != nil {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
-			return
-		}
-		byteRange = rng
+	single, multi, perr := parseObjectRanges(r, manifest.ObjectSize)
+	if perr != nil {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+		return
 	}
 
 	// Gateway-encrypted oversize range: bufferedGatewayDecryptedGet
@@ -2353,7 +2430,7 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 	// range (chunk-level range seek lands in v0.2.0). Mirror that
 	// rejection on HEAD so pre-flight probes learn up-front rather
 	// than discovering the failure on the GET.
-	if IsGatewayEncrypted(manifest.Encryption.Mode) && byteRange != nil && manifest.ObjectSize > MaxInMemoryObjectBytes {
+	if IsGatewayEncrypted(manifest.Encryption.Mode) && (single != nil || multi != nil) && manifest.ObjectSize > MaxInMemoryObjectBytes {
 		writeError(w, http.StatusInsufficientStorage, "RangeRequestTooLargeForBufferedDecrypt",
 			fmt.Sprintf("range GET on gateway-encrypted object of %d bytes exceeds in-memory decrypt ceiling of %d bytes; full-object GETs stream without this ceiling",
 				manifest.ObjectSize, MaxInMemoryObjectBytes),
@@ -2365,19 +2442,22 @@ func (h *Handler) Head(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", quote(etag))
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	status := http.StatusOK
-	if byteRange != nil {
-		end := byteRange.End
+	switch {
+	case multi != nil:
+		setMultipartByteRangesHeaders(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"))
+		w.WriteHeader(http.StatusPartialContent)
+	case single != nil:
+		end := single.End
 		if end < 0 {
 			end = manifest.ObjectSize - 1
 		}
-		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
-		status = http.StatusPartialContent
-	} else {
+		w.Header().Set("Content-Range", formatContentRange(single, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-single.Start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+	default:
 		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+		w.WriteHeader(http.StatusOK)
 	}
-	w.WriteHeader(status)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	// Audit HEAD with the same shape as GET. Country comes from
@@ -2440,29 +2520,28 @@ func (h *Handler) headErasureCoded(
 		writeError(w, http.StatusInternalServerError, "ErasureProfileNotRegistered", err.Error(), r.URL.Path)
 		return
 	}
-	var byteRange *providers.ByteRange
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
-		if perr != nil {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
-			return
-		}
-		byteRange = rng
+	single, multi, perr := parseObjectRanges(r, manifest.ObjectSize)
+	if perr != nil {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+		return
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	status := http.StatusOK
-	if byteRange != nil {
-		end := byteRange.End
+	switch {
+	case multi != nil:
+		setMultipartByteRangesHeaders(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"))
+		w.WriteHeader(http.StatusPartialContent)
+	case single != nil:
+		end := single.End
 		if end < 0 {
 			end = manifest.ObjectSize - 1
 		}
-		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
-		status = http.StatusPartialContent
-	} else {
+		w.Header().Set("Content-Range", formatContentRange(single, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-single.Start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+	default:
 		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+		w.WriteHeader(http.StatusOK)
 	}
-	w.WriteHeader(status)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	auditBackend, auditPieceID, auditCountry := h.ecAuditAttribution(manifest)
@@ -2494,14 +2573,10 @@ func (h *Handler) headMultipart(
 	_ providers.StorageProvider,
 	tenantID, bucket string,
 ) {
-	var byteRange *providers.ByteRange
-	if hdr := r.Header.Get("Range"); hdr != "" {
-		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
-		if perr != nil {
-			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
-			return
-		}
-		byteRange = rng
+	single, multi, perr := parseObjectRanges(r, manifest.ObjectSize)
+	if perr != nil {
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+		return
 	}
 	if manifest.ObjectSize > maxMultipartInMemoryBytes {
 		writeError(w, http.StatusInsufficientStorage, "MultipartTooLarge",
@@ -2531,19 +2606,22 @@ func (h *Handler) headMultipart(
 		}
 	}
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	status := http.StatusOK
-	if byteRange != nil {
-		end := byteRange.End
+	switch {
+	case multi != nil:
+		setMultipartByteRangesHeaders(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"))
+		w.WriteHeader(http.StatusPartialContent)
+	case single != nil:
+		end := single.End
 		if end < 0 {
 			end = manifest.ObjectSize - 1
 		}
-		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-byteRange.Start+1, 10))
-		status = http.StatusPartialContent
-	} else {
+		w.Header().Set("Content-Range", formatContentRange(single, manifest.ObjectSize))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-single.Start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+	default:
 		w.Header().Set("Content-Length", strconv.FormatInt(manifest.ObjectSize, 10))
+		w.WriteHeader(http.StatusOK)
 	}
-	w.WriteHeader(status)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	auditBackend, auditPieceID, auditCountry := h.multipartAuditAttribution(manifest)
