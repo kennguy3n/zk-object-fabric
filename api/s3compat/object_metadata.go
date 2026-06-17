@@ -204,3 +204,66 @@ func applyResponseOverrideHeaders(w http.ResponseWriter, q url.Values) {
 		}
 	}
 }
+
+const (
+	// metadataDirectiveHeader selects how CopyObject derives the
+	// destination's object metadata, mirroring x-amz-tagging-directive.
+	metadataDirectiveHeader = "x-amz-metadata-directive"
+	// metadataDirectiveCopy preserves the source object's stored metadata
+	// (the default when the header is absent), matching AWS.
+	metadataDirectiveCopy = "COPY"
+	// metadataDirectiveReplace takes the destination metadata from the
+	// copy request's own system/x-amz-meta-* headers instead.
+	metadataDirectiveReplace = "REPLACE"
+)
+
+// validateCopyMetadataDirective checks x-amz-metadata-directive up front in
+// CopyObject so a malformed request fails before any bytes move: an unknown
+// directive is 400 InvalidArgument, and a REPLACE whose x-amz-meta-* set
+// exceeds the size limit is 400 MetadataTooLarge. COPY (the default) needs
+// no validation — it carries the already-stored source metadata. The value
+// is case-sensitive, matching resolveCopyTags and AWS.
+func validateCopyMetadataDirective(hdr http.Header) *metadataValidationError {
+	switch hdr.Get(metadataDirectiveHeader) {
+	case "", metadataDirectiveCopy:
+		return nil
+	case metadataDirectiveReplace:
+		return validateRequestObjectMetadata(hdr)
+	default:
+		return &metadataValidationError{http.StatusBadRequest, "InvalidArgument",
+			"The x-amz-metadata-directive you provided is invalid"}
+	}
+}
+
+// applyCopyObjectMetadata sets a CopyObject destination manifest's object
+// metadata per x-amz-metadata-directive. The directive MUST already have
+// been validated by validateCopyMetadataDirective (Copy guards it up
+// front), so this never fails. REPLACE takes the system headers and
+// x-amz-meta-* set from the copy request via the same applyRequestObjectMetadata
+// the live PUT path uses; COPY (default) preserves the source object's
+// stored metadata. The source values are deep-copied (a fresh UserMetadata
+// map) so the destination manifest never aliases the source's.
+func applyCopyObjectMetadata(m *metadata.ObjectManifest, hdr http.Header, src *metadata.ObjectManifest) {
+	if hdr.Get(metadataDirectiveHeader) == metadataDirectiveReplace {
+		applyRequestObjectMetadata(m, hdr)
+		return
+	}
+	srcFields := systemMetadataHeaders(src)
+	for i, hf := range systemMetadataHeaders(m) {
+		*hf.field = *srcFields[i].field
+	}
+	m.UserMetadata = cloneUserMetadata(src.UserMetadata)
+}
+
+// cloneUserMetadata returns a fresh copy of a user-metadata map (nil for an
+// empty input) so a copied manifest never shares the source's map.
+func cloneUserMetadata(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
