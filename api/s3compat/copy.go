@@ -97,10 +97,11 @@ type ListDeleteMarkerEntry struct {
 // ignored. copy-source-if-match uses RFC 7232 §3.1 strong comparison;
 // copy-source-if-none-match uses §3.2 weak comparison. etag is the
 // source object's advertised ETag in quoted wire form ("" when it
-// exposes none, e.g. erasure-coded / multipart sources — which Copy
-// rejects with 501 before reaching here); lastModified is the source
-// CreatedAt, truncated to whole seconds to agree with the second
-// resolution of the HTTP-date validators.
+// exposes none, e.g. erasure-coded / multipart sources — which now
+// reconstruct rather than 501, so an entity-tag conditional against
+// them genuinely fails the precondition with 412 here); lastModified
+// is the source CreatedAt, truncated to whole seconds to agree with
+// the second resolution of the HTTP-date validators.
 func evaluateCopySourceConditionals(hdr http.Header, etag string, lastModified time.Time) bool {
 	modifiedAfter := func(raw string) (modified bool, ok bool) {
 		t, err := http.ParseTime(raw)
@@ -558,6 +559,17 @@ func (h *Handler) copyReconstructedSource(
 	tenantID, dstBucket, dstKey string,
 	srcManifest *metadata.ObjectManifest,
 ) {
+	// A gateway-encrypted source must be unsealed during reconstruction
+	// (decryptFromStorage) and re-sealed before storing, both of which
+	// need the gateway CMK. Fail fast with the same explicit guard as
+	// copyReencrypt / copyEncryptForDefault rather than relying on the
+	// implicit nil check deeper in the encrypt/decrypt pipeline.
+	if IsGatewayEncrypted(srcManifest.Encryption.Mode) && h.cfg.Encryption == nil {
+		writeError(w, http.StatusInternalServerError, "EncryptionNotConfigured",
+			"source object is gateway-encrypted but no gateway encryption is configured", r.URL.Path)
+		return
+	}
+
 	// Reconstruct the source's logical bytes into one contiguous buffer.
 	var content []byte
 	if isErasureCodedManifest(srcManifest) {
@@ -826,6 +838,14 @@ func (h *Handler) writeCopyManifest(
 	if chunkSize == 0 {
 		chunkSize = srcManifest.ChunkSize
 	}
+	// The destination inherits the source's placement policy (residency,
+	// backends, hot-cache) but is always written as a single piece (see
+	// Pieces below) — never erasure-coded. Clear the source's
+	// ErasureProfile so a reconstructed EC→single-piece copy does not
+	// advertise a stale profile name that would mislead tools inspecting
+	// placement (the struct documents empty ErasureProfile == single-piece).
+	dstPolicy := srcManifest.PlacementPolicy
+	dstPolicy.ErasureProfile = ""
 	manifest := &metadata.ObjectManifest{
 		TenantID:        tenantID,
 		Bucket:          dstBucket,
@@ -836,7 +856,7 @@ func (h *Handler) writeCopyManifest(
 		ChunkSize:       chunkSize,
 		ContentHash:     contentHash,
 		Encryption:      enc,
-		PlacementPolicy: srcManifest.PlacementPolicy,
+		PlacementPolicy: dstPolicy,
 		Pieces:          []metadata.Piece{piece},
 		Tags:            copyDestinationTags(r.Header, srcManifest.Tags),
 		MigrationState: metadata.MigrationState{

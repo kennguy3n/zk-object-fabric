@@ -173,6 +173,13 @@ func assertCopyRoundTrip(t *testing.T, h *Handler, store manifest_store.Manifest
 	if isErasureCodedManifest(man) || isMultipartManifest(man) {
 		t.Errorf("dst manifest still classified as EC/multipart")
 	}
+	// A single-piece destination must not carry the source's EC profile;
+	// a stale ErasureProfile on a single-piece manifest misleads tools
+	// that inspect placement metadata.
+	if man.PlacementPolicy.ErasureProfile != "" {
+		t.Errorf("dst manifest PlacementPolicy.ErasureProfile = %q, want empty (reconstructed single-piece copy)",
+			man.PlacementPolicy.ErasureProfile)
+	}
 }
 
 // TestCopyObject_ReconstructsErasureCodedSource pins that CopyObject of an
