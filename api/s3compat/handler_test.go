@@ -1269,6 +1269,73 @@ func TestGetErasureCoded_AuditsOnSuccess(t *testing.T) {
 	}
 }
 
+// TestGetErasureCoded_Range exercises buffered single-Range reads on
+// the EC GET path: a closed range, a suffix range, and an
+// unsatisfiable range. The full object is reconstructed in memory and
+// sliced, so the served bytes must match the plaintext exactly.
+func TestGetErasureCoded_Range(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	h := New(Config{
+		Manifests:     store,
+		Providers:     map[string]providers.StorageProvider{"test": fp},
+		Placement:     ecPlacement{backend: "test", profile: erasure_coding.Profile6Plus2.Name},
+		ErasureCoding: erasure_coding.DefaultRegistry(),
+		Now:           func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	body := bytes.Repeat([]byte("ec-payload!"), 4096)
+	put := httptest.NewRequest(http.MethodPut, "/bucket/ec-obj", bytes.NewReader(body))
+	put.ContentLength = int64(len(body))
+	putRec := httptest.NewRecorder()
+	h.Put(putRec, put)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("EC PUT status = %d, want 200; body=%s", putRec.Code, putRec.Body)
+	}
+
+	// Closed range.
+	req := httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+	req.Header.Set("Range", "bytes=100-199")
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("EC GET Range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes 100-199/%d", len(body)); got != want {
+		t.Errorf("EC GET Content-Range = %q, want %q", got, want)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "100" {
+		t.Errorf("EC GET Content-Length = %q, want 100", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), body[100:200]) {
+		t.Fatalf("EC GET Range body mismatch")
+	}
+
+	// Suffix range: final 50 bytes.
+	sreq := httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+	sreq.Header.Set("Range", "bytes=-50")
+	srec := httptest.NewRecorder()
+	h.Get(srec, sreq)
+	if srec.Code != http.StatusPartialContent {
+		t.Fatalf("EC GET suffix Range status = %d, want 206; body=%s", srec.Code, srec.Body)
+	}
+	if !bytes.Equal(srec.Body.Bytes(), body[len(body)-50:]) {
+		t.Fatalf("EC GET suffix Range body mismatch")
+	}
+	if got, want := srec.Header().Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", len(body)-50, len(body)-1, len(body)); got != want {
+		t.Errorf("EC GET suffix Content-Range = %q, want %q", got, want)
+	}
+
+	// Unsatisfiable: start at/after object size -> 416.
+	ireq := httptest.NewRequest(http.MethodGet, "/bucket/ec-obj", nil)
+	ireq.Header.Set("Range", fmt.Sprintf("bytes=%d-", len(body)))
+	irec := httptest.NewRecorder()
+	h.Get(irec, ireq)
+	if irec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("EC GET invalid Range status = %d, want 416; body=%s", irec.Code, irec.Body)
+	}
+}
+
 func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 	store := memory.New()
 	fp := newFakeProvider("test")
@@ -1364,6 +1431,103 @@ func TestGetMultipart_AuditsOnSuccess(t *testing.T) {
 	}
 }
 
+// TestGetMultipart_Range exercises buffered single-Range reads on the
+// multipart GET path with a range that spans the boundary between two
+// parts, plus a suffix range and an unsatisfiable range. The served
+// bytes must match a slice of the concatenated plaintext.
+func TestGetMultipart_Range(t *testing.T) {
+	store := memory.New()
+	fp := newFakeProvider("test")
+	mpStore := multipart.NewMemoryStore()
+	h := New(Config{
+		Manifests: store,
+		Providers: map[string]providers.StorageProvider{"test": fp},
+		Placement: fixedPlacement{backend: "test"},
+		Multipart: mpStore,
+		Now:       func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	createReq := httptest.NewRequest(http.MethodPost, "/bucket/mp-obj?uploads", nil)
+	createRec := httptest.NewRecorder()
+	h.CreateMultipartUpload(createRec, createReq)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("CreateMultipartUpload status = %d, want 200; body=%s", createRec.Code, createRec.Body)
+	}
+	var initRes initiateMultipartUploadResult
+	if err := xml.Unmarshal(createRec.Body.Bytes(), &initRes); err != nil {
+		t.Fatalf("decode initiate: %v", err)
+	}
+	uploadID := initRes.UploadID
+
+	parts := [][]byte{
+		bytes.Repeat([]byte("part-1-"), 1024),
+		bytes.Repeat([]byte("part-2-"), 1024),
+	}
+	completed := make([]completeUploadEntry, 0, len(parts))
+	for i, partBody := range parts {
+		partNum := i + 1
+		url := fmt.Sprintf("/bucket/mp-obj?uploadId=%s&partNumber=%d", uploadID, partNum)
+		uploadReq := httptest.NewRequest(http.MethodPut, url, bytes.NewReader(partBody))
+		uploadReq.ContentLength = int64(len(partBody))
+		uploadRec := httptest.NewRecorder()
+		h.UploadPart(uploadRec, uploadReq)
+		if uploadRec.Code != http.StatusOK {
+			t.Fatalf("UploadPart %d status = %d, want 200; body=%s", partNum, uploadRec.Code, uploadRec.Body)
+		}
+		etag := strings.Trim(uploadRec.Header().Get("ETag"), `"`)
+		completed = append(completed, completeUploadEntry{PartNumber: partNum, ETag: etag})
+	}
+	completeXML, _ := xml.Marshal(completeMultipartUploadRequest{Parts: completed})
+	completeReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/bucket/mp-obj?uploadId=%s", uploadID), bytes.NewReader(completeXML))
+	completeRec := httptest.NewRecorder()
+	h.CompleteMultipartUpload(completeRec, completeReq)
+	if completeRec.Code != http.StatusOK {
+		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", completeRec.Code, completeRec.Body)
+	}
+
+	full := append(append([]byte{}, parts[0]...), parts[1]...)
+	boundary := len(parts[0])
+
+	// Range spanning the part boundary.
+	req := httptest.NewRequest(http.MethodGet, "/bucket/mp-obj", nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", boundary-20, boundary+19))
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("multipart GET Range status = %d, want 206; body=%s", rec.Code, rec.Body)
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", boundary-20, boundary+19, len(full)); got != want {
+		t.Errorf("multipart GET Content-Range = %q, want %q", got, want)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "40" {
+		t.Errorf("multipart GET Content-Length = %q, want 40", got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), full[boundary-20:boundary+20]) {
+		t.Fatalf("multipart GET Range body mismatch")
+	}
+
+	// Suffix range: final 100 bytes.
+	sreq := httptest.NewRequest(http.MethodGet, "/bucket/mp-obj", nil)
+	sreq.Header.Set("Range", "bytes=-100")
+	srec := httptest.NewRecorder()
+	h.Get(srec, sreq)
+	if srec.Code != http.StatusPartialContent {
+		t.Fatalf("multipart GET suffix Range status = %d, want 206; body=%s", srec.Code, srec.Body)
+	}
+	if !bytes.Equal(srec.Body.Bytes(), full[len(full)-100:]) {
+		t.Fatalf("multipart GET suffix Range body mismatch")
+	}
+
+	// Unsatisfiable: start at/after object size -> 416.
+	ireq := httptest.NewRequest(http.MethodGet, "/bucket/mp-obj", nil)
+	ireq.Header.Set("Range", fmt.Sprintf("bytes=%d-", len(full)))
+	irec := httptest.NewRecorder()
+	h.Get(irec, ireq)
+	if irec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("multipart GET invalid Range status = %d, want 416; body=%s", irec.Code, irec.Body)
+	}
+}
+
 // TestHead_ErasureCoded_NoRange pins that HEAD on an EC manifest
 // mirrors getErasureCoded's response shape: 200 OK with the full
 // ObjectSize as Content-Length, NO ETag (EC piece hashes are
@@ -1407,13 +1571,12 @@ func TestHead_ErasureCoded_NoRange(t *testing.T) {
 	}
 }
 
-// TestHead_ErasureCoded_RangeReturns501 pins that HEAD on an EC
-// manifest with a Range header returns 501 NotImplemented, exactly
-// what getErasureCoded does. Returning 206 with a slice-sized
-// Content-Length would advertise capability the follow-up GET
-// doesn't have, breaking AWS SDK / CDN pre-flight probes that use
-// HEAD to discover Range support.
-func TestHead_ErasureCoded_RangeReturns501(t *testing.T) {
+// TestHead_ErasureCoded_Range206 pins that HEAD on an EC manifest
+// with a satisfiable Range mirrors getErasureCoded's GET: 206
+// PartialContent with a Content-Range and a slice-sized
+// Content-Length, body omitted. HEAD must advertise exactly the
+// Range capability the matching GET now provides.
+func TestHead_ErasureCoded_Range206(t *testing.T) {
 	store := memory.New()
 	fp := newFakeProvider("test")
 	h := New(Config{
@@ -1434,11 +1597,17 @@ func TestHead_ErasureCoded_RangeReturns501(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.Head(rec, req)
 
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("EC HEAD with Range status = %d, want 501 (mirror getErasureCoded)", rec.Code)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("EC HEAD with Range status = %d, want 206 (mirror getErasureCoded); body=%s", rec.Code, rec.Body)
 	}
-	if rec.Header().Get("Content-Range") != "" {
-		t.Errorf("EC HEAD with Range must NOT set Content-Range on 501 response")
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes 0-99/%d", len(body)); got != want {
+		t.Errorf("EC HEAD Content-Range = %q, want %q", got, want)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "100" {
+		t.Errorf("EC HEAD Content-Length = %q, want 100", got)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("EC HEAD must omit body, got %d bytes", rec.Body.Len())
 	}
 }
 
@@ -1733,11 +1902,13 @@ func TestHead_Multipart_NoRange(t *testing.T) {
 	}
 }
 
-// TestHead_Multipart_RangeReturns501 pins that HEAD on a multipart
-// manifest with a Range header returns 501 NotImplemented, exactly
-// what getMultipart does. Same rationale as the EC case: HEAD must
-// not advertise Range support the matching GET doesn't have.
-func TestHead_Multipart_RangeReturns501(t *testing.T) {
+// TestHead_Multipart_Range206 pins that HEAD on a multipart
+// manifest with a satisfiable Range mirrors getMultipart's GET:
+// 206 PartialContent with a Content-Range and a slice-sized
+// Content-Length, body omitted. Same rationale as the EC case:
+// HEAD must advertise exactly the Range support the matching GET
+// now provides.
+func TestHead_Multipart_Range206(t *testing.T) {
 	store := memory.New()
 	fp := newFakeProvider("test")
 	mpStore := multipart.NewMemoryStore()
@@ -1785,13 +1956,23 @@ func TestHead_Multipart_RangeReturns501(t *testing.T) {
 		t.Fatalf("CompleteMultipartUpload status = %d, want 200; body=%s", completeRec.Code, completeRec.Body)
 	}
 
+	total := len(parts[0]) + len(parts[1])
 	headReq := httptest.NewRequest(http.MethodHead, "/bucket/mp-obj", nil)
 	headReq.Header.Set("Range", "bytes=0-99")
 	headRec := httptest.NewRecorder()
 	h.Head(headRec, headReq)
 
-	if headRec.Code != http.StatusNotImplemented {
-		t.Fatalf("multipart HEAD with Range status = %d, want 501 (mirror getMultipart)", headRec.Code)
+	if headRec.Code != http.StatusPartialContent {
+		t.Fatalf("multipart HEAD with Range status = %d, want 206 (mirror getMultipart); body=%s", headRec.Code, headRec.Body)
+	}
+	if got, want := headRec.Header().Get("Content-Range"), fmt.Sprintf("bytes 0-99/%d", total); got != want {
+		t.Errorf("multipart HEAD Content-Range = %q, want %q", got, want)
+	}
+	if got := headRec.Header().Get("Content-Length"); got != "100" {
+		t.Errorf("multipart HEAD Content-Length = %q, want 100", got)
+	}
+	if headRec.Body.Len() != 0 {
+		t.Errorf("multipart HEAD must omit body, got %d bytes", headRec.Body.Len())
 	}
 }
 

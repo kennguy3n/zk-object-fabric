@@ -279,9 +279,13 @@ func (h *Handler) putErasureCoded(
 }
 
 // getErasureCoded reconstructs the plaintext from the shards named in
-// manifest.Pieces. Range reads are not supported on EC objects in
-// Phase 3; the handler returns the full object and leaves range-read
-// support to Phase 4 streaming work.
+// manifest.Pieces and serves it whole (200) or, when the request
+// carries a Range header, as a byte-range slice (206 + Content-Range).
+// The full object is reconstructed in memory regardless, so slicing
+// the already-materialised plaintext costs nothing extra. Streaming
+// range reads that fetch only the stripes overlapping the range remain
+// a Phase 4 optimisation (docs/PROPOSAL.md §6); this buffered path
+// gives correct S3-compatible Range semantics in the meantime.
 func (h *Handler) getErasureCoded(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -307,10 +311,14 @@ func (h *Handler) getErasureCoded(
 		writeError(w, http.StatusInternalServerError, "ErasureProfileNotRegistered", err.Error(), r.URL.Path)
 		return
 	}
-	if r.Header.Get("Range") != "" {
-		writeError(w, http.StatusNotImplemented, "NotImplemented",
-			"range reads on erasure-coded objects are not yet supported", r.URL.Path)
-		return
+	var byteRange *providers.ByteRange
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
+		if perr != nil {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+			return
+		}
+		byteRange = rng
 	}
 
 	total := encoder.Profile().TotalShards()
@@ -443,10 +451,26 @@ func (h *Handler) getErasureCoded(
 		plaintext = decrypted
 	}
 
+	out := plaintext
+	status := http.StatusOK
+	if byteRange != nil {
+		end := byteRange.End
+		if end < 0 || end >= int64(len(plaintext)) {
+			end = int64(len(plaintext)) - 1
+		}
+		if byteRange.Start < 0 || byteRange.Start > end+1 {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
+			return
+		}
+		out = plaintext[byteRange.Start : end+1]
+		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+		status = http.StatusPartialContent
+	}
+
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(plaintext)))
-	w.WriteHeader(http.StatusOK)
-	n, _ := w.Write(plaintext)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(out)))
+	w.WriteHeader(status)
+	n, _ := w.Write(out)
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
 	if n > 0 {
@@ -496,27 +520,33 @@ func shardKindFromManifest(s string) erasure_coding.ShardKind {
 }
 
 // getMultipart serves a multipart-assembled object by concatenating
-// each piece in ascending PartNumber order. Range reads are not yet
-// supported on multipart manifests; S3 SDKs do not rely on ranged
-// reads for multipart downloads, so this is a Phase 4 workstream.
+// each piece in ascending PartNumber order. It serves the whole
+// object (200) or, when the request carries a Range header, a
+// byte-range slice (206 + Content-Range) of the assembled plaintext.
 //
 // All piece backends are verified up front, then every piece body is
 // fetched and buffered in memory before the HTTP status line or
 // Content-Length header is committed. This mirrors getErasureCoded:
 // a GetPiece failure surfaces as a clean 502 instead of a
-// silently-truncated response body. The whole-object buffering
-// trade-off matches Phase 3's EC path; streaming multipart GETs
-// are a Phase 4 workstream tracked in docs/PROPOSAL.md §6.
+// silently-truncated response body. Because the whole object is
+// already buffered (bounded by maxMultipartInMemoryBytes), serving a
+// Range is a slice of that buffer at no extra cost. Streaming
+// multipart GETs that fetch only the parts overlapping the range
+// remain a Phase 4 workstream tracked in docs/PROPOSAL.md §6.
 func (h *Handler) getMultipart(
 	w http.ResponseWriter,
 	r *http.Request,
 	manifest *metadata.ObjectManifest,
 	tenantID, bucket string,
 ) {
-	if r.Header.Get("Range") != "" {
-		writeError(w, http.StatusNotImplemented, "NotImplemented",
-			"range reads on multipart objects are not yet supported", r.URL.Path)
-		return
+	var byteRange *providers.ByteRange
+	if hdr := r.Header.Get("Range"); hdr != "" {
+		rng, perr := parseHTTPRange(hdr, manifest.ObjectSize)
+		if perr != nil {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", perr.Error(), r.URL.Path)
+			return
+		}
+		byteRange = rng
 	}
 
 	if manifest.ObjectSize > maxMultipartInMemoryBytes {
@@ -656,13 +686,34 @@ func (h *Handler) getMultipart(
 	}
 
 	w.Header().Set("x-amz-version-id", manifest.VersionID)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", total))
-	w.WriteHeader(http.StatusOK)
 
 	var written int64
-	for _, b := range bodies {
-		n, _ := w.Write(b)
+	if byteRange != nil {
+		assembled := make([]byte, 0, total)
+		for _, b := range bodies {
+			assembled = append(assembled, b...)
+		}
+		end := byteRange.End
+		if end < 0 || end >= total {
+			end = total - 1
+		}
+		if byteRange.Start < 0 || byteRange.Start > end+1 {
+			writeError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "range out of bounds", r.URL.Path)
+			return
+		}
+		slice := assembled[byteRange.Start : end+1]
+		w.Header().Set("Content-Range", formatContentRange(byteRange, manifest.ObjectSize))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(slice)))
+		w.WriteHeader(http.StatusPartialContent)
+		n, _ := w.Write(slice)
 		written += int64(n)
+	} else {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", total))
+		w.WriteHeader(http.StatusOK)
+		for _, b := range bodies {
+			n, _ := w.Write(b)
+			written += int64(n)
+		}
 	}
 
 	h.emit(tenantID, bucket, billing.GetRequests, 1)
