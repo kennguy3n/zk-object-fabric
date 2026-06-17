@@ -468,7 +468,12 @@ func (h *Handler) getErasureCoded(
 
 	var n int64
 	if multi != nil {
-		n = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), plaintext)
+		var werr error
+		n, werr = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), plaintext)
+		if werr != nil {
+			writeError(w, http.StatusBadGateway, "BackendGetFailed", werr.Error(), r.URL.Path)
+			return
+		}
 	} else {
 		out := plaintext
 		status := http.StatusOK
@@ -713,7 +718,12 @@ func (h *Handler) getMultipart(
 		for _, b := range bodies {
 			assembled = append(assembled, b...)
 		}
-		written = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), assembled)
+		var werr error
+		written, werr = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), assembled)
+		if werr != nil {
+			writeError(w, http.StatusBadGateway, "BackendGetFailed", werr.Error(), r.URL.Path)
+			return
+		}
 	case single != nil:
 		assembled := make([]byte, 0, total)
 		for _, b := range bodies {

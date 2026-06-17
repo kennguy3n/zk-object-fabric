@@ -367,3 +367,52 @@ func TestHead_MultiRange_MirrorsGet(t *testing.T) {
 		t.Errorf("HEAD Content-Length = %q, want %q (GET body length)", got, want)
 	}
 }
+
+// TestWriteMultipartByteRangesFromBuffer_BoundsGuard pins the defensive
+// guard that mirrors the single-range buffer paths' bounds clamp: the
+// ranges are resolved against the manifest's ObjectSize, so a buffer that
+// reconstruction / decryption returned shorter than the manifest claims
+// must fail the GET as a clean error rather than panic on the slice. The
+// caller turns that error into a 502, so the helper must not commit any
+// response bytes when it rejects.
+func TestWriteMultipartByteRangesFromBuffer_BoundsGuard(t *testing.T) {
+	// total advertises a 20-byte object but the materialised buffer is
+	// only 8 bytes — the second range runs past the buffer.
+	const total int64 = 20
+	buf := []byte("01234567")
+	ranges := []providers.ByteRange{{Start: 0, End: 3}, {Start: 10, End: 14}}
+
+	rec := httptest.NewRecorder()
+	n, err := writeMultipartByteRangesFromBuffer(rec, ranges, total, "text/plain", buf)
+	if err == nil {
+		t.Fatalf("expected an out-of-bounds error, got nil (n=%d, body=%q)", n, rec.Body.Bytes())
+	}
+	if n != 0 {
+		t.Errorf("payload = %d, want 0 when the guard rejects", n)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body length = %d, want 0 (no bytes committed on rejection)", rec.Body.Len())
+	}
+	if ct := rec.Header().Get("Content-Type"); strings.HasPrefix(ct, "multipart/byteranges") {
+		t.Errorf("Content-Type = %q, want no multipart commit on rejection", ct)
+	}
+
+	// Ranges fully inside the buffer stream a well-formed 206 body and
+	// report no error, even when the buffer is longer than the highest
+	// range needs (the EC decode path can hand back a padded buffer).
+	okRanges := []providers.ByteRange{{Start: 0, End: 2}, {Start: 5, End: 7}}
+	okRec := httptest.NewRecorder()
+	if _, err := writeMultipartByteRangesFromBuffer(okRec, okRanges, int64(len(buf)), "text/plain", buf); err != nil {
+		t.Fatalf("in-bounds ranges returned error: %v", err)
+	}
+	parts := parseMultipartByteRanges(t, okRec)
+	if len(parts) != len(okRanges) {
+		t.Fatalf("decoded %d parts, want %d", len(parts), len(okRanges))
+	}
+	if got := string(parts[0].body); got != "012" {
+		t.Errorf("part 0 body = %q, want %q", got, "012")
+	}
+	if got := string(parts[1].body); got != "567" {
+		t.Errorf("part 1 body = %q, want %q", got, "567")
+	}
+}

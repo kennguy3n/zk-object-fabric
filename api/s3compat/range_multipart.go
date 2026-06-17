@@ -218,12 +218,25 @@ func writeMultipartByteRanges(
 // writeMultipartByteRangesFromBuffer serves a multipart/byteranges
 // response whose parts are sub-slices of an already-materialised buffer
 // (the erasure-coded, multipart and gateway-decrypted read paths all hold
-// the full plaintext in memory). The ranges are guaranteed in-bounds by
-// parseObjectRanges; slicing therefore needs no extra bounds work and the
-// in-memory reader never errors.
-func writeMultipartByteRangesFromBuffer(w http.ResponseWriter, ranges []providers.ByteRange, total int64, objectContentType string, buf []byte) int64 {
+// the full plaintext in memory). parseObjectRanges resolves the ranges
+// against the manifest's recorded ObjectSize, so a buffer that came back
+// shorter than the manifest claims — a reconstruction / decryption size
+// mismatch or a corrupt manifest — would otherwise panic on the slice.
+// Each range is therefore re-checked against the actual buffer length
+// before any byte is written; a range that runs past the buffer returns
+// an error WITHOUT committing a response so the caller can fail the GET
+// as a 502, mirroring the bounds clamp the single-range buffer paths
+// apply before slicing. Once the ranges are validated the in-memory
+// reader never errors.
+func writeMultipartByteRangesFromBuffer(w http.ResponseWriter, ranges []providers.ByteRange, total int64, objectContentType string, buf []byte) (int64, error) {
+	bufLen := int64(len(buf))
+	for _, rng := range ranges {
+		if rng.Start < 0 || rng.End < rng.Start || rng.End >= bufLen {
+			return 0, fmt.Errorf("range %d-%d out of bounds for %d-byte buffer", rng.Start, rng.End, bufLen)
+		}
+	}
 	payload, _, _ := writeMultipartByteRanges(w, ranges, total, objectContentType, func(rng providers.ByteRange) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(buf[rng.Start : rng.End+1])), nil
 	})
-	return payload
+	return payload, nil
 }

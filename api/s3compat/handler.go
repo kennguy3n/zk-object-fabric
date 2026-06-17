@@ -1480,7 +1480,12 @@ func (h *Handler) bufferedGatewayDecryptedGet(
 
 	var n int64
 	if multi != nil {
-		n = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), plaintext)
+		var werr error
+		n, werr = writeMultipartByteRangesFromBuffer(w, multi, manifest.ObjectSize, w.Header().Get("Content-Type"), plaintext)
+		if werr != nil {
+			writeError(w, http.StatusBadGateway, "BackendGetFailed", werr.Error(), r.URL.Path)
+			return
+		}
 	} else {
 		end := single.End
 		if end < 0 || end >= int64(len(plaintext)) {
