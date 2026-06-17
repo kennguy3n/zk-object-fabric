@@ -22,6 +22,8 @@
 //	    wrapped_key_id      TEXT,
 //	    wrap_algorithm      TEXT,
 //	    content_algorithm   TEXT,
+//	    metadata            JSONB,  -- object tags + S3 system / user
+//	                                -- metadata captured at Create
 //	    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 //	);
 //	CREATE INDEX multipart_uploads_by_tenant_bucket
@@ -266,6 +268,16 @@ func (s *PostgresStore) Create(upload *Upload) error {
 	if err != nil {
 		return fmt.Errorf("multipart: marshal policy: %w", err)
 	}
+	// Persist tags + object metadata as a single JSONB document so a
+	// Complete on a different node than the Create still stamps them on
+	// the final manifest. NULL when nothing was supplied.
+	var metadataJSON []byte
+	if !upload.Metadata.IsZero() {
+		metadataJSON, err = json.Marshal(upload.Metadata)
+		if err != nil {
+			return fmt.Errorf("multipart: marshal metadata: %w", err)
+		}
+	}
 	if upload.CreatedAt.IsZero() {
 		upload.CreatedAt = s.clock()
 	}
@@ -274,8 +286,8 @@ func (s *PostgresStore) Create(upload *Upload) error {
 			upload_id, tenant_id, bucket, object_key, version_id, backend,
 			policy, enc_mode,
 			wrapped_dek, wrapped_key_id, wrap_algorithm, content_algorithm,
-			created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			metadata, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`, s.uploadsTable)
 	// Bind the upload's tenant so the RLS WITH CHECK clause admits the
 	// INSERT (it rejects any row whose tenant_id != the bound GUC).
@@ -297,6 +309,7 @@ func (s *PostgresStore) Create(upload *Upload) error {
 		nullableString(upload.WrappedKeyID),
 		nullableString(upload.WrapAlgorithm),
 		nullableString(upload.ContentAlgorithm),
+		nullableBytes(metadataJSON),
 		upload.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("multipart: insert upload: %w", err)
@@ -381,20 +394,21 @@ func (s *PostgresStore) loadUpload(q rowQuerier, uploadID string) (*Upload, erro
 	query := fmt.Sprintf(`
 		SELECT tenant_id, bucket, object_key, version_id, backend, policy,
 		       enc_mode, wrapped_dek, wrapped_key_id, wrap_algorithm,
-		       content_algorithm, created_at
+		       content_algorithm, metadata, created_at
 		FROM %s WHERE upload_id = $1
 	`, s.uploadsTable)
 	row := q.QueryRowContext(context.Background(), query, uploadID)
 	var (
-		policyJSON       []byte
-		wrappedDEK       []byte
-		wrappedKeyID     sql.NullString
-		wrapAlg          sql.NullString
-		contentAlg       sql.NullString
-		encMode          sql.NullString
-		backend          sql.NullString
-		versionID        sql.NullString
-		upload           = &Upload{ID: uploadID}
+		policyJSON   []byte
+		wrappedDEK   []byte
+		wrappedKeyID sql.NullString
+		wrapAlg      sql.NullString
+		contentAlg   sql.NullString
+		encMode      sql.NullString
+		backend      sql.NullString
+		versionID    sql.NullString
+		metadataJSON []byte
+		upload       = &Upload{ID: uploadID}
 	)
 	switch err := row.Scan(
 		&upload.TenantID,
@@ -408,6 +422,7 @@ func (s *PostgresStore) loadUpload(q rowQuerier, uploadID string) (*Upload, erro
 		&wrappedKeyID,
 		&wrapAlg,
 		&contentAlg,
+		&metadataJSON,
 		&upload.CreatedAt,
 	); {
 	case errors.Is(err, sql.ErrNoRows):
@@ -417,6 +432,11 @@ func (s *PostgresStore) loadUpload(q rowQuerier, uploadID string) (*Upload, erro
 	}
 	if err := json.Unmarshal(policyJSON, &upload.Policy); err != nil {
 		return nil, fmt.Errorf("multipart: unmarshal policy: %w", err)
+	}
+	if len(metadataJSON) > 0 {
+		if err := json.Unmarshal(metadataJSON, &upload.Metadata); err != nil {
+			return nil, fmt.Errorf("multipart: unmarshal metadata: %w", err)
+		}
 	}
 	if versionID.Valid {
 		upload.VersionID = versionID.String

@@ -149,6 +149,23 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "InvalidArgument", "path must be /{bucket}/{key...}", r.URL.Path)
 		return
 	}
+
+	// Object tags (x-amz-tagging) and S3 system / user metadata
+	// (x-amz-meta-*) are supplied here, at CreateMultipartUpload, and
+	// stamped on the object CompleteMultipartUpload produces (matching
+	// AWS). Validate both up front so a malformed tag set or an
+	// oversized metadata set fails with 400 before any session row or
+	// backend write, then capture the normalised values onto the upload
+	// (persisted by the store) for Complete to apply.
+	if _, verr := parseObjectTaggingHeader(r.Header.Get("x-amz-tagging")); verr != nil {
+		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
+		return
+	}
+	if verr := validateRequestObjectMetadata(r.Header); verr != nil {
+		writeError(w, verr.code, verr.s3code, verr.msg, r.URL.Path)
+		return
+	}
+
 	if h.cfg.Placement == nil {
 		writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "placement engine not configured", r.URL.Path)
 		return
@@ -214,6 +231,9 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		// UploadPart time; Complete records this same value on the
 		// manifest so the GET path reproduces the identical AAD.
 		VersionID: newPieceID(tenantID, bucket, key, now),
+		// Tags + object metadata supplied here are applied to the
+		// final manifest at Complete (validated above).
+		Metadata: captureMultipartObjectMetadata(r.Header),
 	}
 	if IsGatewayEncrypted(policy.EncryptionMode) {
 		if h.cfg.Encryption == nil {
@@ -581,6 +601,11 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		},
 		CreatedAt: h.cfg.Now(),
 	}
+	// Stamp the tags + object metadata captured at CreateMultipartUpload
+	// (and persisted on the session) onto the final object. Applied
+	// before the dedup branches below so a dedup-redirected manifest
+	// keeps them too — they are object-level, independent of placement.
+	applyMultipartObjectMetadata(manifest, upload.Metadata)
 
 	// Multipart dedup. Two flows feed the content_index, selected
 	// by the encryption mode of the upload:

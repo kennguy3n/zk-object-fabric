@@ -57,6 +57,39 @@ type Part struct {
 	UploadedAt time.Time
 }
 
+// ObjectMetadata carries the S3 object metadata and tag set a client
+// supplies on CreateMultipartUpload. AWS attaches x-amz-tagging and the
+// system / user-metadata headers (Content-Type, Content-Disposition,
+// x-amz-meta-*, …) at create time and stamps them on the object that
+// CompleteMultipartUpload produces — not on the individual parts. The
+// gateway therefore captures the normalised values up front and persists
+// them on the upload session so a Complete served by a different node
+// than the Create still records them on the final manifest. Every field
+// is optional; the zero value means "no tags / no metadata".
+type ObjectMetadata struct {
+	Tags               map[string]string `json:"tags,omitempty"`
+	ContentType        string            `json:"content_type,omitempty"`
+	ContentEncoding    string            `json:"content_encoding,omitempty"`
+	ContentDisposition string            `json:"content_disposition,omitempty"`
+	ContentLanguage    string            `json:"content_language,omitempty"`
+	CacheControl       string            `json:"cache_control,omitempty"`
+	Expires            string            `json:"expires,omitempty"`
+	UserMetadata       map[string]string `json:"user_metadata,omitempty"`
+}
+
+// IsZero reports whether no tags and no metadata were supplied, so a
+// durable store can persist NULL rather than an empty JSON object.
+func (m ObjectMetadata) IsZero() bool {
+	return len(m.Tags) == 0 &&
+		m.ContentType == "" &&
+		m.ContentEncoding == "" &&
+		m.ContentDisposition == "" &&
+		m.ContentLanguage == "" &&
+		m.CacheControl == "" &&
+		m.Expires == "" &&
+		len(m.UserMetadata) == 0
+}
+
 // Upload is the server-side record of an in-flight multipart session.
 //
 // Encryption fields (EncMode, DEKMaterial, WrappedDEK, …) are
@@ -105,6 +138,14 @@ type Upload struct {
 	WrappedKeyID     string
 	WrapAlgorithm    string
 	ContentAlgorithm string
+
+	// Metadata is the object tag set + S3 system / user metadata the
+	// client supplied on CreateMultipartUpload, captured up front and
+	// applied to the final manifest at CompleteMultipartUpload. Unlike
+	// the transient part-hash maps, it is persisted by a durable store
+	// (one JSONB column) so a Complete on a different node than the
+	// Create still stamps the tags and metadata on the object.
+	Metadata ObjectMetadata
 
 	// PartHashes holds the BLAKE3 digest of every part the
 	// multipart handler streamed to the backend, keyed by

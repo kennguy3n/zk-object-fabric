@@ -82,6 +82,7 @@ func requireMultipartPostgres(t *testing.T) *sql.DB {
 			wrapped_key_id    TEXT,
 			wrap_algorithm    TEXT,
 			content_algorithm TEXT,
+			metadata          JSONB,
 			created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 		)
 	`); err != nil {
@@ -187,6 +188,74 @@ func TestPostgresStore_CreateGetCompleteAbort(t *testing.T) {
 	}
 	if _, err := store.Get("tenant-a", "u2"); err != ErrNotFound {
 		t.Errorf("post-abort Get err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPostgresStore_MetadataDurableRoundTrip verifies that the tags +
+// object metadata captured at CreateMultipartUpload survive a reload
+// from Postgres on a different node. A second store instance (its own
+// empty session cache) forces Get to hit loadUpload rather than return
+// the create-time pointer, mirroring a Complete served by another node.
+func TestPostgresStore_MetadataDurableRoundTrip(t *testing.T) {
+	db := requireMultipartPostgres(t)
+	newStore := func() *PostgresStore {
+		s, err := NewPostgresStore(PostgresConfig{
+			DB:                  db,
+			UploadsTable:        "multipart_uploads_test",
+			PartsTable:          "multipart_parts_test",
+			ExpirySweepInterval: 1 * time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("NewPostgresStore: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+
+	createStore := newStore()
+	md := ObjectMetadata{
+		Tags:               map[string]string{"team": "drive", "env": "prod"},
+		ContentType:        "image/png",
+		ContentDisposition: `attachment; filename="x.png"`,
+		CacheControl:       "max-age=3600",
+		UserMetadata:       map[string]string{"author": "ken"},
+	}
+	if err := createStore.Create(&Upload{
+		ID: "u-md", TenantID: "tenant-a", Bucket: "bkt", ObjectKey: "obj", Metadata: md,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Reload through a fresh store so the row is read back from Postgres.
+	got, err := newStore().Get("tenant-a", "u-md")
+	if err != nil {
+		t.Fatalf("Get from fresh store: %v", err)
+	}
+	if got.Metadata.ContentType != "image/png" ||
+		got.Metadata.ContentDisposition != `attachment; filename="x.png"` ||
+		got.Metadata.CacheControl != "max-age=3600" {
+		t.Errorf("system metadata round-trip mismatch: %+v", got.Metadata)
+	}
+	if got.Metadata.Tags["team"] != "drive" || got.Metadata.Tags["env"] != "prod" {
+		t.Errorf("tags round-trip mismatch: %+v", got.Metadata.Tags)
+	}
+	if got.Metadata.UserMetadata["author"] != "ken" {
+		t.Errorf("user metadata round-trip mismatch: %+v", got.Metadata.UserMetadata)
+	}
+
+	// An upload created without metadata reads back zero-valued (NULL
+	// column), not an error.
+	if err := createStore.Create(&Upload{
+		ID: "u-nomd", TenantID: "tenant-a", Bucket: "bkt", ObjectKey: "obj2",
+	}); err != nil {
+		t.Fatalf("Create no-metadata: %v", err)
+	}
+	plain, err := newStore().Get("tenant-a", "u-nomd")
+	if err != nil {
+		t.Fatalf("Get no-metadata: %v", err)
+	}
+	if !plain.Metadata.IsZero() {
+		t.Errorf("expected zero metadata, got %+v", plain.Metadata)
 	}
 }
 
