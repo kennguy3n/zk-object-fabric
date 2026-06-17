@@ -34,9 +34,12 @@ const maxObjectRanges = 100
 //     exceeds maxObjectRanges) — serve the whole
 //     object (200), matching net/http's ServeContent.
 //
-// At most one of single / multi is non-nil. The single range is returned
-// exactly as parseHTTPRange produced it (an open-ended "bytes=start-"
-// keeps End == -1) so the single-range read paths are unchanged. The
+// At most one of single / multi is non-nil. A comma-less single range is
+// returned exactly as parseHTTPRange produced it (an open-ended
+// "bytes=start-" keeps End == -1); a degenerate comma list that collapses
+// to one range ("bytes=5-,") comes back with End already resolved to a
+// concrete byte. Either way the single-range read paths are unchanged —
+// they all handle both an open-ended (End < 0) and a resolved End. The
 // multi ranges are resolved to concrete, in-bounds Start/End so callers
 // can slice and format Content-Range without further bounds work.
 func parseObjectRanges(r *http.Request, size int64) (single *providers.ByteRange, multi []providers.ByteRange, err error) {
