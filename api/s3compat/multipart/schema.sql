@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     wrapped_key_id    TEXT,
     wrap_algorithm    TEXT,
     content_algorithm TEXT,
+    -- metadata is the object tag set + S3 system / user metadata the
+    -- client supplied on CreateMultipartUpload (x-amz-tagging,
+    -- Content-Type, x-amz-meta-*, …), captured up front and applied to
+    -- the final manifest at CompleteMultipartUpload. Holding it here
+    -- (rather than only in-memory) lets a Complete served by a different
+    -- node than the Create still stamp the tags and metadata on the
+    -- object. NULL when neither tags nor metadata were supplied.
+    metadata          JSONB,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -65,6 +73,16 @@ CREATE INDEX IF NOT EXISTS multipart_uploads_by_created_at
 -- deploy-before-migrate window where Create/Get would 500 on a
 -- missing column.
 ALTER TABLE multipart_uploads ADD COLUMN IF NOT EXISTS version_id TEXT;
+
+-- Backfill for deployments whose multipart_uploads table predates the
+-- object tags + metadata capture (x-amz-tagging / x-amz-meta-* applied
+-- at CreateMultipartUpload). Same idempotent pattern as version_id
+-- above: a no-op on a fresh or already-migrated DB. The column is
+-- nullable, so adding it is an instant metadata-only change; pre-existing
+-- in-flight uploads read back NULL -> no tags / no metadata, exactly
+-- matching how those sessions were created. Apply before rolling out the
+-- new gateway code so Create/Complete never 500 on a missing column.
+ALTER TABLE multipart_uploads ADD COLUMN IF NOT EXISTS metadata JSONB;
 
 CREATE TABLE IF NOT EXISTS multipart_parts (
     upload_id           TEXT        NOT NULL
