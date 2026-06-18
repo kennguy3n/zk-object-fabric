@@ -160,11 +160,14 @@ maintained.
   --cell "$ZKOF_CELL_ID"
 ```
 
-This calls the (Phase 4) `PATCH /api/tenants/{id}/dedicated-cells/{cell_id}`
-endpoint with `{"status":"active"}`. Phase 3 ships the
-provisioning + decommission paths and returns the cell as
-`provisioning`; the flip endpoint is a future addition tracked
-on the Phase 4 checklist.
+This wrapper targets a manual `PATCH .../dedicated-cells/{cell_id}`
+status-flip endpoint with `{"status":"active"}`. That manual flip
+endpoint is not part of the console's dedicated-cell HTTP surface,
+which exposes the provisioning (`POST`) and listing (`GET`) paths and
+returns a newly provisioned cell as `provisioning`. Cells advance to
+`active` through the provisioner's bring-up completion workflow, which
+flips the cell record once the node reports ready — the wrapper is kept
+so operator muscle memory survives if a manual flip endpoint is added.
 
 ## Decommission
 

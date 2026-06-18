@@ -1,4 +1,4 @@
-// Package chaos is the WS1.2 chaos / failure-injection test suite for
+// Package chaos is the chaos / failure-injection test suite for
 // zk-object-fabric.
 //
 // The suite has two layers:
@@ -21,8 +21,8 @@
 //     no silently-lost writes, no leaked goroutines).
 //
 // The scenarios in this package cover the in-process slice of the
-// failure modes called out in docs/PROGRESS.md "Chaos /
-// failure-injection testing":
+// fabric's chaos / failure-injection coverage
+// (see docs/runbooks/dr-verification.md):
 //
 //   - Provider 503 storms (Wasabi-style transient origin failures).
 //   - Provider partition mid-write (the dark path that exposes

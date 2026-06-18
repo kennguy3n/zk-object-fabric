@@ -44,7 +44,7 @@ type ObjectManifest struct {
 
 	// DeleteMarker, when true, marks this manifest version as an S3
 	// delete marker rather than a real object version. It is created
-	// by DeleteObject on a versioning-enabled bucket (WS8.4): the
+	// by DeleteObject on a versioning-enabled bucket: the
 	// marker becomes the latest version, hiding older versions from
 	// GET/HEAD/ListObjectsV2 while preserving them for
 	// ListObjectVersions and versionId-addressed reads. A delete
@@ -88,7 +88,7 @@ type ObjectManifest struct {
 	UserMetadata map[string]string `json:"user_metadata,omitempty"`
 
 	// RetentionMode and RetainUntil hold the S3 Object Lock retention
-	// for this object version (WS8.3), set by PutObjectRetention or
+	// for this object version, set by PutObjectRetention or
 	// inherited from the bucket default rule at PUT time. RetentionMode
 	// is "GOVERNANCE" or "COMPLIANCE" (object_lock.RetentionMode);
 	// empty means no retention. A version whose RetainUntil is in the
@@ -102,19 +102,19 @@ type ObjectManifest struct {
 	RetainUntil   time.Time `json:"retain_until,omitempty"`
 
 	// LegalHold, when true, marks this object version as under an S3
-	// Object Lock legal hold (WS8.3), set by PutObjectLegalHold. A
+	// Object Lock legal hold, set by PutObjectLegalHold. A
 	// held version cannot be permanently deleted or overwritten until
 	// the hold is turned off, independently of RetentionMode/RetainUntil
 	// and with no expiry. Enforced at the api/s3compat boundary.
 	LegalHold bool `json:"legal_hold,omitempty"`
 
 	// CreatedAt is the wall-clock instant the object version was
-	// written (WS8.2). It is set once at PUT/Copy/CompleteMultipartUpload
+	// written. It is set once at PUT/Copy/CompleteMultipartUpload
 	// time and is never amended afterwards, so it records the version's
 	// true age — distinct from LIST's LastModified, which the API
 	// derives separately. The daily lifecycle evaluator uses it to
 	// decide age-based ("Days") expiration; a manifest written before
-	// WS8.2 has the zero value, and for a Days-based rule the evaluator
+	// this field existed has the zero value, and for a Days-based rule the evaluator
 	// treats an unknown age as "never expire" so it can never delete an
 	// object whose age it cannot establish. This fail-safe is specific
 	// to Days-based rules: a Date-based rule is an absolute cutoff (not

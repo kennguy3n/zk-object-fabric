@@ -156,7 +156,7 @@ func TestRebalancer_StateMachineFullMigration(t *testing.T) {
 // TestRebalancer_ThrottleHonoursContextCancellation asserts that
 // cancelling ctx while throttle is sleeping unblocks the call
 // promptly instead of waiting the full bytes / BytesPerSecond
-// duration. Prior to the Phase 2 hardening pass the throttle used
+// duration. An earlier throttle implementation used
 // time.Sleep, so a SIGTERM-driven shutdown would block for up to
 // piece_size / BytesPerSecond seconds.
 func TestRebalancer_ThrottleHonoursContextCancellation(t *testing.T) {

@@ -130,7 +130,7 @@ func TestDossierDoc_NoUnknownConstantReferences(t *testing.T) {
 // business appearing in the dossier at all. "eleven nines" has
 // exactly one licit occurrence because the docs/PROPOSAL.md §11.4
 // quote in §1 of the dossier ("Publish theoretical 'eleven nines'
-// durability — Cannot be validated in Phase 1.") uses it inside the
+// durability — Cannot be validated by analysis.") uses it inside the
 // quote block to state the non-goal. A second occurrence anywhere
 // would be a real claim creeping in.
 //
@@ -140,7 +140,7 @@ func TestDossierDoc_NoUnknownConstantReferences(t *testing.T) {
 // "99.999999999". Per-string licit counts close that hole.
 func TestDossierDoc_ForbidsTheoreticalDurabilityNines(t *testing.T) {
 	doc := readDossierDoc(t)
-	if !strings.Contains(doc, "Cannot be validated in Phase 1") {
+	if !strings.Contains(doc, "Cannot be validated by analysis") {
 		t.Fatalf("docs/CAPACITY.md missing the docs/PROPOSAL.md §11.4 non-goal quote about theoretical durability — the dossier must explicitly state this is out of scope")
 	}
 

@@ -2,8 +2,8 @@
 //
 // ManifestStore is the control-plane contract for reading and writing
 // encrypted object manifests. See docs/PROPOSAL.md §3.3 and §3.5.
-// Concrete implementations (Postgres/RDS in Phase 1, CockroachDB in
-// Phase 2+) live outside this package.
+// Concrete implementations (Postgres, SQLite, and an in-memory test
+// fake) live in subpackages.
 package manifest_store
 
 import (

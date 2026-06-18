@@ -13,8 +13,8 @@ import "fmt"
 type MigrationPhase string
 
 const (
-	// WasabiPrimary: object lives only on Wasabi. This is the Phase 1
-	// default.
+	// WasabiPrimary: object lives only on Wasabi. This is the
+	// initial state before any migration begins.
 	WasabiPrimary MigrationPhase = "wasabi_primary"
 
 	// DualWrite: new writes go to both Wasabi and the local cell.

@@ -4,11 +4,10 @@
 // function recognises the three hash forms the gateway has written
 // over time:
 //
-//  1. "blake3:<hex>"   — the canonical Phase 4 content-derived hash
+//  1. "blake3:<hex>"   — the canonical content-derived hash
 //                        written by api/s3compat/handler.go's PUT
-//                        path after the BLAKE3 piece-integrity work
-//                        landed.
-//  2. raw SHA-256 hex   — the legacy Phase 2 form (no prefix). Kept
+//                        path.
+//  2. raw SHA-256 hex   — the legacy form (no prefix). Kept
 //                        so manifests written before the BLAKE3
 //                        cut-over still verify cleanly. The string
 //                        must be exactly 64 lowercase hex chars.

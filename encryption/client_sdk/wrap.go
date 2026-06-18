@@ -13,10 +13,10 @@ import (
 )
 
 // WrapAlgorithm is the canonical wrap algorithm written to
-// encryption.DataEncryptionKey.WrapAlgorithm for Phase 2. It is an
+// encryption.DataEncryptionKey.WrapAlgorithm by LocalFileWrapper. It is an
 // AEAD wrap using XChaCha20-Poly1305 with a key derived from the
-// local CMK file. Phase 3 replaces this with AWS KMS / Vault while
-// leaving the envelope shape intact.
+// local CMK file. The KMS and Vault wrappers record their own
+// algorithm tags while leaving the envelope shape intact.
 const WrapAlgorithm = "xchacha20-poly1305-wrap-v1"
 
 // WrappedDEK is the encrypted form of a DataEncryptionKey. It
@@ -25,17 +25,17 @@ const WrapAlgorithm = "xchacha20-poly1305-wrap-v1"
 type WrappedDEK = encryption.DataEncryptionKey
 
 // Wrapper seals and opens DEKs using a customer master key
-// reference. Phase 2 ships LocalFileWrapper; Phase 3 adds
-// KMSWrapper and VaultWrapper behind the same interface.
+// reference. LocalFileWrapper, KMSWrapper, and VaultWrapper all
+// implement this interface.
 type Wrapper interface {
 	WrapDEK(dek DataEncryptionKey, cmk encryption.CustomerMasterKeyRef) (WrappedDEK, error)
 	UnwrapDEK(wrapped WrappedDEK, cmk encryption.CustomerMasterKeyRef) (DataEncryptionKey, error)
 }
 
 // LocalFileWrapper loads a 32-byte master key from a file on disk.
-// It is the Phase 2 default and is NOT suitable for production use —
+// It is the default for dev and is NOT suitable for production use —
 // the plaintext master key sits on the node that reads the file.
-// Production deployments MUST use KMSWrapper / VaultWrapper in Phase 3.
+// Production deployments MUST use KMSWrapper / VaultWrapper.
 type LocalFileWrapper struct {
 	// Path is the filesystem path holding the master key. The file
 	// must contain exactly 32 random bytes (no newline, no wrapping).

@@ -21,7 +21,7 @@ the top-level shape is:
 
 ```jsonc
 {
-  "suite": "zk-object-fabric-phase2",
+  "suite": "zk-object-fabric-benchmark",
   "started_at": "...",
   "finished_at": "...",
   "all_passed": true,
@@ -60,9 +60,8 @@ table.
 
 ## What gates on these reports
 
-The **Load testing** item in
-[`docs/PROGRESS.md`](../../PROGRESS.md#production-readiness) cannot be
-checked off until a passing Tier 3 `linode-wasabi-*.json` report lands
+The gateway's published load-testing SLA is only considered
+demonstrated once a passing Tier 3 `linode-wasabi-*.json` report lands
 here. CI automates the reduced-scale smoke confidence (see the
 `staging-validation` workflow job); the production SLA itself is only
 validated by a real Tier 3 run, which requires paid infrastructure and

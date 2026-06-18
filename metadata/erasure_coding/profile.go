@@ -1,11 +1,11 @@
 // Package erasure_coding defines the erasure-coding profile types used
-// by the Phase 2+ local-DC data plane. See docs/PROPOSAL.md §3.8 and
+// by the local-DC data plane. See docs/PROPOSAL.md §3.8 and
 // §6 for the context in which these profiles are consumed.
 //
-// Phase 1 does not perform erasure coding: objects land on Wasabi,
-// which provides its own durability. The profiles defined here are
-// the declarative specification that Phase 2 engineers will wire into
-// the repair engine, the placement engine, and the cell manifest.
+// On cloud backends (e.g. Wasabi) objects rely on the provider's own
+// durability rather than erasure coding. The profiles defined here are
+// the declarative specification the repair engine, the placement
+// engine, and the cell manifest consume.
 package erasure_coding
 
 import (
@@ -38,8 +38,8 @@ type ErasureCodingProfile struct {
 	StripeSize int64 `json:"stripe_size" yaml:"stripe_size"`
 }
 
-// Standard Phase 2+ profiles. Phase 1 declares them so the schema is
-// stable; Phase 2 wires them into the placement engine.
+// Standard profiles. They are declared here so the schema is
+// stable and the placement engine can reference them by name.
 var (
 	// Profile6Plus2 is the entry-level profile. Storage overhead is
 	// 1.33x with tolerance for 2 shard losses per stripe.
@@ -53,7 +53,7 @@ var (
 	// Profile8Plus3 is the default production profile. Storage
 	// overhead is 1.375x with tolerance for 3 shard losses per
 	// stripe. This matches the erasure-overhead target in
-	// docs/PROGRESS.md line 208.
+	// docs/CAPACITY.md.
 	Profile8Plus3 = ErasureCodingProfile{
 		Name:         "8+3",
 		DataShards:   8,
@@ -94,7 +94,7 @@ var (
 	}
 )
 
-// StandardProfiles returns the Phase 2+ profiles in declaration
+// StandardProfiles returns the standard profiles in declaration
 // order. The slice is freshly allocated so callers may mutate it.
 func StandardProfiles() []ErasureCodingProfile {
 	return []ErasureCodingProfile{
@@ -123,12 +123,12 @@ func (p ErasureCodingProfile) StorageOverhead() float64 {
 // Validate performs structural checks on the profile.
 //
 // It enforces the invariants needed to safely wire a profile into the
-// Phase 2 repair engine:
+// repair engine:
 //
 //   - Name is required.
 //   - DataShards and ParityShards are both positive. Pure replication
-//     (m = 0) is not an erasure-coding profile; Phase 1 uses Wasabi
-//     durability for that case.
+//     (m = 0) is not an erasure-coding profile; cloud backends rely on
+//     provider durability for that case.
 //   - StripeSize is positive. Cells may enforce a stricter minimum
 //     but zero or negative values are always illegal.
 //

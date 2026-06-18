@@ -9,7 +9,7 @@ import (
 
 // TestSmoke_LocalFSLatencyTargets is the CI-level production-validation
 // smoke test referenced by the staging-validation workflow
-// (.github/workflows/ci.yml) and docs/PROGRESS.md. It drives an
+// (.github/workflows/ci.yml). It drives an
 // in-process SustainedRunner against the local_fs_dev provider for a
 // short burst at ~1000 RPS and asserts that the harness meets the
 // published p99 latency and error-rate SLA targets at reduced scale.

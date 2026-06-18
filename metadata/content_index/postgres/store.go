@@ -71,8 +71,9 @@ func (s *Store) Lookup(ctx context.Context, tenantID, contentHash string) (*cont
 // LookupByPlaintextHash returns the entry for (tenantID,
 // plaintextHash) using the plaintext_hash secondary index.
 // Returns ErrNotFound when no matching row exists. Pattern C and
-// pre-Phase-3.5 rows are excluded automatically by the partial
-// index — empty plaintext_hash values never match.
+// rows written before the plaintext_hash index existed are excluded
+// automatically by the partial index — empty plaintext_hash values
+// never match.
 func (s *Store) LookupByPlaintextHash(ctx context.Context, tenantID, plaintextHash string) (*content_index.ContentIndexEntry, error) {
 	if tenantID == "" {
 		return nil, errors.New("postgres: tenant_id is required")

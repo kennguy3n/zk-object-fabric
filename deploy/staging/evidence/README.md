@@ -6,7 +6,7 @@ assembled by [`../scripts/collect_evidence.sh`](../scripts/collect_evidence.sh)
 or `make tier3-evidence`.
 
 The directory layout is part of the audit contract — when the
-WS2.4 audit hand-off package bundles this dossier, the layout is
+audit hand-off package bundles this dossier, the layout is
 what auditors expect.
 
 ## Layout
@@ -141,7 +141,7 @@ the previous dossier must be retained for the audit retention
 window (typically the audit firm specifies — usually >= 12 months
 post-engagement).
 
-For the WS2.4 audit hand-off package, the most recent passing
+For the audit hand-off package, the most recent passing
 dossier tarball is included verbatim. Failing dossiers are
 included separately under a `incidents/` subdirectory with an
 attached incident report.

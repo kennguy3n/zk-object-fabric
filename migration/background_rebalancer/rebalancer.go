@@ -177,8 +177,8 @@ func eligible(m *metadata.ObjectManifest) bool {
 	}
 }
 
-// phaseOf infers the manifest's MigrationPhase. Phase 2 stores only
-// the PrimaryBackend and a Generation counter on the manifest, not
+// phaseOf infers the manifest's MigrationPhase. The manifest stores
+// only the PrimaryBackend and a Generation counter, not
 // the phase name directly; the helper defaults to WasabiPrimary for
 // Generation 0/1 and uses the presence of the CloudCopy field to
 // decide between DualWrite and LocalPrimaryWasabiBackup.
@@ -303,7 +303,7 @@ func nextPhase(p migration.MigrationPhase) (migration.MigrationPhase, bool) {
 }
 
 // applyPhase writes the new phase onto the manifest's MigrationState.
-// It increments Generation so Phase 2's numeric mapping in phaseOf
+// It increments Generation so the numeric mapping in phaseOf
 // stays internally consistent.
 func applyPhase(m *metadata.ObjectManifest, next migration.MigrationPhase) {
 	switch next {

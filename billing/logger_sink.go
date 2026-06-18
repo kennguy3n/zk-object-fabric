@@ -4,7 +4,8 @@ import "log"
 
 // LoggerSink is an in-memory BillingSink that logs usage events and
 // aggregates them by (tenant, bucket, dimension) for test / dev
-// introspection. Phase 3 swaps in a ClickHouse-backed sink.
+// introspection. A ClickHouse-backed sink (clickhouse_sink.go) backs
+// production deployments.
 type LoggerSink struct {
 	Logger *log.Logger
 }

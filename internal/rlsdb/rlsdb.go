@@ -1,11 +1,11 @@
 // Package rlsdb is the shared Postgres Row-Level Security (RLS)
-// substrate — Workstream 3.4 defence-in-depth — used by every
+// substrate — defence-in-depth — used by every
 // tenant-scoped metadata store (manifests, content_index, …).
 //
 // Tenant scoping is enforced in two independent layers:
 //
 //  1. Every query carries an explicit `WHERE tenant_id = $1` predicate
-//     (the application layer, present since Phase 2).
+//     (the application layer).
 //  2. Postgres RLS policies re-check the same predicate from a
 //     transaction-local GUC, so a query that omits or mistakes the
 //     predicate still cannot read or write another tenant's rows.

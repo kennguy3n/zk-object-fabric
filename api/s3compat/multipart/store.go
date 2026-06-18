@@ -97,7 +97,7 @@ func (m ObjectMetadata) IsZero() bool {
 // calls for gateway-side encryption. They are in-memory only:
 // DEKMaterial (the plaintext DEK) is never persisted, so a
 // multi-node multipart session store must hold these on a durable
-// encrypted channel (Phase 3). The wrapped form and key
+// encrypted channel. The wrapped form and key
 // identifiers are recorded on the final manifest so GET can
 // unwrap after the fact.
 type Upload struct {

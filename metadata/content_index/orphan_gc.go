@@ -2,8 +2,8 @@
 // removes content_index rows whose piece is no longer referenced
 // by any live manifest.
 //
-// Phase 3.5 wired DELETE-time refcounting (see handler.go), but
-// non-deduped paths and crash recoveries can leave content_index
+// DELETE-time refcounting (see handler.go) decrements ref counts,
+// but non-deduped paths and crash recoveries can leave content_index
 // rows whose ref_count never reached zero on the DELETE path.
 // The sweep walks every (tenant, content_hash) row periodically,
 // asks the manifest store whether any manifest in the tenant

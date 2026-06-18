@@ -51,7 +51,7 @@ type AuthStore interface {
 	// (_, false) when the store has no record of the tenant — the
 	// S3 PUT gate treats the last case as out-of-scope and lets
 	// the request through. This keeps HMAC-only tenants loaded
-	// from a JSON bindings file (the Phase 2 path) from being
+	// from a JSON bindings file from being
 	// blocked by a verification system they never opted into.
 	IsVerified(tenantID string) (verified, tracked bool)
 
@@ -85,7 +85,7 @@ type AuthStore interface {
 // TokenStore maps opaque bearer tokens to tenant IDs. It is used by
 // the SPA to authenticate subsequent requests without resending
 // email / password. Production replaces this with a JWT issuer or a
-// signed session cookie; the Phase 3 scaffold keeps it in memory so
+// signed session cookie; the in-memory store keeps it in memory so
 // the frontend can round-trip without a database dependency.
 type TokenStore interface {
 	// IssueToken mints a new token for tenantID and returns it.
@@ -96,8 +96,8 @@ type TokenStore interface {
 	ResolveToken(token string) (tenantID string, ok bool)
 }
 
-// MemoryAuthStore is a process-local AuthStore suitable for the
-// Phase 3 console scaffold and tests.
+// MemoryAuthStore is a process-local AuthStore suitable for
+// development and tests.
 type MemoryAuthStore struct {
 	mu    sync.RWMutex
 	users map[string]memoryAuthRow
@@ -271,13 +271,13 @@ func (s *MemoryTokenStore) ResolveToken(token string) (string, bool) {
 }
 
 // AuthHooks collects the optional production integrations the signup
-// flow needs to wire up before going live. All hooks are no-ops in
-// the Phase 3 scaffold; the TODO comments below capture what each
+// flow needs to wire up before going live. All hooks default to
+// no-ops; the TODO comments below capture what each
 // integration must eventually do.
 type AuthHooks struct {
 	// VerifyCAPTCHA validates the CAPTCHA token submitted with the
 	// signup payload. A nil hook skips CAPTCHA verification — the
-	// Phase 3 scaffold default.
+	// default.
 	//
 	// TODO(production): wire this to a real CAPTCHA provider
 	// (hCaptcha / reCAPTCHA) and reject signups whose token fails
@@ -286,7 +286,7 @@ type AuthHooks struct {
 
 	// SendVerificationEmail is called after a successful signup so
 	// the user can verify their email. A nil hook skips the email
-	// — the Phase 3 scaffold default. The hook receives the
+	// — the default. The hook receives the
 	// opaque per-signup token that must appear in the verify
 	// request; production implementations embed the token in the
 	// email link (e.g. https://console.example.com/verify?token=…)
@@ -358,7 +358,7 @@ type AuthConfig struct {
 	// so a freshly-minted tenant is reflected on the provider
 	// (Stripe, Chargebee, …) before any usage event lands. A nil
 	// provider skips the call — acceptable for dev and for the
-	// HMAC-only Phase 2 path.
+	// HMAC-only path.
 	BillingProvider billing.BillingProvider
 
 	// EnsureCustomerTimeout caps the EnsureCustomer round-trip so
@@ -1402,7 +1402,7 @@ func summarizeTenant(t tenant.Tenant) TenantSummary {
 // delegates to. The signup handler passes the just-minted timestamp
 // so the SPA renders a valid ISO date on the tenant card; the login
 // handler uses the zero value because the tenant.Tenant record does
-// not carry a persisted creation timestamp yet (the Phase 4 Postgres
+// not carry a persisted creation timestamp yet (a future Postgres
 // schema will populate it via a column default).
 func summarizeTenantAt(t tenant.Tenant, createdAt time.Time) TenantSummary {
 	burst := 2 * t.Budgets.RequestsPerSec

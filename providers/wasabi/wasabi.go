@@ -1,4 +1,4 @@
-// Package wasabi implements the Phase 2 primary storage backend.
+// Package wasabi implements the Wasabi cloud storage backend.
 //
 // Wasabi is S3-compatible, so this adapter embeds *s3_generic.Provider
 // and only overrides the fields that differ for Wasabi: provider
@@ -150,11 +150,10 @@ func (p *Provider) PlacementLabels() providers.PlacementLabels {
 	}
 }
 
-// regionToCountry is a Phase 1/2 approximation. A real mapping lives
-// in the control-plane's provider inventory.
-//
-// TODO(phase-3): replace with a lookup against the control-plane
-// inventory, which records the authoritative region → country mapping.
+// regionToCountry is an approximation. The authoritative mapping
+// lives in the control-plane's provider inventory, which records the
+// region → country mapping; this fallback is used when that inventory
+// is not consulted.
 func regionToCountry(region string) string {
 	switch {
 	case region == "":

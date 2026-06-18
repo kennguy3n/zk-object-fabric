@@ -2,7 +2,7 @@
 
 This runbook documents the **published procedure** for measuring
 zk-object-fabric latency, throughput, and error rate against the SLA
-targets in [`docs/PROGRESS.md`](../PROGRESS.md#appendix-key-metrics-to-track).
+targets the benchmark suite enforces.
 
 The targets are enforced by code, not aspiration — every benchmark
 scenario in [`tests/benchmark/suite.go`](../../tests/benchmark/suite.go)
@@ -134,7 +134,7 @@ If any criterion fails, **do not promote** the gateway build. File an
 incident, attach the failed report, and triage from the per-scenario
 histograms in the JSON.
 
-### 4.1 Deployment artifacts (WS2.1)
+### 4.1 Deployment artifacts
 
 The staging infrastructure is codified in
 [`deploy/staging/`](../../deploy/staging/README.md):
@@ -165,7 +165,7 @@ The harness emits a single JSON document per run. Top-level shape:
 
 ```jsonc
 {
-  "suite": "zk-object-fabric-phase2",
+  "suite": "zk-object-fabric-benchmark",
   "started_at": "...",
   "finished_at": "...",
   "all_passed": true,
@@ -221,7 +221,6 @@ Once a real-deployment run lands, commit the JSON report to
 |-------------------|--------------------------|-----------|--------|
 | _none yet_        |                          |           |        |
 
-The Linode + Wasabi staging report is the artifact that gates the
-"Load testing" item in
-[`docs/PROGRESS.md`](../PROGRESS.md#production-readiness) from being
-checked off.
+The Linode + Wasabi staging report is the canonical artifact that
+demonstrates the gateway meets its load-testing acceptance criteria
+on a real cloud deployment.

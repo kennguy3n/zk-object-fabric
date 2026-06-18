@@ -10,9 +10,6 @@
 // consumes; concrete implementations live in subpackages
 // (postgres/, in-memory test fakes, etc.) and are wired through
 // dependency injection at gateway startup.
-//
-// Phase 3.5 status: scaffolding only. Implementations land
-// alongside the PUT/GET/DELETE wiring in subsequent PRs.
 package content_index
 
 import (

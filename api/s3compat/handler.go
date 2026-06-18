@@ -1,11 +1,11 @@
 // Package s3compat is the S3-compatible HTTP handler surface for the
-// Linode-hosted ZK Gateway. See docs/PROPOSAL.md §3.1.
+// ZK Gateway. See docs/PROPOSAL.md §3.1.
 //
-// Phase 2 wires the HTTP surface to the control-plane ManifestStore
-// and the data-plane StorageProvider registry. Request parsing is
-// path-style (/{bucket}/{key...}); authentication is still a stub
-// (see Authenticator) and multipart, versioning, and cache promotion
-// are tracked as their own Phase 2 gates.
+// It wires the HTTP surface to the control-plane ManifestStore and the
+// data-plane StorageProvider registry. Request parsing is path-style
+// (/{bucket}/{key...}); authentication is SigV4 (see Authenticator),
+// and multipart, versioning, and cache promotion each have a dedicated
+// handler.
 package s3compat
 
 import (
@@ -119,10 +119,10 @@ var ErrAuthMisconfigured = errors.New("s3compat: authenticator not configured bu
 // range seek and streaming EC land.
 const MaxInMemoryObjectBytes int64 = 256 * 1024 * 1024
 
-// PlacementEngine chooses the storage backend for a new object. Phase
-// 2 supplies a concrete implementation; the handler treats the engine
-// as a black box that resolves (tenant, bucket, key) to a backend
-// name registered in the StorageProvider registry.
+// PlacementEngine chooses the storage backend for a new object. The
+// handler treats the engine as a black box that resolves
+// (tenant, bucket, key) to a backend name registered in the
+// StorageProvider registry.
 type PlacementEngine interface {
 	ResolveBackend(tenantID, bucket, objectKey string) (string, metadata.PlacementPolicy, error)
 }
@@ -165,7 +165,7 @@ type IntegrityFailureSink interface {
 
 // Config collects the dependencies Handler needs.
 type Config struct {
-	// Manifests is the encrypted-manifest store (Phase 2: Postgres).
+	// Manifests is the encrypted-manifest store (Postgres-backed).
 	Manifests manifest_store.ManifestStore
 
 	// Providers is the backend registry keyed by provider name
@@ -194,7 +194,7 @@ type Config struct {
 
 	// Notifications receives object-level events (PUT / DELETE /
 	// COPY / CompleteMultipartUpload) for asynchronous fan-out to
-	// each bucket's configured webhook destinations (WS8.6). The
+	// each bucket's configured webhook destinations. The
 	// handler calls Emit on the success path only; Emit must be
 	// non-blocking so a slow destination never adds latency to the
 	// S3 request. Optional; nil disables event notifications (the
@@ -208,7 +208,7 @@ type Config struct {
 	Multipart multipart.Store
 
 	// BucketConfig persists per-bucket S3 configuration
-	// sub-resources (today: versioning state — WS8.4). A nil store
+	// sub-resources (today: versioning state). A nil store
 	// makes PutBucketVersioning / GetBucketVersioning return 501
 	// NotImplemented and leaves DeleteObject on its non-versioned
 	// (permanent-delete) path.
@@ -272,7 +272,7 @@ type Config struct {
 
 	// Compliance hooks the gateway up to the data-residency
 	// pre-flight check and audit trail. Both fields are optional;
-	// when nil the gateway behaves as it did before Phase 4.
+	// when nil the gateway skips the residency check and audit trail.
 	Compliance ComplianceHooks
 
 	// IntegrityFailures, when non-nil, is invoked once per piece
@@ -369,7 +369,7 @@ type LegalHoldChecker interface {
 
 // NotificationEmitter receives one ObjectEvent per successfully
 // serviced object mutation, for asynchronous fan-out to the bucket's
-// configured webhook destinations (WS8.6). Emit must be non-blocking:
+// configured webhook destinations. Emit must be non-blocking:
 // the implementation (internal/notifications.Dispatcher) enqueues the
 // event and returns immediately, so a slow or unreachable destination
 // can never add latency to — or fail — the originating S3 request.
@@ -574,15 +574,15 @@ func (h *Handler) capRequestBody(w http.ResponseWriter, r *http.Request) bool {
 // The conformance harness in `tests/s3_conformance` asserts every
 // entry here returns 4xx (specifically 501); a future implementation
 // that wires up a sub-resource removes its key from this map and adds
-// routing in the dispatch switch below. Object tagging (WS8.1) and
-// bucket versioning (WS8.4) both followed exactly this path: their
+// routing in the dispatch switch below. Object tagging and
+// bucket versioning both followed exactly this path: their
 // keys (`tagging`, `versioning`) were removed here and `?tagging` /
 // `?versioning` routing was added to the dispatch switch. Object
-// Lock (WS8.3) followed the same path for `object-lock`, `retention`,
-// and `legal-hold`, bucket CORS (WS8.5) for `cors`, bucket
-// lifecycle (WS8.2) for `lifecycle`, bucket event notifications
-// (WS8.6) for `notification`, and bucket default encryption
-// (WS8.7) for `encryption`.
+// Lock followed the same path for `object-lock`, `retention`,
+// and `legal-hold`, bucket CORS for `cors`, bucket
+// lifecycle for `lifecycle`, bucket event notifications
+// for `notification`, and bucket default encryption
+// for `encryption`.
 //
 // Rejection is method-agnostic: the moment a sub-resource key is in
 // this map, requests for that key are refused regardless of HTTP
@@ -672,14 +672,14 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 	r = withAuthMemo(r)
 	q := r.URL.Query()
 	h.capRequestBody(w, r)
-	// An OPTIONS request is a CORS preflight (WS8.5); answer it before
+	// An OPTIONS request is a CORS preflight; answer it before
 	// the unsupported-subresource check and the method switch, since it
 	// is unauthenticated and never carries a real S3 operation.
 	if r.Method == http.MethodOptions {
 		h.handleCORSPreflight(w, r)
 		return
 	}
-	// Attach cross-origin response headers (WS8.5) before routing so
+	// Attach cross-origin response headers before routing so
 	// they are present on the actual request's response, including
 	// error responses (e.g. the 501 from an unsupported sub-resource —
 	// otherwise a browser would surface a CORS error instead of the
@@ -694,7 +694,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.UploadPart(w, r)
 			return
 		}
-		// Object tagging (?tagging) — WS8.1. Checked before the
+		// Object tagging (?tagging). Checked before the
 		// implicit-CreateBucket and CopyObject branches because it is
 		// a distinct sub-resource operation, not an object write.
 		if q.Has("tagging") {
@@ -708,7 +708,7 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutBucketVersioning(w, r)
 			return
 		}
-		// Object Lock sub-resources (WS8.3) route before the
+		// Object Lock sub-resources route before the
 		// implicit-CreateBucket / CopyObject / Put branches because
 		// they are distinct config operations, not object writes.
 		// ?object-lock is bucket-level; ?retention and ?legal-hold are
@@ -717,28 +717,28 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.PutObjectLockConfiguration(w, r)
 			return
 		}
-		// Bucket CORS config (PUT /{bucket}?cors) — WS8.5. Bucket-level
+		// Bucket CORS config (PUT /{bucket}?cors). Bucket-level
 		// sub-resource; must route before the implicit-CreateBucket /
 		// CopyObject / Put branches.
 		if q.Has("cors") {
 			h.PutBucketCors(w, r)
 			return
 		}
-		// Bucket lifecycle config (PUT /{bucket}?lifecycle) — WS8.2.
+		// Bucket lifecycle config (PUT /{bucket}?lifecycle).
 		// Bucket-level sub-resource; route before the
 		// implicit-CreateBucket / CopyObject / Put branches.
 		if q.Has("lifecycle") {
 			h.PutBucketLifecycleConfiguration(w, r)
 			return
 		}
-		// Bucket event notifications (PUT /{bucket}?notification) —
-		// WS8.6. Bucket-level sub-resource; route before the
+		// Bucket event notifications (PUT /{bucket}?notification).
+		// Bucket-level sub-resource; route before the
 		// implicit-CreateBucket / CopyObject / Put branches.
 		if q.Has("notification") {
 			h.PutBucketNotificationConfiguration(w, r)
 			return
 		}
-		// Bucket default encryption (PUT /{bucket}?encryption) — WS8.7.
+		// Bucket default encryption (PUT /{bucket}?encryption).
 		// Bucket-level sub-resource; route before the
 		// implicit-CreateBucket / CopyObject / Put branches.
 		if q.Has("encryption") {
@@ -783,12 +783,12 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported POST operation", r.URL.Path)
 	case http.MethodGet:
 		bucket, key := parseBucketKey(r.URL.Path)
-		// Object tagging (?tagging) — WS8.1.
+		// Object tagging (?tagging).
 		if q.Has("tagging") {
 			h.GetObjectTagging(w, r)
 			return
 		}
-		// Object Lock sub-resources (WS8.3). ?object-lock is
+		// Object Lock sub-resources. ?object-lock is
 		// bucket-level (guard key=="" so GET /{bucket}/{key}?object-lock
 		// falls through to the object GET); ?retention and ?legal-hold
 		// are object-level.
@@ -796,28 +796,28 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.GetObjectLockConfiguration(w, r, bucket)
 			return
 		}
-		// Bucket CORS config (GET /{bucket}?cors) — WS8.5. Guard on
+		// Bucket CORS config (GET /{bucket}?cors). Guard on
 		// key=="" so GET /{bucket}/{key}?cors falls through to the
 		// object GET rather than returning the bucket CORS document.
 		if key == "" && q.Has("cors") {
 			h.GetBucketCors(w, r, bucket)
 			return
 		}
-		// Bucket lifecycle config (GET /{bucket}?lifecycle) — WS8.2.
+		// Bucket lifecycle config (GET /{bucket}?lifecycle).
 		// Guard on key=="" so GET /{bucket}/{key}?lifecycle falls
 		// through to the object GET.
 		if key == "" && q.Has("lifecycle") {
 			h.GetBucketLifecycleConfiguration(w, r, bucket)
 			return
 		}
-		// Bucket event notifications (GET /{bucket}?notification) —
-		// WS8.6. Guard on key=="" so GET /{bucket}/{key}?notification
+		// Bucket event notifications (GET /{bucket}?notification).
+		// Guard on key=="" so GET /{bucket}/{key}?notification
 		// falls through to the object GET.
 		if key == "" && q.Has("notification") {
 			h.GetBucketNotificationConfiguration(w, r, bucket)
 			return
 		}
-		// Bucket default encryption (GET /{bucket}?encryption) — WS8.7.
+		// Bucket default encryption (GET /{bucket}?encryption).
 		// Guard on key=="" so GET /{bucket}/{key}?encryption falls
 		// through to the object GET.
 		if key == "" && q.Has("encryption") {
@@ -869,28 +869,28 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request) {
 			h.AbortMultipartUpload(w, r)
 			return
 		}
-		// Object tagging (?tagging) — WS8.1.
+		// Object tagging (?tagging).
 		if q.Has("tagging") {
 			h.DeleteObjectTagging(w, r)
 			return
 		}
-		// Bucket CORS config (DELETE /{bucket}?cors) — WS8.5.
+		// Bucket CORS config (DELETE /{bucket}?cors).
 		if q.Has("cors") {
 			h.DeleteBucketCors(w, r)
 			return
 		}
-		// Bucket lifecycle config (DELETE /{bucket}?lifecycle) — WS8.2.
+		// Bucket lifecycle config (DELETE /{bucket}?lifecycle).
 		if q.Has("lifecycle") {
 			h.DeleteBucketLifecycleConfiguration(w, r)
 			return
 		}
-		// Bucket default encryption (DELETE /{bucket}?encryption) — WS8.7.
+		// Bucket default encryption (DELETE /{bucket}?encryption).
 		if q.Has("encryption") {
 			h.DeleteBucketEncryption(w, r)
 			return
 		}
-		// Bucket event notifications (DELETE /{bucket}?notification) —
-		// WS8.6. S3 has no DeleteBucketNotification operation; a
+		// Bucket event notifications (DELETE /{bucket}?notification).
+		// S3 has no DeleteBucketNotification operation; a
 		// configuration is cleared by PUTting an empty
 		// <NotificationConfiguration/>. Intercept the bucket-level case
 		// (key=="") so it returns this explicit guidance instead of
@@ -986,7 +986,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Object Lock overwrite enforcement (WS8.3): when versioning is
+	// Object Lock overwrite enforcement: when versioning is
 	// NOT Enabled, a PUT replaces the current version in place, which
 	// would destroy a locked version. Refuse the overwrite up-front
 	// (before touching the backend) if the current version is locked.
@@ -1018,7 +1018,7 @@ func (h *Handler) Put(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Layer the bucket default-encryption configuration (WS8.7) over
+	// Layer the bucket default-encryption configuration over
 	// the placement policy: when the policy leaves the mode empty, a
 	// configured bucket default promotes the write to managed. Done
 	// before the EC / dedup branches so every write path sees the same
@@ -2647,7 +2647,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	// Versioning-enabled DELETE without an explicit ?versionId does
 	// not remove data: it inserts a delete marker as a new latest
-	// version (WS8.4), which hides older versions from
+	// version, which hides older versions from
 	// GET/HEAD/ListObjectsV2 while preserving them for
 	// ListObjectVersions and versionId-addressed reads. This mirrors
 	// AWS S3, where the marker is created even if the key has no
@@ -2723,7 +2723,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ManifestGetFailed", err.Error(), r.URL.Path)
 		return
 	}
-	// Object Lock enforcement (WS8.3): a version under an active
+	// Object Lock enforcement: a version under an active
 	// retention or a legal hold cannot be permanently deleted.
 	// GOVERNANCE retention can be bypassed with the bypass header;
 	// COMPLIANCE and legal holds cannot. This applies to permanent
@@ -2746,9 +2746,8 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	// ContentHash AND the gateway has a content_index store
 	// wired, decrement the per-(tenant, content_hash) refcount.
 	// The piece is removed from the backend only when the new
-	// count reaches zero. Manifests that predate Phase 3.5 (no
-	// ContentHash) take the original path and delete pieces
-	// directly.
+	// count reaches zero. Manifests without a ContentHash take
+	// the original path and delete pieces directly.
 	// piecesDeleted records whether bytes were actually removed from
 	// the backend. It gates the Wasabi early-delete warning below: a
 	// refcount decrement that leaves the piece in place (still
@@ -2937,7 +2936,7 @@ func (h *Handler) listBucket(w http.ResponseWriter, r *http.Request, bucket stri
 			continue
 		}
 		// A delete marker as the latest version hides the key from
-		// ListObjectsV2 (WS8.4); it remains visible via
+		// ListObjectsV2; it remains visible via
 		// ListObjectVersions. List returns latest-per-key, so a
 		// marker here means the object is logically deleted.
 		if m.DeleteMarker {
@@ -2995,7 +2994,7 @@ func (h *Handler) resolve(r *http.Request) (*metadata.ObjectManifest, providers.
 		}
 		return nil, nil, metadata.Piece{}, "", "", &httpError{code: http.StatusInternalServerError, s3code: "ManifestGetFailed", msg: err.Error()}
 	}
-	// Delete markers (WS8.4) carry no payload. AWS S3 returns 404
+	// Delete markers carry no payload. AWS S3 returns 404
 	// NoSuchKey when the *latest* version is a delete marker (an
 	// unversioned GET/HEAD), and 405 MethodNotAllowed when a delete
 	// marker is addressed directly by ?versionId. Both responses set
@@ -3099,7 +3098,7 @@ func (h *Handler) emit(tenantID, bucket string, dim billing.Dimension, delta uin
 
 // notify hands one object-mutation event to the notification emitter,
 // if any, for asynchronous fan-out to the bucket's configured webhook
-// destinations (WS8.6). Like audit it is best-effort and called only on
+// destinations. Like audit it is best-effort and called only on
 // the success path; Emit is non-blocking, so this never adds latency to
 // the request. eventName is the specific leaf S3 event name (e.g.
 // "s3:ObjectCreated:Put").
@@ -3169,9 +3168,8 @@ func NewVersionID(tenantID, bucket, key string, now time.Time) string {
 }
 
 // newPieceID mints a deterministic-looking but unique piece ID for a
-// new object. Phase 2's client SDK will later hand the gateway a
-// BLAKE3 hash of the ciphertext; this helper unblocks the gateway
-// until that lands.
+// new object when the client does not supply a BLAKE3 content hash of
+// the ciphertext.
 func newPieceID(tenantID, bucket, key string, now time.Time) string {
 	sum := sha256.Sum256([]byte(tenantID + "\x00" + bucket + "\x00" + key + "\x00" + strconv.FormatInt(now.UnixNano(), 10)))
 	return hex.EncodeToString(sum[:])
@@ -3465,8 +3463,8 @@ func writeResolveError(w http.ResponseWriter, r *http.Request, err error) {
 	writeError(w, http.StatusInternalServerError, "InternalError", err.Error(), r.URL.Path)
 }
 
-// s3ErrorResponse is the minimal S3 XML error shape. Phase 2+ widens
-// it with RequestId and HostId.
+// s3ErrorResponse is the minimal S3 XML error shape; RequestId and
+// HostId may be added to widen it.
 type s3ErrorResponse struct {
 	XMLName  xml.Name `xml:"Error"`
 	Code     string   `xml:"Code"`

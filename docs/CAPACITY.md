@@ -11,12 +11,11 @@
 
 This document collects in one place every numeric target the
 gateway commits to: performance, S3 protocol limits, per-cell sizing,
-availability, and the operational metrics that are still open. It
-extends the "Key Metrics to Track" appendix in
-[`docs/PROGRESS.md`](PROGRESS.md) by adding the per-region capacity
-envelope, the S3 protocol limits, and an explicit list of open
-operational targets (so a reviewer never has to guess whether a
-missing number is an oversight or an open question).
+availability, and the operational metrics that are still open. It is
+the canonical capacity reference — the per-region capacity envelope,
+the S3 protocol limits, and an explicit list of open operational
+targets (so a reviewer never has to guess whether a missing number
+is an oversight or an open question).
 
 If a number in this document does not match the corresponding
 constant in `tests/capacity/targets.go`, the document is stale —
@@ -35,10 +34,10 @@ non-negotiably from the S3 protocol surface.
 **Out of scope.** Theoretical durability nines. Per
 [`docs/PROPOSAL.md`](PROPOSAL.md) §11.4 ("Anti-patterns to avoid"):
 
-> **Publish theoretical "eleven nines" durability** — Cannot be validated in Phase 1. Only publish measured durability from chaos tests.
+> **Publish theoretical "eleven nines" durability** — Cannot be validated by analysis. Only publish measured durability from chaos tests.
 
 The only durability number that ships with an audit bundle is the
-measured durability the WS1.2 chaos suite produces under the specific
+measured durability the chaos suite produces under the specific
 gateway build under audit; that number is recorded in the chaos
 report, not in this dossier.
 
@@ -65,8 +64,8 @@ that violates any one of them fails the load-test gate.
 | Wasabi origin egress ratio (egress ÷ stored)        | ≤ 1.0 per tenant      | `capacity.WasabiOriginEgressRatioMax`                 | `cmd/benchmark-runner`, `tests/benchmark/suite.go`                |
 
 The Tier 3 staging verifier
-([`cmd/tier3-verify`](../cmd/tier3-verify/main.go), shipped with
-WS2.1) consumes the JSON output of `cmd/benchmark-runner` and
+([`cmd/tier3-verify`](../cmd/tier3-verify/main.go)) consumes the JSON
+output of `cmd/benchmark-runner` and
 asserts every one of these targets before declaring a deployment
 audit-ready. A staging run that produces no benchmark report at all
 fails the verifier with a non-zero exit code (see
@@ -107,7 +106,7 @@ RegionRPS ≈ PerGatewayNodeSustainedRPS × NumGatewayNodes
 
 This is the planning number that operators use when sizing a new
 cell. It is a lower bound: a gateway node that does not sustain
-10 000 req/s under the standard load profile fails the WS1.1
+10 000 req/s under the standard load profile fails the
 benchmark gate and is not eligible for production rollout.
 
 ---
@@ -176,7 +175,7 @@ request-success counters during a sustained-load run; the
 **Durability** is intentionally NOT listed as a target. Per
 [`docs/PROPOSAL.md`](PROPOSAL.md) §11.4, only chaos-measured
 durability is published, and only against the specific build under
-audit. The chaos suite ([`tests/chaos`](../tests/chaos), WS1.2)
+audit. The chaos suite ([`tests/chaos`](../tests/chaos))
 records observed durability under single-node loss, zone loss,
 metadata-DB failover, provider-side outage, and cache partition.
 That report ships in the audit bundle ([§9](#9-cross-reference--enforcement-map)) and is the only durability
@@ -186,16 +185,15 @@ number that should appear in any external communication.
 
 ## §8. Open operational targets
 
-These metrics are listed as TBD in the
-[`docs/PROGRESS.md`](PROGRESS.md) "Key Metrics" appendix. They are
-explicitly enumerated here so an auditor sees the gap as a known,
-tracked gap and does not mistake the absence for an oversight.
+These metrics are not yet machine-enforced. They are explicitly
+enumerated here so an auditor sees the gap as a known, tracked gap
+and does not mistake the absence for an oversight.
 
-| Metric                                       | Unit        | Owner    | Source-of-truth gate (once closed)                            |
-| -------------------------------------------- | ----------- | -------- | ------------------------------------------------------------- |
-| Repair time (single node loss)               | hours       | Phase 2  | To be added to `tests/chaos` measurement reports              |
-| Storage COGS / TB-month (local DC)           | USD         | Phase 3  | To be added to operator cost dossier (separate from this one) |
-| Migration throughput (Wasabi → local cell)   | bytes / sec | Phase 3  | To be added to `migration/` runbook + chaos report            |
+| Metric                                       | Unit        | Gated on          | Source-of-truth gate (once closed)                            |
+| -------------------------------------------- | ----------- | ----------------- | ------------------------------------------------------------- |
+| Repair time (single node loss)               | hours       | Hybrid / owned-DC | To be added to `tests/chaos` measurement reports              |
+| Storage COGS / TB-month (local DC)           | USD         | Owned-DC          | To be added to operator cost dossier (separate from this one) |
+| Migration throughput (Wasabi → local cell)   | bytes / sec | Hybrid            | To be added to `migration/` runbook + chaos report            |
 
 When a target lands here, the canonical constant moves into
 `tests/capacity/targets.go` and `tests/capacity/dossier_test.go`
@@ -214,16 +212,15 @@ the audit-bundle artifact:
 | Dossier section            | Enforcement gate                                       | Audit-bundle artifact                                                |
 | -------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------- |
 | §2 Performance             | `cmd/benchmark-runner` + `cmd/tier3-verify`            | `reports/load/{timestamp}.json` (raw) + `tier3-verify` exit summary  |
-| §3 S3 protocol             | `api/s3compat/multipart_handler.go`                    | `tests/s3_compat/` results, plus external conformance matrix (WS2.2) |
+| §3 S3 protocol             | `api/s3compat/multipart_handler.go`                    | `tests/s3_compat/` results, plus external conformance matrix         |
 | §4 Per-gateway-node        | `cmd/benchmark-runner` `SustainedRPS` gate             | Same as §2                                                           |
-| §5 Per-cell                | Operator runbook (cell-sizing dossier in WS2.4)        | `deploy/staging/evidence/{timestamp}/cell-sizing.md`                 |
+| §5 Per-cell                | Operator runbook (cell-sizing dossier)                 | `deploy/staging/evidence/{timestamp}/cell-sizing.md`                 |
 | §6 Per-tenant              | `internal/auth/rate_limit.go`, `internal/auth/abuse.go` | Tenant record dump + abuse-trip log                                  |
 | §7 Reliability             | `cmd/benchmark-runner` + `cmd/tier3-verify`            | Same as §2; chaos report for durability                              |
 | §8 Open                    | n/a (gap)                                              | Listed in audit-bundle "Known limitations" section                   |
 
-The audit bundle is assembled by `make audit-bundle` (WS1.3/1.4,
-PR #77). Each row of the table above corresponds to a directory in
-the bundle's MANIFEST.
+The audit bundle is assembled by `make audit-bundle`. Each row of
+the table above corresponds to a directory in the bundle's MANIFEST.
 
 ---
 
@@ -238,10 +235,7 @@ the bundle's MANIFEST.
 3. Update the row in §2-§8 above with the new value AND the
    commit-level rationale (link to the measurement report, the
    business decision, or the upstream protocol spec).
-4. If the change is in §2 (performance), update
-   [`docs/PROGRESS.md`](PROGRESS.md) "Key Metrics to Track"
-   appendix to match.
-5. If the change closes an open target from §8, also remove the
+4. If the change closes an open target from §8, also remove the
    entry from `OpenOperationalTargets()` in
    `tests/capacity/targets.go` AND update the §8 table.
 

@@ -190,7 +190,7 @@ func (h *Handler) CreateMultipartUpload(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Layer the bucket default-encryption configuration (WS8.7) over
+	// Layer the bucket default-encryption configuration over
 	// the placement policy before the session's encryption state is
 	// fixed, so EncMode and the per-session DEK decision below reflect
 	// the bucket default exactly as the single-piece PUT does.
@@ -449,7 +449,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "manifest store not configured", r.URL.Path)
 		return
 	}
-	// Object Lock (WS8.3) pre-flight: completing a multipart upload
+	// Object Lock pre-flight: completing a multipart upload
 	// publishes a new manifest for the key, so on an Object-Lock bucket
 	// that is not versioning-Enabled it would overwrite the current
 	// (possibly locked) version. Mirror the Put/Copy guard and refuse

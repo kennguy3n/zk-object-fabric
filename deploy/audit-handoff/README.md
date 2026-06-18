@@ -70,8 +70,9 @@ Read in this order. Each step has a target read time.
    §3 (data path), §6 (multi-tenant isolation), §11.4 (durability
    non-goals).
 
-2. **`docs/PROGRESS.md`** (~5min) — workstream status pin. Every
-   component in this hand-off cites a WS-N reference here.
+2. **`docs/ARCHITECTURE.md`** (~5min) — the component map. Every
+   component in this hand-off resolves to a package and call site
+   documented here.
 
 3. **`docs/CAPACITY.md`** (~10min) — the *only* place where the
    numeric envelope is committed to in prose. Every per-operation
@@ -193,7 +194,7 @@ up which prose section it belonged to:
 | `conformance_matrix`   | S3 protocol conformance matrix (in-process + external) | "Then: operational dossier" (s3-conformance sub-section)       |
 | `dr_runbooks`          | Disaster-recovery runbooks + verifier                  | "Then: operational dossier" (dr.md sub-section)                |
 | `staging_deploy`       | Linode + Wasabi staging deploy + Tier 3 verifier       | "Then: staging-run evidence (optional)"                        |
-| `progress_pin`         | WS-workstream progress / scope pin                     | "First: start here" (PROGRESS.md + PROPOSAL.md)                |
+| `overview_pin`         | System overview + scope pin                            | "First: start here" (PROPOSAL.md + ARCHITECTURE.md)            |
 
 The exact layout of this tarball is enumerated in
 `deploy/audit-handoff/manifest.yaml`, which is included at the

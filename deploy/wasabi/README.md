@@ -1,6 +1,6 @@
 # Wasabi Multi-Region Bucket Provisioning
 
-This directory ships the operator scripts that stand up the Phase 3
+This directory ships the operator scripts that stand up the
 production Wasabi origin: one bucket per region, naming convention
 `zkof-{region}-{env}`, with per-bucket IAM and presigned-URL CORS
 support.

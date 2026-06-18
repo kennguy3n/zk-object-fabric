@@ -340,10 +340,10 @@ func (m *Monitor) waitInflight(ctx context.Context) error {
 	}
 }
 
-// drainCache evicts every entry from the local cache. Phase 3
-// deliberately cold-starts the replacement node rather than
-// streaming the local cache to a peer — cross-gateway cache
-// warm-up is tracked as a Phase 4 follow-up.
+// drainCache evicts every entry from the local cache. The
+// replacement node deliberately cold-starts rather than
+// streaming the local cache to a peer; cross-gateway cache
+// warm-up is not performed.
 func (m *Monitor) drainCache(ctx context.Context) error {
 	stats := m.cfg.Cache.Stats()
 	// Peer list gives operators a way to report the drain but the

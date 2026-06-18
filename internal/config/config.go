@@ -1,6 +1,5 @@
 // Package config loads runtime configuration for the gateway and the
-// control-plane services. Phase 1 accepts only a minimal set of
-// knobs; the file format and schema will expand as Phase 2 lands.
+// control-plane services.
 package config
 
 import (
@@ -116,7 +115,7 @@ type Config struct {
 }
 
 // NotificationsConfig configures the bucket event-notification
-// dispatcher (WS8.6). When Enabled is false the gateway still stores
+// dispatcher. When Enabled is false the gateway still stores
 // and serves per-bucket notification configurations
 // (Put/GetBucketNotificationConfiguration) but never delivers events —
 // the s3compat handler is wired with a nil emitter. All tunables have
@@ -178,7 +177,7 @@ type MetricsConfig struct {
 
 // ComplianceConfig configures the data-residency enforcer and the
 // audit trail. When neither field is enabled the gateway behaves
-// as it did before Phase 4: no residency check, no audit rows.
+// when neither is enabled: no residency check, no audit rows.
 type ComplianceConfig struct {
 	// ResidencyEnabled gates the pre-flight residency check on
 	// the PUT path. Uses the per-tenant country allowlist
@@ -336,16 +335,16 @@ type AbuseConfig struct {
 // for "managed" and "public_distribution" tenant policies, plus
 // the optional manifest body encryption key.
 //
-// Phase 2 wires the wrapper to a 32-byte local key file
-// (CMKPath). Phase 3 replaces this with a KMS ARN or Vault
-// transit path; both are consumed through the same
+// With a local CMK the wrapper reads a 32-byte local key file
+// (CMKPath); a KMS ARN or Vault transit path selects the KMS or
+// Vault wrapper instead. All are consumed through the same
 // client_sdk.Wrapper interface.
 //
 // ManifestBodyKeyPath is the separate gateway-held key the
 // Postgres manifest store uses to seal manifest JSON at rest
 // (see metadata/manifest_store/postgres BodyEncryptor). A tenant
 // or operator with only Postgres access cannot read manifests
-// when this is set. Leave empty to keep the Phase 2 JSONB
+// when this is set. Leave empty to keep the plaintext JSONB
 // layout.
 type EncryptionConfig struct {
 	CMKPath             string `json:"cmk_path"`
@@ -933,8 +932,8 @@ type ControlPlaneConfig struct {
 //
 // BillingConfig.Provider is the optional outbound integration to
 // an external invoicing / payment system (Stripe, Chargebee, …).
-// Phase 3 only registers the "noop" provider; future plug-ins
-// drop in behind the billing.BillingProvider interface without
+// Only the "noop" provider is registered by default; additional
+// plug-ins drop in behind the billing.BillingProvider interface without
 // any other code in the codebase needing to learn about a
 // specific vendor.
 type BillingConfig struct {
@@ -1060,7 +1059,7 @@ type HealthPeer struct {
 	Endpoint string `json:"endpoint"`
 }
 
-// ProvidersConfig carries per-provider settings. Phase 2 surfaces
+// ProvidersConfig carries per-provider settings. It surfaces
 // the full B2C / B2B / BYOC provider matrix described in
 // docs/STORAGE_INFRA.md. Empty sub-configs mean "do not register
 // this provider".
@@ -1074,12 +1073,12 @@ type ProvidersConfig struct {
 	Storj        StorjConfig        `json:"storj"`
 }
 
-// WasabiConfig configures the Phase 1 primary storage backend.
+// WasabiConfig configures the Wasabi primary storage backend.
 //
 // The single-region fields (Endpoint, Region, Bucket, AccessKey,
-// SecretKey) are kept for backward compatibility with Phase 1 / 2
+// SecretKey) are kept for single-region
 // configs and register the provider under the bare name "wasabi".
-// Phase 3 production deploys set Regions instead, registering one
+// Multi-region production deploys set Regions instead, registering one
 // Wasabi provider per region under "wasabi-<region>" (or the
 // region's explicit `name`). The two paths are independent — both
 // can be set at once and they all register side-by-side.
@@ -1237,7 +1236,7 @@ func (r *RebalancerConfig) UnmarshalJSON(data []byte) error {
 }
 
 // LifecycleConfig gates the background object-lifecycle evaluator
-// (WS8.2). When enabled the gateway runs a periodic sweep that, for
+// evaluator. When enabled the gateway runs a periodic sweep that, for
 // every bucket with a stored lifecycle configuration, expires aged
 // objects (delete marker when versioning is enabled, permanent +
 // Object-Lock-guarded otherwise) and aborts stale incomplete

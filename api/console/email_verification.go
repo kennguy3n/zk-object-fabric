@@ -25,9 +25,8 @@ import (
 // to AWS_SES_SMTP_HOST / _PORT / _USER / _PASSWORD environment
 // variables so operators can rotate credentials without editing
 // config. VerifyBaseURL is the user-facing URL the verification link
-// points at; the sender appends ?token=<opaque> in a future
-// phase — for now the message carries a stubbed link so the end-to-
-// end path (CAPTCHA → signup → email dispatch) is testable.
+// points at; the sender appends ?tenant=<id>&token=<opaque> so the
+// recipient can satisfy the verify endpoint.
 type SESEmailConfig struct {
 	FromAddress   string
 	Region        string

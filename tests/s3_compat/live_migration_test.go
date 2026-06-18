@@ -20,7 +20,7 @@ import (
 // TestLiveMigration_WasabiToCephRGW drives the full S3 compliance
 // suite through a Wasabi → Ceph RGW dual-write topology while a
 // background rebalancer is concurrently advancing the migration
-// state machine. It is the integration gate for Phase 3's
+// state machine. It is the integration gate for the
 // "compliance during live migration" requirement: the suite must
 // stay green end-to-end while the rebalancer is actively copying
 // pieces from Wasabi to Ceph RGW so no in-flight migration step
@@ -168,7 +168,7 @@ func TestLiveMigration_WasabiToCephRGW(t *testing.T) {
 	}
 
 	// Sanity: the preloaded object must still be readable on the
-	// primary throughout the migration. (Phase 3's rebalancer
+	// primary throughout the migration. (The rebalancer
 	// only copies pieces; it never deletes from the source until
 	// the cut-over phase, which this test does not trigger.)
 	rc, err := primary.GetPiece(context.Background(), prePiece.PieceID, nil)

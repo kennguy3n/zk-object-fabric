@@ -1604,8 +1604,8 @@ func TestManagedEncryption_StreamingPut_ContentLengthOverflow(t *testing.T) {
 }
 
 // ---------------------------------------------------------------
-// WS8.7 conformance: the bucket default-encryption sub-resource
-// (?encryption) driven end-to-end through the AWS SDK, mirroring the
+// Bucket default-encryption conformance: the ?encryption sub-resource
+// driven end-to-end through the AWS SDK, mirroring the
 // versioning / lifecycle / CORS / tagging / notification conformance
 // pattern in tests/s3_conformance. The handler-level unit tests in
 // api/s3compat/encryption_handler_test.go pin XML/validation edge

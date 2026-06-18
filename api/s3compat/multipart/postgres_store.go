@@ -1,6 +1,6 @@
 // Package-internal Postgres-backed multipart store.
 //
-// The Phase 2 multipart store (NewMemoryStore) lives in process
+// The in-memory multipart store (NewMemoryStore) lives in process
 // memory: it is a single-node, no-durability primitive. The
 // production deployment shape needs a multipart record that
 // survives gateway restarts and lets a client complete an upload
@@ -849,13 +849,13 @@ func (s *PostgresStore) sweepExpired() error {
 // row deletion — the alternative would be an infinitely retrying
 // sweep on a single broken upload.
 func (s *PostgresStore) expireOne(tenantID, uploadID string) {
-	// Phase 1 — load the upload + parts under a short, read-only,
+	// Step 1 — load the upload + parts under a short, read-only,
 	// tenant-bound transaction and release it *before* the cleanup
 	// callback. The callback fans out to storage backends with a 30s
 	// timeout (network I/O); holding the load transaction open across it
 	// would pin a pool connection idle for the whole callback, and with
 	// up to 1000 victims swept sequentially a slow backend could starve
-	// the pool. The delete runs in its own transaction below (Phase 2),
+	// the pool. The delete runs in its own transaction below (step 2),
 	// matching how Complete/Abort split Get from deleteUpload.
 	upload, err := func() (*Upload, error) {
 		tx, err := rlsdb.BeginTenant(context.Background(), s.db, tenantID)
@@ -903,7 +903,7 @@ func (s *PostgresStore) expireOne(tenantID, uploadID string) {
 			s.cleanup(ctx, upload, parts)
 		}()
 	}
-	// Phase 2 — delete the row (parts cascade) under its own short
+	// Step 2 — delete the row (parts cascade) under its own short
 	// tenant-bound transaction, so the pool connection is only held for
 	// the DELETE, never across the cleanup callback above.
 	if err := s.deleteUpload(tenantID, uploadID); err != nil {

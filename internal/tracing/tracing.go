@@ -8,11 +8,10 @@
 // thin adapter that converts our SpanRecord into otlp protobufs;
 // the default NoopExporter is a non-allocating drop.
 //
-// Phase 4 wires this package into cmd/gateway via Middleware so
-// every S3 request is wrapped in a Span. Subsequent phases will
-// thread Span objects through the manifest store and provider
-// calls; for now span attributes are limited to the HTTP request
-// surface.
+// This package is wired into cmd/gateway via Middleware so
+// every S3 request is wrapped in a Span. Span attributes are
+// currently limited to the HTTP request surface; the manifest
+// store and provider calls are not threaded with Span objects.
 package tracing
 
 import (

@@ -25,8 +25,8 @@ export interface SignupInput {
    * Optional OAuth provider token (e.g. Google ID token). When
    * present the password field may be left blank and the backend
    * resolves the token against the configured OAuth provider. The
-   * Phase 3 scaffold accepts the field but does not wire an OAuth
-   * provider yet — see AuthHooks in api/console/auth_handler.go.
+   * backend accepts the field but does not wire an OAuth provider
+   * by default — see AuthHooks in api/console/auth_handler.go.
    */
   oauthToken?: string;
 }

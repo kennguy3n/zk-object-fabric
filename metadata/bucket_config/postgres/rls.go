@@ -7,7 +7,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 )
 
-// Row-Level Security (RLS) for the bucket_config tables — Workstream 3.4
+// Row-Level Security (RLS) for the bucket_config tables —
 // defence-in-depth. Every bucket sub-resource (versioning, object lock,
 // CORS, lifecycle, notification, encryption) is keyed on (tenant_id, bucket), so a query that
 // forgot its tenant predicate must not read or write another tenant's

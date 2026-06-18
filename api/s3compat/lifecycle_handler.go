@@ -1,4 +1,4 @@
-// WS8.2 — S3 bucket lifecycle configuration (`?lifecycle`).
+// S3 bucket lifecycle configuration (`?lifecycle`).
 //
 // Implements the bucket-level lifecycle sub-resource
 // (Put/Get/DeleteBucketLifecycleConfiguration), persisted through

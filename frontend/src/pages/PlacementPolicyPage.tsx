@@ -181,7 +181,7 @@ interface PolicySummary {
 //   { tenant, bucket, policy: { encryption, placement: {
 //       provider, region, country, storage_class, cache_location } } }
 //
-// Replication factor is not a Phase 1 knob, so the summary reports the
+// Replication factor is not an exposed knob, so the summary reports the
 // provider fan-out as a proxy. A raw-YAML paste falls back to the
 // legacy regex extractor so the summary degrades gracefully.
 export function summarizeYaml(yaml: string): PolicySummary {

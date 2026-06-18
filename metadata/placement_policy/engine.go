@@ -9,7 +9,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/providers"
 )
 
-// Engine is the Phase 2 concrete PlacementEngine. It maps a
+// Engine is the concrete PlacementEngine. It maps a
 // (tenant, bucket, key) request to one of the StorageProviders in the
 // Providers registry, honouring the tenant's Policy and falling back
 // to Default when no tenant-specific policy is registered.

@@ -88,7 +88,7 @@ func newCellPair(t *testing.T) (cross_cell.Cell, cross_cell.Cell) {
 //   - All SteadyObjects are recoverable byte-for-byte from the
 //     destination cell.
 //   - LostObjects equals InFlightObjects exactly (the RPO
-//     contract — Phase 2 cancels the replicator before seeding
+//     contract — Stage 2 cancels the replicator before seeding
 //     in-flight precisely so this is deterministic).
 //   - MeasuredRTO is non-negative and bounded by RTOTarget.
 //   - ReplicatorPiecesCopied >= SteadyObjects (the replicator
@@ -546,13 +546,13 @@ func TestVerifier_MultiPieceManifestHappyPath(t *testing.T) {
 	}
 }
 
-// TestVerifier_MeasureRPOCountsMissingInDest pins the Phase-4
+// TestVerifier_MeasureRPOCountsMissingInDest pins the Stage 4
 // defence-in-depth probe: MeasuredRPO is computed by actually
 // counting missing in-flight manifests in the destination cell,
 // not by assuming MeasuredRPO == InFlightObjects.
 //
 // The test stages two seededObjects — one present in the dest
-// manifests (a "leaked" object that the Phase-2 cancellation
+// manifests (a "leaked" object that the stage-2 cancellation
 // failed to prevent) and one absent (the expected lost object).
 // measureRPO must surface lost=1, leaked=1.
 func TestVerifier_MeasureRPOCountsMissingInDest(t *testing.T) {
@@ -602,7 +602,7 @@ func TestVerifier_MeasureRPOCountsMissingInDest(t *testing.T) {
 }
 
 // TestVerifier_LeakedInFlightFailsRun proves that if the
-// Phase-2 ordering invariant is ever broken (an in-flight
+// stage-2 ordering invariant is ever broken (an in-flight
 // manifest reaches the destination cell despite the replicator
 // being cancelled before the in-flight seed), the verifier
 // surfaces it as a run-level error rather than silently
@@ -627,10 +627,10 @@ func TestVerifier_LeakedInFlightFailsRun(t *testing.T) {
 
 	// Pre-stage the in-flight manifest in the destination cell
 	// at the exact key seedInFlight will use. The replicator
-	// would never have produced this on its own because Phase 2
+	// would never have produced this on its own because stage 2
 	// cancels it before the in-flight seed — but a regression
-	// that re-orders Phase 2 would land the manifest here. The
-	// Phase-4 probe must surface this as a run-level error.
+	// that re-orders stage 2 would land the manifest here. The
+	// stage-4 probe must surface this as a run-level error.
 	inFlightKey := "in-flight/obj-000002" // SteadyObjects=2, so first in-flight index is 2
 	inFlightHash := sha256Hex(inFlightKey)
 	if err := dst.Manifests.Put(context.Background(), manifest_store.ManifestKey{
@@ -650,10 +650,10 @@ func TestVerifier_LeakedInFlightFailsRun(t *testing.T) {
 
 	_, err := v.Run(context.Background())
 	if err == nil {
-		t.Fatalf("expected phase-2 invariant breach error, got nil")
+		t.Fatalf("expected stage-2 invariant breach error, got nil")
 	}
-	if !strings.Contains(err.Error(), "phase-2 invariant breach") {
-		t.Errorf("error %q does not mention phase-2 invariant; the Phase-4 probe may have regressed", err)
+	if !strings.Contains(err.Error(), "stage-2 invariant breach") {
+		t.Errorf("error %q does not mention stage-2 invariant; the stage-4 probe may have regressed", err)
 	}
 }
 
@@ -690,7 +690,7 @@ func TestVerifier_MeasureRPOSurfacesStoreError(t *testing.T) {
 
 // flakyManifestStore wraps a real ManifestStore but forces
 // Get to return a synthetic non-ErrNotFound error so the
-// Phase-4 probe's "is this ErrNotFound?" branch can be tested
+// Stage 4 probe's "is this ErrNotFound?" branch can be tested
 // without standing up a broken provider.
 type flakyManifestStore struct {
 	manifest_store.ManifestStore

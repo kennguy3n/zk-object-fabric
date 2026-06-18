@@ -55,7 +55,7 @@ func (s *recordingBillingSink) dimensions() []billing.Dimension {
 // TestBuildBucketConfigStore_MemoryFallback verifies that with no
 // metadata DB and no embedded DB the gateway falls back to a usable
 // in-memory bucket_config store rather than returning nil (which
-// would leave every WS8 sub-resource handler and the evaluator
+// would leave every bucket sub-resource handler and the evaluator
 // dormant).
 func TestBuildBucketConfigStore_MemoryFallback(t *testing.T) {
 	store := buildBucketConfigStore(config.Default(), nil, nil)

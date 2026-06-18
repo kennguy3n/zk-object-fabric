@@ -9,7 +9,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/tenant"
 )
 
-// PostgresTenantStore is the Phase 3 Postgres-backed TenantStore. It
+// PostgresTenantStore is the Postgres-backed TenantStore. It
 // implements the same surface as MemoryTenantStore plus the two
 // helper methods (AddBinding, LookupByTenantID) that the gateway's
 // main.go adapter wires into the console API.

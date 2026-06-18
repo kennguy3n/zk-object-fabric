@@ -1,9 +1,9 @@
-// Package placement_policy defines the Phase 1 placement policy DSL
+// Package placement_policy defines the placement policy DSL
 // described in docs/PROPOSAL.md §3.9.
 //
-// Phase 1 exposes only four knobs: provider, region, country, and
+// The DSL exposes four knobs: provider, region, country, and
 // storage_class, plus an optional cache_location hint. DC / rack /
-// node placement is deliberately not exposed until Phase 2+.
+// node placement is deliberately not exposed at this layer.
 package placement_policy
 
 import (
@@ -35,7 +35,7 @@ type EncryptionSpec struct {
 	KMS  string `json:"kms,omitempty" yaml:"kms,omitempty"`
 }
 
-// PlacementSpec captures the Phase 1 knobs.
+// PlacementSpec captures the placement knobs.
 type PlacementSpec struct {
 	// Provider is the set of allowed storage providers, e.g.
 	// ["wasabi", "local-cell-1"]. At least one must be set.

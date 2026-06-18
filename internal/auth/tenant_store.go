@@ -1,9 +1,9 @@
-// Package auth implements the Phase 2 multi-tenant authenticator and
+// Package auth implements the multi-tenant authenticator and
 // tenant directory for the S3-compatible gateway.
 //
-// Phase 2 uses an in-memory tenant directory (loaded from config or a
-// JSON file) plus an HMAC-based AWS Signature V4 authenticator. Phase 3
-// swaps the directory for a Postgres-backed store behind the same
+// The in-memory tenant directory (loaded from config or a
+// JSON file) plus an HMAC-based AWS Signature V4 authenticator is the
+// default; a Postgres-backed store implements the same
 // TenantStore interface.
 package auth
 
@@ -27,7 +27,7 @@ type TenantBinding struct {
 }
 
 // TenantStore is the read / write surface the authenticator and the
-// tenant console need. It is kept narrow so the Phase 3 Postgres
+// tenant console need. It is kept narrow so the Postgres
 // implementation drops in without touching the authenticator.
 type TenantStore interface {
 	// LookupByAccessKey returns the binding for accessKey, or
@@ -80,7 +80,7 @@ type TenantStore interface {
 	CountTenants() int
 }
 
-// MemoryTenantStore is the Phase 2 in-memory TenantStore.
+// MemoryTenantStore is the in-memory TenantStore.
 type MemoryTenantStore struct {
 	mu       sync.RWMutex
 	byAccess map[string]TenantBinding

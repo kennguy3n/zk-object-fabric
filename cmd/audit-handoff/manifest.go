@@ -6,7 +6,7 @@
 //
 // The manifest is intentionally a plain YAML file (not a Go
 // literal) so that it can be edited by anyone landing a new
-// workstream without having to recompile the bundler. The drift
+// component without having to recompile the bundler. The drift
 // tests in tests/audit/handoff_test.go assert three invariants:
 //
 //   1. Every component listed in the manifest has at least one
@@ -109,9 +109,9 @@ type Component struct {
 	// components with a clear log message identifying the
 	// originating PR.
 	//
-	// `progress_pin` is the only required component (it always
-	// exists on every branch); every WS-1.x and WS-2.x output
-	// is optional until merged.
+	// `overview_pin` and `audit_bundle` are required components
+	// (they always exist on every branch); the remaining
+	// deliverables are optional until their source files land.
 	Optional bool `yaml:"optional"`
 }
 
@@ -229,8 +229,8 @@ func (m *Manifest) validate(path string) error {
 		// content and still pass the drift test. Require at
 		// least one always-present component so the bundle
 		// always has something concrete in it (today this is
-		// `progress_pin`, which references docs/PROGRESS.md
-		// and docs/PROPOSAL.md — files that exist on every
+		// `overview_pin`, which references docs/PROPOSAL.md
+		// and docs/ARCHITECTURE.md — files that exist on every
 		// branch).
 		return fmt.Errorf("manifest %q: at least one component must be non-optional (so the bundle always has anchored content)", path)
 	}

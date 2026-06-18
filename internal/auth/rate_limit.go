@@ -63,7 +63,7 @@ type AlertSink interface {
 // three guardrails:
 //
 //  1. Token-bucket rate limiting per tenant keyed by
-//     tenant.Budgets.RequestsPerSec (the Phase 2 behaviour).
+//     tenant.Budgets.RequestsPerSec.
 //  2. Monthly egress-budget enforcement keyed by
 //     tenant.Budgets.EgressTBMonth: once a tenant has served their
 //     quota of bytes for the current calendar month the limiter
@@ -578,7 +578,7 @@ func minFloat(a, b float64) float64 {
 
 // TenantBudgetsLookup adapts a *MemoryTenantStore to the
 // RateLimitLookup signature. The burst is the same as rps when no
-// explicit burst is configured: the Phase 2 tenant record carries
+// explicit burst is configured: the tenant record carries
 // only a single RequestsPerSec knob.
 //
 // ok distinguishes "tenant could not be resolved" from "tenant

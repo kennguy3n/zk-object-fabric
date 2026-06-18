@@ -42,7 +42,7 @@ type Config struct {
 // UplinkProject is the subset of storj.io/uplink.Project we depend
 // on. Keeping it narrow lets tests inject a fake without pulling
 // in the real uplink dependency graph and keeps the adapter
-// honest about which uplink features actually ship in this phase.
+// honest about which uplink features it actually depends on.
 //
 // Operators wire the real uplink.Project in cmd/gateway/main.go via
 // NewWithUplink. The parameter types intentionally mirror the
@@ -59,7 +59,7 @@ type UplinkProject interface {
 	StatObject(ctx context.Context, bucket, key string) (StatResult, error)
 	// DeleteObject removes (bucket, key). Already-missing objects
 	// must return a storj-ish not-found error so the adapter can
-	// map it to providers.ErrNotFound (added in a future phase).
+	// map it to providers.ErrNotFound.
 	DeleteObject(ctx context.Context, bucket, key string) error
 	// ListObjects walks bucket/prefix and returns one page.
 	ListObjects(ctx context.Context, bucket, prefix, cursor string) (ListPage, error)
@@ -109,8 +109,7 @@ type Provider struct {
 // NewWithUplink wraps a caller-supplied UplinkProject. Tests use
 // this to exercise the adapter against an in-memory fake; operators
 // will use it to inject a pre-dialed *uplink.Project once the
-// storj.io/uplink dependency is added to the module graph (tracked
-// in the Phase 4 roadmap).
+// storj.io/uplink dependency is added to the module graph.
 //
 // A plain New(cfg) entry point is intentionally omitted: it would
 // have to either pull in storj.io/uplink (not yet in go.mod) or

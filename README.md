@@ -13,9 +13,9 @@ client-side by default, stores ciphertext across pluggable storage
 providers (Wasabi, Linode, AWS, local DC cells), and serves hot reads
 from a regional cache — all behind an S3-compatible API.
 
-The fabric is designed to start on public cloud and migrate to owned
-infrastructure without changing customer-facing APIs. The same SDK,
-bucket name, object key, and URL work across every phase.
+The fabric runs on public cloud, hybrid, and owned infrastructure
+without changing customer-facing APIs. The same SDK, bucket name,
+object key, and URL work across every deployment model.
 
 ## Quick Start (Docker)
 
@@ -81,8 +81,11 @@ provider credentials via environment variables. See
 ## Key Features
 
 - **S3 API as the stable contract** — the S3-compatible API surface is
-  frozen across phases. Backend storage, encryption, caching, and
-  erasure coding evolve underneath; the API never changes.
+  the fixed contract. Backend storage, encryption, caching, and
+  erasure coding evolve underneath; the API stays constant. See
+  [docs/S3_COMPATIBILITY.md](docs/S3_COMPATIBILITY.md) for the full
+  supported surface (ranges, conditional reads, tagging, metadata,
+  multipart, and server-side copy).
 - **Client-side encryption available (Strict ZK mode)** — when the SDK
   performs client-side encryption with a customer-held KEK, the service
   operator cannot read customer object bodies. Note that metadata
@@ -150,10 +153,10 @@ flowchart TD
     Enc["Client-side or Gateway-side Encryption<br/>(Linode data plane)"]
     Manifest["Encrypted Object Manifest"]
     Adapter["Storage Provider Adapter"]
-    Wasabi["Wasabi<br/>(Phase 1 primary)"]
+    Wasabi["Wasabi<br/>(cloud primary)"]
     B2["Backblaze B2<br/>(alternative)"]
     R2["Cloudflare R2<br/>(hot egress alternative)"]
-    Local["Local DC Cell<br/>(Phase 2+)"]
+    Local["Local DC Cell"]
     Cache["Hot Cache Layer<br/>(Linode NVMe / Akamai CDN)"]
     Repair["Repair &amp; Audit System"]
     Bw["Bandwidth Accounting"]
@@ -193,25 +196,15 @@ data flow, deployment modes), see
 Managed encrypted mode is not strict zero-knowledge — the gateway can
 access plaintext in memory during request handling.
 
-## Project Status
-
-- **Current phase**: Phase 3 — Beta Cell (IMPLEMENTATION COMPLETE —
-  production validation pending). Phase 3.5 — Intra-Tenant
-  Deduplication (IMPLEMENTATION COMPLETE — production validation
-  pending). Phase 4 — Production & Scale (~75% implementation
-  scaffold complete). See [Production Readiness](docs/PROGRESS.md#production-readiness)
-  for what is and isn't yet validated.
-- **Tracker**: [docs/PROGRESS.md](docs/PROGRESS.md).
-- **Technical design**: [docs/PROPOSAL.md](docs/PROPOSAL.md).
-
 ## Documentation
 
-- [docs/PROPOSAL.md](docs/PROPOSAL.md) — Technical design and architecture spec
-- [docs/PROGRESS.md](docs/PROGRESS.md) — Phase-gated development progress
-- [docs/PHASES.md](docs/PHASES.md) — Phase summary and status overview
+- [docs/PROPOSAL.md](docs/PROPOSAL.md) — Technical design and architecture
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — As-built architecture overview
+- [docs/S3_COMPATIBILITY.md](docs/S3_COMPATIBILITY.md) — S3 API surface supported by the gateway
 - [docs/INTEGRATION.md](docs/INTEGRATION.md) — Dedup integration guide for external apps
 - [docs/STORAGE_INFRA.md](docs/STORAGE_INFRA.md) — Deployment-model to storage mapping
+- [docs/CAPACITY.md](docs/CAPACITY.md) — Capacity envelope and protocol limits
+- [docs/security/](docs/security/) — Threat model and cryptography/security review packages
 - [docs/runbooks/](docs/runbooks/) — Operational runbooks (CMK rotation, tenant setup, beta onboarding, BYOC)
 
 ## License

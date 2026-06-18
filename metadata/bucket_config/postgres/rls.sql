@@ -1,4 +1,4 @@
--- Row-Level Security for the bucket_config tables (Workstream 3.4,
+-- Row-Level Security for the bucket_config tables (see
 -- docs/security/audit-package-security.md §8). This is the operator
 -- reference; the gateway's live tests apply the identical statements via
 -- postgres.RLSStatements(table, appRole), which delegates to

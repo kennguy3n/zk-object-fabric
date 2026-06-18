@@ -3,7 +3,7 @@
 This runbook covers rotation, version pinning, and emergency
 revocation of the gateway's Customer Master Key (CMK), which wraps
 every per-object Data Encryption Key (DEK) before the manifest
-store sees it. Phase 3 supports three CMK backends:
+store sees it. The gateway supports three CMK backends:
 
 | Scheme              | Wrapper              | Source                                                           |
 | ------------------- | -------------------- | ---------------------------------------------------------------- |
@@ -269,10 +269,10 @@ rotation log via `GET /api/admin/cmk/audit`.
 
 ---
 
-## 7. Open follow-ups for Phase 4
+## 7. Open follow-ups
 
 - Per-tenant CMK so a tenant's key compromise never leaks
-  another tenant's data. Tracked in `docs/PROPOSAL.md` Phase 4.
+  another tenant's data.
 - Automated re-keying job that walks the manifest store and
   rewrites wrapped DEKs onto the latest key version on a schedule,
   so old key versions can be retired without waiting for organic

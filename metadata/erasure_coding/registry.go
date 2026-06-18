@@ -19,7 +19,7 @@ func NewRegistry() *Registry {
 	return &Registry{encoders: map[string]*Encoder{}}
 }
 
-// DefaultRegistry returns a Registry pre-populated with the Phase 2+
+// DefaultRegistry returns a Registry pre-populated with the
 // StandardProfiles. Operators can still Register additional custom
 // profiles on top of it.
 func DefaultRegistry() *Registry {

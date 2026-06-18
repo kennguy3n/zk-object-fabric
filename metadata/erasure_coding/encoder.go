@@ -1,5 +1,5 @@
 // Encoder is the clean-room erasure-coding primitive used by the
-// Phase 3 local-DC write path.
+// local-DC write path.
 //
 // The profile types in profile.go describe the (k + m, StripeSize)
 // shape of a Reed-Solomon code; this file provides the actual

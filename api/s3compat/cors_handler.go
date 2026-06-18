@@ -1,4 +1,4 @@
-// WS8.5 — S3 bucket CORS (`?cors`) plus cross-origin response headers.
+// S3 bucket CORS (`?cors`) plus cross-origin response headers.
 //
 // Implements the bucket-level CORS configuration sub-resource
 // (Put/Get/DeleteBucketCors), persisted through metadata/bucket_config,

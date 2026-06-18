@@ -1,4 +1,4 @@
-// Package s3_compat_test is Workstream 7: the end-to-end S3 compliance
+// Package s3_compat_test is the end-to-end S3 compliance
 // test suite. It runs the full PUT/GET/HEAD/DELETE/LIST/range operation
 // set against the gateway's HTTP handler, wired to different
 // StorageProvider backends, using the AWS SDK v2 as the client so the
@@ -138,7 +138,7 @@ func Run(t *testing.T, setup Setup) {
 	t.Run("ObjectTagging", func(t *testing.T) { testObjectTagging(t, setup) })
 }
 
-// testObjectTagging exercises the WS8.1 ?tagging sub-resource:
+// testObjectTagging exercises the ?tagging sub-resource:
 // Put/Get/Delete round-trip, tag-set replacement, the empty tag set on
 // an untagged object, tagging on a missing key (404), and the 10-tag
 // limit.
@@ -947,9 +947,9 @@ func TestSuite_LocalFSDev(t *testing.T) {
 }
 
 // TestSuite_CephRGW runs the full S3 compliance suite against a live
-// Ceph RADOS Gateway deployment. It is the Phase 3 gate required
-// before production traffic can be cut over to a local-DC Ceph cell
-// (see docs/PROGRESS.md Phase 3 checklist).
+// Ceph RADOS Gateway deployment. It is the gate required before
+// production traffic can be cut over to a local-DC Ceph cell
+// (see docs/runbooks/beta-onboarding.md).
 //
 // The test is gated behind environment variables so CI does not need
 // a Ceph cluster to run the unit test battery:

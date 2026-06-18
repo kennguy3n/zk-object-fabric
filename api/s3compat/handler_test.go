@@ -952,7 +952,7 @@ func TestCopyObject_MissingSource(t *testing.T) {
 	}
 }
 
-// TestCopyObject_DeleteMarkerSource guards the WS8.4 fix where a copy
+// TestCopyObject_DeleteMarkerSource guards the fix where a copy
 // source resolving to a delete marker must mirror GET/HEAD semantics
 // (404 when resolved as latest, 405 when addressed by explicit
 // versionId) rather than surfacing the marker's empty Pieces list as

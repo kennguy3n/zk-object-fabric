@@ -1,10 +1,10 @@
 # Local DC Cell — Ceph RGW
 
-Phase 3 stand-up for the first local data-center cell. This is the
+Stand-up for a local data-center cell. This is the
 B2B / sovereign deployment model: 6–12 storage nodes running Ceph
 with the RADOS Gateway (RGW) for S3-compatible access, fronted by
-the same gateway fleet as Phase 2 but routing placement to a local
-`ceph_rgw` provider rather than Wasabi.
+the same gateway fleet as the cloud deployment but routing placement
+to a local `ceph_rgw` provider rather than Wasabi.
 
 ## Architecture
 
@@ -56,12 +56,13 @@ exercised in production.
 
 ## Quick start (Reef demo, single node)
 
-For the Phase 3 development / compliance loop the snapshot already
+For the development / compliance loop the snapshot already
 ships the `quay.io/ceph/demo:latest-reef` image. The
-[`ceph_rgw` knowledge note](../../docs/PROGRESS.md) describes how
-to start a single-node demo cluster on `:8888` for the
-`TestSuite_CephRGW` compliance run; the production cluster below
-uses cephadm against real hardware.
+[local Ceph RGW demo run](../../docs/runbooks/load-testing.md)
+(`docker compose up ceph-rgw` from `deploy/demo/`) starts a
+single-node demo cluster on `:8888` for the `TestSuite_CephRGW`
+compliance run; the production cluster below uses cephadm against
+real hardware.
 
 ## Quick start (production cluster)
 
@@ -129,7 +130,7 @@ existing tenant moving onto the cell — see
 - 25 Gbps per OSD node cluster network (replication / EC encode).
 - 10 Gbps minimum for mon / mgr / RGW.
 - 25–100 Gbps aggregate uplink to the gateway fleet (matches
-  Phase 3 target).
+  the production target).
 
 ## Monitoring
 
@@ -137,8 +138,7 @@ The shipped Prometheus config scrapes:
 
 - Ceph mgr's built-in Prometheus exporter.
 - RGW metrics (Prometheus exporter sidecar).
-- Gateway `/internal/ready` and the fabric's metric endpoint
-  (Phase 4).
+- Gateway `/internal/ready` and the fabric's metric endpoint.
 
 Grafana dashboard ships with three rows: cluster health (mons,
 PGs, recovery throughput), client traffic (RGW ops/s, p99
@@ -230,7 +230,7 @@ counters per tenant:
 | `dedup_hits`                   | `api/s3compat/dedup.go` (gateway PUT path)    |
 | `dedup_bytes_saved`            | `api/s3compat/dedup.go` (gateway PUT path)    |
 | `dedup_ref_count`              | `api/s3compat/handler.go` Delete path         |
-| `ceph_dedup_chunk_pool_bytes`  | `ceph-mgr` Prometheus exporter (Phase 4)      |
+| `ceph_dedup_chunk_pool_bytes`  | `ceph-mgr` Prometheus exporter                |
 
 Operators reconcile gateway-reported `dedup_bytes_saved` against
 the Ceph-reported chunk pool size to surface configuration drift

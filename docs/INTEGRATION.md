@@ -441,8 +441,8 @@ This matrix enumerates every (upload method × encryption mode)
 combination the gateway recognises and whether the dedup pipeline
 fires for it. It is the canonical answer to "will my upload dedup?"
 and is referenced from
-[STORAGE_INFRA.md](STORAGE_INFRA.md), [PROPOSAL.md](PROPOSAL.md)
-§3.14, and [PROGRESS.md](PROGRESS.md) Phase 3.5.
+[STORAGE_INFRA.md](STORAGE_INFRA.md) and [PROPOSAL.md](PROPOSAL.md)
+§3.14.
 
 | Upload Method | Encryption Mode | Dedup? | Reason |
 |---|---|---|---|
@@ -458,7 +458,7 @@ and is referenced from
 | Multipart (N parts, N>1) | `managed` / `public_distribution` | Yes (Pattern B) | Deferred convergent consolidation (see below) |
 | `CopyObject` | Source has `ContentHash` | Yes | Refcount++ on existing piece, no data movement |
 | `CopyObject` | Source has no `ContentHash` | No | Fresh piece via server-side copy or GET+PUT |
-| `CopyObject` | Source is EC or multipart | Rejected (501) | Multi-piece sources cannot be safely refcounted |
+| `CopyObject` | Source is EC or multipart | No | Source is reconstructed into a fresh single-piece destination; multi-piece sources cannot be refcounted |
 | `DeleteObject` | Manifest has `ContentHash` | Refcount-- | Piece removed only when refcount reaches 0 |
 | `DeleteObject` | No `ContentHash` | Direct delete | Legacy path, pieces deleted immediately |
 
@@ -515,8 +515,8 @@ followed by a multipart upload (or vice versa) does not currently
 dedup across methods — only within the same method. Single-PUT
 after multipart still dedups when the consolidated ciphertext's
 `content_hash` matches a previously written single-PUT, but that
-is a coincidental match and not the primary path. A future Phase
-4+ task may add an eager backfill that recomputes
+is a coincidental match and not the primary path. A future
+enhancement may add an eager backfill that recomputes
 `BLAKE3(plaintext)` for legacy single-PUT rows so cross-method
 dedup falls out automatically.
 
@@ -601,11 +601,14 @@ none of the schema complexity.
    support, the gateway streams the source through itself and
    writes a fresh piece on the destination.
 
-EC and multipart sources are rejected with HTTP 501
-(`NotImplemented`): a multi-piece source has no single canonical
-`piece_id` to refcount, and the `CopyPiece` server-side path is
-not defined for sharded objects. Clients receive the same 501 for
-both source types so the failure surface is uniform.
+EC and multipart sources take a fourth path: a multi-piece source
+has no single canonical `piece_id` to refcount and no provider-side
+`CopyPiece` across its shards, so the gateway reconstructs the
+object's logical bytes and re-stores them as a fresh single-piece
+destination (`copyReconstructedSource`). The conditional, tagging,
+and metadata-directive validations run against these sources too;
+the destination is a normal single-piece object that can itself be
+copied via the fast paths above.
 
 ### Versioning and dedup
 
@@ -711,8 +714,6 @@ is deleted.
   (intra-tenant scope, ContentIndex, convergent encryption).
 - [STORAGE_INFRA.md](STORAGE_INFRA.md) — Deduplication section
   (per-backend support matrix, Ceph RGW block-level dedup).
-- [PROGRESS.md](PROGRESS.md) — Phase 3.5 (Deduplication rollout
-  status).
 - [PROPOSAL.md](PROPOSAL.md) §3.8 — Encryption model
   (`client_side` / `managed` / `public_distribution`).
 - `metadata/manifest.go` — `EncryptionConfig` and `Piece` types.

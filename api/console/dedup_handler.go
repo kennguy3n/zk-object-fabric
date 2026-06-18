@@ -208,7 +208,7 @@ func (h *Handler) deleteDedupPolicy(w http.ResponseWriter, r *http.Request, tena
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// bucketResolvesToCephRGW is the Phase 3.5 guardrail for the
+// bucketResolvesToCephRGW is the guardrail for the
 // "object+block" dedup level: only Ceph RGW deployments on
 // dedicated cells expose RADOS-tier chunk dedup, so accepting the
 // level on a placement that resolves anywhere else (Wasabi, B2,
@@ -261,10 +261,9 @@ func (h *Handler) bucketResolvesToCephRGW(ctx context.Context, tenantID, bucket 
 }
 
 // listDedupPoliciesIfImplemented is a hook the SPA can call once
-// per session to bulk-load every bucket's dedup policy. It is not
-// in the Phase 3.5 task list but is a natural extension; left as a
-// TODO for the next phase.
+// per session to bulk-load every bucket's dedup policy. It is a
+// natural extension, left as a TODO.
 //
-// TODO(phase4): GET /api/v1/tenants/{tid}/dedup-policies returns
+// TODO: GET /api/v1/tenants/{tid}/dedup-policies returns
 // every (bucket, policy) tuple for the tenant.
 var _ = errors.New

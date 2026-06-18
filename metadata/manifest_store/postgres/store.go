@@ -1,6 +1,6 @@
-// Package postgres is the Postgres-backed ManifestStore. It fulfils
-// the Phase 2 control-plane gate "encrypted manifest storage in the
-// AWS control plane" (docs/PROGRESS.md).
+// Package postgres is the Postgres-backed ManifestStore. It provides
+// encrypted manifest storage in the control plane
+// (see docs/ARCHITECTURE.md).
 //
 // The implementation uses database/sql with JSONB for the opaque
 // manifest body and a composite primary key on
@@ -48,7 +48,7 @@ type Config struct {
 	// BodyEncryptor, when non-nil, seals the manifest JSON before
 	// INSERT and opens it after SELECT. The column in the schema
 	// must be BYTEA in that case (JSONB rejects opaque bytes).
-	// Leaving this nil preserves the Phase 2 JSONB layout.
+	// Leaving this nil preserves the plaintext JSONB layout.
 	BodyEncryptor BodyEncryptor
 }
 

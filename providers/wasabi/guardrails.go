@@ -1,6 +1,6 @@
 // Package wasabi — guardrails.
 //
-// This file defines the fair-use guardrail types the Phase 2 data
+// This file defines the fair-use guardrail types the data
 // plane uses to keep Wasabi usage inside its advertised envelope.
 // The guardrails are declarative: the types describe the constraints
 // and thresholds; the enforcement loop lives in the control plane and
@@ -11,8 +11,8 @@
 //	per-tenant monthly Wasabi origin egress <= per-tenant active
 //	storage volume on Wasabi.
 //
-// See docs/PROPOSAL.md §2.2, §3.11, and docs/PROGRESS.md line 55 for
-// the product-level context.
+// See docs/PROPOSAL.md and docs/runbooks/wasabi-cost.md for the
+// product-level context.
 package wasabi
 
 import (
@@ -108,8 +108,8 @@ type CacheHitRatioTarget struct {
 	TenantID string `json:"tenant_id"`
 
 	// Min is the minimum acceptable hit ratio in the range [0, 1].
-	// Phase 3 default is 0.9 (see docs/PROGRESS.md "Key Metrics to
-	// Track").
+	// The default is 0.9 (the hot-tier cache hit-ratio target; see
+	// docs/runbooks/load-testing.md).
 	Min float64 `json:"min"`
 
 	// WindowDuration is the rolling window over which the ratio is
@@ -150,7 +150,7 @@ type Guardrails struct {
 	MinStorage time.Duration       `json:"min_storage_duration"`
 }
 
-// DefaultGuardrails returns Phase 2 default guardrails for tenantID.
+// DefaultGuardrails returns the default guardrails for tenantID.
 // Operators may override any field.
 func DefaultGuardrails(tenantID string) Guardrails {
 	return Guardrails{

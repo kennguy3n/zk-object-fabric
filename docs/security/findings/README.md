@@ -60,8 +60,8 @@ Status is one of `open | acknowledged | fixed | wontfix | duplicate`.
    PDF, preserving the original under `_originals/`).
 3. Split the report into per-finding files using the format above.
 4. For each `fixed` finding, link to the commit / PR that closed it.
-5. Update [`../../PROGRESS.md`](../../PROGRESS.md) WS1.3 / WS1.4
-   sections with the engagement summary.
+5. Link the new engagement directory from [`../README.md`](../README.md)
+   so it is discoverable.
 
 ## Public disclosure
 

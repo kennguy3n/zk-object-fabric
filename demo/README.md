@@ -16,8 +16,8 @@ still loaded from `demo/tenants.json` on each boot, and in-flight
 multipart uploads remain in-memory. To run the control plane on
 Postgres instead, set `control_plane.metadata_dsn` in
 `demo/config.json`, which overrides the embedded store.
-It is the same S3 API surface Phase 1 (Wasabi), Phase 2 (Ceph RGW),
-and Phase 3 (owned DC) serve — downstream apps can point at it now
+It is the same S3 API surface the Cloud (Wasabi), Hybrid (Ceph RGW),
+and Owned-DC deployment models serve — downstream apps can point at it now
 and keep the same bucket name, object key, and URL when the
 backend is swapped out under the gateway.
 

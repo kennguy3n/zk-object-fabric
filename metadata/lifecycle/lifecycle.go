@@ -1,5 +1,5 @@
 // Package lifecycle defines the provider-neutral domain types for S3
-// bucket lifecycle configuration (WS8.2): the per-bucket set of
+// bucket lifecycle configuration: the per-bucket set of
 // lifecycle rules and the matching/age logic the daily evaluator uses
 // to decide which objects to expire, which incomplete multipart
 // uploads to abort, and (in a future slice) which objects to
@@ -96,7 +96,7 @@ type Expiration struct {
 // Transition is a single storage-class transition action. Exactly one
 // of Days or Date is set, and StorageClass names an archival tier.
 //
-// NOTE (WS8.2 scope): transition rules are validated, persisted, and
+// NOTE: transition rules are validated, persisted, and
 // served at full S3 fidelity, but the daily evaluator does not yet
 // execute them — moving object data between tiers reuses the
 // migration tiering engine (docs/PROPOSAL.md §4) and lands in a

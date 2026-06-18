@@ -21,7 +21,7 @@ const DefaultPromotionWindow = 24 * time.Hour
 const promotionPruneThreshold = 1024
 
 // PromotionFetcher resolves a PromotionSignal to the ciphertext
-// bytes it should copy into the cache. Phase 2 wires this to the
+// bytes it should copy into the cache. It is wired to the
 // gateway's StorageProvider registry so PromotionWorker can pull
 // directly from the Wasabi origin or any other backend.
 type PromotionFetcher interface {

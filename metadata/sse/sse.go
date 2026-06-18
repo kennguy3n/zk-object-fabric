@@ -1,5 +1,5 @@
 // Package sse defines the provider-neutral domain types for S3 bucket
-// default server-side encryption (SSE) configuration (WS8.7): the
+// default server-side encryption (SSE) configuration: the
 // per-bucket default that PutBucketEncryption sets and
 // GetBucketEncryption returns.
 //

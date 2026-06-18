@@ -7,7 +7,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/rlsdb"
 )
 
-// Row-Level Security (RLS) for the content_index table — Workstream 3.4
+// Row-Level Security (RLS) for the content_index table —
 // defence-in-depth. content_index's (tenant_id, content_hash) primary key
 // is the load-bearing isolation boundary for intra-tenant dedup, so a
 // query that forgot its tenant predicate must not be able to read or

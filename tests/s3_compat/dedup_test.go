@@ -1,4 +1,4 @@
-// End-to-end S3-compliance tests for Phase 3.5 intra-tenant
+// End-to-end S3-compliance tests for intra-tenant
 // deduplication. The tests cover:
 //
 //   - Pattern B: managed encryption + dedup on. Two PUTs with

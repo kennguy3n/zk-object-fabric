@@ -30,7 +30,7 @@ type TierConfig struct {
 }
 
 // DefaultTierConfigs returns the canonical mapping defined in the
-// Phase 4 Tier 3 product brief. The returned slice is in
+// Tier 3 product brief. The returned slice is in
 // product-ordered presentation order; consumers that need a map
 // can build one with TierConfigMap.
 func DefaultTierConfigs() []TierConfig {

@@ -2,10 +2,12 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 3 — Beta Cell (COMPLETE). Phase 3.5 — Intra-Tenant
-> Deduplication (COMPLETE). Phase 4 — Production & Scale (IN PROGRESS).
-> This document defines the target architecture. See
-> [PROGRESS.md](PROGRESS.md) for the live build tracker.
+> This document defines the architecture of ZK Object Fabric: the
+> S3-compatible API contract, the encryption envelope and manifest
+> format, the placement DSL, the deduplication design, the migration
+> engine, and the cell architecture. The same gateway runs across
+> three deployment models — **cloud**, **hybrid**, and **owned-DC** —
+> without changing any customer-facing API.
 
 ---
 
@@ -19,8 +21,8 @@
 - **Why**: The market leaves a gap.
   - **Wasabi** is proprietary and centralized, has no zero-knowledge
     mode, and uses an opaque fair-use egress policy. It is the
-    cheapest S3-compatible storage available and the right Phase 1
-    primary backend, but it is not a finished product for ZK-sensitive
+    cheapest S3-compatible storage available and the primary cloud
+    backend, but it is not a finished product for ZK-sensitive
     customers.
   - **Storj** is open and ZK-friendly, but its 80/29 erasure coding is
     tuned for untrusted peers and is too expensive to run on controlled
@@ -32,10 +34,10 @@
     migration*.
 - **How**: S3-compatible API, client-side encryption (per-object DEKs,
   encrypted manifests, optional CMK), provider-neutral object
-  manifests, pluggable storage backends (with **Wasabi as the Phase 1
-  primary**), a hot cache layer, explicit per-tenant bandwidth
+  manifests, pluggable storage backends (with **Wasabi as the primary
+  cloud backend**), a hot cache layer, explicit per-tenant bandwidth
   accounting, and a built-in migration engine.
-- **Phase 1 stack**: **AWS control plane + Linode data plane + Wasabi
+- **Cloud stack**: **AWS control plane + Linode data plane + Wasabi
   storage backend.** Customer data flows only through Linode; it
   never transits AWS.
 - **For whom**:
@@ -46,12 +48,14 @@
     and SLAs.
 - **License**: Proprietary. AGPL-licensed bases are ruled out for
   production. Permissive / weak-copyleft bases (Ceph RGW LGPL-2.1,
-  SeaweedFS Apache-2.0) are acceptable for Phase 2+ local DC storage.
-- **Deployment trajectory**: Phase 1 runs on public cloud (AWS
-  control plane + Linode data plane + Wasabi storage) so the product
-  and the migration layer can be proven without owned infrastructure.
-  Phase 2 introduces hybrid local-DC cells. Phase 3 moves the primary
-  origin onto owned cells with cloud retained for DR and overflow.
+  SeaweedFS Apache-2.0) are acceptable for hybrid / local-DC storage.
+- **Deployment models**: the fabric runs in three interchangeable
+  models behind one S3 API. **Cloud** runs entirely on public cloud
+  (AWS control plane + Linode data plane + Wasabi storage).
+  **Hybrid** adds local-DC cells alongside the cloud origin.
+  **Owned-DC** places the primary origin on owned cells with cloud
+  retained for DR and overflow. The migration engine moves tenants
+  between models with no customer-facing API change.
 
 ### 1.1 Tech stack
 
@@ -65,9 +69,9 @@
   onboarding, billing portal, and operator UIs.
 - **Rust, selectively.** Used only where it makes a large, measurable
   difference: chunking and encryption hot paths, cache eviction loops,
-  erasure-coding workers (Phase 2+), and any node-local agent where
-  memory footprint and per-byte CPU cost matter. Rust is **not** the
-  default server-side language.
+  erasure-coding workers (hybrid / local-DC), and any node-local
+  agent where memory footprint and per-byte CPU cost matter. Rust is
+  **not** the default server-side language.
 
 ---
 
@@ -85,27 +89,27 @@ determine where ciphertext physically lives.
 
 | Backend                       | Egress model                                  | Architectural role                                                         |
 | ----------------------------- | --------------------------------------------- | -------------------------------------------------------------------------- |
-| Wasabi                        | Free, fair-use ≤ 1× stored                    | Phase 1 primary durable origin                                             |
+| Wasabi                        | Free, fair-use ≤ 1× stored                    | Primary cloud durable origin                                               |
 | Linode Object Storage         | Monthly transfer allowance per node           | Data plane compute, hot cache                                              |
 | AWS S3 Standard               | Per-GB egress                                 | Control-plane storage only; never used for the customer data path         |
 | Cloudflare R2                 | No per-GB egress, request fees                | Optional hot-egress backend                                                |
 | Backblaze B2                  | Free egress up to 3× stored                   | Alternative durable backend                                                |
 | Storj                         | Per-tier egress allowance                     | BYOC / ZK reference; not used as a production base                         |
 
-### 2.2 Phase 1 economics with AWS + Linode + Wasabi
+### 2.2 Cloud economics with AWS + Linode + Wasabi
 
 Why this stack works:
 
 - Wasabi is the cheapest S3-compatible durable storage with included
-  egress and is the right place to put long-term ciphertext in
-  Phase 1.
+  egress and is the right place to put long-term ciphertext in the
+  cloud deployment model.
 - Linode provides data-plane compute with predictable bandwidth.
   Each Linode instance includes a monthly transfer allowance that
   absorbs hot-read egress from the cache.
 - AWS control-plane costs are minimal because no customer data
   crosses AWS — only metadata, auth tokens, billing counters, and
   monitoring traffic.
-- Phase 1 COGS per TB combines Wasabi storage, amortised Linode
+- Cloud COGS per TB combines Wasabi storage, amortised Linode
   compute and bandwidth, and a small amortised AWS control-plane
   share.
 
@@ -124,11 +128,12 @@ separately.
 
 ## 3. Architecture
 
-### 3.1 Phase 1 Architecture: AWS + Linode + Wasabi
+### 3.1 Cloud Architecture: AWS + Linode + Wasabi
 
-Phase 1 deliberately separates concerns across three providers so that
-data never transits AWS, Linode is the only path for customer bytes,
-and Wasabi is used purely as a durable-origin S3 endpoint.
+The cloud deployment deliberately separates concerns across three
+providers so that data never transits AWS, Linode is the only path for
+customer bytes, and Wasabi is used purely as a durable-origin S3
+endpoint.
 
 #### AWS (Control Plane)
 
@@ -216,19 +221,20 @@ The S3-compatible API is the **architectural invariant** of ZK Object
 Fabric. It is the outermost layer of the system and the only surface
 customers interact with. Everything below it — encryption, manifests,
 cache, storage provider adapters, backends — can evolve, be replaced,
-or be migrated between phases, but the S3 API must not change.
+or be migrated between deployment models, but the S3 API must not
+change.
 
-#### 3.2.1 Principle: S3 API is the phase-invariant contract
+#### 3.2.1 Principle: S3 API is the deployment-invariant contract
 
 - The ZK Gateway exposes an S3-compatible API endpoint. This is the
   **only** interface customers interact with.
-- The S3 API surface is **frozen across phases**. A client application
-  that works against Phase 1 (Wasabi) MUST work identically against
-  Phase 2+ (Ceph RGW) and Phase 3 (owned DC) without any code changes,
-  SDK updates, endpoint changes, or credential rotation (beyond normal
-  key rotation).
+- The S3 API surface is **constant across deployment models**. A
+  client application that works against the cloud model (Wasabi) works
+  identically against the hybrid model (Ceph RGW) and the owned-DC
+  model without any code changes, SDK updates, endpoint changes, or
+  credential rotation (beyond normal key rotation).
 - The same bucket name, object key, URL path, and API semantics work
-  in every phase. Backend migrations are invisible to the S3 API
+  in every model. Backend migrations are invisible to the S3 API
   consumer.
 - This is enforced by the `StorageProvider` adapter abstraction
   (§3.5) and the provider-neutral manifests (§3.3). The S3 API layer
@@ -236,9 +242,8 @@ or be migrated between phases, but the S3 API must not change.
   operations are dispatched to whichever backend currently holds the
   data.
 
-We refer to this property as the S3 API being **phase-invariant** —
-a constant across the variable of phase, backend, or deployment
-model.
+We refer to this property as the S3 API being **deployment-invariant**
+— a constant across the variable of backend or deployment model.
 
 #### 3.2.2 Supported S3 operations (compatibility subset)
 
@@ -248,46 +253,40 @@ subset is deliberately tight: it covers the target use cases
 distribution) and nothing else. It is better to support fewer
 operations perfectly than many operations partially.
 
-| Category     | Operation                                | Phase 1   | Phase 2+ | Phase 3 | Notes                                                                   |
-| ------------ | ---------------------------------------- | --------- | -------- | ------- | ----------------------------------------------------------------------- |
-| Object CRUD  | `PutObject`                              | Yes       | Yes      | Yes     | Gateway encrypts/chunks, writes to active backend                       |
-| Object CRUD  | `GetObject`                              | Yes       | Yes      | Yes     | Gateway reads from cache or origin, decrypts if managed mode            |
-| Object CRUD  | `HeadObject`                             | Yes       | Yes      | Yes     | Metadata from manifest; no origin read                                  |
-| Object CRUD  | `DeleteObject`                           | Yes       | Yes      | Yes     | Manifest tombstone + async backend delete                               |
-| Object CRUD  | `CopyObject`                             | Yes       | Yes      | Yes     | Server-side copy within same tenant                                     |
-| Listing      | `ListObjectsV2`                          | Yes       | Yes      | Yes     | Served from metadata store, not backend                                 |
-| Listing      | `ListBuckets`                            | Yes       | Yes      | Yes     | From tenant metadata                                                    |
-| Multipart    | `CreateMultipartUpload`                  | Yes       | Yes      | Yes     | Gateway manages parts; assembles manifest on complete                   |
-| Multipart    | `UploadPart`                             | Yes       | Yes      | Yes     | Each part encrypted/chunked independently                               |
-| Multipart    | `CompleteMultipartUpload`                | Yes       | Yes      | Yes     | Assembles final manifest from part manifests                            |
-| Multipart    | `AbortMultipartUpload`                   | Yes       | Yes      | Yes     | Cleans up part manifests and backend pieces                             |
-| Range reads  | `GetObject` with `Range` header          | Yes       | Yes      | Yes     | Range-aligned encrypted chunks enable partial reads                     |
-| Presigned    | Presigned GET/PUT URLs                   | Yes       | Yes      | Yes     | Gateway generates presigned URLs; URL format is phase-independent       |
-| Bucket ops   | `CreateBucket`                           | Yes       | Yes      | Yes     | Creates namespace in metadata + backend bucket/prefix                   |
-| Bucket ops   | `DeleteBucket`                           | Yes       | Yes      | Yes     | Requires empty bucket                                                   |
-| Bucket ops   | `HeadBucket`                             | Yes       | Yes      | Yes     |                                                                         |
-| Conditional  | `If-None-Match`, `If-Modified-Since`     | Yes       | Yes      | Yes     | Evaluated against manifest metadata                                     |
-| Versioning   | `GetObject?versionId=`                   | Phase 1+  | Yes      | Yes     | Object versioning via manifest versions                                 |
-| Tagging      | `Put/Get/DeleteObjectTagging`            | Yes       | Yes      | Yes     | Tags stored as JSONB on the manifest row; 10 tags/object (see §15.1)    |
-| Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Shipped | WS8.2 | WS8.2   | Per-bucket rules + daily evaluator wired into the gateway (audit + billing); extends migration tiering (see §15.1) |
-| Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Shipped | WS8.3 | WS8.3 | Governance/compliance retention + legal hold enforced in DELETE/PUT-overwrite; requires versioning (see §15.1) |
-| Versioning   | `Put/GetBucketVersioning`                | Shipped   | WS8.4    | WS8.4   | Bucket-level Enabled/Suspended config + delete markers (see §15.1)      |
-| CORS         | `Put/Get/DeleteBucketCors`               | Shipped   | WS8.5    | WS8.5   | Per-bucket rules + OPTIONS preflight + response headers (see §15.1)      |
-| Notifications| `Put/GetBucketNotificationConfiguration` | Shipped   | WS8.6    | WS8.6   | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events via async dispatcher (see §15.1) |
-| SSE config   | `Put/Get/DeleteBucketEncryption`         | Planned   | WS8.7    | WS8.7   | Maps `x-amz-server-side-encryption` to ZK encryption modes (see §15.1)  |
+All operations below behave identically across the cloud, hybrid, and
+owned-DC deployment models.
 
-The rows marked **Shipped / WS8.x** have landed: tagging (WS8.1),
-lifecycle (WS8.2), Object Lock / WORM (WS8.3), bucket versioning
-(WS8.4), CORS (WS8.5), and event notifications (WS8.6) are wired into
-the gateway and covered by `tests/s3_compat/`, and the lifecycle
-evaluator runs as a daily background sweep emitting audit + billing
-events. The one row still marked
-**Planned / WS8.x** — the server-side
-encryption config sub-resource (WS8.7) — is a roadmap commitment
-tracked in §15.1; the gateway currently rejects its `?encryption`
-sub-resource query key with `501 NotImplemented` (see
-`api/s3compat/handler.go` `unsupportedSubresources`). Each WS8 slice
-removes its key from that map as the handler lands.
+| Category     | Operation                                | Notes                                                                   |
+| ------------ | ---------------------------------------- | ----------------------------------------------------------------------- |
+| Object CRUD  | `PutObject`                              | Gateway encrypts/chunks, writes to active backend; honors `x-amz-tagging`, `Content-Type`, and `x-amz-meta-*` |
+| Object CRUD  | `GetObject`                              | Reads from cache or origin, decrypts if managed mode; `response-*` overrides honored |
+| Object CRUD  | `HeadObject`                             | Metadata from manifest; no origin read; emits `Last-Modified` + persisted headers |
+| Object CRUD  | `DeleteObject`                           | Manifest tombstone + async backend delete                               |
+| Object CRUD  | `CopyObject`                             | Server-side copy within same tenant, including erasure-coded and multipart sources; honors `x-amz-copy-source-if-*`, `x-amz-metadata-directive`, `x-amz-tagging-directive` |
+| Listing      | `ListObjectsV2`                          | Served from metadata store, not backend                                 |
+| Listing      | `ListBuckets`                            | From tenant metadata                                                    |
+| Multipart    | `CreateMultipartUpload`                  | Gateway manages parts; captures tagging + metadata for the final object |
+| Multipart    | `UploadPart`                             | Each part encrypted/chunked independently                               |
+| Multipart    | `CompleteMultipartUpload`                | Assembles final manifest from part manifests; applies tagging + metadata |
+| Multipart    | `AbortMultipartUpload`                   | Cleans up part manifests and backend pieces                             |
+| Range reads  | `GetObject`/`HeadObject` with `Range`    | Single, suffix (`bytes=-N`), and open-ended ranges; multiple ranges returned as `206 multipart/byteranges` |
+| Conditional  | `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since`/`If-Range` | Strong ETag comparison; evaluated against manifest metadata |
+| Presigned    | Presigned GET/PUT URLs                   | Gateway generates presigned URLs; URL format is deployment-independent  |
+| Bucket ops   | `CreateBucket`                           | Creates namespace in metadata + backend bucket/prefix                   |
+| Bucket ops   | `DeleteBucket`                           | Requires empty bucket                                                   |
+| Bucket ops   | `HeadBucket`                             |                                                                         |
+| Versioning   | `GetObject?versionId=`, `Put/GetBucketVersioning` | Object versioning via manifest versions; bucket Enabled/Suspended config + delete markers |
+| Tagging      | `Put/Get/DeleteObjectTagging`            | Tags stored as JSONB on the manifest row; 10 tags/object                |
+| Lifecycle    | `Put/Get/DeleteBucketLifecycleConfiguration` | Per-bucket rules + daily evaluator wired into the gateway (audit + billing); extends migration tiering |
+| Object Lock  | `Put/GetObjectLockConfiguration`, `Put/GetObjectRetention`, `Put/GetObjectLegalHold` | Governance/compliance retention + legal hold enforced in DELETE/PUT-overwrite; requires versioning |
+| CORS         | `Put/Get/DeleteBucketCors`               | Per-bucket rules + OPTIONS preflight + response headers                 |
+| Notifications| `Put/GetBucketNotificationConfiguration` | Webhook destinations; `ObjectCreated`/`ObjectRemoved` events via async dispatcher |
+| SSE config   | `Put/Get/DeleteBucketEncryption`         | Bucket default SSE (`AES256`/`aws:kms`) mapped to gateway-managed encryption, layered onto object writes |
+
+Every row above is wired into the gateway and covered by
+`tests/s3_compat/`. The full request/response surface — including the
+exact set of supported headers, query overrides, and error codes — is
+enumerated in [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md).
 
 **Operations explicitly NOT supported** (to avoid scope creep):
 
@@ -300,16 +299,12 @@ removes its key from that map as the handler lands.
 - Cross-region replication (replaced by the ZK migration engine — see §4)
 - S3 Transfer Acceleration (replaced by the ZK cache layer — see §3.7)
 
-> **Previously deferred, now delivered under Workstream 8.** Object
-> Lock / WORM, object/bucket tagging, bucket lifecycle configuration,
-> bucket-level versioning config, CORS, event notifications, and the
-> server-side encryption config sub-resource were formerly listed here
-> as out of scope. They were taken up as **Workstream 8** (§15.1):
-> tagging, lifecycle, Object Lock / WORM, versioning, CORS, and event
-> notifications are now *Shipped* rows in the table above, while the
-> SSE config sub-resource remains *Planned*. The S3 compatibility matrix
-> in [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) tracks current vs
-> planned coverage against the AWS S3 surface.
+> Object Lock / WORM, object/bucket tagging, bucket lifecycle
+> configuration, bucket-level versioning config, CORS, event
+> notifications, and the server-side encryption config sub-resource are
+> all supported (see the table above and
+> [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) for the complete matrix
+> against the AWS S3 surface).
 
 #### 3.2.3 S3 API behavior across backend transitions
 
@@ -349,7 +344,7 @@ that:
   differences.
 - Uses the AWS SDK (Go and JS) as the test client to ensure
   real-world SDK compatibility.
-- Runs in CI on every commit and before every phase transition.
+- Runs in CI on every commit and before every backend transition.
 
 The compliance test suite is the enforcement mechanism. Without it,
 "S3 compatible" is a marketing claim; with it, it is an engineering
@@ -362,7 +357,7 @@ flowchart TD
     subgraph Stable["Stable Contract (never changes)"]
         S3["S3-Compatible API<br/>(PUT, GET, HEAD, DELETE, LIST,<br/>Multipart, Range, Presigned)"]
     end
-    subgraph Internal["Internal (changes per phase)"]
+    subgraph Internal["Internal (swappable)"]
         GW["ZK Gateway"]
         ENC["Encryption Layer"]
         MAN["Manifest Store"]
@@ -370,9 +365,9 @@ flowchart TD
         ADAPT["StorageProvider Adapter"]
     end
     subgraph Backends["Backends (swappable)"]
-        W["Wasabi (Phase 1)"]
-        CEPH["Ceph RGW (Phase 2+)"]
-        OWN["Owned DC (Phase 3)"]
+        W["Wasabi (cloud)"]
+        CEPH["Ceph RGW (hybrid)"]
+        OWN["Owned DC"]
     end
 
     S3 --> GW
@@ -385,9 +380,9 @@ flowchart TD
     ADAPT --> OWN
 ```
 
-The S3 API sits at the top. Everything below it is internal and may
-change per phase. Everything above it is the customer's application,
-which does not change across phases.
+The S3 API sits at the top. Everything below it is internal and
+swappable. Everything above it is the customer's application, which
+does not change across deployment models.
 
 ### 3.3 Critical design decision: customer object ≠ provider object
 
@@ -403,7 +398,7 @@ object key, URL, or API. The manifest records which provider currently
 holds each piece, and the migration engine rewrites those locators
 without touching the customer's namespace.
 
-This indirection is what makes the S3 API phase-invariant. The
+This indirection is what makes the S3 API deployment-invariant. The
 customer interacts with the S3 API using bucket names and object
 keys; the manifest maps those to backend-specific locators that
 change during migration without affecting the S3 surface.
@@ -468,14 +463,14 @@ type StorageProvider interface {
 }
 ```
 
-Planned implementations:
+Adapter implementations:
 
-- `wasabi` — **Phase 1 primary backend.**
+- `wasabi` — **primary cloud backend.**
 - `aws_s3` — DR / backup only. **Not used in the data plane.**
 - `backblaze_b2` — alternative storage backend.
 - `cloudflare_r2` — alternative hot egress layer.
 - `local_fs_dev` — developer loopback for tests.
-- `ceph_rgw` / `seaweedfs` — Phase 2+ local DC storage.
+- `ceph_rgw` / `seaweedfs` — hybrid / owned-DC local storage.
 
 Adapters report cost models and placement labels back to the policy
 engine so placement decisions can factor in per-provider $/GB, egress
@@ -499,7 +494,7 @@ Responsibilities:
 
 Technology choices:
 
-- **Metadata store**: Postgres / RDS for Phase 1. Migrate to
+- **Metadata store**: Postgres / RDS in the cloud model. Migrate to
   CockroachDB or FoundationDB if per-row transaction throughput on a
   single primary becomes the bottleneck.
 - **Billing / analytics**: ClickHouse for high-cardinality event
@@ -526,7 +521,7 @@ policy:
     carbon_profile: ["low"]
     sovereignty_tag: "eu-only"
   erasure_coding:
-    profile: "10+4"              # Phase 2+ only
+    profile: "10+4"              # hybrid / owned-DC only
     stripe_mb: 4
   egress:
     monthly_budget_tb: 50
@@ -539,17 +534,17 @@ object IDs, sizes, hashes, and accounting counters.
 
 ### 3.7 Data plane — three layers
 
-| Layer | Function                                | Storage format                                | Phase 1 implementation                                            |
+| Layer | Function                                | Storage format                                | Cloud implementation                                              |
 | ----- | --------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------- |
 | L0    | Serve hot reads close to users          | Full encrypted object or range chunks         | Linode NVMe / memory cache                                        |
 | L1    | Reduce repeated origin reads            | Full encrypted object, 1–2 replicas           | Linode block storage, or a second Wasabi region used as a mirror  |
-| L2    | Long-term durability                    | Provider-native (Wasabi) in Phase 1; EC shards in Phase 2+ | Wasabi S3                                              |
+| L2    | Long-term durability                    | Provider-native (Wasabi) in cloud; EC shards in hybrid / owned-DC | Wasabi S3                                          |
 
-In Phase 1, Wasabi provides L2 durability natively — Wasabi handles
-its own replication. Erasure coding is **not** needed until Phase 2+
-when using local DC storage. The Linode cache layer (L0 / L1) is the
-mechanism that keeps Wasabi egress within fair-use and that serves
-hot reads with low latency.
+In the cloud model, Wasabi provides L2 durability natively — Wasabi
+handles its own replication. Erasure coding is **not** needed until
+local DC storage is in play (hybrid / owned-DC). The Linode cache
+layer (L0 / L1) is the mechanism that keeps Wasabi egress within
+fair-use and that serves hot reads with low latency.
 
 **Why EC alone does not solve read bandwidth**: erasure coding lowers
 *storage* overhead (for example 1.33× for 6+2 or 1.4× for 10+4) but
@@ -606,7 +601,7 @@ gateway encrypts/decrypts transparently — the S3 API carries
 plaintext. In both cases, the S3 API semantics (status codes,
 headers, ETags) are identical.
 
-### 3.9 Erasure coding model (Phase 2+ only)
+### 3.9 Erasure coding model (hybrid / owned-DC only)
 
 | Environment                              | Recommended EC   | Raw overhead  | Use case                                             |
 | ---------------------------------------- | ---------------- | ------------- | ---------------------------------------------------- |
@@ -616,12 +611,12 @@ headers, ETags) are identical.
 | Large durable local                      | 10+4             | 1.4×          | PB-scale storage                                     |
 | Archive                                  | 12+4 or 16+4     | 1.33×–1.25×   | Cold data with slower repair                         |
 
-During Phase 1, Wasabi handles durability natively and EC is not
+In the cloud model, Wasabi handles durability natively and EC is not
 needed. Do not overbuild EC.
 
 ### 3.10 Placement control
 
-- **Phase 1**: expose `provider`, `region`, `country`, `storage_class`.
+- **Cloud**: expose `provider`, `region`, `country`, `storage_class`.
   Example:
 
   ```yaml
@@ -633,15 +628,15 @@ needed. Do not overbuild EC.
     cache_location: linode-sg
   ```
 
-- **Phase 2+**: expose DC / rack / node / disk via a CRUSH-like
-  topology (see §6).
+- **Hybrid / owned-DC**: expose DC / rack / node / disk via a
+  CRUSH-like topology (see §6).
 
-Do **not** expose node-level placement in Phase 1. Provider and region
-are the only meaningful knobs while Wasabi owns durability.
+Node-level placement is **not** exposed in the cloud model. Provider
+and region are the only meaningful knobs while Wasabi owns durability.
 
 ### 3.11 Read path & promotion
 
-#### Phase 1 read path
+#### Cloud read path
 
 ```
 GET object
@@ -653,7 +648,7 @@ GET object
   → if read frequency crosses threshold: promote to Linode cache
 ```
 
-#### Phase 2+ read path
+#### Hybrid / owned-DC read path
 
 ```
 GET object
@@ -674,15 +669,15 @@ GET object
 - `p95 latency miss > SLO`
 - Tenant is on the Hot tier (default-aggressive promotion)
 
-**Critical for Phase 1**: promotion to Linode cache keeps Wasabi
-egress within fair-use. If a hot object is read repeatedly, it **must**
-be cached on Linode to avoid excessive Wasabi origin reads.
+**Critical in the cloud model**: promotion to Linode cache keeps
+Wasabi egress within fair-use. If a hot object is read repeatedly, it
+**must** be cached on Linode to avoid excessive Wasabi origin reads.
 
 ### 3.12 Bandwidth strategy
 
-- **Phase 1**: Linode provides the bandwidth. Wasabi fair-use egress
+- **Cloud**: Linode provides the bandwidth. Wasabi fair-use egress
   is the constraint. A cache-first design on Linode absorbs hot reads.
-- **Phase 3**: flat / high-commit bandwidth providers (Leaseweb,
+- **Owned-DC**: flat / high-commit bandwidth providers (Leaseweb,
   FDCServers, OVH) for local DC cells.
 
 Rules:
@@ -885,10 +880,11 @@ When the source has no `ContentHash` (or the `content_index` row
 has been GC'd out from under us), the copy falls back to the
 provider's server-side copy via `CopyPiece`, and from there to a
 GET+PUT through the gateway when the provider has no native copy
-path. EC and multipart sources are rejected with HTTP 501
-(`NotImplemented`): a multi-piece source has no single canonical
-`piece_id` to refcount, so neither the fast path nor the
-provider's `CopyPiece` is safe.
+path. EC and multipart sources have no single canonical `piece_id`
+to refcount and no provider-side `CopyPiece` across their shards,
+so the gateway reconstructs their logical bytes and re-stores them
+as a fresh single-piece destination — the copy succeeds and the
+destination is a normal single-piece object.
 
 #### 3.14.4 Block-level dedup (Ceph RGW only)
 
@@ -1054,7 +1050,7 @@ consumer. The same `aws s3 cp`, `boto3`, or `@aws-sdk/client-s3`
 command works before, during, and after a migration. No endpoint
 change, no credential rotation, no SDK update, no bucket rename.
 
-### 4.2 Phase 1 → Phase 2 migration
+### 4.2 Cloud → hybrid migration
 
 Move objects from **Wasabi → local DC cell** using three mechanisms:
 
@@ -1134,12 +1130,12 @@ are handled by the background rebalancer.
 - SDK handles client-side encryption; plaintext keys never cross to
   the service.
 - Automated onboarding: signup → bucket → API key in minutes.
-- Standard tier defaults (ZK Beta or ZK Hot in Phase 1; ZK Standard or
-  ZK Hot in Phase 2+).
+- Standard tier defaults (ZK Beta or ZK Hot in the cloud model; ZK
+  Standard or ZK Hot in hybrid / owned-DC).
 
 ### 5.3 B2B model
 
-- Dedicated cells (physical or logical) in Phase 2+.
+- Dedicated cells (physical or logical) in hybrid / owned-DC.
 - Custom SLAs (durability, availability, latency).
 - Sovereign placement (specific countries / DCs / racks).
 - Committed bandwidth contracts.
@@ -1151,7 +1147,7 @@ are handled by the background rebalancer.
   directly.
 - ZK Object Fabric ships the gateway, SDK, migration engine, and
   control-plane tooling as SaaS.
-- Useful for early enterprise adoption before local DC cells are in
+- Useful for enterprise adoption where local DC cells are not in
   place.
 
 ### 5.5 Tenant metadata schema (conceptual)
@@ -1180,7 +1176,7 @@ tenant:
 
 ---
 
-## 6. Cell Architecture (Phase 2+)
+## 6. Cell Architecture (hybrid / owned-DC)
 
 ### 6.1 Why not one giant cluster
 
@@ -1287,7 +1283,7 @@ Linode data plane, not AWS.
 
 ## 8. Public Cloud Provider Selection
 
-Phase 1 recommended stack:
+Cloud recommended stack:
 
 | Component               | Choice                                     | Reason                                                               |
 | ----------------------- | ------------------------------------------ | -------------------------------------------------------------------- |
@@ -1299,9 +1295,9 @@ Phase 1 recommended stack:
 | DR copy                 | AWS S3 Standard-IA or a 2nd Wasabi region  | Not hot serving; cold DR only                                        |
 | Encryption              | Client-side SDK or Linode-hosted gateway   | Required for real ZK                                                 |
 
-Phase 2+ adds local DC cells (Ceph RGW or SeaweedFS on owned
-high-density HDD storage) and migrates tenants off Wasabi on a
-per-bucket basis.
+The hybrid and owned-DC models add local DC cells (Ceph RGW or
+SeaweedFS on owned high-density HDD storage) and migrate tenants off
+Wasabi on a per-bucket basis.
 
 ---
 
@@ -1312,13 +1308,13 @@ dynamically linking proprietary service code with AGPL code would
 force the combined work under AGPL terms. Reference / study use is
 fine; production build on AGPL is not.
 
-### 9.1 Phase 1 base
+### 9.1 Cloud base
 
 - **Custom Go gateway + provider adapters.** Wasabi, B2, R2, S3, and a
   `local_fs_dev` adapter for tests. No Ceph or Storj fork.
 - Rust is reserved for chunking / encryption / EC workers.
 
-### 9.2 Phase 2+ base (local DC storage)
+### 9.2 Hybrid / owned-DC base (local DC storage)
 
 | Base       | License     | Maturity       | EC support              | Fit as a local-DC base            | Notes                                                                     |
 | ---------- | ----------- | -------------- | ----------------------- | --------------------------------- | ------------------------------------------------------------------------- |
@@ -1336,10 +1332,11 @@ fine; production build on AGPL is not.
 
 ### 9.3 Recommended build paths
 
-- **Option A — Fastest**: SeaweedFS (Apache-2.0) in Phase 2+ with the
-  ZK Gateway, placement, repair, billing, and cache layers on top.
-- **Option B — Most production-grade**: Ceph RGW (LGPL-2.1) in
-  Phase 2+ with the ZK Gateway, placement abstraction, cache layer,
+- **Option A — Fastest**: SeaweedFS (Apache-2.0) for local DC storage
+  with the ZK Gateway, placement, repair, billing, and cache layers
+  on top.
+- **Option B — Most production-grade**: Ceph RGW (LGPL-2.1) for local
+  DC storage with the ZK Gateway, placement abstraction, cache layer,
   and policy API on top.
 - **Option C — Research / fork**: Storj — **RULED OUT** as a
   production base. Retained as a reference implementation for ZK-style
@@ -1358,19 +1355,19 @@ fine; production build on AGPL is not.
 | Enable cross-tenant deduplication                                  | Permanently incompatible with ZK. Intra-tenant dedup only, via convergent encryption (§3.14). Cross-tenant dedup is never offered. |
 | Use AGPL bases (Storj, MinIO, Garage) as production bases          | Conflicts with the proprietary license. Permitted only as reference / study material.          |
 | Build Storj-style 80/29 EC in controlled DCs                       | Tuned for untrusted peers. Wastes capacity when nodes are controlled (use 8+3 or 10+4).        |
-| Expose node-level placement in Phase 1                             | Meaningless while Wasabi owns durability. Wait until Phase 2+ for DC / rack / node knobs.      |
-| Build a full decentralized reputation / token / satellite system   | Out of scope. Adds complexity without improving the Phase 1 / 2 value proposition.             |
-| Publish theoretical "eleven nines" durability                      | Cannot be validated in Phase 1. Only publish measured durability from chaos tests.             |
-| Block on a custom distributed filesystem                           | Wasabi is the Phase 1 durable origin; Ceph RGW or SeaweedFS is the Phase 2+ base.              |
+| Expose node-level placement in the cloud model                     | Meaningless while Wasabi owns durability. Use DC / rack / node knobs only in hybrid / owned-DC. |
+| Build a full decentralized reputation / token / satellite system   | Out of scope. Adds complexity without improving the cloud / hybrid value proposition.          |
+| Publish theoretical "eleven nines" durability                      | Cannot be validated on cloud backends. Only publish measured durability from chaos tests.      |
+| Block on a custom distributed filesystem                           | Wasabi is the cloud durable origin; Ceph RGW or SeaweedFS is the local-DC base.                |
 
 ---
 
 ## 11. Cost Architecture
 
-### 11.1 Phase 1 COGS per usable TB
+### 11.1 Cloud COGS per usable TB
 
 ```
-cost_per_TB_month_phase1 =
+cost_per_TB_month_cloud =
     wasabi_storage_per_TB_month
   + linode_compute_amortized_per_TB_served_per_month
   + linode_bandwidth_amortized_per_TB_served_per_month
@@ -1386,10 +1383,10 @@ Notes:
   served from the included transfer allowance.
 - AWS control-plane cost is roughly fixed per tenant, not per TB.
 
-### 11.2 Phase 3 COGS per usable TB
+### 11.2 Owned-DC COGS per usable TB
 
 ```
-cost_per_TB_month_phase3 =
+cost_per_TB_month_owned_dc =
     raw_disk_cost_per_TB_month × erasure_overhead
   + server_amortization_per_TB_month
   + rack_per_TB_month
@@ -1433,7 +1430,7 @@ cost_per_TB_month_phase3 =
 This is the product's strongest zone. Win on:
 
 - Erasure coding on controlled nodes (8+3 / 10+4, not 80/29) in
-  Phase 2+.
+  hybrid / owned-DC.
 - Dedicated cells or pooled-with-pinning.
 - Regional cache layers.
 - Committed bandwidth.
@@ -1457,7 +1454,7 @@ Becomes an **infrastructure company problem**. Needs:
 
 1. Zero-knowledge by default.
 2. Customer-controlled placement.
-3. Lower storage price for capped-egress workloads in Phase 3.
+3. Lower storage price for capped-egress workloads in the owned-DC model.
 4. Better frequent-read economics via the Linode cache.
 5. Dedicated cells for PB+ / sovereign customers.
 6. Transparent egress pricing (no fair-use surprises at the product
@@ -1479,8 +1476,8 @@ Becomes an **infrastructure company problem**. Needs:
 | Frequent uncached reads hammering Wasabi origin             | Promote to L1 / L0 once thresholds cross; decline promotion on Archive tier                                 |
 | ZK metadata leakage (names, sizes, access patterns)         | Encrypt manifests; minimize object names in logs; pad sizes where practical                                 |
 | Deduplication vs ZK conflict                                | Cross-tenant dedup permanently excluded. Intra-tenant dedup via convergent encryption for managed/public_distribution (Pattern B) and client_side_convergent (Pattern C). Stored files under convergent encryption lose forward secrecy — explicit trade-off. See §3.14 and [INTEGRATION.md](INTEGRATION.md). |
-| AGPL exposure from the chosen base                          | Use SeaweedFS or Ceph RGW only in Phase 2+; AGPL bases remain reference only                                |
-| Repair storms saturating inter-DC bandwidth (Phase 2+)      | Rate-limit repair workers; prioritize by durability risk; schedule off-peak; cap per-link throughput        |
+| AGPL exposure from the chosen base                          | Use SeaweedFS or Ceph RGW only for local DC storage; AGPL bases remain reference only                       |
+| Repair storms saturating inter-DC bandwidth (hybrid / owned-DC) | Rate-limit repair workers; prioritize by durability risk; schedule off-peak; cap per-link throughput    |
 | Placement policy bugs (data in wrong country)               | Formalize constraints in OPA; test failure domains in CI; chaos-test placement under node loss              |
 | Abuse traffic (viral files, DDoS, scraping)                 | Per-tenant egress budgets, anomaly detection, CDN shielding, reputation-based throttling                    |
 | Durability marketing ("eleven nines") that cannot be met    | Chaos testing, audit replays, measured durability — do not publish theoretical nines                        |
@@ -1491,14 +1488,14 @@ Becomes an **infrastructure company problem**. Needs:
 
 ## 14. Product Tiers (Consolidated)
 
-| Tier          | Phase  | Egress shape             | Backend                                        | Target                           |
-| ------------- | ------ | ------------------------ | ---------------------------------------------- | -------------------------------- |
-| ZK Beta       | 1      | Capped, cache-shaped     | Wasabi via Linode                              | Privacy-premium early adopters   |
-| ZK Hot        | 1–3    | 2–5× stored, cacheable   | Wasabi + Linode cache → local + CDN            | SaaS assets, frequent reads      |
-| ZK Archive    | 3      | Low / retrieval-priced   | Local HDD EC (10+4)                            | Backup, compliance               |
-| ZK Standard   | 2–3    | 1× stored                | Local EC + Wasabi DR / local HDD EC            | Wasabi / B2 replacement          |
-| ZK Dedicated  | 2–3    | Committed bandwidth      | Dedicated cell                                 | PB+ customers                    |
-| ZK Sovereign  | 3      | Contractual              | Country / DC / rack-constrained cell           | Regulated customers              |
+| Tier          | Deployment        | Egress shape             | Backend                                        | Target                           |
+| ------------- | ----------------- | ------------------------ | ---------------------------------------------- | -------------------------------- |
+| ZK Beta       | Cloud             | Capped, cache-shaped     | Wasabi via Linode                              | Privacy-premium early adopters   |
+| ZK Hot        | All models        | 2–5× stored, cacheable   | Wasabi + Linode cache → local + CDN            | SaaS assets, frequent reads      |
+| ZK Archive    | Owned-DC          | Low / retrieval-priced   | Local HDD EC (10+4)                            | Backup, compliance               |
+| ZK Standard   | Hybrid / owned-DC | 1× stored                | Local EC + Wasabi DR / local HDD EC            | Wasabi / B2 replacement          |
+| ZK Dedicated  | Hybrid / owned-DC | Committed bandwidth      | Dedicated cell                                 | PB+ customers                    |
+| ZK Sovereign  | Owned-DC          | Contractual              | Country / DC / rack-constrained cell           | Regulated customers              |
 
 All tiers are zero-knowledge by default. All tiers are S3-compatible.
 All tiers expose placement policy; ZK Archive and ZK Standard use
@@ -1509,53 +1506,43 @@ in this document.
 
 ---
 
-## 15. Roadmap Workstreams: Richer S3 API & Client SDK Parity
+## 15. Advanced S3 Sub-Resources & Client-Side Encryption SDK
 
-These two workstreams extend the SaaS transformation effort. Each
-numbered slice below is sized to land as an independent PR (matching
-the existing slice-based delivery model). **Workstream 8 is
-substantially shipped**: tagging (8.1), lifecycle (8.2), Object Lock /
-WORM (8.3), bucket versioning (8.4), CORS (8.5), and event
-notifications (8.6) are built, wired into the gateway, and covered by
-`tests/s3_compat/`; only the SSE config sub-resource (8.7) remains a
-roadmap commitment. **Workstream 9 (Rust SDK) is not yet started.**
-The live status of each slice is tracked in [PROGRESS.md](PROGRESS.md);
-the AWS-surface coverage view lives in
-[S3_COMPATIBILITY.md](S3_COMPATIBILITY.md). Each slice's per-section
-status is noted inline below.
+Beyond the core object and bucket operations (§3.2.2), the gateway
+implements the most-demanded S3 sub-resources so that off-the-shelf
+S3 tooling — browser SPAs, backup software, compliance tooling —
+works against ZK Object Fabric without bespoke glue. Every
+sub-resource handler is wired into the gateway and covered by
+`tests/s3_compat/`. The AWS-surface coverage view lives in
+[S3_COMPATIBILITY.md](S3_COMPATIBILITY.md).
 
-### 15.1 Workstream 8 — Richer S3 API Support
+### 15.1 Advanced S3 sub-resources
 
-**Goal**: implement the most-demanded currently-unsupported S3
-sub-resources so that off-the-shelf S3 tooling (browser SPAs, backup
-software, compliance tooling) works against ZKOF without bespoke
-glue. Each slice removes its key from `unsupportedSubresources` in
-`api/s3compat/handler.go` only when the handler is wired and covered
-by `tests/s3_compat/`.
+None of the sub-resource keys below appears in
+`unsupportedSubresources` in `api/s3compat/handler.go`: each handler
+is wired into the gateway and persists through `metadata/bucket_config`
+(memory + Postgres + SQLite) alongside the others.
 
 #### 15.1.1 Object Tagging (`?tagging`)
 
-**Status: Shipped (WS8.1).**
-
 - Handlers `PutObjectTagging`, `GetObjectTagging`,
-  `DeleteObjectTagging` in a new `api/s3compat/tagging_handler.go`.
+  `DeleteObjectTagging` in `api/s3compat/tagging_handler.go`.
 - Tags stored as JSONB on the manifest row in
-  `metadata/manifest_store/` via a new `Tags map[string]string` field
+  `metadata/manifest_store/` via a `Tags map[string]string` field
   on the manifest struct.
 - S3 limits enforced: ≤ 10 tags per object, ≤ 128-char keys, ≤
   256-char values.
 - S3 compliance tests in `tests/s3_compat/`.
 
-#### 15.1.2 Object Lifecycle (`?lifecycle`) — extends WS 4.4
+#### 15.1.2 Object Lifecycle (`?lifecycle`)
 
-**Status: Shipped (WS8.2).** The daily evaluator lives in the
-top-level `lifecycle/evaluator/` package and is wired into the gateway
-main loop; per-bucket rules persist via `metadata/bucket_config`
-(memory + Postgres + SQLite) rather than a standalone
-`bucket_lifecycle` table, and each evaluator action emits an audit
-entry + billing event.
+The daily evaluator lives in the top-level `lifecycle/evaluator/`
+package and is wired into the gateway main loop; per-bucket rules
+persist via `metadata/bucket_config` (memory + Postgres + SQLite)
+rather than a standalone `bucket_lifecycle` table, and each evaluator
+action emits an audit entry + billing event.
 
-- New `metadata/lifecycle/` package with a `LifecycleRule` struct:
+- The `metadata/lifecycle/` package defines a `LifecycleRule` struct:
   expiration (days or date), transition (to archive tier), abort
   incomplete multipart (days), and a tag-based filter.
 - Handlers `PutBucketLifecycleConfiguration`,
@@ -1573,14 +1560,14 @@ entry + billing event.
 
 #### 15.1.3 Object Lock / WORM (`?object-lock`, `?retention`, `?legal-hold`)
 
-**Status: Shipped (WS8.3).** Bucket Object Lock config lives in the
+Bucket Object Lock config lives in the
 `bucket_object_lock` table of `metadata/bucket_config` (memory +
 Postgres + SQLite); per-object-version retention / legal-hold ride on
 the manifest. The legal-hold store in `internal/auth` is backed by
 memory + Postgres + SQLite so the embedded profile persists holds
 across restart.
 
-- New `metadata/object_lock/` package: `LockConfig`
+- The `metadata/object_lock/` package defines `LockConfig`
   (governance/compliance mode, retain-until-date) and `LegalHold`
   (on/off per object).
 - Handlers `PutObjectLockConfiguration`,
@@ -1589,18 +1576,18 @@ across restart.
 - Enforcement: the `DeleteObject` and `PutObject` (overwrite) paths in
   `api/s3compat/handler.go` check lock / retention / legal-hold status
   before allowing the operation and return `403 AccessDenied` if the
-  object is locked. (`internal/auth` already carries a legal-hold
-  check on DELETE — this generalises it.)
-- **Depends on bucket versioning (15.1.4).**
+  object is locked. `internal/auth` carries a legal-hold check on
+  DELETE that this generalises.
+- Requires bucket versioning (15.1.4).
 
 #### 15.1.4 Bucket Versioning (`?versioning`)
 
-**Status: Shipped (WS8.4).** State lives in the `bucket_versioning`
-table of `metadata/bucket_config` (memory + Postgres + SQLite).
+State lives in the `bucket_versioning` table of
+`metadata/bucket_config` (memory + Postgres + SQLite).
 
-- Object versioning via manifest versions already exists (§3.2.2:
-  `GetObject?versionId=`). What is missing is the bucket-level config
-  endpoints.
+- Object versioning rides on manifest versions (§3.2.2:
+  `GetObject?versionId=`); these endpoints add the bucket-level
+  versioning config on top.
 - Handlers `PutBucketVersioning`, `GetBucketVersioning` in
   `api/s3compat/versioning_handler.go`.
 - Versioning state (Enabled / Suspended) stored per bucket in tenant
@@ -1610,14 +1597,12 @@ table of `metadata/bucket_config` (memory + Postgres + SQLite).
 
 #### 15.1.5 CORS (`?cors`)
 
-**Status: Shipped (WS8.5).**
-
 - Handlers `PutBucketCors`, `GetBucketCors` (404 `NoSuchCORSConfiguration`
   when unset), `DeleteBucketCors` (idempotent 204).
 - CORS config stored per bucket via `metadata/bucket_config` (the
   `bucket_cors` table; memory + Postgres + SQLite), with the rule set
-  JSON-encoded and keyed by `(tenant_id, bucket)`. Rules and matching
-  (single-`*` origin/header wildcards) live in the `metadata/cors`
+  JSON-encoded and keyed by `(tenant_id, bucket)`. Rule matching
+  (single-`*` origin/header wildcards) lives in the `metadata/cors`
   domain package.
 - Gateway middleware (`applyCORS`) reads the config on every request
   carrying an `Origin` and, when a rule matches the origin + method,
@@ -1631,8 +1616,6 @@ table of `metadata/bucket_config` (memory + Postgres + SQLite).
   SPAs.
 
 #### 15.1.6 Event Notifications (`?notification`)
-
-**Status: Shipped (WS8.6).**
 
 - Handlers `PutBucketNotificationConfiguration`,
   `GetBucketNotificationConfiguration`
@@ -1658,49 +1641,38 @@ table of `metadata/bucket_config` (memory + Postgres + SQLite).
 
 #### 15.1.7 Server-Side Encryption Config (`?encryption`)
 
-**Status: Planned (WS8.7) — not yet shipped.**
-
 - Handlers `PutBucketEncryption`, `GetBucketEncryption`,
-  `DeleteBucketEncryption`.
-- Maps to ZKOF encryption modes (§3.7): the
-  `x-amz-server-side-encryption` header selects between
-  `managed` (ManagedEncrypted) and `client_side` (StrictZK) modes.
-- Default: `managed` encrypted, matching the SaaS default for ease of
-  use.
+  `DeleteBucketEncryption` in `api/s3compat/encryption_handler.go`,
+  with the `<ServerSideEncryptionConfiguration>` wire format and the
+  config stored per bucket via `metadata/bucket_config` (the
+  `bucket_encryption` table; memory + Postgres + SQLite).
+- Both AWS bucket-default algorithms — `AES256` (SSE-S3) and `aws:kms`
+  (SSE-KMS) — map to ZKOF's gateway-side `ManagedEncrypted` mode (the
+  gateway holds the DEK-wrapping key and encrypts on the tenant's
+  behalf); the mapping lives in `effectiveEncryptionMode`.
+- The write path layers the bucket default onto objects written
+  without an explicit `x-amz-server-side-encryption` header
+  (`metadata/sse`).
 
-#### 15.1.8 Documentation
+Production wiring: `cmd/gateway/main.go` constructs the `bucket_config`
+store and starts the lifecycle evaluator ticker (audit + billing
+hooks, per-node `SourceNodeID` via `os.Hostname()`), and the embedded
+single-node profile persists the audit trail and legal holds to local
+SQLite so the compliance trail survives a restart.
 
-**Status: Shipped (WS8.8).**
+### 15.2 Client-Side Encryption SDK Interoperability
 
-- This section and the §3.2.2 table mark the shipped slices (8.1–8.5)
-  and the gateway production wiring, and flag 8.6–8.7 as the remaining
-  planned slices.
-- [ARCHITECTURE.md](ARCHITECTURE.md) folds the built WS8 packages
-  (`api/s3compat` sub-resource handlers, `metadata/lifecycle`,
-  `metadata/object_lock`, `metadata/cors`, `metadata/bucket_config`,
-  the top-level `lifecycle/evaluator`, and the embedded SQLite
-  compliance stores) into the as-built layout.
-- [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) is the ZKOF-vs-AWS-S3
-  compatibility matrix, with the shipped sub-resources marked
-  Supported.
+The client-side encryption wire format is a stable, documented
+contract so that any client SDK — the reference Go SDK in
+`encryption/client_sdk/`, or an additional implementation in another
+language (for example, a Rust crate for Strict-ZK Rust consumers) —
+can seal and open the same objects. An object sealed by one SDK
+decrypts cleanly with any other SDK that reproduces the format. The Go
+SDK is the reference; `encryption/client_sdk/sdk.go` states that
+"other SDK implementations MUST reproduce this format byte-for-byte to
+interoperate."
 
-Production wiring landed alongside the slices: `cmd/gateway/main.go`
-constructs the `bucket_config` store and starts the lifecycle
-evaluator ticker (audit + billing hooks, per-node `SourceNodeID` via
-`os.Hostname()`), and the embedded single-node profile persists the
-audit trail and legal holds to local SQLite so the compliance trail
-survives a restart.
-
-### 15.2 Workstream 9 — Rust Client-Side Encryption SDK
-
-**Goal**: a Rust client-side encryption SDK that is **byte-compatible**
-with the existing Go SDK (`encryption/client_sdk/`), so an object
-sealed by one SDK decrypts cleanly with the other. This unlocks Strict
-ZK mode for Rust consumers and for the selective Rust hot paths
-described in §1.1 without forking the wire format.
-
-**Byte-compatibility contract** (the Go SDK is the reference; the Rust
-SDK MUST reproduce it exactly):
+**Byte-compatibility contract:**
 
 - **Chunk frame**: `| 24-byte nonce | 4-byte big-endian ciphertext
   length | ciphertext |`, where ciphertext is `plaintext_len + 16-byte
@@ -1718,21 +1690,11 @@ SDK MUST reproduce it exactly):
   is empty the AAD is `nil` for both seal and open, preserving
   compatibility with pre-AAD objects.
 - **DEK wrapping**: per-object DEKs generated with a CSPRNG and wrapped
-  with the tenant CMK behind the same `Wrapper` abstraction (local key
-  file in Phase 2; AWS KMS / Vault Transit in Phase 3).
+  with the tenant CMK behind the `Wrapper` abstraction (local key file
+  for development; AWS KMS / Vault Transit for production).
 
-**Deliverables**:
-
-- A new Rust crate (proposed `encryption/rust_sdk/`) exposing
-  `encrypt_object` / `decrypt_object` and a `Wrapper` trait mirroring
-  the Go SDK surface.
-- A cross-language parity test corpus: Go-sealed fixtures opened by
-  Rust and vice-versa, asserting byte-identical ciphertext for a fixed
-  DEK + nonce schedule, wired into CI alongside `tests/s3_compat/`.
-- SDK usage docs and an interop note added to
-  [INTEGRATION.md](INTEGRATION.md).
-
-> **Note**: the Go SDK already declares this cross-language invariant —
-> `encryption/client_sdk/sdk.go` states that "other SDK implementations
-> MUST reproduce this format byte-for-byte to interoperate." WS9 is the
-> first such implementation.
+An additional-language SDK reproduces this contract, exposing
+`encrypt_object` / `decrypt_object` and a `Wrapper` trait mirroring the
+Go SDK surface, and is validated by a cross-language parity corpus
+(fixtures sealed by one SDK opened by another, asserting byte-identical
+ciphertext for a fixed DEK + nonce schedule).

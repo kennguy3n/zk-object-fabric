@@ -21,10 +21,10 @@ CREATE TABLE content_index (
     -- etag is the original PUT response ETag the first uploader saw.
     -- Recorded so subsequent dedup-hit PUTs / GETs / HEADs return the
     -- same ETag a non-dedup PUT of the same content would have. NULL
-    -- for entries written before Phase 3.5 added the column.
+    -- for entries written before this column was added.
     etag          TEXT        NULL,
-    -- piece_ids is the multi-piece extension (Phase 4+ multi-part
-    -- multipart dedup). When NULL the entry is a single-piece
+    -- piece_ids is the multi-piece extension for multipart dedup.
+    -- When NULL the entry is a single-piece
     -- canonical and piece_id alone identifies the piece. When
     -- non-NULL it is a JSON array of {piece_id, backend,
     -- part_number, size_bytes} objects in ascending part_number
@@ -47,8 +47,8 @@ CREATE TABLE content_index (
 CREATE INDEX content_index_piece_id ON content_index (piece_id);
 
 -- Partial index supporting the multipart Pattern B lookup-by-plaintext-hash
--- path. Pattern C and pre-Phase-3.5 rows skip the index by virtue of the
--- WHERE clause.
+-- path. Pattern C and legacy rows without a plaintext hash skip the
+-- index by virtue of the WHERE clause.
 CREATE INDEX content_index_plaintext_hash
     ON content_index (tenant_id, plaintext_hash)
     WHERE plaintext_hash IS NOT NULL;

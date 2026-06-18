@@ -95,7 +95,7 @@ func newLocalFSGateway(t *testing.T) (*s3.Client, string, string) {
 //     lifecycle, bulk DeleteObjects) all returned a 4xx and were
 //     correctly classified as Unsupported (not silently accepted
 //     with OpFailed)
-//   - the WS8.4 bucket-versioning surface (Put/GetBucketVersioning +
+//   - the bucket-versioning surface (Put/GetBucketVersioning +
 //     delete markers) passed, since this gateway wires a BucketConfig
 //     store
 //   - the matrix serialises cleanly to both JSON and Markdown

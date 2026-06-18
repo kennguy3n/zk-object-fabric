@@ -8,14 +8,14 @@ It answers two questions:
 
 1. "Given a tenant's deployment model, which backends do we put their
    ciphertext on?"
-2. "What does the provider adapter matrix look like today, and which
-   adapters land in which phase?"
+2. "What does the provider adapter matrix look like today, and what
+   is each adapter's role?"
 
 ## Deployment models
 
 | Model | Who owns the data plane | Who owns the control plane | Primary backend | Secondary / DR | Cache | Dedup |
 | --- | --- | --- | --- | --- | --- | --- |
-| **B2C**  | ZK Object Fabric      | ZK Object Fabric | Wasabi (Phase 1 primary) → Ceph RGW pooled cells (Phase 2+) | Backblaze B2 or Cloudflare R2 | Linode NVMe (L0 / L1) | Object-level (intra-tenant, ContentIndex) |
+| **B2C**  | ZK Object Fabric      | ZK Object Fabric | Wasabi (cloud primary) → Ceph RGW pooled cells (hybrid / owned-DC) | Backblaze B2 or Cloudflare R2 | Linode NVMe (L0 / L1) | Object-level (intra-tenant, ContentIndex) |
 | **B2B**  | ZK Object Fabric (dedicated cell) | ZK Object Fabric | Ceph RGW dedicated cell with EC 8+3 or 10+4 | Second Ceph cell in a different failure domain | Co-located NVMe per cell | Object-level + block-level (Ceph dedup tier) |
 | **BYOC** | Customer | ZK Object Fabric (SaaS) | Customer's own S3-compatible backend (AWS S3, GCP, Azure via S3 shim) | Customer responsibility | Customer responsibility | Object-level (intra-tenant, if dedup policy enabled) |
 | **SME Single-Pool** | ZK Object Fabric (single VM, 2 gateway replicas) | ZK Object Fabric (Postgres on the same VM) | Wasabi | Wasabi versioning / cross-region (operator policy) | Local SSD hot cache (per replica) | Object-level (intra-tenant, ContentIndex) |
@@ -23,9 +23,9 @@ It answers two questions:
 
 ### B2C — multi-tenant shared fabric
 
-- **Primary (Phase 1)**: Wasabi. See [PROPOSAL.md §2](PROPOSAL.md)
+- **Primary (cloud)**: Wasabi. See [PROPOSAL.md §2](PROPOSAL.md)
   for the backend economics rationale.
-- **Primary (Phase 2+)**: Ceph RGW pooled cells. See PROPOSAL.md §4 for
+- **Primary (hybrid / owned-DC)**: Ceph RGW pooled cells. See PROPOSAL.md §4 for
   the Wasabi → local-DC migration playbook. Ceph RGW is the
   recommended production base: S3-compatible, LGPL-2.1, and mature at
   the 2–20 PB cell sizes the fabric targets.
@@ -105,16 +105,16 @@ It answers two questions:
 
 ## Provider adapter matrix
 
-| Adapter | Package | Phase | Role | Status |
+| Adapter | Package | Models | Role | Status |
 | --- | --- | --- | --- | --- |
-| `wasabi`        | [`providers/wasabi`](../providers/wasabi)               | 1 | B2C primary (cold origin) | Wired on AWS SDK v2; registered as default provider in `cmd/gateway`; exercised by the S3 compliance suite via `s3_generic` fake. 90-day minimum-storage guardrails shipped. |
-| `local_fs_dev`  | [`providers/local_fs_dev`](../providers/local_fs_dev)   | 1 | Dev / conformance loopback | Wired; drives the Phase 2 S3 compliance suite (`tests/s3_compat`), the migration suite, and the benchmark runner. Also serves as the backend for the Docker demo container (`demo/config.json`). |
-| `s3_generic`    | [`providers/s3_generic`](../providers/s3_generic)       | 1 | Shared S3-compatible base | Wired on AWS SDK v2 with S3-quoted ETag normalization. |
-| `ceph_rgw`      | [`providers/ceph_rgw`](../providers/ceph_rgw)           | 2 | B2B / sovereign primary | Scaffold — Config, constructor, Capabilities, CostModel, PlacementLabels. Passes conformance against a fake S3 backend; Phase 3 wires a real RGW cluster. |
-| `backblaze_b2`  | [`providers/backblaze_b2`](../providers/backblaze_b2)   | 2 | B2C alternative          | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.BackblazeB2.Endpoint` is set. |
-| `cloudflare_r2` | [`providers/cloudflare_r2`](../providers/cloudflare_r2) | 2 | B2C hot-egress backend   | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.CloudflareR2.AccountID` or `cfg.Providers.CloudflareR2.Endpoint` is set. |
-| `aws_s3`        | [`providers/aws_s3`](../providers/aws_s3)               | 2 | BYOC / DR-only           | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.AWSS3.Region` is set. |
-| `storj`         | [`providers/storj`](../providers/storj)                 | 2 | BYOC / ZK reference      | Wired end-to-end via `storj.io/uplink v1.14.0`; `uplink_bridge.go` adapts `*uplink.Project` to the `UplinkProject` interface; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.Storj.AccessGrant` is set; `TestSuite_Storj` in `tests/s3_compat/suite_test.go` gated on `STORJ_ACCESS_GRANT` + `STORJ_BUCKET`; nightly CI in `.github/workflows/storj-compliance.yml`. |
+| `wasabi`        | [`providers/wasabi`](../providers/wasabi)               | Cloud | B2C primary (cold origin) | Wired on AWS SDK v2; registered as default provider in `cmd/gateway`; exercised by the S3 compliance suite via `s3_generic` fake. 90-day minimum-storage guardrails shipped. |
+| `local_fs_dev`  | [`providers/local_fs_dev`](../providers/local_fs_dev)   | Dev | Dev / conformance loopback | Wired; drives the S3 compliance suite (`tests/s3_compat`), the migration suite, and the benchmark runner. Also serves as the backend for the Docker demo container (`demo/config.json`). |
+| `s3_generic`    | [`providers/s3_generic`](../providers/s3_generic)       | All | Shared S3-compatible base | Wired on AWS SDK v2 with S3-quoted ETag normalization. |
+| `ceph_rgw`      | [`providers/ceph_rgw`](../providers/ceph_rgw)           | Hybrid / owned-DC | B2B / sovereign primary | Scaffold — Config, constructor, Capabilities, CostModel, PlacementLabels. Passes conformance against a fake S3 backend; an owned-DC deployment wires a real RGW cluster. |
+| `backblaze_b2`  | [`providers/backblaze_b2`](../providers/backblaze_b2)   | Cloud | B2C alternative          | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.BackblazeB2.Endpoint` is set. |
+| `cloudflare_r2` | [`providers/cloudflare_r2`](../providers/cloudflare_r2) | Cloud | B2C hot-egress backend   | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.CloudflareR2.AccountID` or `cfg.Providers.CloudflareR2.Endpoint` is set. |
+| `aws_s3`        | [`providers/aws_s3`](../providers/aws_s3)               | BYOC / DR | BYOC / DR-only           | Wired; pending live compliance validation — Config, constructor, descriptive methods; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.AWSS3.Region` is set. |
+| `storj`         | [`providers/storj`](../providers/storj)                 | BYOC | BYOC / ZK reference      | Wired end-to-end via `storj.io/uplink v1.14.0`; `uplink_bridge.go` adapts `*uplink.Project` to the `UplinkProject` interface; registered in `cmd/gateway/main.go#buildProviderRegistry` when `cfg.Providers.Storj.AccessGrant` is set; `TestSuite_Storj` in `tests/s3_compat/suite_test.go` gated on `STORJ_ACCESS_GRANT` + `STORJ_BUCKET`; nightly CI in `.github/workflows/storj-compliance.yml`. |
 
 `wasabi`, `ceph_rgw`, `backblaze_b2`, `cloudflare_r2`, and `aws_s3`
 all embed `s3_generic.Provider` so the API surface is identical; only
@@ -126,7 +126,7 @@ reed-solomon segment distribution.
 
 ## Reference implementations we draw on
 
-- **Ceph RGW** (LGPL-2.1) — recommended Phase 2+ local-DC base. Mature
+- **Ceph RGW** (LGPL-2.1) — recommended hybrid / owned-DC base. Mature
   at cell-sized deployments; battle-tested S3-compatible surface. See
   <https://docs.ceph.com/en/latest/radosgw/>.
 - **Storj** (AGPL-3.0) — the canonical reference for zero-knowledge
@@ -135,7 +135,7 @@ reed-solomon segment distribution.
   policy) but **do not** vendor its code: AGPL would infect the
   fabric's control plane. See <https://github.com/storj/storj>.
 - **SeaweedFS** (Apache-2.0) — lower operational complexity than
-  Ceph; a viable alternative for faster Phase 2 iteration at the cost
+  Ceph; a viable alternative for faster owned-DC iteration at the cost
   of smaller community and fewer large-scale proof points. See
   <https://github.com/seaweedfs/seaweedfs>.
 - **MinIO** (AGPL-3.0) — frequently requested by operators but AGPL
@@ -260,5 +260,4 @@ message stream. See [INTEGRATION.md](INTEGRATION.md) §7 for details.
 - [PROPOSAL.md §3.14](PROPOSAL.md) — intra-tenant deduplication design
 - [PROPOSAL.md §4](PROPOSAL.md) — migration engine
 - [INTEGRATION.md](INTEGRATION.md) — external app integration guide (KChat, non-MLS apps)
-- [PROGRESS.md](PROGRESS.md) — phase-gated tracker
 - [demo/README.md](../demo/README.md) — Docker demo quick-start and downstream integration guide

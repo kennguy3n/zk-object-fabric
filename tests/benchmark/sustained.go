@@ -1,8 +1,8 @@
 // Sustained load runner.
 //
-// This file implements the production-grade load driver
-// referenced in docs/PROGRESS.md "Production Readiness > Load
-// testing". Unlike the unit-test-sized ProviderRunner in
+// This file implements the production-grade load driver used for
+// the load-testing runbook (docs/runbooks/load-testing.md). Unlike
+// the unit-test-sized ProviderRunner in
 // runner.go (which is capped at 256 requests for fast CI), the
 // SustainedRunner drives the full requested workload at the
 // declared TargetRPS for the declared DurationSeconds against a

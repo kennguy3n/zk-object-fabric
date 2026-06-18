@@ -1,4 +1,4 @@
-// WS8.1 — S3 object metadata (system HTTP headers + x-amz-meta-*).
+// S3 object metadata (system HTTP headers + x-amz-meta-*).
 //
 // S3 lets a client attach metadata to an object at write time and
 // receive it back verbatim on every GET/HEAD: the system-defined HTTP

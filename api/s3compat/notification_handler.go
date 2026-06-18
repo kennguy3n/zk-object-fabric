@@ -1,4 +1,4 @@
-// WS8.6 — S3 bucket event notifications (`?notification`).
+// S3 bucket event notifications (`?notification`).
 //
 // Implements the bucket-level notification configuration sub-resource
 // (Put/GetBucketNotificationConfiguration), persisted through
