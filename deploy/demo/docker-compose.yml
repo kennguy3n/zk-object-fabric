@@ -1,0 +1,64 @@
+# Single-node Ceph RADOS Gateway (S3) demo.
+#
+#   docker compose -f deploy/demo/docker-compose.yml up ceph-rgw
+#
+# Boots a throwaway, all-in-one Ceph "Reef" cluster (mon/mgr/osd/rgw in
+# one container) and exposes its S3-compatible RADOS Gateway on :8888.
+# It is the local backend for two documented workflows:
+#
+#   * the load-testing harness   — docs/runbooks/load-testing.md §3
+#     (Tier 2: `-provider=ceph_rgw -rgw-endpoint=http://localhost:8888`)
+#   * the live conformance gate  — tests/s3_compat TestSuite_CephRGW
+#     (docs/runbooks/s3-conformance.md, deploy/local-dc/README.md)
+#
+# The boot parameters mirror .github/workflows/ci.yml's "Start Ceph RGW
+# demo container" step, which runs the same image as the conformance
+# gate, so a local run reproduces CI exactly. This is development-only:
+# the cluster has a single OSD, no replication, and serves plain HTTP.
+#
+# CEPH_DEMO_UID / *_ACCESS_KEY / *_SECRET_KEY create the demo RGW user
+# and its S3 credentials at boot; CEPH_DEMO_BUCKET pre-creates the
+# `bench` bucket the load-testing runbook writes to. To run the
+# conformance suite, create its bucket once the gateway is up:
+#
+#   AWS_ACCESS_KEY_ID=zkof-test-ak \
+#   AWS_SECRET_ACCESS_KEY=zkof-test-sk-0000000000000000000000000 \
+#   AWS_DEFAULT_REGION=us-east-1 \
+#     aws --endpoint-url http://localhost:8888 \
+#         s3api create-bucket --bucket zkof-ceph-compliance
+#
+# See deploy/demo/README.md for the full walkthrough.
+
+name: zkof-ceph-demo
+
+services:
+  ceph-rgw:
+    image: quay.io/ceph/demo:latest-reef
+    container_name: zkof-ceph-rgw
+    command: demo
+    environment:
+      MON_IP: 127.0.0.1
+      CEPH_PUBLIC_NETWORK: 127.0.0.0/8
+      NETWORK_AUTO_DETECT: "0"
+      CEPH_DEMO_UID: zkof
+      CEPH_DEMO_ACCESS_KEY: zkof-test-ak
+      CEPH_DEMO_SECRET_KEY: zkof-test-sk-0000000000000000000000000
+      CEPH_DEMO_BUCKET: bench
+      RGW_NAME: ceph-rgw
+      RGW_FRONTEND_PORT: "8888"
+    ports:
+      - "8888:8888"
+    volumes:
+      - ceph-etc:/etc/ceph
+      - ceph-lib:/var/lib/ceph
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8888/"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 20s
+    restart: "no"
+
+volumes:
+  ceph-etc:
+  ceph-lib:
