@@ -9,9 +9,13 @@ documented workflows without a real Ceph cluster:
 - **Live conformance gate** — `tests/s3_compat` `TestSuite_CephRGW`
   (see `docs/runbooks/s3-conformance.md` and `deploy/local-dc/README.md`).
 
-The boot parameters mirror the `Start Ceph RGW demo container` step in
-`.github/workflows/ci.yml`, so a local run reproduces the CI conformance
-gate exactly.
+The image and cluster boot parameters match the `Start Ceph RGW demo
+container` step in `.github/workflows/ci.yml`, so the conformance suite
+runs against the same backend locally as it does in CI. The compose file
+adds two things CI does out-of-band so the demo is self-contained: it
+pre-creates the `bench` bucket (`CEPH_DEMO_BUCKET`) and pins the
+container hostname so the image's in-container bucket creation resolves
+its own endpoint.
 
 > **Development only.** All-in-one mon/mgr/osd/rgw in one container, a
 > single OSD, no replication, plain HTTP. Do not use for anything real.
