@@ -142,7 +142,7 @@ func TestMigration_WritesAreMirrored(t *testing.T) {
 // TestMigration_WasabiToCephRGW runs the full compliance suite
 // through a DualWriteProvider that mirrors every write from Wasabi
 // (primary) to Ceph RGW (secondary). It is the integration gate
-// for the Phase 3 Ceph-RGW cell bring-up: the suite must pass
+// for the Ceph-RGW cell bring-up: the suite must pass
 // end-to-end against the dual-write topology before the rebalancer
 // is allowed to advance a tenant from state=mirror to
 // state=cutover.

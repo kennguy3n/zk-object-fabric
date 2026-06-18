@@ -1,5 +1,5 @@
-// Package evaluator implements the daily background lifecycle worker
-// (WS8.2). One Run pass enumerates every bucket that has a lifecycle
+// Package evaluator implements the daily background lifecycle worker.
+// One Run pass enumerates every bucket that has a lifecycle
 // configuration (across all tenants), then for each bucket:
 //
 //   - aborts incomplete multipart uploads older than a rule's
@@ -15,7 +15,7 @@
 // version under a legal hold or within its retention window. (Adding a
 // delete marker on a versioned bucket is still allowed — an Object Lock
 // blocks permanent deletion of a version, not the creation of a marker
-// that hides it, matching AWS and the WS8.3 delete path.)
+// that hides it, matching AWS and the Object Lock delete path.)
 //
 // Storage-class Transition rules are validated, persisted, and served
 // at full S3 fidelity by the api/s3compat layer, but are NOT acted on

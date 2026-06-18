@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Idempotent Wasabi bucket provisioner for the Phase 3 multi-region
+# Idempotent Wasabi bucket provisioner for the multi-region
 # origin. Reads regions.env (sourced) and creates one bucket per
 # region named zkof-${REGION}-${ZKOF_ENV} with the per-bucket IAM
 # policy and CORS configuration.

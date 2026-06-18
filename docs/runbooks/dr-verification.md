@@ -129,5 +129,4 @@ runbook's "DR drill" section.
 A future infrastructure-level harness could lift those out into
 container-based drill scripts (e.g. spin up a Postgres + pgbackrest
 + gateway under docker compose and assert the restore flow). That
-is out of scope for this PR but tracked under WS2 (Scaling) and
-WS6 (Observability) follow-up work.
+is out of scope for this runbook.

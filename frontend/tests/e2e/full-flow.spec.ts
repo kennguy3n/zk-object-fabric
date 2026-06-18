@@ -5,7 +5,7 @@ import { requireGateway } from "./helpers";
 // full-flow.spec.ts walks the entire B2C onboarding journey through
 // the SPA: signup → land on dashboard → navigate to buckets →
 // create a bucket → confirm it appears in the list → delete it.
-// Object upload is intentionally NOT exercised here: the Phase 3
+// Object upload is intentionally NOT exercised here: the console
 // SPA does not own an object-upload page (uploads go through the
 // S3 data-plane endpoint, not the console mux), so the "upload"
 // step is replaced by a list-after-create assertion that confirms

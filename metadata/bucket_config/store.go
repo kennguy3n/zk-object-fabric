@@ -1,8 +1,8 @@
 // Package bucket_config is the control-plane store for per-bucket S3
-// configuration sub-resources. Today it persists bucket versioning
-// state (WS8.4) and Object Lock configuration (WS8.3); future
-// workstreams (CORS, lifecycle, notifications) can extend the same
-// store rather than adding one table per sub-resource.
+// configuration sub-resources: bucket versioning state, Object Lock,
+// CORS, lifecycle, event notifications, and default encryption (SSE)
+// all persist through the same store rather than one table per
+// sub-resource.
 //
 // The Store interface is the integration boundary the gateway
 // consumes. Concrete implementations live in subpackages
@@ -78,7 +78,7 @@ type Store interface {
 	SetVersioning(ctx context.Context, tenantID, bucket string, state VersioningState) error
 
 	// GetObjectLock returns the bucket-level S3 Object Lock
-	// configuration for (tenantID, bucket) — WS8.3. A bucket that was
+	// configuration for (tenantID, bucket). A bucket that was
 	// never configured returns the zero object_lock.Config (Enabled
 	// false) with a nil error, so callers never have to distinguish
 	// "missing" from "no Object Lock".
@@ -91,7 +91,7 @@ type Store interface {
 	SetObjectLock(ctx context.Context, tenantID, bucket string, cfg object_lock.Config) error
 
 	// GetCORS returns the bucket CORS configuration for (tenantID,
-	// bucket) — WS8.5. A bucket with no CORS configuration returns the
+	// bucket). A bucket with no CORS configuration returns the
 	// zero cors.Config (no rules) with a nil error; callers use
 	// Config.Empty to distinguish "not configured" (which the S3 API
 	// surfaces as 404 NoSuchCORSConfiguration) from a configured rule
@@ -109,7 +109,7 @@ type Store interface {
 	DeleteCORS(ctx context.Context, tenantID, bucket string) error
 
 	// GetLifecycle returns the bucket lifecycle configuration for
-	// (tenantID, bucket) — WS8.2. A bucket with no lifecycle
+	// (tenantID, bucket). A bucket with no lifecycle
 	// configuration returns the zero lifecycle.Config (no rules) with
 	// a nil error; callers use Config.Empty to distinguish "not
 	// configured" (which the S3 API surfaces as 404
@@ -136,7 +136,7 @@ type Store interface {
 	ListLifecycle(ctx context.Context) ([]LifecycleEntry, error)
 
 	// GetNotification returns the bucket event-notification
-	// configuration for (tenantID, bucket) — WS8.6. A bucket with no
+	// configuration for (tenantID, bucket). A bucket with no
 	// notification configuration returns the zero notification.Config
 	// (no rules) with a nil error; callers use Config.Empty to
 	// distinguish "not configured" from a configured rule set. S3 has
@@ -152,7 +152,7 @@ type Store interface {
 	SetNotification(ctx context.Context, tenantID, bucket string, cfg notification.Config) error
 
 	// GetEncryption returns the bucket default SSE configuration for
-	// (tenantID, bucket) — WS8.7. A bucket with no default-encryption
+	// (tenantID, bucket). A bucket with no default-encryption
 	// configuration returns the zero sse.Config with a nil error;
 	// callers use Config.Empty to distinguish "not configured" (which
 	// the S3 API surfaces as 404

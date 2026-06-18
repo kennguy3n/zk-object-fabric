@@ -5,8 +5,8 @@
 // branch needs: (1) resolving the per-object DEK and its wrap, (2)
 // encrypting plaintext to ciphertext for storage, and (3) decrypting
 // ciphertext back to plaintext at read time. Keeping them in one
-// place avoids drift between the data-path branches and means the
-// Phase 3 KMS migration touches a single call site per path.
+// place avoids drift between the data-path branches and means a
+// change of DEK-wrapping backend touches a single call site per path.
 
 package s3compat
 

@@ -1,5 +1,5 @@
-// This file implements the concrete Runner that Workstream 8
-// requires: a driver that executes the Scenarios declared in
+// This file implements the concrete Runner: a driver that
+// executes the Scenarios declared in
 // suite.go against any providers.StorageProvider, records the
 // requested metrics, and emits a JSON report for CI consumption.
 //

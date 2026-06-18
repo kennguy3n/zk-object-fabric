@@ -710,9 +710,8 @@ func TestEffectiveMaxHeaderBytes_FloorsExplicitZero(t *testing.T) {
 }
 
 // TestDefault_HealthHasReadTimeout pins that HealthConfig.Default()
-// includes a non-zero ReadTimeout. The field was omitted in the
-// original WS1.7 PR #80 hardening and the bot (Devin Review
-// ANALYSIS_0004) flagged the asymmetry vs gateway/console. With
+// includes a non-zero ReadTimeout. An earlier hardening pass omitted
+// the field, creating an asymmetry vs gateway/console. With
 // the field added, this test guards against a regression that
 // reverts to the missing-ReadTimeout state, which would silently
 // nullify the health-listener timeout-order Validate() check

@@ -169,7 +169,7 @@ func (c *DiskCache) Get(_ context.Context, pieceID string) (io.ReadCloser, Cache
 		// next PUT repopulates cleanly. The optimistic hit
 		// recorded above is compensated so Stats() reports the
 		// true hit ratio that the Wasabi fair-use guardrails and
-		// the PROGRESS.md hot-tier targets rely on.
+		// the hot-tier cache targets rely on.
 		//
 		// Between the first c.mu.Unlock() above and this re-lock
 		// a concurrent Put() may have replaced the corrupt entry

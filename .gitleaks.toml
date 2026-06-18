@@ -1,4 +1,4 @@
-# gitleaks configuration for zk-object-fabric (Workstream 6.7).
+# gitleaks configuration for zk-object-fabric.
 #
 # We extend gitleaks' built-in ruleset (AWS keys, private keys, GCP
 # service accounts, JWTs, etc.) rather than redefining it, so upstream

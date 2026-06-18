@@ -1,6 +1,6 @@
 # Linode Gateway Fleet
 
-Phase 3 stand-up for the production ZK Object Fabric gateway fleet
+Production stand-up for the ZK Object Fabric gateway fleet
 on Linode. The gateway is the S3-compatible data plane that fronts
 the AWS control plane (RDS, KMS, ClickHouse) and the Wasabi origin.
 

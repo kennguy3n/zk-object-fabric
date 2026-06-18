@@ -40,7 +40,7 @@ type BodyContext struct {
 
 // BodyEncryptor seals and opens the manifest JSON document stored
 // in the body column. A nil BodyEncryptor leaves the JSON in the
-// clear (the legacy Phase 2 layout).
+// clear (the plaintext layout).
 //
 // Implementations must be safe for concurrent use by the store.
 // The BodyContext argument is mandatory on every call so the

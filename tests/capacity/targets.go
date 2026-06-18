@@ -29,12 +29,12 @@
 // docs/PROPOSAL.md §11.4.x ("Anti-patterns to avoid"):
 //
 //	"Publish theoretical 'eleven nines' durability — Cannot be
-//	 validated in Phase 1. Only publish measured durability from
+//	 validated by analysis. Only publish measured durability from
 //	 chaos tests."
 //
 // We therefore do NOT publish a theoretical durability nines target
 // here. Durability lives in the chaos-test measurement reports
-// produced under WS1.2 (PR #76) and is recorded in the audit bundle
+// produced by tests/chaos and is recorded in the audit bundle
 // as measured, not committed.
 package capacity
 
@@ -88,12 +88,12 @@ const (
 	// every latency target passed.
 	RPSEfficiencyMin = benchmark.TargetRPSEfficiencyMin
 
-	// CacheHitRatioHotMin is the Phase 3 Hot-tier cache hit ratio
+	// CacheHitRatioHotMin is the hot-tier cache hit ratio
 	// target: the fraction of reads served from L0 or L1 must
 	// exceed this value.
 	CacheHitRatioHotMin = benchmark.TargetCacheHitRatioHotMin
 
-	// WasabiOriginEgressRatioMax is the Phase 2-3 Wasabi origin
+	// WasabiOriginEgressRatioMax is the Wasabi origin
 	// egress ratio ceiling: monthly egress bytes pulled from Wasabi
 	// must be at most this multiple of the tenant's stored bytes.
 	WasabiOriginEgressRatioMax = benchmark.TargetWasabiOriginEgressRatioMax
@@ -199,7 +199,7 @@ const (
 // ErrorRateMax. We deliberately do NOT include a durability number
 // because (a) docs/PROPOSAL.md forbids publishing theoretical
 // durability nines and (b) the only honest durability number is the
-// one measured by tests/chaos (WS1.2) and recorded in the audit
+// one measured by tests/chaos and recorded in the audit
 // bundle for the specific gateway build under audit.
 // ----------------------------------------------------------------------
 
@@ -216,12 +216,12 @@ const (
 // ----------------------------------------------------------------------
 // §6. Operational targets — open.
 //
-// The PROGRESS.md appendix lists three operational metrics whose
-// targets are TBD ("repair time on single-node loss", "storage COGS
-// per TB-month", "Wasabi -> local cell migration throughput"). These
-// will become committed constants once Phase 2 / Phase 3 measurement
-// closes them. The dossier explicitly enumerates them as OPEN so an
-// auditor reviewing the bundle does not mistake their absence for an
+// Three operational metrics have targets that are still open
+// ("repair time on single-node loss", "storage COGS per TB-month",
+// "Wasabi -> local cell migration throughput"). These become
+// committed constants once production measurement closes them. The
+// dossier explicitly enumerates them as OPEN so an auditor
+// reviewing the bundle does not mistake their absence for an
 // oversight.
 //
 // When a number lands here, also remove the corresponding entry
@@ -237,30 +237,30 @@ type OpenOperationalTarget struct {
 	Name string
 	// Unit is the unit of the target value once committed.
 	Unit string
-	// Owner names the phase under which the target is expected to
-	// be measured and committed.
+	// Owner names the deployment context under which the target is
+	// expected to be measured and committed.
 	Owner string
 }
 
-// OpenOperationalTargets enumerates the operational metrics that
-// PROGRESS.md flags as TBD and that the dossier surfaces as known
+// OpenOperationalTargets enumerates the operational metrics whose
+// targets are still open and that the dossier surfaces as known
 // gaps rather than missing entries.
 func OpenOperationalTargets() []OpenOperationalTarget {
 	return []OpenOperationalTarget{
 		{
 			Name:  "RepairTimeSingleNodeLoss",
 			Unit:  "hours",
-			Owner: "Phase 2",
+			Owner: "Hybrid / owned-DC",
 		},
 		{
 			Name:  "StorageCOGSPerTBMonth",
 			Unit:  "USD",
-			Owner: "Phase 3",
+			Owner: "Owned-DC",
 		},
 		{
 			Name:  "MigrationThroughputWasabiToCell",
 			Unit:  "bytes/sec",
-			Owner: "Phase 3",
+			Owner: "Hybrid",
 		},
 	}
 }

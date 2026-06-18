@@ -1,5 +1,5 @@
 // Package notification defines the provider-neutral domain types for
-// S3 bucket event-notification configuration (WS8.6): the per-bucket
+// S3 bucket event-notification configuration: the per-bucket
 // set of notification rules and the matching logic the gateway uses to
 // decide which configured webhook destinations should receive an event
 // for a given object operation.

@@ -1,4 +1,4 @@
-// WS8.3 — S3 Object Lock / WORM (`?object-lock`, `?retention`,
+// S3 Object Lock / WORM (`?object-lock`, `?retention`,
 // `?legal-hold`).
 //
 // Implements the bucket-level Object Lock configuration

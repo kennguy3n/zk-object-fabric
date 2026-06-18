@@ -1,7 +1,7 @@
 package console
 
 // ops_handler.go exposes a small, read-only operations surface that
-// the Phase 3 React console renders for SME operators who do not run
+// the React console renders for SME operators who do not run
 // Grafana/Prometheus. The endpoints aggregate data the gateway
 // already tracks internally:
 //

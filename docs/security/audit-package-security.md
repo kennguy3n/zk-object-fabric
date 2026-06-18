@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Document version | 2026-05-30 (WS1.3) |
+| Document version | 2026-05-30 |
 | Source commit | branch HEAD of PR #77 (recorded in the bundle's `MANIFEST.txt` at build time; merge-base was `dac9ef3` on `main`) |
 | Audience | Third-party security firm (Trail of Bits / Cure53 / NCC Group) |
 | Companion | [`audit-package-cryptography.md`](audit-package-cryptography.md), [`threat-model.md`](threat-model.md) |
@@ -226,8 +226,8 @@ prevSig = expected
 
 so the comparison and the chain-advance are a single typed
 operation that cannot accidentally degrade to a `==`. Note that
-the consuming handler in `api/s3compat/` is tracked as a separate
-workstream (see crypto §6.2 "Note for the auditor") — the
+the consuming handler in `api/s3compat/` is out of scope for this
+package (see crypto §6.2 "Note for the auditor") — the
 function pair is fully tested in `internal/auth/`, but no
 production call site invokes it yet.
 
@@ -268,7 +268,8 @@ scoping in two complementary ways:
    `BodyContext` — even if a Postgres admin swaps the row.
 
 We have no application-layer middleware that auto-injects
-`tenant_id` into every query yet (Workstream 3.4 item). The audit
+`tenant_id` into every query; scoping is enforced in the `Store`
+wrapper and, as defence-in-depth, by Postgres RLS (see §5). The audit
 should look for code paths that perform raw SQL without going
 through `Store.Get`/`Put`/`List` and flag any that don't
 explicitly scope by tenant_id.
@@ -277,7 +278,7 @@ explicitly scope by tenant_id.
 
 `api/console/` has separate auth — it currently uses a flat
 `AdminToken` bearer check. **This is a known weakness** —
-Workstream 3.2 will replace it with RS256/ES256 JWTs. The audit
+the intended hardening is to replace it with RS256/ES256 JWTs. The audit
 should treat the current console API as a privileged endpoint
 that MUST be network-restricted, not as a tenant-isolated
 surface.
@@ -491,10 +492,10 @@ should attempt:
   and the hot-object **cache** is in-process (not a network
   backend), so neither is in scope for internal mTLS. See
   `docs/runbooks/internal-mtls.md` for cert generation and rollout.
-- **Console API uses a flat bearer token.** RS256/ES256 JWT
-  migration is on Workstream 3.2. Same as above: flag but not a
-  novel finding.
-- **Postgres Row Level Security (Workstream 3.4) — in progress.**
+- **Console API uses a flat bearer token.** Replacing it with
+  RS256/ES256 JWTs is the intended hardening. Same as above: flag
+  but not a novel finding.
+- **Postgres Row Level Security.**
   The application layer enforces tenant scoping on every query
   (`metadata/manifest_store/postgres/store.go`); the audit should
   look for any path that bypasses the `Store` wrapper. RLS is now

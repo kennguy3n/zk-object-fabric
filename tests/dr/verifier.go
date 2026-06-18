@@ -26,10 +26,10 @@ import (
 //	v := &Verifier{Source: src, Dest: dst, ...}
 //	rpt, err := v.Run(ctx)
 //
-// Internally Run() drives four phases (steady, snapshot,
-// in-flight, recovery) over the real cross_cell.Replicator. Each
-// phase has explicit synchronisation points so the wall-clock
-// measurements are deterministic — see the phase comments in
+// Internally Run() drives four stages (steady, in-flight,
+// recovery, measure) over the real cross_cell.Replicator. Each
+// stage has explicit synchronisation points so the wall-clock
+// measurements are deterministic — see the stage comments in
 // Run() for the full timeline.
 type Verifier struct {
 	// Source and Dest are the cells the verifier replicates
@@ -167,7 +167,7 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 	}
 
 	// --------------------------------------------------------
-	// Phase 1: Steady state.
+	// Stage 1: Steady state.
 	//
 	// Write SteadyObjects manifests under (TenantID, Bucket)
 	// with an async replication policy targeting (Source -> Dest)
@@ -197,7 +197,7 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 	rpt.ReplicatorLagAtSnapshot = time.Duration(repl.LagNanos())
 
 	// --------------------------------------------------------
-	// Phase 2: Cancel the replicator FIRST, then seed in-flight.
+	// Stage 2: Cancel the replicator FIRST, then seed in-flight.
 	//
 	// Order matters: cancelling the replicator before the
 	// in-flight seed pins LostObjects == InFlightObjects
@@ -227,7 +227,7 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 	rpt.FailureDetectedAt = now()
 
 	// --------------------------------------------------------
-	// Phase 3: Recovery.
+	// Stage 3: Recovery.
 	//
 	// "Open" the destination cell for reads. We measure RTO as
 	// wall-clock from FailureDetectedAt to the moment the first
@@ -237,12 +237,12 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 		return rpt, err
 	}
 
-	// Phase 4: Measure RPO by actually probing the destination
+	// Stage 4: Measure RPO by actually probing the destination
 	// cell for the in-flight manifests. We do NOT assume
 	// LostObjects == InFlightObjects by construction — if a
-	// future refactor breaks the Phase-2 ordering and lets the
+	// future refactor breaks the stage-2 ordering and lets the
 	// replicator drain some in-flight pieces before cancellation,
-	// the measurement here surfaces it as a Phase-2 invariant
+	// the measurement here surfaces it as a stage-2 invariant
 	// breach rather than silently inflating LostObjects.
 	lost, leaked, err := v.measureRPO(ctx, inFlightObjects)
 	if err != nil {
@@ -250,7 +250,7 @@ func (v *Verifier) Run(ctx context.Context) (Report, error) {
 	}
 	if leaked > 0 {
 		return rpt, fmt.Errorf(
-			"phase-2 invariant breach: %d in-flight manifests reached the destination cell despite the replicator being cancelled before the in-flight seed; the ordering in Run() is the only guarantee that MeasuredRPO == InFlightObjects, so any leakage here means a future refactor broke it",
+			"stage-2 invariant breach: %d in-flight manifests reached the destination cell despite the replicator being cancelled before the in-flight seed; the ordering in Run() is the only guarantee that MeasuredRPO == InFlightObjects, so any leakage here means a future refactor broke it",
 			leaked,
 		)
 	}
@@ -410,9 +410,9 @@ func (v *Verifier) seedRange(ctx context.Context, start, end int, tag string) ([
 //     TestVerifier_LeakedInFlightFailsRun) would race against
 //     the replicator: count >= expected can become true after
 //     only (expected - prestaged) steady objects have actually
-//     been copied. Phase 2 then cancels the replicator and
+//     been copied. Stage 2 then cancels the replicator and
 //     verifyRecovery fails with "steady-object recovery short"
-//     instead of reaching the Phase-4 leak probe. Per-key Get
+//     instead of reaching the stage-4 leak probe. Per-key Get
 //     is immune to pre-existing dst manifests at unrelated
 //     keys.
 //
@@ -743,7 +743,7 @@ func (v *Verifier) verifyRecovery(
 // (the value reported as MeasuredRPO). "leaked" is the number
 // present in the destination despite the replicator being
 // cancelled before the in-flight seed — a non-zero value here
-// means the Phase-2 ordering invariant was broken and the caller
+// means the stage-2 ordering invariant was broken and the caller
 // should surface it as an error.
 //
 // The verifier asserts "the replicator did not drain any in-flight

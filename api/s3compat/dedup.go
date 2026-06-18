@@ -102,7 +102,7 @@ type dedupResult struct {
 	// Empty for Pattern C — the gateway never sees plaintext,
 	// so there is nothing to record.
 	//
-	// TODO(phase4+): consider an eager backfill that walks every
+	// TODO: consider an eager backfill that walks every
 	// pre-existing Pattern B row, unwraps the manifest's DEK,
 	// decrypts the piece, and updates plaintext_hash so the
 	// first multipart upload of previously-single-PUT'd content
@@ -126,8 +126,8 @@ const ContentHashAlgo = "blake3"
 
 // formatContentHash prefixes the hex digest with the algorithm
 // tag so every persisted hash carries its own self-description.
-// Manifests that predate Phase 3.5 have an empty ContentHash; ones
-// written after carry the prefix.
+// Manifests written without a ContentHash leave it empty; ones
+// written with content hashing carry the prefix.
 func formatContentHash(hexDigest string) string {
 	return ContentHashAlgo + ":" + hexDigest
 }

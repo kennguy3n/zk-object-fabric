@@ -15,13 +15,13 @@ import (
 // present in the cache.
 var ErrCacheMiss = errors.New("hot_object_cache: miss")
 
-// MemoryCache is the Phase 2 in-memory HotObjectCache. It uses a
+// MemoryCache is the in-memory HotObjectCache. It uses a
 // doubly-linked list keyed by a hash map for O(1) LRU bookkeeping
 // and supports a hot-pin region per EvictionPolicy.
 //
-// The implementation buffers piece bodies in memory. Phase 2 uses it
-// for the L0/L1 hot cache on small gateways and for tests; Phase 3
-// adds an NVMe-backed disk cache behind the same interface.
+// The implementation buffers piece bodies in memory. It backs
+// the L0/L1 hot cache on small gateways and tests; an NVMe-backed
+// disk cache can sit behind the same interface.
 type MemoryCache struct {
 	mu        sync.Mutex
 	policy    EvictionPolicy

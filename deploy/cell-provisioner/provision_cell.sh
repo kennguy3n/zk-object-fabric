@@ -58,7 +58,7 @@ echo "    OK tenant=$tenant_id region=$region country=$country capacity=${capaci
 
 echo "==> step 2/7: allocate hardware (terraform)"
 echo "    NOTE: this would run 'terraform apply' against deploy/local-dc/terraform/."
-echo "    For Phase 3 the operator runs this manually; the script logs the spec for audit."
+echo "    The operator runs this manually; the script logs the spec for audit."
 
 echo "==> step 3/7: deploy ceph (ansible + cephadm)"
 echo "    NOTE: this would run 'ansible-playbook' from deploy/local-dc/ansible/."

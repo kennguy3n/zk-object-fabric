@@ -37,7 +37,7 @@ const objectLockEnabledNoRule = "<ObjectLockConfiguration><ObjectLockEnabled>Ena
 func TestPutObjectLockConfiguration_RequiresVersioning(t *testing.T) {
 	h, _ := newVersioningTestHandler()
 	// Versioning is Unset on the bucket → enabling Object Lock is a
-	// 409 conflict (Object Lock depends on versioning, WS8.4).
+	// 409 conflict (Object Lock depends on versioning).
 	req := httptest.NewRequest(http.MethodPut, "/bucket?object-lock", strings.NewReader(objectLockEnabledNoRule))
 	rec := httptest.NewRecorder()
 	h.dispatch(rec, req)

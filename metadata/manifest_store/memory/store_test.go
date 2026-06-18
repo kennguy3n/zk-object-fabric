@@ -394,7 +394,7 @@ func TestScanManifests_RejectsMalformedCursor(t *testing.T) {
 	}
 }
 
-// TestUpdateManifest_PreservesLatestPointer pins the WS8.1 contract:
+// TestUpdateManifest_PreservesLatestPointer pins the contract:
 // amending a NON-latest version's body (e.g. tagging an old version)
 // must not promote it to latest. After Put(v1), Put(v2),
 // UpdateManifest(v1), the empty-VersionID "latest" read must still

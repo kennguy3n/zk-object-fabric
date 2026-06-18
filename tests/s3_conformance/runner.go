@@ -625,7 +625,7 @@ func (r *Runner) copyOps(ctx context.Context) []OpResult {
 }
 
 // versioningOps exercises the version-aware GET / ListObjectVersions
-// endpoints plus the WS8.4 bucket-versioning surface
+// endpoints plus the bucket-versioning surface
 // (Put/GetBucketVersioning and delete-marker semantics).
 //
 // The bucket-versioning probes are adaptive: the gateway only honours
@@ -728,7 +728,7 @@ func (r *Runner) versioningOps(ctx context.Context) []OpResult {
 	return out
 }
 
-// taggingOps drives the WS8.1 object-tagging round trip
+// taggingOps drives the object-tagging round trip
 // (Put/Get/Delete ?tagging) against a freshly-written key. Every op
 // is expected to succeed; the detail string reports the observed tag
 // set so a matrix diff shows exactly what the gateway returned.
@@ -783,7 +783,7 @@ func (r *Runner) taggingOps(ctx context.Context) []OpResult {
 	}
 }
 
-// lifecycleOps exercises the bucket lifecycle sub-resource (WS8.2):
+// lifecycleOps exercises the bucket lifecycle sub-resource:
 // PUT a configuration, GET it back and assert the rule round-trips,
 // then DELETE it. The gateway wires a BucketConfig store, so all
 // three are expected to succeed.

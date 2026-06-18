@@ -51,7 +51,7 @@ func (d *DualWriteProvider) PutPiece(ctx context.Context, pieceID string, r io.R
 		return providers.PutResult{}, errors.New("dual_write: both providers are required")
 	}
 	// Primary needs the body; tee into a buffer so secondary can
-	// replay it. For Phase 2 we buffer to memory which is consistent
+	// replay it. The buffer is held in memory, which is consistent
 	// with ChunkSize-bounded pieces.
 	buf, err := io.ReadAll(r)
 	if err != nil {

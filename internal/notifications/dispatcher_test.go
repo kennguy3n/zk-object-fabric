@@ -417,7 +417,7 @@ func TestShutdownDeliversQueuedEvents(t *testing.T) {
 
 // TestShutdownDeadLettersUndeliverableQueuedEvents proves that when a
 // queued event cannot be delivered during shutdown it is dead-lettered
-// rather than silently dropped (the WS8.6 review's #7 finding).
+// rather than silently dropped.
 func TestShutdownDeadLettersUndeliverableQueuedEvents(t *testing.T) {
 	doer := &errorBlockDoer{started: make(chan struct{}), release: make(chan struct{})}
 	dead := &recordingDeadLetters{}

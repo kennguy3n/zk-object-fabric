@@ -32,7 +32,7 @@
 // backend providers. The existing RateLimiter in rate_limit.go
 // remains in the chain and retains its own budget counter; the two
 // counters are intentionally independent so the guards can be
-// toggled on and off separately during Phase 3 rollout.
+// toggled on and off separately.
 package auth
 
 import (
@@ -201,7 +201,7 @@ func (g *AbuseGuard) Middleware(next http.Handler) http.Handler {
 		// the window it crosses the threshold. Enforcing a hard
 		// pre-request cap would require buffering the backend
 		// response body and making a double-HEAD call to size it
-		// — an explicit non-goal for Phase 3. The billing pipeline
+		// — an explicit non-goal. The billing pipeline
 		// backfills the exhaustion event when it lands, and every
 		// subsequent request is rejected with 429.
 		if !g.allowBudget(tenantID, t) {

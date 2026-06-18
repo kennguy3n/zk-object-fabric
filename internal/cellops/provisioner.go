@@ -6,11 +6,11 @@
 // runbook ticket), and eventually flips the record to "active"
 // once the operator-side bring-up workflow completes.
 //
-// Phase 3 ships ManualProvisioner: it logs the request and stores
+// ManualProvisioner logs the request and stores
 // a pending record in the DedicatedCellStore so the request is
-// surfaced to operators without yet automating hardware
-// allocation. Full automation (Terraform / Ansible) lives behind
-// the same interface in Phase 4.
+// surfaced to operators without automating hardware
+// allocation. AutomatedProvisioner provides Terraform-driven
+// automation behind the same interface.
 package cellops
 
 import (
@@ -61,15 +61,15 @@ type CellRequest struct {
 	// "use the platform default".
 	ErasureProfile string `json:"erasure_profile"`
 
-	// NodeCount is the planned storage-node count. Phase 3
-	// requires 6 nodes minimum to satisfy a 6+2 erasure layout
+	// NodeCount is the planned storage-node count. A minimum of
+	// 6 nodes is required to satisfy a 6+2 erasure layout
 	// without a hot reconstruction tax.
 	NodeCount int `json:"node_count"`
 }
 
 // Validate reports whether the request is well-formed enough to
 // hand to a provisioner. Implementations are free to apply
-// stricter checks (e.g. region whitelists), but every Phase 3
+// stricter checks (e.g. region whitelists), but every
 // provisioner must enforce the floor below.
 func (r CellRequest) Validate() error {
 	switch {
@@ -135,11 +135,11 @@ type CellSink interface {
 	UpdateCellStatus(ctx context.Context, cellID string, status ProvisionStatus) error
 }
 
-// ManualProvisioner is the Phase 3 default. It records a pending
+// ManualProvisioner is the default. It records a pending
 // cell row, logs the request so operators get a paged audit trail,
 // and otherwise defers the actual hardware bring-up to the
-// out-of-band runbook. Phase 4 drops a Terraform-backed
-// provisioner in behind the same interface.
+// out-of-band runbook. AutomatedProvisioner offers a Terraform-backed
+// alternative behind the same interface.
 type ManualProvisioner struct {
 	// Sink persists cell records. Required.
 	Sink CellSink

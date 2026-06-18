@@ -1,6 +1,6 @@
 # AWS Control Plane
 
-Phase 3 control plane provisioning for ZK Object Fabric on AWS.
+Control plane provisioning for ZK Object Fabric on AWS.
 This directory ships Terraform modules and CloudWatch dashboard
 JSON for a beta-cell deployment.
 

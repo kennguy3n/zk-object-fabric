@@ -117,7 +117,7 @@ charge applies).
 
 **Caveat — objects with no creation timestamp:** the warning is
 derived from the object manifest's `CreatedAt`. Manifests written
-before creation-timestamp tracking existed (pre-WS8.2) carry a zero
+before creation-timestamp tracking existed carry a zero
 `CreatedAt`; for those the gateway cannot determine the object's age,
 so it **fails open** and emits no warning, even if the object is in
 fact within the 90-day window. This is deliberate (better to stay

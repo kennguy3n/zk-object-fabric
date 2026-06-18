@@ -6,7 +6,7 @@
 // so that range-aligned encrypted chunks can be served directly
 // without reconstruction.
 //
-// Sizing guidance for the Linode hot cache (Phase 2+):
+// Sizing guidance for the Linode hot cache:
 //
 //   - NVMe-backed Linode shapes are preferred for L0 (edge) because
 //     per-object lookup latency dominates. Target a minimum of
@@ -21,7 +21,7 @@
 //     more.
 //
 //   - Cache capacity should be sized against the product target
-//     "Hot tier hit ratio > 90%" (see docs/PROGRESS.md). Under-
+//     "Hot tier hit ratio > 90%" (see docs/CAPACITY.md). Under-
 //     provisioned caches push Wasabi origin egress toward the
 //     fair-use ceiling (egress ÷ stored > 1).
 package hot_object_cache
@@ -96,12 +96,11 @@ type PromotionSignal struct {
 	OriginBackend  string
 }
 
-// CacheTier names a cache layer. The data plane uses three tiers in
-// Phase 2+:
+// CacheTier names a cache layer. The data plane uses three tiers:
 //
 //   - TierL0: per-gateway NVMe edge cache.
 //   - TierL1: regional hot replica (block storage or NVMe).
-//   - TierL2: durable origin (Wasabi, or a local cell in later phases).
+//   - TierL2: durable origin (Wasabi, or a local cell).
 type CacheTier string
 
 const (
@@ -115,7 +114,7 @@ const (
 // read-path signal; any threshold crossed at its tier promotes the
 // piece.
 //
-// The thresholds are intentionally conservative so that the Phase 2
+// The thresholds are intentionally conservative so that the
 // promotion engine can start with these values and tighten them
 // against real traffic measured by the benchmark suite.
 type PromotionPolicy struct {
@@ -154,7 +153,7 @@ type PromotionPolicy struct {
 	PinHotByDefault bool
 }
 
-// DefaultPromotionPolicies returns the conservative Phase 2 defaults
+// DefaultPromotionPolicies returns the conservative defaults
 // for L0 (edge NVMe) and L1 (regional) tiers. Operators may override
 // any field per tenant or per cell.
 func DefaultPromotionPolicies() []PromotionPolicy {
@@ -205,8 +204,8 @@ func (p PromotionPolicy) Validate() error {
 }
 
 // EvictionPolicyKind names the eviction algorithm used by a cache
-// tier. Phase 2 ships LRU with a hot-pin extension; the enum is wider
-// so later phases can add LFU or TinyLFU without breaking consumers.
+// tier. The default is LRU with a hot-pin extension; the enum is wider
+// so LFU or TinyLFU can be added without breaking consumers.
 type EvictionPolicyKind string
 
 const (
@@ -245,7 +244,7 @@ type EvictionPolicy struct {
 	TTL time.Duration
 }
 
-// DefaultEvictionPolicy returns the Phase 2 default: LRU with
+// DefaultEvictionPolicy returns the default: LRU with
 // hot-pin support and a 10% hot region.
 func DefaultEvictionPolicy(maxBytes int64) EvictionPolicy {
 	return EvictionPolicy{

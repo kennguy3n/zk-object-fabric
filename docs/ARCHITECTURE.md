@@ -12,8 +12,8 @@ replace:
   storage-backend mapping and provider adapter matrix.
 - [INTEGRATION.md](INTEGRATION.md) — dedup integration patterns for
   external applications.
-- [PHASES.md](PHASES.md) — phase summary and current status.
-- [PROGRESS.md](PROGRESS.md) — detailed phase-gated checklist.
+- [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) — the supported S3 API
+  surface.
 
 ## High-level architecture
 
@@ -24,10 +24,10 @@ flowchart TD
     Enc["Client-side or Gateway-side Encryption<br/>(Linode data plane)"]
     Manifest["Encrypted Object Manifest"]
     Adapter["Storage Provider Adapter"]
-    Wasabi["Wasabi<br/>(Phase 1 primary)"]
+    Wasabi["Wasabi<br/>(cloud primary)"]
     B2["Backblaze B2<br/>(alternative)"]
     R2["Cloudflare R2<br/>(hot egress alternative)"]
-    Local["Local DC Cell<br/>(Phase 2+)"]
+    Local["Local DC Cell"]
     Cache["Hot Cache Layer<br/>(Linode NVMe / Akamai CDN)"]
     Repair["Repair & Audit System"]
     Bw["Bandwidth Accounting"]
@@ -62,8 +62,8 @@ managed key mode.
   (`frontend/`).
 - **Rust** is reserved for selective hot paths where memory
   footprint and per-byte CPU cost dominate (chunking, encryption,
-  cache eviction loops, erasure coding); not yet wired in the
-  current build — Go covers the data plane for Phase 1 → Phase 4.
+  cache eviction loops, erasure coding); Go currently covers the
+  full data plane.
 - **Datastores**: PostgreSQL for metadata (manifest, tenant, auth,
   placement, dedicated-cell, audit, legal hold, content index),
   ClickHouse for billing telemetry, Redis-style in-memory + on-disk
@@ -84,8 +84,10 @@ zk-object-fabric/
   cmd/
     gateway/              # Gateway entry point (main.go)
   api/
-    s3compat/             # S3 API handlers, multipart, dedup,
-                          # erasure coding, encryption
+    s3compat/             # S3 API handlers (object, multipart, copy,
+                          # tagging, versioning, lifecycle, object
+                          # lock, CORS, notification, bucket SSE),
+                          # dedup, erasure coding, encryption
     console/              # Console API: tenant mgmt, auth, billing,
                           # placement, dedup policy
   encryption/
@@ -94,25 +96,28 @@ zk-object-fabric/
     envelope.go           # Encryption envelope types
   metadata/
     manifest_store/       # Manifest persistence (memory + Postgres)
-    bucket_config/        # Per-bucket S3 config (versioning state +
-                          # Object Lock config + CORS rules + lifecycle
-                          # rules; memory + Postgres + SQLite) —
-                          # WS8.4 / WS8.3 / WS8.5 / WS8.2
-    lifecycle/            # WS8.2 LifecycleRule domain + validation
-    object_lock/          # WS8.3 LockConfig + retention/legal-hold
-    cors/                 # WS8.5 CORS rule domain + origin matching
+    bucket_config/        # Per-bucket S3 config (versioning state,
+                          # Object Lock config, CORS rules, lifecycle
+                          # rules, notification config, default SSE;
+                          # memory + Postgres + SQLite)
+    lifecycle/            # LifecycleRule domain + validation
+    object_lock/          # LockConfig + retention/legal-hold
+    cors/                 # CORS rule domain + origin matching
+    notification/         # Bucket notification rule domain
+    sse/                  # Bucket default SSE config domain
     placement_policy/     # Placement engine and policy DSL
     erasure_coding/       # EC profiles, encoder, registry
     content_index/        # Dedup ContentIndex (memory + Postgres)
+    pieceintegrity/       # Shared per-piece content-hash verification
     tenant/               # Tenant schema, tier config
   lifecycle/
-    evaluator/            # WS8.2 daily lifecycle sweep (expire /
+    evaluator/            # Daily lifecycle sweep (expire /
                           # delete-marker / abort), audit + billing
                           # hooks; wired into cmd/gateway/main.go
   providers/
     s3_generic/           # Shared S3-compatible base adapter
     wasabi/               # Wasabi adapter + fair-use guardrails
-    ceph_rgw/             # Ceph RGW adapter (Phase 2+)
+    ceph_rgw/             # Ceph RGW adapter (local-DC origin)
     aws_s3/               # AWS S3 adapter (BYOC / DR)
     backblaze_b2/         # Backblaze B2 adapter
     cloudflare_r2/        # Cloudflare R2 adapter
@@ -158,9 +163,7 @@ zk-object-fabric/
     entrypoint.sh         # Docker entrypoint
     README.md             # Demo usage guide
   docs/
-    PROPOSAL.md           # Technical proposal (full architecture spec)
-    PROGRESS.md           # Phase-gated progress tracker
-    PHASES.md             # Phase summary and status
+    PROPOSAL.md           # Technical design (full architecture spec)
     ARCHITECTURE.md       # As-built architecture overview (this file)
     INTEGRATION.md        # Dedup integration guide for external apps
     STORAGE_INFRA.md      # Deployment-model to storage mapping
@@ -168,45 +171,33 @@ zk-object-fabric/
     runbooks/             # Operational runbooks
 ```
 
-### Planned packages (Workstreams 8–9)
+### Per-bucket S3 configuration storage
 
-The following packages are **planned, not yet built**. They are
-specified in [PROPOSAL.md §15](PROPOSAL.md) and tracked in
-[PROGRESS.md](PROGRESS.md); listed here so the as-built layout above
-stays the source of truth for what exists today.
+The richer S3 sub-resources are all wired into the gateway and
+persisted through the `metadata/bucket_config` store, keyed by
+`(tenant_id, bucket)` with memory + Postgres + SQLite backends (the
+embedded single-node profile self-creates equivalent tables):
 
-Workstream 8 is substantially built and folded into the as-built
-layout above: tagging (`api/s3compat/tagging_handler.go`, WS8.1),
-lifecycle (`lifecycle_handler.go` + `metadata/lifecycle` +
-`lifecycle/evaluator`, WS8.2), Object Lock / WORM
-(`object_lock_handler.go` + `metadata/object_lock`, WS8.3), bucket
-versioning (`versioning_handler.go`, WS8.4), CORS
-(`cors_handler.go` + `metadata/cors`, WS8.5), and event notifications
-(`notification_handler.go` + `metadata/notification` +
-`internal/notifications` async dispatcher, WS8.6), all persisted
-through the `metadata/bucket_config` store. The packages below remain
-**planned, not yet built**:
-
-```
-api/s3compat/
-  encryption_handler.go   # WS8.7 Put/Get/DeleteBucketEncryption
-encryption/
-  rust_sdk/               # WS9 byte-compatible Rust client-side SDK
-```
-
-Per-bucket S3 config (WS8, built) is owned by the
-`metadata/bucket_config` package, keyed by `(tenant_id, bucket)` with
-memory + Postgres + SQLite backends — the embedded single-node profile
-self-creates equivalent tables. Bucket versioning state (WS8.4) lives
-in `bucket_versioning`, Object Lock config (WS8.3) in
-`bucket_object_lock`, CORS rules (WS8.5) in `bucket_cors`, and
-lifecycle rules (WS8.2) in `bucket_lifecycle` (rule sets JSON-encoded).
-Object tags (WS8.1) are stored as JSONB on the existing manifest row
-rather than in a new table, and per-object-version retention mode /
-retain-until / legal-hold ride on the object manifest so they version
-with the object. Notification configs (WS8.6) live in
-`bucket_notification` (rule sets JSON-encoded); the WS8.7 SSE-config
-table is finalised when that slice lands.
+- **Object tagging** — `api/s3compat/tagging_handler.go`; tags stored
+  as JSONB on the existing manifest row rather than in a new table.
+- **Lifecycle** — `lifecycle_handler.go` + `metadata/lifecycle` +
+  the `lifecycle/evaluator` daily sweep; rules in `bucket_lifecycle`
+  (rule sets JSON-encoded).
+- **Object Lock / WORM** — `object_lock_handler.go` +
+  `metadata/object_lock`; default config in `bucket_object_lock`,
+  with per-object-version retention mode / retain-until / legal-hold
+  riding on the object manifest so they version with the object.
+- **Bucket versioning** — `versioning_handler.go`; state in
+  `bucket_versioning`.
+- **CORS** — `cors_handler.go` + `metadata/cors`; rules in
+  `bucket_cors`.
+- **Event notifications** — `notification_handler.go` +
+  `metadata/notification` + the `internal/notifications` async
+  dispatcher; rules in `bucket_notification` (JSON-encoded).
+- **Bucket default encryption (SSE)** — `encryption_handler.go` +
+  `metadata/sse`; `Put/Get/DeleteBucketEncryption` set a bucket
+  default of `AES256` or `aws:kms`, layered onto object writes as
+  gateway-managed encryption.
 
 ## Component overview
 
@@ -219,13 +210,21 @@ table is finalised when that slice lands.
   validation, S3-compatible XML errors.
 - SigV4 verification and per-tenant rate limiting via
   `internal/auth/`.
-- WS8 sub-resource handlers: object tagging (`tagging_handler.go`),
+- Conditional reads on GET/HEAD (`If-Match` / `If-None-Match` with
+  strong ETag comparison, `If-Modified-Since` / `If-Unmodified-Since`,
+  and `If-Range`), `response-*` header overrides, multi-range reads
+  served as `206 multipart/byteranges`, and `x-amz-copy-source-if-*`
+  conditionals on `CopyObject`. Server-side copy reconstructs
+  erasure-coded and multipart sources.
+- Sub-resource handlers: object tagging (`tagging_handler.go`),
   bucket lifecycle config (`lifecycle_handler.go`), Object Lock /
   retention / legal-hold (`object_lock_handler.go`), bucket versioning
-  (`versioning_handler.go`), and CORS (`cors_handler.go` plus the
+  (`versioning_handler.go`), CORS (`cors_handler.go` plus the
   request-time `applyCORS` middleware and unauthenticated OPTIONS
-  preflight). The daily `lifecycle/evaluator` sweep is wired into
-  `cmd/gateway/main.go` against the same `bucket_config` store.
+  preflight), event notifications (`notification_handler.go`), and
+  bucket default encryption (`encryption_handler.go`). The daily
+  `lifecycle/evaluator` sweep is wired into `cmd/gateway/main.go`
+  against the same `bucket_config` store.
 - Encryption pipeline: client-side ciphertext passthrough,
   managed-mode envelope encryption (gateway derives DEK and wraps
   with the configured CMK), erasure-coding shard fan-out for the
@@ -235,7 +234,7 @@ table is finalised when that slice lands.
   consolidation for `managed` / `public_distribution` multipart
   uploads at `CompleteMultipartUpload` time.
 - Compliance hooks: residency pre-flight, audit trail emission,
-  legal-hold check on DELETE. Object Lock / WORM (WS8.3) enforces
+  legal-hold check on DELETE. Object Lock / WORM enforces
   per-version retention (GOVERNANCE/COMPLIANCE) and legal holds in
   the permanent-delete and PUT-overwrite paths.
 
@@ -294,9 +293,9 @@ fabric can add, remove, and migrate between backends without
 customer-visible changes:
 
 - `s3_generic/` — shared S3-compatible base.
-- `wasabi/` — primary Phase 1 origin + fair-use guardrails
+- `wasabi/` — primary cloud origin + fair-use guardrails
   (egress budgets, min-storage tracker, cache-hit-ratio target).
-- `ceph_rgw/` — Phase 2+ local-DC origin.
+- `ceph_rgw/` — local-DC origin.
 - `aws_s3/` — BYOC / DR.
 - `backblaze_b2/`, `cloudflare_r2/`, `storj/` — alternative
   backends, gated on per-provider config sections.
@@ -392,7 +391,7 @@ configuration:
 
 See [demo/README.md](../demo/README.md) for full instructions.
 
-### Production: AWS + Linode + Wasabi (Phase 1 → Phase 3)
+### Cloud: AWS + Linode + Wasabi
 
 - **AWS** (control plane): RDS PostgreSQL 16 (multi-AZ, encrypted),
   KMS CMK with annual rotation, IAM roles, CloudWatch dashboards
@@ -406,7 +405,7 @@ See [demo/README.md](../demo/README.md) for full instructions.
   presigned URLs. Provisioned via `deploy/wasabi/`.
 - ClickHouse (managed or self-hosted) for the billing sink.
 
-### Hybrid: + Ceph RGW local DC (Phase 2 → Phase 4)
+### Hybrid: + Ceph RGW local DC
 
 - Adds local DC cells provisioned via `deploy/local-dc/`:
   cephadm-bootstrapped Ceph Reef cluster, OSD HDD nodes with
@@ -477,8 +476,7 @@ The Prometheus exporter is mounted at `GET /internal/metrics`.
 - [PROPOSAL.md](PROPOSAL.md) §3.8 — encryption modes.
 - [PROPOSAL.md](PROPOSAL.md) §3.14 — intra-tenant dedup design.
 - [PROPOSAL.md](PROPOSAL.md) §4 — migration engine.
-- [PROPOSAL.md](PROPOSAL.md) §6 — cell architecture (Phase 2+).
+- [PROPOSAL.md](PROPOSAL.md) §6 — cell architecture.
 - [STORAGE_INFRA.md](STORAGE_INFRA.md) — deployment-model mapping.
 - [INTEGRATION.md](INTEGRATION.md) — external app dedup integration.
-- [PHASES.md](PHASES.md) — phase summary.
-- [PROGRESS.md](PROGRESS.md) — detailed progress tracker.
+- [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) — supported S3 API surface.

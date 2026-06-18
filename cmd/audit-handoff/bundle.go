@@ -230,7 +230,7 @@ func Build(m *Manifest, opts BundleOptions) (*Result, error) {
 			// not at audit time.
 			//
 			// Today this is unreachable: every required
-			// component (progress_pin) declares specific files
+			// component (overview_pin) declares specific files
 			// and TestHandoffManifest_PathsResolveOrAreOptional
 			// enforces required-path existence. If a future
 			// manifest points a required component at a
@@ -416,7 +416,7 @@ func (w *bundleWriter) writeMissingPlaceholder(c Component, rel string) error {
 // when extracting the bundle. It is deliberately a separate
 // file from README.md (which is the *source* doc that lives
 // in deploy/audit-handoff/README.md and is copied in via the
-// progress_pin / always-included path); INDEX.md is generated
+// overview_pin / always-included path); INDEX.md is generated
 // per-bundle and carries the build timestamp, commit, and the
 // resolved-vs-missing component status.
 //
@@ -435,12 +435,12 @@ func (w *bundleWriter) writeIndex(m *Manifest, opts BundleOptions, included []st
 	fmt.Fprintf(&sb, "Source:  https://github.com/kennguy3n/zk-object-fabric/commit/%s\n\n", opts.CommitSHA)
 	// Reference the actual files the auditor will find inside the bundle.
 	// The bundle layout is <bundle-stem>/<componentID>/<rel-path>, so the
-	// system overview lives at progress_pin/docs/PROPOSAL.md (always
-	// shipped — progress_pin is the only required component) and the
+	// system overview lives at overview_pin/docs/PROPOSAL.md (always
+	// shipped — overview_pin is a required component) and the
 	// security README at audit_bundle/docs/security/README.md (shipped
 	// when the audit_bundle make target succeeds and the optional source
 	// files are present on the branch).
-	fmt.Fprintf(&sb, "Start by reading `progress_pin/docs/PROPOSAL.md` (system overview) and then\n")
+	fmt.Fprintf(&sb, "Start by reading `overview_pin/docs/PROPOSAL.md` (system overview) and then\n")
 	fmt.Fprintf(&sb, "`audit_bundle/docs/security/README.md` if this bundle has the audit_bundle component.\n\n")
 	fmt.Fprintf(&sb, "Components\n----------\n\n")
 	for _, c := range m.Components {

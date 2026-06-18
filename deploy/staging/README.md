@@ -1,11 +1,11 @@
 # Tier 3 (Linode + Wasabi) staging deployment
 
-This directory is the **WS2.1 deliverable**: the operator-runnable
+This directory holds the operator-runnable
 artifacts that stand up the published-SLA staging environment
 described in `docs/runbooks/load-testing.md` §4 ("Tier 3: Linode +
 Wasabi staging gateway"). Running the harness here produces the
-benchmark report that gates the *Load testing* line in
-`docs/PROGRESS.md`.
+canonical benchmark report that demonstrates the gateway meets its
+published load-testing SLA on a real cloud deployment.
 
 The contents are **external-prep-only** — every script in this tree
 is designed to be invoked by a human operator (or an external party
@@ -225,8 +225,8 @@ runbook's §4 contract:
 | 4 | `sustained_rps >= 10_000` ∧ `rps_efficiency >= 0.95` ∧ `error_rate <= 1e-3` ∧ `skipped_op_fraction <= 0.05`. | Same. |
 | 5 | No required metric `Pending`. | `tests/tier3verify.verifyScenario`. |
 
-A `tier3-verify` exit code of 0 means the run gates the *Load
-testing* item in `docs/PROGRESS.md`. A non-zero exit means **do
+A `tier3-verify` exit code of 0 means the run satisfies the
+published load-testing SLA. A non-zero exit means **do
 NOT promote** the gateway build — file an incident, attach the
 verdict and the full evidence dossier, and triage from the
 per-scenario `histogram` field in the JSON.
@@ -244,9 +244,7 @@ terraform -chdir=deploy/linode/terraform destroy ...
 ## See also
 
 - [`docs/runbooks/load-testing.md`](../../docs/runbooks/load-testing.md)
-  §4 — Tier 3 invocation contract.
-- [`docs/PROGRESS.md`](../../docs/PROGRESS.md) — *Load testing*
-  line, gated on a passing Tier 3 verdict.
+  §4 — Tier 3 invocation contract and load-testing SLA targets.
 - [`tests/tier3verify`](../../tests/tier3verify) — the verifier
   package consumed by the CLI.
 - [`cmd/tier3-verify`](../../cmd/tier3-verify) — the CLI itself.

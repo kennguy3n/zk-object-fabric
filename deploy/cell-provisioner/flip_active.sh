@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # PATCH /api/admin/dedicated-cells/{cell_id} to flip status to
-# active. Phase 4 endpoint — Phase 3 ships the provisioning +
-# decommission paths only. This wrapper exists so operator
-# muscle memory survives the Phase 4 cutover.
+# active. This manual status-flip endpoint is not part of the
+# console's current dedicated-cell HTTP surface (which exposes the
+# provisioning and decommission paths); cells advance to active
+# through the provisioner's bring-up completion workflow. This
+# wrapper is kept so operator muscle memory survives if a manual
+# flip endpoint is added.
 set -euo pipefail
 
 CONSOLE_URL=""

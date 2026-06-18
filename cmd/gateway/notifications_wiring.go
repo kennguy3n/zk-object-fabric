@@ -36,7 +36,7 @@ func (e notificationEmitter) Emit(evt s3compat.ObjectEvent) {
 }
 
 // buildNotificationDispatcher constructs the bucket event-notification
-// dispatcher (WS8.6) when enabled in config and a bucket-config store
+// dispatcher when enabled in config and a bucket-config store
 // is available to resolve per-bucket rules. It returns (nil, nil) when
 // notifications are disabled or unsupported, in which case the s3
 // handler is wired with no emitter and events are never delivered (the

@@ -1,10 +1,10 @@
 // Command gateway is the entry point for the S3-compatible ZK Gateway
 // that runs on the Linode data plane. See docs/PROPOSAL.md §3.1.
 //
-// Phase 2 wires the HTTP surface end-to-end: a Postgres (or memory)
+// The gateway wires the HTTP surface end-to-end: a Postgres (or memory)
 // ManifestStore, the provider registry, the placement engine, the
 // HMAC authenticator, the hot object cache, and a logging billing
-// sink. Subsequent phases swap the billing sink for ClickHouse and
+// sink. Configuration can swap the billing sink for ClickHouse and
 // the tenant store for a Postgres-backed directory.
 package main
 
@@ -215,7 +215,7 @@ func main() {
 	enforceProductionManifestEncryption(cfg.Env, metadataDB != nil || embeddedDB != nil, cfg.Encryption.ManifestBodyKeyPath)
 	// Production safety net: refuse to start when env=production and the
 	// Postgres metadata connection uses a role that bypasses Row-Level
-	// Security (superuser or BYPASSRLS). RLS is the Workstream 3.4
+	// Security (superuser or BYPASSRLS). RLS is the
 	// defence-in-depth layer behind the application-level tenant
 	// predicates; Postgres silently skips it for such roles, so booting
 	// on a superuser connection would ship that layer disabled with no
@@ -377,7 +377,7 @@ func main() {
 	// cfg.Env they used previously.
 	gatewayNodeID := resolveGatewayNodeID(cfg.Gateway.NodeID)
 	// notificationDispatcher fans bucket events out to tenant-configured
-	// webhook destinations (WS8.6). nil when notifications are disabled
+	// webhook destinations. nil when notifications are disabled
 	// or no bucket-config store is available; the handler then runs with
 	// no emitter and only the configuration sub-resource is active.
 	notificationDispatcher, err := buildNotificationDispatcher(cfg.Notifications, bucketConfigStore)
@@ -765,7 +765,7 @@ var errProductionManifestEncryptionRequired = errors.New("gateway: env=productio
 // would persist manifest bodies unencrypted. Without a
 // BodyEncryptor key the manifest table leaks object keys, piece
 // locators, sizes, and the wrapped DEK to anyone with read access
-// to the store — the exact threat model the Phase 2 manifest body
+// to the store — the exact threat model the manifest body
 // encryption was added to defend against (see
 // manifest_store.BodyEncryptor and docs/PROPOSAL.md §3.7). Both
 // persistent backends are covered: Postgres (plaintext JSONB) and
@@ -816,7 +816,7 @@ func enforceProductionManifestEncryption(env string, manifestStorePersistent boo
 // store, but the connecting role bypasses Row-Level Security — either it
 // is a superuser or it carries the BYPASSRLS attribute. Postgres skips
 // all RLS policies for such roles regardless of FORCE ROW LEVEL
-// SECURITY, so the Workstream 3.4 tenant-isolation policies on the
+// SECURITY, so the tenant-isolation policies on the
 // manifests table (and the other control-plane tables) would be silently
 // inert: a query that omitted or mistook its tenant predicate could read
 // or write across tenants with no database-level backstop. Exposed as a
@@ -826,7 +826,7 @@ var errProductionRLSRoleInert = errors.New("gateway: env=production with a Postg
 
 // checkProductionRLSRole refuses to start the gateway when cfg.Env ==
 // "production" and the Postgres metadata connection uses a role that
-// bypasses RLS. RLS is the Workstream 3.4 defence-in-depth layer
+// bypasses RLS. RLS is the defence-in-depth layer
 // (docs/security/audit-package-security.md §8): it only takes effect for
 // non-superuser, non-BYPASSRLS roles, so booting in production on a
 // superuser connection would ship that layer disabled without any visible
@@ -1372,7 +1372,7 @@ func startRebalancer(
 }
 
 // startLifecycleEvaluator spins up the background object-lifecycle
-// evaluator (WS8.2) on a ticker when cfg.Lifecycle.Enabled. It
+// evaluator on a ticker when cfg.Lifecycle.Enabled. It
 // returns a channel that closes when the worker has fully drained,
 // or nil when the worker was not started. It shares ctx with the
 // other gateway workers so a SIGTERM-triggered cancelWorker() also
@@ -1898,14 +1898,14 @@ func buildContentIndex(cfg config.Config, db, embeddedDB *sql.DB) content_index.
 }
 
 // buildBucketConfigStore returns the per-bucket S3 configuration
-// store (versioning, object-lock, CORS, lifecycle — the WS8
+// store (versioning, object-lock, CORS, lifecycle — the bucket
 // sub-resources). It follows the same backend selection as the
 // manifest and content-index stores: Postgres when a metadata DSN
 // is configured, the embedded SQLite database in the single-node
 // profile, and an in-memory store otherwise. The in-memory store is
 // process-local and loses every bucket config on restart, so it
 // MUST NOT be used in production. A non-nil store is always
-// returned; the gateway cannot serve the WS8 sub-resource handlers
+// returned; the gateway cannot serve the bucket sub-resource handlers
 // or run the lifecycle evaluator without one.
 func buildBucketConfigStore(cfg config.Config, db, embeddedDB *sql.DB) bucket_config.Store {
 	if db == nil {
@@ -2006,7 +2006,7 @@ func buildMFASecretSealer(cfg config.Config) console.SecretSealer {
 // the S3 handler consumes for managed / public_distribution
 // tenant policies. The wrapper is selected from cfg.CMKURI:
 //
-//   - "" or "cmk://local/..."   → LocalFileWrapper (Phase 2 default;
+//   - "" or "cmk://local/..."   → LocalFileWrapper (local default;
 //     plaintext master key on disk; suitable for dev only).
 //   - "arn:aws:kms:..." or "kms://..." → KMSWrapper backed by AWS KMS.
 //   - "vault://..." or "transit://..." → VaultWrapper backed by
@@ -2232,7 +2232,7 @@ func buildProviderRegistry(ctx context.Context, cfg config.Config) map[string]pr
 		}
 		registry["wasabi"] = w
 	}
-	// Per-region Wasabi providers (Phase 3 multi-region).
+	// Per-region Wasabi providers (multi-region).
 	// Each region registers under its ResolvedName() so placement
 	// policies can target e.g. "wasabi-us-east-1" or
 	// "wasabi-eu-central-1" explicitly.
@@ -2377,7 +2377,7 @@ func firstWasabiRegionKey(registry map[string]providers.StorageProvider) string 
 // is set and a writable directory, falling back to an in-memory
 // cache for developer/test flows. The cache capacity is 1 GiB so
 // small dev machines don't fill the disk; operators size it via
-// the eviction policy in Phase 4's config refactor.
+// the eviction policy.
 //
 // Production nodes configure cache_path so the NVMe tier survives
 // gateway restarts. Dev and CI environments leave it unset and get
@@ -2666,7 +2666,7 @@ func startConsoleAPI(
 	mux := http.NewServeMux()
 	h.Register(mux)
 
-	// Operations dashboard (Phase 3 console): read-only /api/v1/ops/*
+	// Operations dashboard (console): read-only /api/v1/ops/*
 	// endpoints the React console renders for SME operators who do
 	// not run Grafana/Prometheus. Health and cache stats are wired
 	// from the live monitor and hot-object cache. The Wasabi
@@ -2992,8 +2992,8 @@ func buildDedicatedCellStore(db *sql.DB) console.DedicatedCellStore {
 }
 
 // buildCellProvisioner returns a ManualProvisioner backed by store
-// when store satisfies cellops.CellSink. The Phase 3 in-memory and
-// Postgres dedicated-cell stores both do; a future custom store
+// when store satisfies cellops.CellSink. The in-memory and
+// Postgres dedicated-cell stores both do; a custom store
 // that does not implement CellSink simply gets a nil provisioner
 // and the POST /dedicated-cells endpoint reports
 // 503 service unavailable.
@@ -3026,7 +3026,7 @@ func buildAdminAuth(cfg config.Config) func(r *http.Request) bool {
 }
 
 // buildAuthHooks wires the hCaptcha / SES hooks when their
-// configuration secrets are available via the environment. Phase 3
+// configuration secrets are available via the environment. The
 // hooks fall back to no-ops so dev / test deploys still work without
 // a hCaptcha site secret or an AWS SES account.
 func buildAuthHooks(cfg config.Config) console.AuthHooks {

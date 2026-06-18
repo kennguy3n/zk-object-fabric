@@ -1,6 +1,6 @@
 name: security
 
-# Supply-chain and secret-hygiene gates (Workstream 6.7). govulncheck
+# Supply-chain and secret-hygiene gates. govulncheck
 # already runs in ci.yml's dedicated job, so this workflow adds the
 # pieces ci.yml does not yet cover: secret scanning, frontend
 # dependency audit, and SPDX SBOM generation. Kept separate so the

@@ -1,5 +1,5 @@
 // Package console implements the tenant-console HTTP API that the
-// Phase 3 React frontend (in frontend/) consumes. The endpoints
+// React frontend (in frontend/) consumes. The endpoints
 // expose read/write operations on tenant records, per-tenant usage
 // counters sourced from the ClickHouse billing pipeline, API-key
 // management, and the tenant's placement policy.
@@ -22,7 +22,7 @@
 //	GET  /api/tenants/{id}/placement  — placement policy
 //	PUT  /api/tenants/{id}/placement  — replace placement policy
 //
-// Phase 3 ships a scaffold: TenantStore reads off the existing
+// TenantStore reads off the existing
 // in-memory tenant store, UsageQuery is a thin interface the
 // ClickHouse billing sink can satisfy, and PlacementStore is an
 // in-memory policy store suitable for development and tests. The
@@ -96,8 +96,8 @@ type APIKeyLister interface {
 }
 
 // BucketDescriptor mirrors the shape frontend/src/api/types.ts
-// `Bucket` consumes. BytesStored / ObjectCount are Phase 3
-// placeholders populated from the manifest store when available;
+// `Bucket` consumes. BytesStored / ObjectCount are
+// populated from the manifest store when available;
 // in-memory stores report zero.
 type BucketDescriptor struct {
 	Name               string    `json:"name"`
@@ -183,7 +183,7 @@ type Config struct {
 	// CellProvisioner accepts dedicated-cell provisioning
 	// requests submitted via POST /api/tenants/{id}/dedicated-cells.
 	// When nil the endpoint returns 503 so the operator workflow
-	// is opt-in (Phase 3 wires this only when MetadataDSN is
+	// is opt-in (wired only when MetadataDSN is
 	// set).
 	CellProvisioner cellops.CellProvisioner
 
@@ -202,8 +202,8 @@ type Config struct {
 	// signup handler calls EnsureCustomer immediately after
 	// CreateTenant commits so a freshly-minted tenant is reflected
 	// on the provider before any usage event lands. A nil provider
-	// skips the call — acceptable for dev and the HMAC-only Phase
-	// 2 path; production wires cmd/gateway/main.go's provider.
+	// skips the call — acceptable for dev and the HMAC-only auth
+	// path; production wires cmd/gateway/main.go's provider.
 	BillingProvider billing.BillingProvider
 
 	// AdminAuth is the per-request admin-authorization check. The
@@ -466,7 +466,7 @@ func (c Config) usageStreamWindowEffective() time.Duration {
 // surface (reverse proxy, chi router, etc.) without going through a
 // ServeMux.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Phase 3.5: /api/v1/tenants/{tid}/buckets/{bucket}/dedup-policy
+	// The /api/v1/tenants/{tid}/buckets/{bucket}/dedup-policy route
 	// is registered in Register() under a different mux prefix
 	// than the legacy /api/tenants/ surface. ServeHTTP callers
 	// (test harnesses, custom routers) need the same routing

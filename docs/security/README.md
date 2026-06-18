@@ -1,8 +1,7 @@
 # Security & Cryptography Audit Packages
 
 This directory contains the hand-off packages for the **external**
-security review (Workstream 1.3) and the **external** cryptography
-review (Workstream 1.4) listed in [`docs/PROGRESS.md`](../PROGRESS.md).
+security review and the **external** cryptography review.
 
 Each package is a single Markdown document that an external auditor
 can read end-to-end without needing a guided code walkthrough. The

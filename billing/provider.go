@@ -22,8 +22,8 @@ import (
 //     charges customers. It is per-deployment and may be left
 //     unset; the gateway then falls back to NoopProvider.
 //
-// Phase 3 ships only the abstraction and a no-op default. A
-// future Phase 4 / 5 plug-in will register e.g. a StripeProvider
+// The package ships the abstraction and a no-op default. A
+// payment plug-in (e.g. a StripeProvider) can register
 // behind this interface without any other code in the codebase
 // needing to learn about Stripe specifically.
 //

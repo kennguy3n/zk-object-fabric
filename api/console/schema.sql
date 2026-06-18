@@ -1,5 +1,5 @@
 -- schema.sql defines the tables the Postgres-backed PlacementStore
--- and the Phase 3 Postgres-backed AuthStore / DedicatedCellStore
+-- and the Postgres-backed AuthStore / DedicatedCellStore
 -- depend on. Each tenant has at most one active placement policy
 -- document; the full policy body is stored as JSON so the schema
 -- can evolve without per-field migrations.

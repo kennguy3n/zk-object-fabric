@@ -1,6 +1,6 @@
 # Beta Customer Onboarding Runbook
 
-This runbook covers the five Phase 3 beta workload archetypes the
+This runbook covers the five beta workload archetypes the
 fabric is targeting. For each, it lays out the placement policy,
 expected egress profile, billing-budget defaults, and the
 operator-side checklist.
@@ -233,7 +233,7 @@ shaping.
    compliance team.
 7. Set up monitoring exports: Prometheus scrape from the cell's
    `ceph_exporter` to the customer's Prometheus, and the
-   gateway's `/internal/metrics` (Phase 4) to the customer's
+   gateway's `/internal/metrics` to the customer's
    observability stack.
 
 **Avoid:** a sovereign customer who also wants their data

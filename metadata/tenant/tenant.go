@@ -36,7 +36,7 @@ const (
 )
 
 // LicenseTier names a purchased product tier. The set mirrors the
-// phase-specific product tables in docs/PROPOSAL.md §2.4.
+// product tables in docs/PROPOSAL.md §2.4.
 type LicenseTier string
 
 const (

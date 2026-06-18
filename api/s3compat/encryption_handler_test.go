@@ -28,8 +28,8 @@ import (
 // BucketConfig store (so the ?encryption sub-resource is supported) and
 // a gateway keyring (so a bucket default can be honored). It mirrors
 // newVersioningTestHandler's store + advancing-clock setup and
-// newAADTestHandler's LocalFileWrapper keyring, the two halves WS8.7
-// exercises together.
+// newAADTestHandler's LocalFileWrapper keyring, the two halves the
+// bucket default-encryption tests exercise together.
 func newEncryptionTestHandler(t *testing.T) (*Handler, bucket_config.Store, manifest_store.ManifestStore) {
 	t.Helper()
 	store := memory.New()
@@ -447,7 +447,7 @@ func TestPutObject_BucketDefaultPromotesToManaged(t *testing.T) {
 	}
 }
 
-// TestCopyObject_BucketDefaultPromotesToManaged pins the WS8.7
+// TestCopyObject_BucketDefaultPromotesToManaged pins the
 // behavior that CopyObject honors the *destination* bucket's default
 // encryption: a plaintext source copied into a bucket with an AES256
 // default lands gateway-managed (matching AWS S3), while a copy into a

@@ -1,5 +1,5 @@
 // Package object_lock defines the provider-neutral domain types for
-// S3 Object Lock / WORM (WS8.3): the bucket-level lock configuration
+// S3 Object Lock / WORM: the bucket-level lock configuration
 // (default retention rule) and the per-object retention and legal-hold
 // values. It carries no persistence of its own — bucket-level Config
 // is stored through metadata/bucket_config (the per-bucket S3 config
@@ -8,7 +8,7 @@
 //
 // Object Lock can only protect data that cannot be silently
 // overwritten, so it requires bucket versioning to be enabled
-// (dependency on WS8.4). The api/s3compat layer enforces that
+// (it depends on bucket versioning). The api/s3compat layer enforces that
 // dependency and maps between these types and the manifest's flat
 // retention/legal-hold fields; this package only owns the value
 // semantics (valid modes, default-rule consistency, retain-until

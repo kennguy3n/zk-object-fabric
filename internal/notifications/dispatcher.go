@@ -1,4 +1,4 @@
-// Package notifications delivers S3 bucket event notifications (WS8.6)
+// Package notifications delivers S3 bucket event notifications
 // to the per-bucket webhook destinations configured through
 // metadata/bucket_config. The gateway's S3 handler hands the dispatcher
 // a fully-populated Event on the hot path via Notify, which is

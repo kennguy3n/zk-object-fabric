@@ -1,4 +1,4 @@
-// WS8.7 — S3 bucket default server-side encryption (`?encryption`).
+// S3 bucket default server-side encryption (`?encryption`).
 //
 // Implements the bucket-level default-encryption sub-resource
 // (Put/Get/DeleteBucketEncryption), persisted through
@@ -196,7 +196,7 @@ func (h *Handler) DeleteBucketEncryption(w http.ResponseWriter, r *http.Request)
 // ---- write-path integration ----
 
 // effectiveEncryptionMode layers the bucket default-encryption
-// configuration (WS8.7) on top of the tenant placement policy to
+// configuration on top of the tenant placement policy to
 // produce the encryption mode applied to an object write. It is called
 // by Put, CreateMultipartUpload, and Copy after the (destination)
 // policy is resolved, so a plaintext source copied into a bucket with a

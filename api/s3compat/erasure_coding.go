@@ -10,8 +10,8 @@
 // Streaming the encode/decode is possible in principle — the
 // klauspost/reedsolomon codec supports it — but requires tuning the
 // stripe size vs. the HTTP buffer size and coordinating provider
-// back-pressure. Phase 3 buffers the whole object; streaming is a
-// Phase 4 workstream covered in docs/PROPOSAL.md §6.
+// back-pressure. The current path buffers the whole object in
+// memory; streaming encode/decode is not implemented.
 
 package s3compat
 
@@ -39,9 +39,8 @@ import (
 // maxECObjectSize caps the size of an object the EC PUT path is
 // willing to buffer into memory before encoding. The path reads the
 // entire request body before handing it to the reed-solomon
-// encoder; until streaming EC lands (docs/PROPOSAL.md §6) operators
-// must keep individual objects below this ceiling or route them
-// through a non-EC backend.
+// encoder, so operators must keep individual objects below this
+// ceiling or route them through a non-EC backend.
 //
 // Matches MaxInMemoryObjectBytes (handler.go) so operators have a
 // single ceiling to reason about across the gateway-encrypted GET,
@@ -55,9 +54,9 @@ const maxECObjectSize int64 = MaxInMemoryObjectBytes
 // so any single GET must fit; the pathological request cannot
 // OOM the gateway. Both getMultipart and headMultipart reference
 // this constant so HEAD/GET agree on the rejection threshold.
-// Streaming multipart GETs are a Phase 4 workstream; until that
-// lands operators should route very large objects through the EC
-// path or a direct-to-backend presigned URL.
+// Streaming multipart GETs are not implemented; operators should
+// route very large objects through the EC path or a
+// direct-to-backend presigned URL.
 const maxMultipartInMemoryBytes int64 = 256 * 1024 * 1024
 
 // ecAuditAttribution computes the (backend, pieceID, country)
@@ -128,9 +127,9 @@ func (h *Handler) putErasureCoded(
 
 	// The EC PUT path buffers the entire request body in memory
 	// before encoding into k+m shards; the klauspost/reedsolomon
-	// codec supports streaming but the wiring is a Phase 4
-	// workstream (docs/PROPOSAL.md §6). Until streaming EC lands,
-	// reject requests whose Content-Length advertises a body above
+	// codec supports streaming but that wiring is not implemented.
+	// Because EC writes buffer in memory, reject requests whose
+	// Content-Length advertises a body above
 	// the in-memory ceiling so a single client cannot OOM the
 	// gateway. The check matches MaxInMemoryObjectBytes so
 	// operators have a single knob for both the EC and the
@@ -443,9 +442,9 @@ func (h *Handler) reconstructErasureCoded(ctx context.Context, manifest *metadat
 // carries a Range header, as a byte-range slice (206 + Content-Range).
 // The full object is reconstructed in memory regardless, so slicing
 // the already-materialised plaintext costs nothing extra. Streaming
-// range reads that fetch only the stripes overlapping the range remain
-// a Phase 4 optimisation (docs/PROPOSAL.md §6); this buffered path
-// gives correct S3-compatible Range semantics in the meantime.
+// range reads that fetch only the stripes overlapping the range are
+// not implemented; this buffered path gives correct S3-compatible
+// Range semantics.
 func (h *Handler) getErasureCoded(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -690,7 +689,7 @@ func (h *Handler) reconstructMultipart(ctx context.Context, manifest *metadata.O
 // already buffered (bounded by maxMultipartInMemoryBytes), serving a
 // Range is a slice of that buffer at no extra cost. Streaming
 // multipart GETs that fetch only the parts overlapping the range
-// remain a Phase 4 workstream tracked in docs/PROPOSAL.md §6.
+// are not implemented.
 func (h *Handler) getMultipart(
 	w http.ResponseWriter,
 	r *http.Request,

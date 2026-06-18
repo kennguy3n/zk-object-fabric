@@ -8,7 +8,7 @@ import (
 )
 
 // MemoryPlacementStore is a process-local PlacementStore suitable for
-// the Phase 3 console scaffold and tests. The real control plane
+// development and tests. The real control plane
 // will replace this with a Postgres-backed store behind the same
 // PlacementStore interface; the handler does not care which
 // implementation is wired in.

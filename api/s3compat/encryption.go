@@ -3,9 +3,9 @@
 // The gateway consumes the encryption SDK at the HTTP surface so
 // tenant-level encryption policy (managed / public_distribution /
 // client_side) is applied uniformly across single-piece,
-// erasure-coded, and multipart paths. Phase 2 ships with a
-// LocalFileWrapper for DEK wrapping; Phase 3 swaps in KMS / Vault
-// behind the same Wrapper interface without touching the handler.
+// erasure-coded, and multipart paths. DEK wrapping is pluggable
+// behind the Wrapper interface: LocalFileWrapper, KMSWrapper, and
+// VaultWrapper are interchangeable without touching the handler.
 
 package s3compat
 
@@ -19,9 +19,9 @@ import (
 // on the Handler Config causes PUTs for those modes to fail with
 // EncryptionNotConfigured.
 type GatewayEncryption struct {
-	// Wrapper wraps / unwraps per-object DEKs. Phase 2 uses
-	// client_sdk.LocalFileWrapper; Phase 3 swaps in KMS / Vault
-	// behind the same interface.
+	// Wrapper wraps / unwraps per-object DEKs. Any client_sdk
+	// Wrapper implementation (LocalFileWrapper, KMSWrapper,
+	// VaultWrapper) plugs in behind the same interface.
 	Wrapper client_sdk.Wrapper
 
 	// CMK is the customer master key reference used for wrapping.

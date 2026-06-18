@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// PostgresAuthStore is the Phase 3 Postgres-backed AuthStore for
+// PostgresAuthStore is the Postgres-backed AuthStore for
 // the B2C self-service signup / login flow. It mirrors the contract
 // of MemoryAuthStore (single row per email; tenant_id, password
 // hash, verified flag, optional verification token) but persists

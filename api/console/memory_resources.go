@@ -10,8 +10,8 @@ import (
 )
 
 // MemoryBucketStore is a process-local BucketStore used by dev and
-// test deployments that do not run the Phase-3 Postgres bucket
-// registry yet. The manifest store is the authoritative source of
+// test deployments that do not run the Postgres bucket
+// registry. The manifest store is the authoritative source of
 // truth for object placement; this registry only tracks bucket
 // metadata (name → placement policy ref) so the console can render
 // the "Buckets" tab without scanning every manifest.

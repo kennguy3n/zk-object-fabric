@@ -10,7 +10,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/internal/cellops"
 )
 
-// PostgresDedicatedCellStore is the Phase 3 Postgres-backed
+// PostgresDedicatedCellStore is the Postgres-backed
 // DedicatedCellStore. It satisfies both DedicatedCellStore (the
 // SPA-facing read interface used by the console handler) and
 // cellops.CellSink (the operator-facing write interface used by

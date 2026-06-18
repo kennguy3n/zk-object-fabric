@@ -10,10 +10,10 @@ operation flips from `passed` to `failed` or `unsupported`.
 
 ## What the conformance matrix is
 
-Workstream 1.5 of the Production Validation plan asks for "a
-published S3 conformance report covering: PUT, GET, HEAD, DELETE,
-LIST, multipart, range, ACL, versioning, lifecycle, tagging".
-The matrix is the deliverable. It is a deterministic, signed JSON +
+The conformance matrix is the published S3 conformance report
+covering PUT, GET, HEAD, DELETE, LIST, multipart, range, ACL,
+versioning, lifecycle, and tagging.
+It is a deterministic, signed JSON +
 Markdown document recording the outcome of every operation in
 that surface against a real running gateway. Each row is one
 `OpStatus`:
@@ -292,8 +292,8 @@ the operator MUST:
 - **Internal**: the in-process gate runs on every commit; broken
   on PR means broken on merge.
 - **External audits**: the published matrix + the s3-tests /
-  mint reports are part of the WS1.3 / WS1.4 audit hand-off
-  bundle (see `Makefile#audit-bundle`).
+  mint reports are part of the security and cryptography audit
+  hand-off bundle (see `Makefile#audit-bundle`).
 - **Customers**: the published matrix is the canonical answer to
   "does your gateway support tagging?" — if the row says
   `unsupported`, the answer is no, today.

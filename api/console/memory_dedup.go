@@ -1,7 +1,6 @@
-// In-memory DedupPolicyStore for dev / tests. The Postgres
-// implementation lands in api/console/postgres_dedup.go in a future
-// phase; until then operators use this store via the local_fs_dev
-// profile and via tests that exercise the dedup-policy routes.
+// In-memory DedupPolicyStore for dev / tests. Operators use this
+// store via the local_fs_dev profile and via tests that exercise
+// the dedup-policy routes.
 package console
 
 import (

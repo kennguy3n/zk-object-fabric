@@ -1,8 +1,8 @@
--- Per-bucket S3 configuration sub-resources (WS8.4+).
+-- Per-bucket S3 configuration sub-resources.
 --
--- Today this holds bucket versioning state and Object Lock config;
--- future sub-resources (CORS, lifecycle, notifications) can add columns
--- or sibling tables.
+-- This holds bucket versioning state, Object Lock, CORS, lifecycle,
+-- event-notification, and default-encryption configuration, one
+-- sibling table per sub-resource.
 -- Buckets are implicit in the fabric, so the row is keyed by
 -- (tenant_id, bucket) directly rather than referencing a bucket table.
 --
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS bucket_versioning (
     PRIMARY KEY (tenant_id, bucket)
 );
 
--- Per-bucket S3 Object Lock configuration (WS8.3). The never-configured
+-- Per-bucket S3 Object Lock configuration. The never-configured
 -- state is the absence of a row, surfaced as a zero object_lock.Config
 -- (Enabled false). When enabled WITH a default retention rule,
 -- default_mode is set and exactly one of default_days/default_years is
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS bucket_object_lock (
     PRIMARY KEY (tenant_id, bucket)
 );
 
--- Per-bucket S3 CORS configuration (WS8.5). The never-configured state
+-- Per-bucket S3 CORS configuration. The never-configured state
 -- is the absence of a row, surfaced to callers as an empty
 -- cors.Config (no rules) and to the S3 API as 404
 -- NoSuchCORSConfiguration. The rule set is stored as a JSON document
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS bucket_cors (
     PRIMARY KEY (tenant_id, bucket)
 );
 
--- Per-bucket S3 lifecycle configuration (WS8.2). As with CORS, the
+-- Per-bucket S3 lifecycle configuration. As with CORS, the
 -- never-configured state is the absence of a row, surfaced to callers
 -- as an empty lifecycle.Config (no rules) and to the S3 API as 404
 -- NoSuchLifecycleConfiguration. The full rule set (expiration,
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS bucket_lifecycle (
     PRIMARY KEY (tenant_id, bucket)
 );
 
--- Per-bucket S3 event-notification configuration (WS8.6). As with CORS
+-- Per-bucket S3 event-notification configuration. As with CORS
 -- and lifecycle, the never-configured state is the absence of a row,
 -- surfaced to callers as an empty notification.Config (no rules). The
 -- rule set (event classes, webhook endpoint, prefix/suffix filters) is
@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS bucket_notification (
     PRIMARY KEY (tenant_id, bucket)
 );
 
--- Per-bucket default server-side encryption configuration (WS8.7). The
+-- Per-bucket default server-side encryption configuration. The
 -- never-configured state is the absence of a row, surfaced to callers
 -- as an empty sse.Config and to the S3 API as 404
 -- ServerSideEncryptionConfigurationNotFoundError. The default

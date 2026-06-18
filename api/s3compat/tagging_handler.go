@@ -1,4 +1,4 @@
-// WS8.1 — S3 object tagging (`?tagging`).
+// S3 object tagging (`?tagging`).
 //
 // Implements PutObjectTagging, GetObjectTagging, and
 // DeleteObjectTagging. Tags live on the object manifest's Tags map

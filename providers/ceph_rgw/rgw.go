@@ -1,5 +1,5 @@
 // Package ceph_rgw is the StorageProvider adapter for Ceph RADOS
-// Gateway. It is the recommended Phase 2+ local-DC storage base for
+// Gateway. It is the recommended local-DC storage base for
 // B2B dedicated cells and sovereign placement.
 //
 // Ceph RGW is an S3-compatible surface so the adapter embeds
@@ -104,7 +104,7 @@ func (p *Provider) Capabilities() providers.ProviderCapabilities {
 func (p *Provider) CostModel() providers.ProviderCostModel {
 	return providers.ProviderCostModel{
 		// Placeholder: local-DC $/TB-month is operator-specific.
-		// The figure below is an ops-reviewed estimate for Phase 2
+		// The figure below is an ops-reviewed estimate for
 		// capacity planning; operators must override per cell.
 		StorageUSDPerTBMonth:  10.0,
 		EgressUSDPerGB:        0.0,

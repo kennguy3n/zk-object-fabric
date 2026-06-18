@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Document version | 2026-05-30 (WS1.4) |
+| Document version | 2026-05-30 |
 | Source commit | branch HEAD of PR #77 (recorded in the bundle's `MANIFEST.txt` at build time; merge-base was `dac9ef3` on `main`) |
 | Audience | Third-party cryptography auditor |
 | Companion | [`audit-package-security.md`](audit-package-security.md), [`threat-model.md`](threat-model.md) |
@@ -57,8 +57,8 @@ Concrete claims we need the auditor to confirm or refute:
 | HMAC-SHA256 (RFC 2104) | stdlib `crypto/hmac` + `crypto/sha256` | SigV4 signing key derivation, per-chunk SigV4 signatures |
 | SHA-256 | stdlib `crypto/sha256` | SigV4 canonical request hash, DEK key-ID derivation, CMK content-hash inputs |
 | crypto/rand (system CSPRNG) | stdlib `crypto/rand` | Per-object DEK generation, per-chunk random nonces (non-convergent mode), CMK wrap nonces |
-| AWS KMS (Phase 3) | `github.com/aws/aws-sdk-go-v2/service/kms` | DEK wrap when `cmk://kms/...` is configured |
-| HashiCorp Vault Transit (Phase 3) | direct REST client in `encryption/client_sdk/vault_wrapper.go` | DEK wrap when `cmk://vault/...` is configured |
+| AWS KMS | `github.com/aws/aws-sdk-go-v2/service/kms` | DEK wrap when `cmk://kms/...` is configured |
+| HashiCorp Vault Transit | direct REST client in `encryption/client_sdk/vault_wrapper.go` | DEK wrap when `cmk://vault/...` is configured |
 
 **No bespoke cryptography.** Every primitive is taken from the
 upstream `golang.org/x/crypto` or stdlib packages. We do not hand-
@@ -193,8 +193,8 @@ return aad
 > objects already on the legacy path: until a per-manifest
 > marker indicating which AAD shape was used at Seal time is
 > wired into the manifest, switching the call site would make
-> every legacy object unreadable. That wiring is tracked as a
-> separate workstream and is out of scope for this audit
+> every legacy object unreadable. That migration wiring is out of
+> scope for this audit
 > package. The auditor should evaluate the SDK in isolation
 > (the test suite in `encryption/client_sdk/sdk_test.go` exercises
 > the modern AAD path) and flag this gap in
@@ -404,7 +404,7 @@ header signature computed at request entry by
 **Note for the auditor:** at the time this audit package was
 prepared, no `api/s3compat/` handler call site currently invokes
 these helpers — the chunked-upload handler that consumes them is
-tracked as a separate workstream. The functions are exported,
+out of scope for this package. The functions are exported,
 tested in `internal/auth/authenticator_test.go`
 (`TestHeaderV4Strategy_AwsChunkedSeed_*`,
 `TestComputeChunkSignature_*`, `TestVerifyChunkSignature_*`), and

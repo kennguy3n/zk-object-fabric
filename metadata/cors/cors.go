@@ -1,5 +1,5 @@
 // Package cors defines the provider-neutral domain types for S3
-// bucket CORS (Cross-Origin Resource Sharing) configuration (WS8.5):
+// bucket CORS (Cross-Origin Resource Sharing) configuration:
 // the per-bucket set of CORS rules and the matching logic the gateway
 // uses to decide which Access-Control-* response headers to emit for a
 // cross-origin browser request (and how to answer an OPTIONS

@@ -10,7 +10,7 @@ import (
 	"github.com/kennguy3n/zk-object-fabric/metadata/placement_policy"
 )
 
-// PostgresPlacementStore is the Phase 3 Postgres-backed
+// PostgresPlacementStore is the Postgres-backed
 // PlacementStore. Each tenant has at most one active placement
 // policy row keyed by tenant_id; the full policy body is stored as
 // JSON so the schema can evolve without per-field migrations.

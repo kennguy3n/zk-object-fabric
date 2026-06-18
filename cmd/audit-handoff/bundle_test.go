@@ -29,7 +29,7 @@ func newSyntheticRepo(t *testing.T) (repoRoot, manifestPath string) {
 	repoRoot = t.TempDir()
 	mustWrite(t, filepath.Join(repoRoot, "go.mod"), "module example.com/synth\n\ngo 1.25\n")
 	mustWrite(t, filepath.Join(repoRoot, "docs", "OVERVIEW.md"), "# overview\n")
-	mustWrite(t, filepath.Join(repoRoot, "docs", "PROGRESS.md"), "# progress\n")
+	mustWrite(t, filepath.Join(repoRoot, "docs", "GUIDE.md"), "# guide\n")
 	mustWrite(t, filepath.Join(repoRoot, "tests", "core", "x.go"), "package core\n")
 	// note: tests/optional/missing.go is intentionally NOT written
 	manifestPath = filepath.Join(repoRoot, "manifest.yaml")
@@ -44,10 +44,10 @@ components:
     pr_origin: synthetic
     paths:
       - docs/OVERVIEW.md
-      - docs/PROGRESS.md
+      - docs/GUIDE.md
       - tests/core
     optional: false
-  # Intentional duplicate of docs/PROGRESS.md (also declared by
+  # Intentional duplicate of docs/GUIDE.md (also declared by
   # the core component above): the synthetic-only duplication
   # lets these tests exercise Build's hadReal/included/missing
   # accounting -- optional_partial has one present path and one
@@ -62,7 +62,7 @@ components:
     description: optional with one present, one missing
     pr_origin: "#999"
     paths:
-      - docs/PROGRESS.md
+      - docs/GUIDE.md
       - tests/optional/missing.go
     optional: true
 `)
@@ -103,7 +103,7 @@ func TestBuild_HappyPath_MissingOptionalProducesPlaceholder(t *testing.T) {
 		t.Errorf("expected `core` in ComponentsIncluded, got %v", res.ComponentsIncluded)
 	}
 	if !contains(res.ComponentsIncluded, "optional_partial") {
-		// optional_partial has docs/PROGRESS.md present, so it
+		// optional_partial has docs/GUIDE.md present, so it
 		// IS included (one real file) — the missing path is a
 		// placeholder.
 		t.Errorf("expected optional_partial in ComponentsIncluded (it has one real path); got %v", res.ComponentsIncluded)
@@ -119,9 +119,9 @@ func TestBuild_HappyPath_MissingOptionalProducesPlaceholder(t *testing.T) {
 		"MANIFEST.txt",
 		"manifest.yaml",
 		"core/docs/OVERVIEW.md",
-		"core/docs/PROGRESS.md",
+		"core/docs/GUIDE.md",
 		"core/tests/core/x.go",
-		"optional_partial/docs/PROGRESS.md",
+		"optional_partial/docs/GUIDE.md",
 		"optional_partial/__MISSING__/tests_optional_missing.go.MISSING",
 	}
 	for _, p := range wantPaths {

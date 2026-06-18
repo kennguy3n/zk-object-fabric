@@ -44,10 +44,3 @@ npm run build
 npm run lint
 npm run test
 ```
-
-## Roadmap
-
-- OAuth2 PKCE for browser-side authentication, layered on top of the
-  existing Postgres-backed authenticator.
-- Role-based access so `b2b_dedicated` and `sovereign` tenants see
-  the placement-hardware UI their operators need.

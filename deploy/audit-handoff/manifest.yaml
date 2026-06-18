@@ -19,8 +19,8 @@
 #        (c) every component name in README.md resolves to a real
 #            entry in this manifest (no stale / typo'd references).
 #
-# When a new workstream lands a new deliverable that the audit firm
-# should see, the canonical procedure is:
+# When a new deliverable that the audit firm should see lands, the
+# canonical procedure is:
 #
 #   1. Add a `components:` entry here.
 #   2. Add a matching section to deploy/audit-handoff/README.md.
@@ -43,9 +43,9 @@ components:
   - id: audit_bundle
     title: External security + cryptography audit packages
     description: |
-      The WS1.3 (external security review) and WS1.4 (external
-      cryptography review) hand-off documents plus their cross-
-      referenced source files. Produced by `make audit-bundle`
+      The external security review and external cryptography review
+      hand-off documents plus their cross-referenced source files.
+      Produced by `make audit-bundle`
       (top-level Makefile target) as a self-contained inner tarball.
       The auditor receives a `make`-emitted bundle nested inside the
       hand-off tarball so the inner manifest / SHA-256 chain remains
@@ -80,10 +80,10 @@ components:
   - id: conformance_matrix
     title: S3 protocol conformance matrix (in-process + external)
     description: |
-      WS1.5 lands the deterministic in-process matrix runner
+      The deterministic in-process matrix runner
       (tests/s3_conformance/) plus the runbook for wiring external
-      third-party harnesses (Ceph s3-tests, MinIO mint). WS2.2 lands
-      the orchestration scripts that drive those external harnesses
+      third-party harnesses (Ceph s3-tests, MinIO mint), and the
+      orchestration scripts that drive those external harnesses
       against a deployed gateway and aggregate their JUnit/JSON
       output into the matrix format. The auditor receives the
       matrix schema, the runbook, the aggregator, and a sample
@@ -108,7 +108,7 @@ components:
       targets, plus the in-process verifier that exercises the
       cross-cell async path on every CI run and pins the
       LostObjects == InFlightObjects invariant via deliberate
-      Phase 2 ordering. The verifier returns an error when the
+      cancel-before-seed ordering. The verifier returns an error when the
       measured RTO exceeds the published target.
     pr_origin: "#79"
     paths:
@@ -124,11 +124,11 @@ components:
   - id: staging_deploy
     title: Linode + Wasabi staging deploy + Tier 3 verifier
     description: |
-      WS2.1 deliverable. Terraform + cloud-init for a load-driver
+      Terraform + cloud-init for a load-driver
       VM, a wrapped harness invocation (run_tier3.sh), the
       cmd/tier3-verify in-process checker that the harness shells
       out to, and the evidence-collection script the operator runs
-      post-burn. Closes the WS1.1 runbook's "Linode + Wasabi
+      post-burn. Satisfies the load-testing runbook's "Linode + Wasabi
       staging run" gate.
     pr_origin: "#81"
     paths:
@@ -141,16 +141,17 @@ components:
       - cmd/tier3-verify/main.go
     optional: true
 
-  - id: progress_pin
-    title: WS-workstream progress / scope pin
+  - id: overview_pin
+    title: System overview + scope pin
     description: |
-      The published validation roadmap (docs/PROGRESS.md) names
-      every workstream and pins its status. Each component above
-      cites its WS-N reference; the auditor uses PROGRESS.md to
-      cross-walk a finding back to the workstream that owns it
-      and to see what is *not yet* validated. Always included.
+      The anchored, always-included system overview. docs/PROPOSAL.md
+      states the system design, trust boundaries, and durability
+      non-goals; docs/ARCHITECTURE.md maps every component to its
+      package and call site. The auditor uses these two documents to
+      cross-walk a finding back to the component that owns it and to
+      establish the scope of what the fabric does. Always included.
     pr_origin: "always (live document)"
     paths:
-      - docs/PROGRESS.md
       - docs/PROPOSAL.md
+      - docs/ARCHITECTURE.md
     optional: false

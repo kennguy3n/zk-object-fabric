@@ -1,12 +1,12 @@
-// Package client_sdk implements the Phase 2 client-side encryption
+// Package client_sdk implements the client-side encryption
 // SDK that underpins Strict ZK mode (docs/PROPOSAL.md §3.7).
 //
 // The SDK seals plaintext with XChaCha20-Poly1305 in fixed-size
 // chunks so that range reads can decrypt individual chunks without
 // reconstructing the entire object. Per-object DEKs are generated
 // with crypto/rand (see keygen.go) and wrapped with the tenant's CMK
-// (see wrap.go). Phase 2 uses a local key file as the CMK; Phase 3
-// swaps in AWS KMS and Vault behind the same Wrapper interface.
+// (see wrap.go). The CMK can be a local key file, AWS KMS, or Vault,
+// all behind the same Wrapper interface.
 //
 // On-disk frame for a chunk is:
 //
@@ -42,7 +42,7 @@
 //
 // When ChunkAAD is empty (zero-length slice) the SDK falls back to
 // AAD = nil for both Seal and Open — this preserves ciphertext
-// compatibility with Phase 1 / Phase 2 objects that were sealed
+// compatibility with objects that were sealed
 // before the AAD field existed.
 package client_sdk
 

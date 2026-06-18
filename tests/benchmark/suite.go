@@ -1,13 +1,13 @@
-// Package benchmark defines the benchmark harness structure for the
-// ZK Object Fabric data plane. See docs/PROPOSAL.md §3.11 and
-// docs/PROGRESS.md for the product-level targets this suite exists to
-// enforce.
+// Package benchmark defines the benchmark harness for the
+// ZK Object Fabric data plane: the Suite, Scenario, and Target
+// types that encode the product-level performance targets, plus
+// the runner that executes them. See docs/PROPOSAL.md and
+// docs/runbooks/load-testing.md for the product-level targets this
+// suite enforces.
 //
-// Phase 1 ships this file as a specification: the Suite, Scenario,
-// and Target types describe what Phase 2 will execute, not a working
-// runner. Having the target metrics encoded in Go rather than prose
-// lets the Phase 2 implementation be generated and checked against
-// the product spec instead of re-interpreted per test run.
+// Encoding the target metrics in Go rather than prose lets the
+// runner check measured results against the product spec
+// programmatically instead of re-interpreting them per test run.
 package benchmark
 
 import (
@@ -15,12 +15,12 @@ import (
 	"time"
 )
 
-// Suite is the top-level benchmark definition that Phase 2+ tooling
+// Suite is the top-level benchmark definition that the runner
 // materializes into concrete runs. A Suite is a named collection of
 // Scenarios plus the Targets that a scenario must meet to pass.
 type Suite struct {
 	// Name is a stable identifier for the suite
-	// (e.g. "phase2-single-cell").
+	// (e.g. "zk-object-fabric-benchmark").
 	Name string
 
 	// Scenarios are the individually runnable workloads. Every
@@ -81,7 +81,7 @@ type Workload struct {
 	// driver pre-warms the content_index with HitFraction * total
 	// PUT objects before the run begins so the steady-state hit
 	// ratio is deterministic. 0.0 disables pre-warming. Used by
-	// the Phase 3.5 B2C-80%-dup and B2B-60%-dup scenarios.
+	// the B2C-80%-dup and B2B-60%-dup dedup scenarios.
 	DedupHitFraction float64
 }
 
@@ -122,12 +122,12 @@ const (
 	MetricGetP99 Metric = "get_latency_p99"
 
 	// MetricCacheHitRatioHot is the ratio of hot-tier cache hits to
-	// total reads in that tier. The Phase 3 target is > 0.9.
+	// total reads in that tier. The target is > 0.9.
 	MetricCacheHitRatioHot Metric = "cache_hit_ratio_hot"
 
 	// MetricWasabiOriginEgressRatio is the ratio of bytes read from
 	// the Wasabi origin to bytes stored on Wasabi, per tenant, per
-	// month. The Phase 2–3 target is <= 1.0 (the Wasabi fair-use
+	// month. The target is <= 1.0 (the Wasabi fair-use
 	// ceiling).
 	MetricWasabiOriginEgressRatio Metric = "wasabi_origin_egress_ratio"
 
@@ -139,19 +139,18 @@ const (
 	MetricMigrationThroughput Metric = "migration_throughput_bytes_per_sec"
 
 	// MetricRepairTimeSeconds is the wall-clock time, in seconds, to
-	// recover a single failed storage node for a Phase 2+ local-DC
+	// recover a single failed storage node for a local-DC
 	// cell. Measured as the interval from node-loss detection to
 	// restored durability targets.
 	MetricRepairTimeSeconds Metric = "repair_time_seconds"
 
 	// MetricNetworkCostUSDPerTB is the aggregate network cost in US
 	// dollars per terabyte of ciphertext served (includes Wasabi
-	// origin egress, Linode transit, and local-DC peering). Per
-	// docs/PROGRESS.md "Key Metrics to Track".
+	// origin egress, Linode transit, and local-DC peering).
 	MetricNetworkCostUSDPerTB Metric = "network_cost_usd_per_tb"
 
 	// MetricDedupHitRatio is the fraction of PUT requests that
-	// landed on an existing content_index entry. The Phase 3.5
+	// landed on an existing content_index entry. The
 	// targets are 0.8 for the B2C scenario and 0.6 for the B2B
 	// scenario.
 	MetricDedupHitRatio Metric = "dedup_hit_ratio"
@@ -164,12 +163,12 @@ const (
 
 	// MetricDedupPutLatencyOverheadP95 is the additional p95 PUT
 	// latency the content_index lookup adds compared to a dedup-
-	// off baseline. Phase 3.5 cap is 5 ms.
+	// off baseline. The cap is 5 ms.
 	MetricDedupPutLatencyOverheadP95 Metric = "dedup_put_latency_overhead_p95"
 
 	// MetricSustainedRPS is the attained aggregate request rate
 	// (across all operations) during the steady-state run window.
-	// The Workstream 1.1 target is >= 10,000 req/s per gateway
+	// The production target is >= 10,000 req/s per gateway
 	// node for the canonical mixed scenario.
 	MetricSustainedRPS Metric = "sustained_rps"
 
@@ -180,7 +179,7 @@ const (
 	MetricRPSEfficiency Metric = "rps_efficiency"
 
 	// MetricErrorRate is errored_requests / total_requests over
-	// the steady-state window. Workstream 1.1 caps it at 1e-3.
+	// the steady-state window. The production SLA caps it at 1e-3.
 	MetricErrorRate Metric = "error_rate"
 
 	// MetricSkippedOpFraction is skipped_ops / (attempts + skipped),
@@ -200,81 +199,79 @@ const (
 	MetricSkippedOpFraction Metric = "skipped_op_fraction"
 
 	// MetricPutP99CacheHit is the 99th-percentile PUT latency
-	// when the gateway's hot-tier cache is warm. Workstream 1.1
+	// when the gateway's hot-tier cache is warm. The production SLA
 	// caps it at 50 ms. The harness selects this metric for
 	// scenarios that pre-warm the cache before measuring.
 	MetricPutP99CacheHit Metric = "put_latency_p99_cache_hit"
 
 	// MetricPutP99Origin is the 99th-percentile PUT latency when
 	// the gateway must round-trip to the Wasabi origin (cold
-	// cache). Workstream 1.1 caps it at 200 ms.
+	// cache). The production SLA caps it at 200 ms.
 	MetricPutP99Origin Metric = "put_latency_p99_origin"
 
 	// MetricGetP99L0CacheHit is the 99th-percentile GET latency
 	// when the L0 (process-local) cache serves the read.
-	// Workstream 1.1 caps it at 20 ms.
+	// The production SLA caps it at 20 ms.
 	MetricGetP99L0CacheHit Metric = "get_latency_p99_l0_cache_hit"
 
 	// MetricGetP99L1CacheHit is the 99th-percentile GET latency
-	// when the L1 (NVMe disk) cache serves the read. Workstream
-	// 1.1 caps it at 100 ms.
+	// when the L1 (NVMe disk) cache serves the read. The
+	// production SLA caps it at 100 ms.
 	MetricGetP99L1CacheHit Metric = "get_latency_p99_l1_cache_hit"
 
 	// MetricGetP99Origin is the 99th-percentile GET latency when
 	// the gateway misses both caches and round-trips to Wasabi.
-	// Workstream 1.1 caps it at 300 ms.
+	// The production SLA caps it at 300 ms.
 	MetricGetP99Origin Metric = "get_latency_p99_origin"
 )
 
-// Target values drawn from docs/PROPOSAL.md §3.11 and
-// docs/PROGRESS.md "Key Metrics to Track". These are declarative; the
-// actual numbers are TBD until Phase 2 produces real measurements.
-// The constants exist so that Phase 2 Scenarios can be constructed
-// programmatically against the documented targets rather than ad hoc
-// literals.
+// Target values drawn from docs/PROPOSAL.md and the SLA gates in
+// docs/runbooks/load-testing.md. The constants exist so that
+// Scenarios can be constructed programmatically against the
+// documented targets rather than ad hoc literals.
 const (
-	// TargetCacheHitRatioHotMin is the Phase 3 Hot-tier cache hit
+	// TargetCacheHitRatioHotMin is the hot-tier cache hit
 	// ratio target: > 0.9 of reads served from the cache.
 	TargetCacheHitRatioHotMin = 0.9
 
-	// TargetWasabiOriginEgressRatioMax is the Phase 2–3 Wasabi
+	// TargetWasabiOriginEgressRatioMax is the Wasabi
 	// origin egress ratio ceiling: egress bytes <= stored bytes per
 	// tenant per month.
 	TargetWasabiOriginEgressRatioMax = 1.0
 
-	// TargetPutP99CacheHitMs is the Workstream 1.1 cap on PUT
+	// TargetPutP99CacheHitMs is the production SLA cap on PUT
 	// 99th-percentile latency when the destination cell is the
 	// hot tier (cache hit on the way out).
 	TargetPutP99CacheHitMs = 50.0
 
-	// TargetPutP99OriginMs is the Workstream 1.1 cap on PUT
+	// TargetPutP99OriginMs is the production SLA cap on PUT
 	// 99th-percentile latency when the destination cell is the
 	// Wasabi origin (cache miss on the way out).
 	TargetPutP99OriginMs = 200.0
 
-	// TargetGetP99L0Ms is the Workstream 1.1 cap on GET 99th-
+	// TargetGetP99L0Ms is the production SLA cap on GET 99th-
 	// percentile latency for L0 (process-local memory) cache
 	// hits.
 	TargetGetP99L0Ms = 20.0
 
-	// TargetGetP99L1Ms is the Workstream 1.1 cap on GET 99th-
+	// TargetGetP99L1Ms is the production SLA cap on GET 99th-
 	// percentile latency for L1 (NVMe disk) cache hits.
 	TargetGetP99L1Ms = 100.0
 
-	// TargetGetP99OriginMs is the Workstream 1.1 cap on GET
+	// TargetGetP99OriginMs is the production SLA cap on GET
 	// 99th-percentile latency when the gateway must reach
 	// Wasabi.
 	TargetGetP99OriginMs = 300.0
 
-	// TargetSustainedRPS is the Workstream 1.1 floor on
+	// TargetSustainedRPS is the production SLA floor on
 	// sustained aggregate request rate per gateway node.
 	TargetSustainedRPS = 10_000.0
 
-	// TargetErrorRateMax is the Workstream 1.1 ceiling on the
+	// TargetErrorRateMax is the production SLA ceiling on the
 	// per-request error rate during a sustained-load run.
 	TargetErrorRateMax = 1e-3
 
-	// TargetRPSEfficiencyMin is the Workstream 1.1 floor on
+	// TargetRPSEfficiencyMin is the production SLA floor on
 	// rps_efficiency. A run that attains less than this
 	// fraction of its declared TargetRPS is reported as a fail
 	// even if all latency targets passed, because it means the
@@ -322,10 +319,9 @@ type Result struct {
 }
 
 // Runner executes a Suite against a single StorageProvider and
-// returns per-scenario Results. Phase 1 ships the interface only;
-// Phase 2 supplies a concrete driver that generates load, measures
-// latency, aggregates counters, and emits Results for downstream
-// Target evaluation.
+// returns per-scenario Results. A concrete driver generates load,
+// measures latency, aggregates counters, and emits Results for
+// downstream Target evaluation.
 //
 // The interface is intentionally provider-shaped rather than
 // gateway-shaped so a benchmark can be pointed at any
@@ -414,15 +410,15 @@ func (sc Scenario) validate() error {
 // are still under negotiation (LIST p95 against 10M/100M/1B object
 // catalogues, dedup ratios) are recorded without gates so the
 // harness publishes a number even when the run-time SLA has not
-// been set. The latency, throughput and error-rate targets
-// referenced by Workstream 1.1 are gated.
+// been set. The latency, throughput and error-rate targets in the
+// production SLA are gated.
 func DefaultSuite() Suite {
 	return Suite{
-		Name: "zk-object-fabric-phase2",
+		Name: "zk-object-fabric-benchmark",
 		Scenarios: []Scenario{
 			{
 				Name:        "put-get-latency",
-				Description: "Steady-state mixed PUT/GET, gating the production p99 targets defined in Workstream 1.1.",
+				Description: "Steady-state mixed PUT/GET, gating the production p99 targets.",
 				Workload: Workload{
 					RequestMix:      map[string]float64{"PUT": 0.3, "GET": 0.7},
 					ObjectSizeBytes: 1024 * 1024, // 1 MiB
@@ -441,7 +437,7 @@ func DefaultSuite() Suite {
 			},
 			{
 				Name:        "put-cache-hit",
-				Description: "Hot-tier-warm PUT workload: gates PUT p99 at the cache-hit SLA from Workstream 1.1.",
+				Description: "Hot-tier-warm PUT workload: gates PUT p99 at the cache-hit SLA.",
 				Workload: Workload{
 					RequestMix:      map[string]float64{"PUT": 1.0},
 					ObjectSizeBytes: 512 * 1024, // 512 KiB
@@ -511,7 +507,7 @@ func DefaultSuite() Suite {
 			},
 			{
 				Name:        "sustained-throughput-10k-rps",
-				Description: "Sustained mixed workload at 10K req/s per gateway node: gates throughput floor, efficiency, and error rate per Workstream 1.1.",
+				Description: "Sustained mixed workload at 10K req/s per gateway node: gates throughput floor, efficiency, and error rate per the production SLA.",
 				Workload: Workload{
 					RequestMix:      map[string]float64{"PUT": 0.2, "GET": 0.7, "HEAD": 0.1},
 					ObjectSizeBytes: 64 * 1024, // 64 KiB

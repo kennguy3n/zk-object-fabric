@@ -25,8 +25,7 @@
 // and check `os.Stat`. This means they run in the standard
 // CI matrix without any extra environment setup.
 //
-// When a new workstream lands a new component, the canonical
-// procedure is:
+// When a new component lands, the canonical procedure is:
 //
 //   1. Add a `components:` entry to manifest.yaml.
 //   2. Add a matching section to README.md (referencing the id
@@ -163,7 +162,7 @@ func TestHandoffManifest_WellFormed(t *testing.T) {
 		}
 	}
 	if !hasRequired {
-		t.Errorf("manifest has no non-optional component — the bundle has no anchored content. At least one component (today: progress_pin) must be optional=false so a fresh-cut branch still produces a meaningful bundle.")
+		t.Errorf("manifest has no non-optional component — the bundle has no anchored content. At least one component (today: overview_pin) must be optional=false so a fresh-cut branch still produces a meaningful bundle.")
 	}
 }
 

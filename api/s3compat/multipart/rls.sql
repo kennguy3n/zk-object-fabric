@@ -1,4 +1,4 @@
--- Row-Level Security for the multipart tables (Workstream 3.4,
+-- Row-Level Security for the multipart tables (see
 -- docs/security/audit-package-security.md §8). This is the operator
 -- reference; the gateway's live tests apply the identical statements via
 -- internal/rlsdb.Statements — the single source of truth shared with the

@@ -1,6 +1,6 @@
 // AutomatedProvisioner: Terraform-driven dedicated cell bring-up.
 //
-// The Phase 4 production implementation shells out to a
+// The automated implementation shells out to a
 // TerraformRunner which is expected to wrap a "terraform apply
 // -auto-approve -var-file ..." invocation against a curated
 // module that bootstraps a Ceph cell (mons, OSDs, RGW, S3

@@ -42,7 +42,7 @@ the operator MUST confirm:
 
 - The source is genuinely down (network split? alert flap?).
 - The destination is hot enough to serve traffic (cache warm-up
-  done — see `docs/PROGRESS.md` Cache Warming Strategy).
+  done — see [`PROPOSAL.md`](../PROPOSAL.md) §3.7, the cache layer).
 - The most recent successful replicator tick happened within RPO
   bound. If lag was already growing before failure, RPO is worse
   than the published number.

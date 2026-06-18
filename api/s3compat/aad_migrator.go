@@ -2,10 +2,10 @@
 // gateway-encrypted objects (EncryptionConfig.AADVersion == "") to the
 // modern v1 per-chunk AAD scheme in place.
 //
-// Phase A2a bound every NEW managed write's per-chunk AEAD tag to the
-// canonical object identity tenant_id|bucket|object_key_hash|
+// The v1 AAD scheme binds every NEW managed write's per-chunk AEAD tag
+// to the canonical object identity tenant_id|bucket|object_key_hash|
 // version_id (see encryption_pipeline.go), but objects written before
-// that change carry AADVersion == "" and were sealed with AAD = nil.
+// that scheme carry AADVersion == "" and were sealed with AAD = nil.
 // The GET path keeps opening them with nil AAD, so they remain
 // readable — but they do not benefit from the identity binding that
 // makes a relocated/confused ciphertext fail closed. This worker walks
@@ -31,7 +31,7 @@
 //     convergent nonce, which the SDK makes mutually exclusive with
 //     ChunkAAD — they cannot carry a v1 binding and stay "" by design.
 //   - single-piece: erasure-coded and multipart manifests hold many
-//     pieces; re-encrypting them is a separate, larger workstream and
+//     pieces; re-encrypting them is a separate, larger effort and
 //     is left as a documented follow-up. The worker counts them as
 //     skipped rather than touching a subset of their pieces.
 //   - within the in-memory ceiling: re-encryption buffers the full
@@ -134,7 +134,7 @@ type MigrateStats struct {
 	SkippedNotMine int // not gateway-encrypted (client_side / legacy plaintext)
 	SkippedAlready int // already AADVersion == "v1"
 	SkippedDedup   int // convergent / dedup object, cannot bind AAD
-	SkippedMulti   int // multi-piece (EC / multipart), follow-up workstream
+	SkippedMulti   int // multi-piece (EC / multipart), handled separately
 	SkippedTooBig  int // above the in-memory re-encrypt ceiling
 	Errors         int
 }

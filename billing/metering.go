@@ -1,9 +1,9 @@
 // Package billing defines the per-tenant billing counter types used by
 // the control plane. See docs/PROPOSAL.md §3.5 and §5.1.
 //
-// The metering types are intentionally minimal for Phase 1. The full
-// billing system (ClickHouse ingestion, invoice generation, SLA
-// reporting) is deferred until the Phase 2 prototype.
+// The metering types are intentionally minimal: they are the core
+// per-tenant counters that the billing sinks (ClickHouse, SQLite, and
+// the logger sink) ingest for invoice generation and SLA reporting.
 package billing
 
 import "time"
@@ -53,7 +53,7 @@ const (
 	TaggingRequests Dimension = "tagging_requests"
 
 	// LifecycleExpirations counts object versions permanently
-	// deleted by the daily lifecycle evaluator (WS8.2) — the
+	// deleted by the daily lifecycle evaluator — the
 	// versioning-disabled expiration path. These are metered on
 	// their own dimension rather than folded into DeleteRequests
 	// because AWS does NOT charge lifecycle expirations as Tier-1

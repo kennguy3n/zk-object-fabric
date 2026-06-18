@@ -146,7 +146,7 @@ func TestObjectTagging_EmitsBillingEvents(t *testing.T) {
 	}
 }
 
-// TestObjectTagging_NonLatestVersionDoesNotPromote guards the WS8.1
+// TestObjectTagging_NonLatestVersionDoesNotPromote guards the
 // fix where tagging an OLD version via ?versionId must not promote it
 // to latest. Tagging is an in-place metadata amend (UpdateManifest),
 // so after tagging v1 the unversioned GET must still resolve to v2.

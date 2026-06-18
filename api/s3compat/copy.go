@@ -166,7 +166,7 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "ServiceUnavailable", "manifest store not configured", r.URL.Path)
 		return
 	}
-	// Object Lock overwrite enforcement (WS8.3): a copy that would
+	// Object Lock overwrite enforcement: a copy that would
 	// replace a locked destination version in place is refused, just
 	// like a regular PUT overwrite.
 	if !h.allowObjectLockOverwrite(w, r, tenantID, dstBucket, dstKey) {
@@ -281,7 +281,7 @@ func (h *Handler) Copy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Destination bucket default encryption (WS8.7). A plaintext
+	// Destination bucket default encryption. A plaintext
 	// source (no encryption config) copied into a bucket whose
 	// effective encryption mode is gateway-managed must land
 	// encrypted at the destination — matching AWS S3 (CopyObject
@@ -417,8 +417,8 @@ func (h *Handler) copyReencrypt(
 	// (single-piece buffered GET, EC PUT, range GET) so a large v1
 	// object cannot OOM the gateway during a copy; the verbatim
 	// (legacy/convergent) copy path streams via copyViaGetPut and is
-	// unaffected. Streaming v1 re-encryption is the same Phase-4
-	// workstream that gates streaming EC.
+	// unaffected. Streaming v1 re-encryption is not yet
+	// implemented, the same gap that gates streaming EC.
 	if srcManifest.ObjectSize > MaxInMemoryObjectBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, "CopyReencryptObjectTooLarge",
 			fmt.Sprintf("server-side copy of AAD v1 object of %d bytes exceeds in-memory re-encrypt ceiling of %d bytes; streaming re-encryption is not yet implemented",
@@ -463,7 +463,7 @@ func (h *Handler) copyReencrypt(
 }
 
 // copyEncryptForDefault performs a CopyObject when the destination
-// bucket's default encryption (WS8.7) promotes an otherwise-plaintext
+// bucket's default encryption promotes an otherwise-plaintext
 // copy to a gateway-managed mode. The source object carries no
 // encryption config, so its piece is read in the clear, encrypted
 // under a fresh DEK bound to the destination identity, and stored as
@@ -545,7 +545,7 @@ func (h *Handler) copyEncryptForDefault(
 //     destination identity, preserving the source mode and ManifestEncrypted.
 //   - plaintext source (no encryption config): honour the destination
 //     bucket's effective encryption — re-encrypt when it resolves to a
-//     gateway-managed mode (WS8.7), else store verbatim.
+//     gateway-managed mode, else store verbatim.
 //   - client_side source: the reconstructed bytes are the opaque ZK payload;
 //     store them verbatim and preserve the source envelope. The gateway
 //     never re-encrypts client-side ciphertext.
@@ -886,7 +886,7 @@ func (h *Handler) writeCopyManifest(
 		}
 	}
 	// The copy destination is a new object version, so it inherits the
-	// bucket's default Object Lock retention (WS8.3) like any PUT.
+	// bucket's default Object Lock retention like any PUT.
 	if err := h.applyDefaultObjectLockRetention(r.Context(), tenantID, dstBucket, manifest); err != nil {
 		rollbackCopyPiece()
 		writeError(w, http.StatusInternalServerError, "ObjectLockGetFailed", err.Error(), r.URL.Path)

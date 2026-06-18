@@ -201,7 +201,7 @@ func putObj(t *testing.T, h *Handler, path, body string) string {
 	return rec.Header().Get("x-amz-version-id")
 }
 
-// TestVersionedDelete_CreatesDeleteMarker exercises the full WS8.4
+// TestVersionedDelete_CreatesDeleteMarker exercises the full
 // delete-marker lifecycle on a versioning-enabled bucket.
 func TestVersionedDelete_CreatesDeleteMarker(t *testing.T) {
 	h, _ := newVersioningTestHandler()
@@ -271,7 +271,7 @@ func TestVersionedDelete_CreatesDeleteMarker(t *testing.T) {
 
 // TestUnversionedDelete_PermanentlyRemoves confirms that with no
 // versioning configured, DELETE still hard-removes the object (no
-// delete marker), preserving the pre-WS8.4 behaviour.
+// delete marker), preserving the unversioned behaviour.
 func TestUnversionedDelete_PermanentlyRemoves(t *testing.T) {
 	h, _ := newVersioningTestHandler() // store present but bucket left unconfigured
 

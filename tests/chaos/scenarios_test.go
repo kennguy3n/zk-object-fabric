@@ -507,7 +507,7 @@ func TestChaos_ConcurrentProviderAndManifestStoreFailureDegrades(t *testing.T) {
 	// piecesOrphaned > 0 is acceptable here — the test is making
 	// the explicit point that without an upstream rollback, the
 	// 2-step write IS partial under concurrent fault. The cell
-	// operator runbook (Workstream 1.6) must address this with a
+	// operator runbook must address this with a
 	// reconciler. Logging the count lets a future change surface
 	// any regression of the rate.
 	t.Logf("multi-fault summary: committed=%d failed=%d orphaned=%d "+
@@ -601,7 +601,7 @@ func TestChaos_MetadataDBFailover(t *testing.T) {
 	const bucket, key = "b", "k1"
 	body := []byte("metadata-failover-payload")
 
-	// Phase 1: healthy store. PUT then GET must round-trip.
+	// Stage 1: healthy store. PUT then GET must round-trip.
 	if rec := gwPut(t, h, bucket, key, body); rec.Code != http.StatusOK {
 		t.Fatalf("healthy PUT status = %d, want 200; body=%s", rec.Code, rec.Body)
 	}
@@ -609,7 +609,7 @@ func TestChaos_MetadataDBFailover(t *testing.T) {
 		t.Fatalf("healthy GET status=%d body=%q, want 200 %q", rec.Code, rec.Body.String(), body)
 	}
 
-	// Phase 2: the metadata store's read path fails (primary down).
+	// Stage 2: the metadata store's read path fails (primary down).
 	// The GET must fail closed with a server error and must NOT leak
 	// the object bytes.
 	fms.GetFault = FaultConfig{Mode: ModeAlwaysFail, Err: errors.New("chaos: postgres primary unreachable")}
@@ -622,7 +622,7 @@ func TestChaos_MetadataDBFailover(t *testing.T) {
 	}
 	t.Logf("metadata-read failure → status %d (production-readiness target: 503 ServiceUnavailable, retryable)", rec.Code)
 
-	// Phase 3: the metadata store's write path fails (primary
+	// Stage 3: the metadata store's write path fails (primary
 	// read-only). The PUT must fail closed AND must not leave an
 	// orphaned object behind: the gateway rolls the piece back, so a
 	// later GET of the never-committed key is a clean 404, not a 500
@@ -634,7 +634,7 @@ func TestChaos_MetadataDBFailover(t *testing.T) {
 		t.Fatalf("PUT under metadata-write failure status = %d, want a 5xx server error", rec.Code)
 	}
 
-	// Phase 4: the store heals. The original object is still
+	// Stage 4: the store heals. The original object is still
 	// readable (no corruption from the outage) and the failed PUT
 	// left nothing behind.
 	fms.PutFault = FaultConfig{}

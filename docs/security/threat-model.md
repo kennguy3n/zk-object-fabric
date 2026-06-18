@@ -21,7 +21,7 @@ mitigation is in the code.
 | A5 | **KMS / Vault operator** | Trusted (out of scope) | Owns the root CMK material. A compromise here is equivalent to losing the entire tenant data set; we do not attempt to defend against it. |
 | A6 | **Cross-tenant attacker** | Untrusted | A legitimate tenant trying to read another tenant's data through any code path (manifest lookup, dedup oracle, presigned URL, EC repair, cache promotion). |
 | A7 | **Network adversary on the public API edge** | Untrusted | Can observe and modify any byte on the wire before TLS terminates at the gateway. |
-| A8 | **Network adversary on the internal control plane** | Untrusted | Between gateway and Postgres / cache / billing sink. The mTLS work in Workstream 3.1 (not yet shipped) is the planned mitigation; today this attacker is partially in scope (gateway-Postgres uses TLS, gateway-cache may be loopback only). |
+| A8 | **Network adversary on the internal control plane** | Untrusted | Between gateway and Postgres / cache / billing sink. Mutual TLS across the internal control plane is the intended mitigation and is not yet enforced end-to-end; today this attacker is partially in scope (gateway-Postgres uses TLS, gateway-cache may be loopback only). |
 
 ## 2. Assets
 
@@ -66,7 +66,7 @@ mitigation is in the code.
          ▼               ▼                          ▼
    Backend storage  Postgres manifest DB     KMS / Vault Transit
    (Wasabi/Ceph/    (BodyEncryptor seals     (CMK lives here in
-    B2/R2)          rows in Strict ZK)        Phase 3+)
+    B2/R2)          rows in Strict ZK)        production)
 ```
 
 The dashed-line direction is "data flows down". The trust boundary

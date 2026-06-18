@@ -65,7 +65,7 @@ type Forecaster struct {
 
 	// AlertWindow is how far in advance of the projected fill
 	// date the forecaster flags Result.Alert. Defaults to 90
-	// days (the operating threshold called out in the Phase 4
+	// days (the operating threshold called out in the capacity
 	// product brief).
 	AlertWindow time.Duration
 

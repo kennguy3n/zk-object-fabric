@@ -17,7 +17,7 @@ import (
 var HCaptchaVerifyURL = "https://hcaptcha.com/siteverify"
 
 // hcaptchaResponse mirrors the documented siteverify response shape.
-// Only the subset of fields the Phase 3 gate consumes is declared;
+// Only the subset of fields the signup gate consumes is declared;
 // unused fields (challenge_ts, hostname, credit) are intentionally
 // omitted so a forward-compatible API change to hCaptcha never fails
 // our decode.

@@ -164,7 +164,7 @@ export class ApiClient {
   // the client adapts the wire shape into a one-element array on
   // read and translates the editor's yaml field back into the
   // backend's JSON Policy on write. The "yaml" editor is JSON under
-  // the hood in Phase 1; the same canonical form is what the gateway
+  // the hood; the same canonical form is what the gateway
   // accepts, so a round-trip through the textarea is lossless.
 
   async listPlacementPolicies(): Promise<PlacementPolicy[]> {
@@ -373,8 +373,8 @@ function isFeatureUnavailable(e: unknown): boolean {
 }
 
 // BackendPlacementPolicy mirrors placement_policy.Policy on the
-// gateway side (metadata/placement_policy/policy.go). Phase 1 does not
-// emit an updated_at timestamp, so the frontend synthesizes one at
+// gateway side (metadata/placement_policy/policy.go). The gateway does
+// not emit an updated_at timestamp, so the frontend synthesizes one at
 // read time for display purposes only.
 interface BackendPlacementPolicy {
   tenant: string;
