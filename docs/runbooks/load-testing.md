@@ -80,7 +80,7 @@ run the harness against the local Ceph RGW demo cluster
 ```bash
 ./benchmark-runner \
   -provider=ceph_rgw \
-  -rgw-endpoint=http://localhost:8888 \
+  -rgw-endpoint=http://127.0.0.1:8888 \
   -rgw-bucket=bench \
   -rgw-region=default \
   -rgw-access-key=$RGW_KEY \

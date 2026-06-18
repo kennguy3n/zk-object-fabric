@@ -7,7 +7,7 @@
 # It is the local backend for two documented workflows:
 #
 #   * the load-testing harness   — docs/runbooks/load-testing.md §3
-#     (Tier 2: `-provider=ceph_rgw -rgw-endpoint=http://localhost:8888`)
+#     (Tier 2: `-provider=ceph_rgw -rgw-endpoint=http://127.0.0.1:8888`)
 #   * the live conformance gate  — tests/s3_compat TestSuite_CephRGW
 #     (docs/runbooks/s3-conformance.md, deploy/local-dc/README.md)
 #
@@ -30,7 +30,7 @@
 #   AWS_ACCESS_KEY_ID=zkof-test-ak \
 #   AWS_SECRET_ACCESS_KEY=zkof-test-sk-0000000000000000000000000 \
 #   AWS_DEFAULT_REGION=us-east-1 \
-#     aws --endpoint-url http://localhost:8888 \
+#     aws --endpoint-url http://127.0.0.1:8888 \
 #         s3api create-bucket --bucket zkof-ceph-compliance
 #
 # See deploy/demo/README.md for the full walkthrough.
@@ -56,8 +56,12 @@ services:
       CEPH_DEMO_BUCKET: bench
       RGW_NAME: ceph-demo
       RGW_FRONTEND_PORT: "8888"
+    # Published on the loopback interface only: the demo ships a writable
+    # S3 endpoint with well-known dev credentials, so it must not be
+    # reachable off the host. Every documented workflow (load-testing
+    # runbook, conformance suite, README examples) hits 127.0.0.1.
     ports:
-      - "8888:8888"
+      - "127.0.0.1:8888:8888"
     volumes:
       - ceph-etc:/etc/ceph
       - ceph-lib:/var/lib/ceph

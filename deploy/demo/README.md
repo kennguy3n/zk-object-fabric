@@ -5,7 +5,7 @@ that exposes an S3-compatible endpoint on `:8888`. It backs two
 documented workflows without a real Ceph cluster:
 
 - **Load-testing Tier 2** — `docs/runbooks/load-testing.md` §3 runs the
-  benchmark harness against `-provider=ceph_rgw -rgw-endpoint=http://localhost:8888`.
+  benchmark harness against `-provider=ceph_rgw -rgw-endpoint=http://127.0.0.1:8888`.
 - **Live conformance gate** — `tests/s3_compat` `TestSuite_CephRGW`
   (see `docs/runbooks/s3-conformance.md` and `deploy/local-dc/README.md`).
 
@@ -18,7 +18,9 @@ container hostname so the image's in-container bucket creation resolves
 its own endpoint.
 
 > **Development only.** All-in-one mon/mgr/osd/rgw in one container, a
-> single OSD, no replication, plain HTTP. Do not use for anything real.
+> single OSD, no replication, plain HTTP with well-known credentials. The
+> endpoint is published on `127.0.0.1` only so it is not reachable off the
+> host. Do not use for anything real.
 
 ## Quick start
 
@@ -32,11 +34,16 @@ The gateway is ready when the container reports `healthy`
 
 | Setting     | Value                                            |
 | ----------- | ------------------------------------------------ |
-| Endpoint    | `http://localhost:8888`                          |
+| Endpoint    | `http://127.0.0.1:8888`                          |
 | Access key  | `zkof-test-ak`                                   |
 | Secret key  | `zkof-test-sk-0000000000000000000000000`         |
 | Region      | `us-east-1` (RGW demo accepts any; `default` ok) |
 | Bucket      | `bench` (auto-created at boot)                   |
+
+Use the IP literal `127.0.0.1`, not `localhost` — as CI does. The image
+sets `rgw dns name` to `RGW_NAME` (`ceph-demo`), so RGW treats a
+`localhost` Host header as a virtual-hosted bucket request; an IP host is
+always parsed path-style.
 
 ## Try it with the AWS CLI
 
@@ -46,8 +53,8 @@ export AWS_SECRET_ACCESS_KEY=zkof-test-sk-0000000000000000000000000
 export AWS_DEFAULT_REGION=us-east-1
 
 echo hello > hello.txt
-aws --endpoint-url http://localhost:8888 s3 cp hello.txt s3://bench/
-aws --endpoint-url http://localhost:8888 s3 ls s3://bench/
+aws --endpoint-url http://127.0.0.1:8888 s3 cp hello.txt s3://bench/
+aws --endpoint-url http://127.0.0.1:8888 s3 ls s3://bench/
 ```
 
 ## Run the conformance suite
@@ -59,10 +66,10 @@ its bucket once, then point the suite at the demo:
 AWS_ACCESS_KEY_ID=zkof-test-ak \
 AWS_SECRET_ACCESS_KEY=zkof-test-sk-0000000000000000000000000 \
 AWS_DEFAULT_REGION=us-east-1 \
-  aws --endpoint-url http://localhost:8888 \
+  aws --endpoint-url http://127.0.0.1:8888 \
       s3api create-bucket --bucket zkof-ceph-compliance
 
-CEPH_RGW_ENDPOINT=http://localhost:8888 \
+CEPH_RGW_ENDPOINT=http://127.0.0.1:8888 \
 CEPH_RGW_BUCKET=zkof-ceph-compliance \
 CEPH_RGW_ACCESS_KEY=zkof-test-ak \
 CEPH_RGW_SECRET_KEY=zkof-test-sk-0000000000000000000000000 \
