@@ -1357,7 +1357,7 @@ fine; production build on AGPL is not.
 | Build Storj-style 80/29 EC in controlled DCs                       | Tuned for untrusted peers. Wastes capacity when nodes are controlled (use 8+3 or 10+4).        |
 | Expose node-level placement in the cloud model                     | Meaningless while Wasabi owns durability. Use DC / rack / node knobs only in hybrid / owned-DC. |
 | Build a full decentralized reputation / token / satellite system   | Out of scope. Adds complexity without improving the cloud / hybrid value proposition.          |
-| Publish theoretical "eleven nines" durability                      | Cannot be validated on cloud backends. Only publish measured durability from chaos tests.      |
+| Publish theoretical "eleven nines" durability                      | Cannot be validated by analysis. Only publish measured durability from chaos tests.      |
 | Block on a custom distributed filesystem                           | Wasabi is the cloud durable origin; Ceph RGW or SeaweedFS is the local-DC base.                |
 
 ---
