@@ -1,0 +1,5 @@
+{"name":"minio-py","function":"put_object","args":{"bucket":"zkof-conf","object":"k2"},"duration":11,"status":"PASS"}
+{"name":"minio-py","function":"get_object","args":{"bucket":"zkof-conf","object":"k2"},"duration":7,"status":"PASS"}
+{"name":"minio-py","function":"presigned_get_object","args":{"bucket":"zkof-conf"},"duration":4,"status":"PASS"}
+{"name":"minio-py","function":"set_bucket_lifecycle","args":{},"duration":3,"status":"NA"}
+{"name":"minio-py","function":"sse_c_object_put","args":{},"duration":5,"status":"WEIRD-STATUS"}

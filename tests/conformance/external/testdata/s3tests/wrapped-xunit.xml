@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="s3tests.functional" tests="2" errors="0" failures="0" skip="0">
+    <testcase classname="s3tests.functional.test_s3" name="test_put_object" time="0.55"></testcase>
+  </testsuite>
+  <testsuite name="s3tests.functional.test_s3_website" tests="1" errors="0" failures="1" skip="0">
+    <testcase classname="s3tests.functional.test_s3_website" name="test_redirect" time="0.31">
+      <failure type="AssertionError" message="redirect missing">no Location header</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

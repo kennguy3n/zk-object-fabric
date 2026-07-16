@@ -1,0 +1,63 @@
+# Ceph s3-tests skip tag list — authoritative mapping to the
+# gateway's "unsupported" S3 surface set.
+#
+# Each line is one nose attribute (or "tag" in s3-tests
+# terminology). The driver script run_s3tests.sh converts each
+# line into "!tag" and feeds them to `nosetests -a` so tests
+# annotated with that tag are skipped.
+#
+# Skipping is the correct behaviour for unimplemented surface:
+# the gateway returns 501 NotImplemented (or 405 MethodNotAllowed
+# for some bucket-level operations) for these features, and the
+# audit matrix records them as `unsupported`, NOT `failed`.
+#
+# If you implement one of these features:
+#   1. Remove its line from this file.
+#   2. Remove the corresponding entry from the
+#      `unsupportedSubresources` map in
+#      api/s3compat/handler.go (so the dispatcher routes the
+#      request instead of returning 501).
+#   3. Move the operation from `mustBeUnsupported` to `mustPass`
+#      in tests/s3_conformance/runner_test.go.
+#   4. Run the in-process and external matrices and verify the
+#      operation flips to `passed` in both.
+
+# Tests that assert behaviour we know diverges from AWS itself
+# (s3-tests covers a few "fails_on_aws" cases for reference
+# implementations; they are not applicable to gateway-level
+# conformance).
+fails_on_aws
+
+# Server-side encryption with customer-provided key (SSE-C).
+# The gateway implements client-side encryption only; SSE-C is
+# not on the road-map (see audit-package-cryptography.md §6).
+sse-c
+encryption
+
+# Object versioning. Not implemented; PUT/DELETE are
+# version-agnostic. Adding versioning requires extending the
+# manifest store schema.
+versioning
+
+# Object lifecycle policies (expiration, transition). Not
+# implemented; the gateway does not interpret X-Amz-Lifecycle
+# headers or the PutBucketLifecycle XML payload.
+lifecycle
+
+# Object tagging. Not implemented; PUT/GET/DELETE of object
+# tags returns 501.
+tagging
+
+# Cross-region replication. Not implemented; out of scope for
+# the single-cell deployment model.
+replication
+
+# Object Lock / WORM retention. Not implemented.
+object-lock
+retention
+
+# Bucket policies and ACLs as full surfaces. The gateway honours
+# bucket ownership via tenant ID but does not implement the
+# PutBucketAcl / PutObjectAcl XML payload surface.
+bucket-policy
+acl
